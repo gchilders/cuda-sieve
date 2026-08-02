@@ -149,9 +149,27 @@ Two differences to carry into any comparison:
 
 1. **CADO includes prime powers** (`BUCKET_SIEVE_POWERS`, `powlim=ULONG_MAX`).
    GGNFS's `.afb.0` has none — the 208-ideal gap in the small part is exactly
-   this. Our small sieve inherits the GGNFS set and is therefore missing
-   powers; that is the remaining known parity gap.
-2. **CADO does not truncate the factor base at q**, GGNFS does. Confirmed
+   this. *(Closed 2026-08-01: we load `c183.fb1` directly.)*
+
+   **Root encoding, and the trap in it (2026-08-02).** A root is stored in
+   `[0, 2q)`; at or above `q` it is projective with reciprocal `rr = r - q`,
+   meaning `a*rr == b (mod q)`. For a **prime** `q` the only projective root is
+   `rr = 0`, the classical `b == 0 (mod q)` — so assuming `rr = 0` is correct
+   on a prime-only factor base and wrong as soon as powers arrive. `c183.fb1`
+   has **35 entries with a nonzero reciprocal**, the projective ladder above
+   the leading coefficient `110880 = 2^5*3^2*5*7*11`, starting at `4:4,3: 6`.
+   They are worth 4.7e8 updates per special-q. Treating them as `rr = 0` gives
+   a lattice of the *same density* on *different congruences* — see RESULTS.md
+   finding 18 for why that defeats every density-based gate.
+
+2. **Side 0's projective ladder.** `Y1 = 59*101*127*281*1259*38321*5746453`,
+   so seven projective primes; the ladders `59^2, 101^2, 127^2` stay under
+   `2^15`. Those three were the **-3** in side 0's small part (3,586 vs 3,589)
+   and are now emitted. Side 0 is 3,957,374 ideals. The remaining -1,114 in the
+   bucketed count is a `powlim` difference: las builds side 0 on the fly with
+   `powlim = ULONG_MAX`, we cap at `maxbits = 15`. For parity runs, pin las
+   down with `-powlim0 32767 -powlim1 32767` rather than chasing it up.
+3. **CADO does not truncate the factor base at q**, GGNFS does. Confirmed
    here: largest prime read was 134,199,997 against `alim = 134,200,000`.
 
 ## Not a timing reference

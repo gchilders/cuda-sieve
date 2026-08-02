@@ -73,7 +73,7 @@ int rfb_build(const poly_t *P, uint32_t lim, int maxbits, double scale, fb_t *fb
     bigint_t Y0, Y1;
     unsigned char *sieve;                  /* odd numbers only: bit k <-> 2k+3 */
     uint32_t nodd, i, k = 0, cap;
-    uint32_t nproj = 0, npow = 0;
+    uint32_t nproj = 0, npow = 0, nprojpow = 0;
     const uint32_t powmax = (maxbits > 0 && maxbits < 31) ? (1u << maxbits) : 0;
 
     memset(fb, 0, sizeof(*fb));
@@ -102,67 +102,63 @@ int rfb_build(const poly_t *P, uint32_t lim, int maxbits, double scale, fb_t *fb
     if (!fb->primes || !fb->roots || !fb->logp) { free(sieve); return -1; }
 
     /* p = 2 first, then the odd primes in order -- fb_split_small and
-     * fb_restrict both assume non-decreasing p */
-    {
-        uint32_t y1 = big_mod(&Y1, 2), y0 = big_mod(&Y0, 2);
-        fb->primes[k] = 2;
-        fb->roots[k]  = y1 ? (uint32_t)((2 - y0 % 2) % 2) : 2;
-        fb->logp[k]   = fb_log_delta(2, 1, 0, scale);
-        if (!y1) nproj++;
-        k++;
-        /* powers of two need a 2-adic inverse, not the binary-Euclid one */
-        if (y1) {
-            uint32_t qk = 2; int e;
-            for (e = 2; e <= 31 && k < cap; e++) {
-                uint64_t nq = (uint64_t)qk * 2;
-                uint32_t yy1, yy0, inv;
-                int t = 0;
-                if (!powmax || nq > powmax) break;
-                qk = (uint32_t)nq;
-                yy1 = big_mod(&Y1, qk);
-                if ((yy1 & 1) == 0) break;
-                yy0 = big_mod(&Y0, qk);
-                (void)t;
-                inv = pl_invmod_any(yy1, qk);
-                fb->primes[k] = qk;
-                fb->roots[k]  = (uint32_t)(((uint64_t)(qk - yy0 % qk) % qk
-                                            * (uint64_t)inv) % (uint64_t)qk);
-                fb->logp[k]   = fb_log_delta(2, e, e - 1, scale);
-                k++; npow++;
-            }
-        }
-    }
-    for (i = 0; i < nodd && k < cap; i++) {
+     * fb_restrict both assume non-decreasing p. pl_invmod_any dispatches on
+     * the parity of the modulus, so 2 needs no separate code path. */
+    for (i = 0; i < nodd + 1 && k < cap; i++) {
         uint32_t p, y0, y1, qk;
-        int e;
-        if (sieve[i >> 3] & (1u << (i & 7))) continue;
-        p  = 2 * i + 3;
+        int e, proj;
+        if (i == 0) p = 2;
+        else {
+            if (sieve[(i - 1) >> 3] & (1u << ((i - 1) & 7))) continue;
+            p = 2 * (i - 1) + 3;
+        }
         y1 = big_mod(&Y1, p);
-        fb->primes[k] = p;
-        fb->logp[k] = fb_log_delta(p, 1, 0, scale);
-        if (y1 == 0) { fb->roots[k] = p; nproj++; k++; continue; }
         y0 = big_mod(&Y0, p);
-        /* r = -Y0/Y1 mod p */
-        fb->roots[k] = (uint32_t)(((uint64_t)(p - y0 % p) % p
-                                   * pl_invmod(y1, p)) % (uint64_t)p);
+        /* G(x) = Y1*x + Y0, so the root is the point (Y0 : -Y1) of P^1. Exactly
+         * one of Y0, Y1 is a unit mod p because gcd(Y0,Y1) = 1, and which one
+         * decides the encoding: p | Y1 normalises to (1 : -Y1/Y0), the
+         * PROJECTIVE form with reciprocal rr = -Y1/Y0; otherwise it normalises
+         * to (-Y0/Y1 : 1), the affine root. This is the same decision at every
+         * rung of the ladder, so both ladders are the same loop. */
+        proj = (y1 == 0);
+        fb->primes[k] = p;
+        fb->logp[k]   = fb_log_delta(p, 1, 0, scale);
+        if (proj) {
+            /* rr == 0 mod p: the classical "b == 0 (mod p)" case */
+            fb->roots[k] = p;
+            nproj++;
+        } else {
+            fb->roots[k] = (uint32_t)(((uint64_t)(p - y0 % p) % p
+                                       * pl_invmod_any(y1, p)) % (uint64_t)p);
+        }
         k++;
-        /* prime powers, exactly as makefb emits them: modulus p^e, root lifted
-         * mod p^e (for a linear polynomial no Hensel step is needed -- the
-         * inverse of Y1 mod p^e is enough), and the log increment is the
-         * MARGINAL fb_log(p^e) - fb_log(p^(e-1)), not log(p^e). */
+        /* Prime powers, exactly as makefb emits them: modulus p^e, root lifted
+         * mod p^e (for a linear polynomial no Hensel step is needed -- one
+         * inverse mod p^e is enough), and the log increment is the MARGINAL
+         * fb_log(p^e) - fb_log(p^(e-1)), not log(p^e).
+         *
+         * The projective ladder is NOT empty, which is what the old "p | Y1: no
+         * lift" break got wrong. v_p(Y1) = 1 for every factor of this Y1, and
+         * the lift of a projective root is a point of P^1(Z/p^e) whose
+         * reciprocal is divisible by p but not by p^e -- nonzero, and encoded
+         * p^e + rr. Skipping them cost the ideals 59^2, 101^2 and 127^2, which
+         * is exactly the -3 in side 0's small-part count against las. */
         for (e = 2, qk = p; e <= 31 && k < cap; e++) {
             uint64_t nq = (uint64_t)qk * p;
-            uint32_t yy1, yy0;
+            uint32_t yy1, yy0, num, den;
             if (!powmax || nq > powmax) break;
             qk = (uint32_t)nq;
             yy1 = big_mod(&Y1, qk);
-            if (yy1 % p == 0) break;           /* p | Y1: no lift */
             yy0 = big_mod(&Y0, qk);
+            num = proj ? yy1 : yy0;            /* numerator of -num/den       */
+            den = proj ? yy0 : yy1;            /* the unit; must stay a unit  */
+            if (den % p == 0) break;           /* gcd(Y0,Y1) > 1: not our case */
             fb->primes[k] = qk;
-            fb->roots[k]  = (uint32_t)(((uint64_t)(qk - yy0 % qk) % qk
-                                        * pl_invmod(yy1, qk)) % (uint64_t)qk);
+            fb->roots[k]  = (uint32_t)(((uint64_t)(qk - num % qk) % qk
+                                        * pl_invmod_any(den, qk)) % (uint64_t)qk)
+                            + (proj ? qk : 0u);
             fb->logp[k]   = fb_log_delta(p, e, e - 1, scale);
-            k++; npow++;
+            k++; npow++; if (proj) nprojpow++;
         }
     }
     free(sieve);
@@ -181,7 +177,8 @@ int rfb_build(const poly_t *P, uint32_t lim, int maxbits, double scale, fb_t *fb
             fb->primes[m+1] = q; fb->roots[m+1] = r; fb->logp[m+1] = l;
         }
     }
-    printf("rational factor base: %u ideals up to %u (%u prime-power, %u projective)"
-           " at scale %.3f\n", k, lim, npow, nproj, scale);
+    printf("rational factor base: %u ideals up to %u (%u prime-power of which"
+           " %u projective, %u projective primes) at scale %.3f\n",
+           k, lim, npow, nprojpow, nproj, scale);
     return 0;
 }

@@ -23,24 +23,43 @@
 
 /* ---- stage T: root transform + plattice reduction --------------------- */
 
+/* The transform runs through pl_transform_enc, not pl_transform, for three
+ * reasons that all bite on CADO's factor base and none of which bite on
+ * GGNFS's:
+ *   - a projective entry (root >= q) must keep its reciprocal, and the affine
+ *     formula would reduce it to a bogus affine root instead;
+ *   - q = 2^15 sits exactly at the default bkthresh, so an EVEN modulus
+ *     reaches this kernel, and binary-Euclid pl_invmod cannot invert mod 2^k;
+ *   - raising -maxbits puts odd prime powers here, where a non-invertible
+ *     denominator makes binary Euclid spin forever ON THE DEVICE.
+ * pl_transform_enc handles all three; the first two are wrong answers and the
+ * third is a hang, so none of them would have shown up as a failed gate.
+ *
+ * What is still not expressible is g > 1: hits confined to every g-th row,
+ * which is not a plat_t walk. Those emit an empty walk, and the kernel
+ * accumulates the number of positions thereby dropped so the loss is a printed
+ * number rather than a silence. With the default bkthresh = I >= J it is
+ * exactly zero: g > 1 needs q | (rows), and every bucketed q exceeds J. */
 __global__ void k_transform(const uint32_t *__restrict primes,
                             const uint32_t *__restrict roots,
                             plat_t *__restrict out,
-                            uint32_t n, int logI,
+                            uint32_t n, int logI, uint32_t J,
                             int64_t a0, int64_t a1, int64_t b0, int64_t b1,
-                            uint32_t *__restrict nproj)
+                            uint32_t *__restrict nproj,
+                            unsigned long long *__restrict nlost)
 {
     uint32_t stride = gridDim.x * blockDim.x;
     for (uint32_t k = blockIdx.x * blockDim.x + threadIdx.x; k < n; k += stride) {
-        uint32_t p = primes[k];
-        uint32_t rt = pl_transform(p, roots[k], a0, a1, b0, b1);
-        if (rt >= p) {                       /* projective: emit an empty walk */
+        const uint32_t q = primes[k];
+        uint32_t rt, g, m = pl_transform_enc(q, roots[k], a0, a1, b0, b1, &rt, &g);
+        if (g > 1) {                         /* rows only: emit an empty walk */
             plat_t P; P.inc_warp = 0xFFFFFFFFu; P.inc_step = PL_VERTICAL;
             P.bound_warp = 0; P.bound_step = 0;
             out[k] = P;
             atomicAdd(nproj, 1u);
+            atomicAdd(nlost, (unsigned long long)((J / g) * ((1u << logI) / m)));
         } else {
-            out[k] = pl_make(p, rt, logI);
+            out[k] = pl_make(m, rt, logI);
         }
     }
 }
@@ -233,10 +252,19 @@ __global__ void k_apply(const uint32_t *__restrict buckets,
                 for (int k = 6; k >= 0; k--)
                     if (k < N.deg) { vp *= v; acc = fmaf(acc, u, N.d[k] * vp); }
                 float s = fabsf(acc);
-                /* las: S = fb_log(|F|) = floor(log2|F| * scale + 0.5), byte */
+                /* las: S = fb_log(|F|) = floor(log2|F| * scale + 0.5).
+                 * las clamps here at 255 because its cell IS a byte, and that
+                 * is the whole reason `scale` exists (1.28 * 196.61 = 251.7).
+                 * Our cell is 16 bits, so the ceiling is CINIT, not 255, and
+                 * scale becomes a free parameter rather than a constraint --
+                 * at scale 1.28 las discards 0.39 bits of resolution per
+                 * position that we can keep. Clamping at 255 threw that away
+                 * and, worse, would have silently flattened every norm above
+                 * 255/scale into one bucket the moment anyone raised scale. */
                 float lg = N.scale * (N.log2M + __log2f(fmaxf(s, 1e-30f)) - N.bias);
                 int ti = (int)floorf(lg + 0.5f);
-                t = (ti < 0) ? 0u : ((uint32_t)ti > 255u ? 255u : (uint32_t)ti);
+                const uint32_t TMAX = (CELLBITS == 8) ? 255u : CINIT;
+                t = (ti < 0) ? 0u : ((uint32_t)ti > TMAX ? TMAX : (uint32_t)ti);
             }
             word |= (CINIT - t) << (c * CELLBITS);
         }
@@ -492,6 +520,7 @@ void k_fill_l2(const uint32_t *__restrict in, const uint32_t *__restrict incnt,
 
 struct dev_bufs {
     uint32_t *primes, *roots, *cursor, *overflow, *nproj, *l1, *l1cnt;
+    unsigned long long *nlost;
     plat_t   *plat;
     uint8_t  *out;
     uint16_t *slice, *slice_logp;
@@ -549,6 +578,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     CK(cudaMalloc(&D.plat,   (size_t)fb->n * sizeof(plat_t)));
     CK(cudaMalloc(&D.overflow, 4));
     CK(cudaMalloc(&D.nproj, 4));
+    CK(cudaMalloc(&D.nlost, 8));
     CK(cudaMemcpy(D.primes, fb->primes, (size_t)fb->n * 4, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(D.roots,  fb->roots,  (size_t)fb->n * 4, cudaMemcpyHostToDevice));
 
@@ -569,16 +599,16 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     uint32_t nsmall = 0, nblk = 0, nwrp = 0;
     uint32_t *hsp = NULL, *hsrt = NULL, *hsg = NULL; uint16_t *hslp = NULL;
     if (cfg->small_sieve && fbs && fbs->n) {
-        uint32_t i, k = 0, nrow = 0;
+        uint32_t i, k = 0, nrow = 0, nprj = 0;
         hsp  = (uint32_t *)malloc((size_t)fbs->n * 4);
         hsrt = (uint32_t *)malloc((size_t)fbs->n * 4);
         hslp = (uint16_t *)malloc((size_t)fbs->n * 2);
         hsg = (uint32_t *)malloc((size_t)fbs->n * 4);
         for (i = 0; i < fbs->n; i++) {
             uint32_t q = fbs->primes[i], r = fbs->roots[i], rt, g, m;
-            m = pl_transform_gen(q, r >= q ? 0 : r, r >= q,
-                                 L->a0, L->a1, L->b0, L->b1, &rt, &g);
+            m = pl_transform_enc(q, r, L->a0, L->a1, L->b0, L->b1, &rt, &g);
             if (g > 1) nrow++;
+            if (r >= q) nprj++;
             hsp[k] = m; hsrt[k] = rt; hsg[k] = g;
             hslp[k] = fbs->logp[i];
             k++;
@@ -611,9 +641,10 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
         {   double upd = 0; uint32_t xm = (1u << cfg->logI) * cfg->J;
             for (i = 0; i < nsmall; i++) upd += (double)xm / hsp[i] / hsg[i];
             printf("  small sieve: %u entries (%u block-tier m<%u, %u warp-tier m<%u,"
-                   " %u thread-tier), %u with a row divisor, %.3e updates\n",
+                   " %u thread-tier), %u with a row divisor, %u projective,"
+                   " %.3e updates\n",
                    nsmall, nblk, SS_BLOCK_CUT, nwrp - nblk, SS_WARP_CUT,
-                   nsmall - nwrp, nrow, upd);
+                   nsmall - nwrp, nrow, nprj, upd);
         }
     }
 
@@ -643,25 +674,30 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
 
     /* ---- stage T ---- */
     CK(cudaMemset(D.nproj, 0, 4));
+    CK(cudaMemset(D.nlost, 0, 8));
     cudaEventRecord(e0);
     for (int rep = 0; rep < cfg->reps; rep++)
         k_transform<<<blocks, cfg->threads>>>(D.primes, D.roots, D.plat, fb->n,
-            cfg->logI, L->a0, L->a1, L->b0, L->b1, D.nproj);
+            cfg->logI, cfg->J, L->a0, L->a1, L->b0, L->b1, D.nproj, D.nlost);
     cudaEventRecord(e1);
     CK(cudaEventSynchronize(e1));
     CK(cudaGetLastError());
     t_trans = time_kernel(e0, e1) / cfg->reps;
 
     uint32_t hproj = 0;
+    unsigned long long hlost = 0;
     CK(cudaMemcpy(&hproj, D.nproj, 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(&hlost, D.nlost, 8, cudaMemcpyDeviceToHost));
     hproj /= cfg->reps;
+    hlost /= (unsigned)cfg->reps;
 
     /* ---- expected record count, for sizing ---- */
     double exp_rec = 0;
     for (uint32_t i = 0; i < fb->n; i++) exp_rec += (double)xmax / fb->primes[i];
     uint64_t est = (uint64_t)(exp_rec * 1.15) + 4096;
 
-    printf("  transformed roots: %u projective (skipped)\n", hproj);
+    printf("  transformed roots: %u row-confined (g > 1), %llu positions lost%s\n",
+           hproj, hlost, hlost ? "  ** move these to the small tier **" : "");
     printf("  analytic records : %.3e   (sized with 1.15x margin)\n", exp_rec);
 
     uint32_t cap = 0;               /* records per region, set by the fill path */
@@ -904,7 +940,7 @@ after_apply:
 
     free(hslice); free(hlogp); free(hsp); free(hsrt); free(hsg); free(hslp);
     cudaFree(D.primes); cudaFree(D.roots); cudaFree(D.plat); cudaFree(D.cursor);
-    cudaFree(D.out); cudaFree(D.overflow); cudaFree(D.nproj);
+    cudaFree(D.out); cudaFree(D.overflow); cudaFree(D.nproj); cudaFree(D.nlost);
     cudaFree(D.l1); cudaFree(D.l1cnt); cudaFree(D.slice); cudaFree(D.slice_logp);
     cudaFree(D.surv); cudaFree(D.nsurv); cudaFree(D.dbg);
     cudaFree(D.sp); cudaFree(D.srt); cudaFree(D.sg); cudaFree(D.slp); cudaFree(D.dumpbuf);

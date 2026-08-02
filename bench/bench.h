@@ -32,6 +32,11 @@ int  fb_load_cado(const char *path, double scale, fb_t *fb);
 /* Fill logp with floor(log2(p)*scale + 0.5) for factor bases that did not come
  * with one (i.e. .afb.0). No-op if logp is already set. */
 void fb_fill_logp(fb_t *fb, double scale);
+
+/* The root transform is only valid for prime-power moduli; these keep that
+ * assumption honest. fb_check_prime_powers returns the first bad index, or -1. */
+int     fb_is_prime_power(uint32_t q);
+int32_t fb_check_prime_powers(const fb_t *fb);
 void fb_free(fb_t *fb);
 /* Restrict to bkthresh <= p < fb_bound, compacting in place. GGNFS truncates
  * the algebraic FB at the special-q; pass fb_bound = q to match it. */
@@ -89,7 +94,8 @@ int  verify_walk(int logI, uint32_t J, int nprimes);
 /* Count updates the walk produces for the given FB, single-threaded.
  * This is the ground truth the GPU fill must reproduce exactly. */
 uint64_t verify_count_updates(const fb_t *fb, const qlat_t *L,
-                              int logI, uint32_t J);
+                              int logI, uint32_t J,
+                              int log_region, uint32_t *per_region);
 
 /* ---- GPU entry points ------------------------------------------------- */
 
@@ -147,6 +153,10 @@ uint32_t verify_apply_region(const uint32_t *records, uint32_t nrec,
 /* Gate the root transform against its definition (a == r*b mod p), which the
  * walk check and the GPU/CPU cross-check both structurally cannot see. */
 int verify_transform(const qlat_t *L, int ncheck);
+
+/* The same set-equality gate driven by a real factor base: checks every entry
+ * with q <= maxq against the definition. Returns entries checked, or -1. */
+int verify_fb_transform(const fb_t *fb, const qlat_t *L, uint32_t maxq);
 
 #ifdef __cplusplus
 }

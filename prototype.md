@@ -135,6 +135,15 @@ Now cost the GPU sieve from this doc's own models, at I15e with 4 B records and 
 > complete two-sided sieve now sits **right at the 56 ms trial-division
 > floor**, and the small-prime sieve is half the chain.
 >
+> **Scope of this number, 2026-08-02.** It is a *sieve* measurement: transform,
+> fill, apply, threshold, survivor list. The two-sided survivor intersection,
+> resieve, factor recovery, host transfer and the cofactor feed do not exist.
+> **Kernel feasibility is demonstrated; relation-collection feasibility is
+> not**, and any whole-box speedup quoted from it is a projection with the
+> cofactor path assumed unchanged, not a measured relation rate. Two placement
+> bugs found in review on 2026-08-02 (findings 18–19) change where updates land
+> but not how many, so they do not move this timing.
+>
 > Measured at `q=120000053, rho=112625526` — a real special-q from las, not a
 > synthetic one — with region 2^14. The apply row is a single fused kernel and
 > already contains norm init (1.76 ms) and the small-prime sieve (13.17 ms
@@ -1018,9 +1027,39 @@ The one strategic risk I see is *over*-polishing the sieve. At 55.5 ms against a
 
 **R1 — Bucketed projective side-0 entries are mishandled, and the CPU reference shares the blind spot.** Y1 = 59 · 101 · 127 · 281 · 1259 · **38321** · **5746453**. The last two are in [2^15, 67.1M], so side 0 has exactly two bucketed projective entries (encoded `root == p` by `rfb.c`). `k_transform` (`bench_kernels.cu:36`) passes `roots[k]` straight into `pl_transform`, which reduces `r = p ≡ 0` and returns a bogus *affine* root — the `rt >= p` check right after it only catches *output*-projective denominators, not *input*-projective roots. Result: ~14,010 (p=38321) + 93 (p=5746453) records per special-q land on a wrong lattice and add 29/43 scaled log units there — pure false-survivor pressure. `verify_count_updates` (`verify_cpu.c:197`) makes the identical mistake, so the "records landed = CPU reference exactly" gate cannot see it — the same failure class as the transposed-basis bug this project already wrote up. Fix in both places: `if (roots[k] >= p) { skip; count; }` *before* the transform — correct because every bucketed p > J = 16384, so a projective entry's only hits are on row j=0 (only i=0 survives the |i| < I/2 < p constraint, and (0,0) isn't a relation). Side 1 is clean for this poly (lc = 110880 = 2^5·3^2·5·7·11, all projective primes < 12), but the fix covers the loader path where `fb_load_cado` keeps `r ≥ q` encodings too.
 
+> **Response, 2026-08-02 — R1's diagnosis is right, its fix is wrong. Do not
+> apply it.** The recommendation to skip bucketed projective entries rests on
+> "every bucketed p > J = 16384, so a projective entry's only hits are on row
+> j = 0". That conflates the two coordinates. The projective condition
+> constrains `b`, and `b = i·a1 + j·b1`; for a special-q of this size the
+> reduced basis has b-components of order `sqrt(q/skew) ≈ 1`, and on this
+> lattice `b = i` exactly. So the condition is `i ≡ 0 (mod p)` — one hit per
+> row, on **every** row: 16,384 positions per entry, not one row's worth. (The
+> review's own "~14,010" is `A/p`, which is the right order of magnitude for
+> the wrong reason.) They are now transformed as projective ideals, not
+> skipped. `fbtest` prints the `b(i,j)` form at startup so this cannot be
+> mis-argued again.
+>
+> R1 also states that `k_transform` passes such roots into `pl_transform` and
+> gets a bogus affine root. In the code as it stood they never reached
+> `k_transform` — `fb_restrict` dropped them first. The bogus-affine-root path
+> was real for a *different* input (see R2/R3), and is fixed.
+>
+> The genuine version of this bug was on the **algebraic** side and larger:
+> projective roots with a **nonzero** reciprocal, 35 of them in `c183.fb1`,
+> 4.7e8 updates and 1.54 scaled log units per cell placed on the wrong
+> congruence. Same density as the right answer, which is why every gate passed.
+> RESULTS.md findings 18–20.
+
 **R2 — q = 32768 sits in the bucketed set with an even modulus.** `fb_split_small` cuts at `p < bkthresh`, so the top of the 2-ladder (2^15, present in `c183.fb1`) goes to the *bucket* path, where `pl_transform` → `pl_invmod_any` returns 0 whenever the denominator is even-but-not-invertible (~half of all special-q) and silently produces root 0 — one ideal, 1 log unit, wrong positions on those q. Cheapest fix: send moduli that are not prime (or the boundary power specifically) to the small tier, whose host-side `pl_transform_gen` handles them exactly; alternatively gate `k_transform` through the gen path for non-prime moduli.
 
 **R3 — Latent GPU hang if anyone raises `-maxbits`.** The device path still uses binary-Euclid `pl_invmod` for odd moduli. An odd prime power q = p^k above bkthresh (which regenerating the FB with `maxbits > 15` would create) hits the gcd > 1 case and **loops forever on the device** — the exact Finding-15 failure, one path over. Until the device transform is power-safe, enforce the assumption: assert in the loaders that every bucketed modulus is prime (or 2^k), so the failure is a message rather than a hang.
+
+> **Done, 2026-08-02** — all three faults removed by routing `k_transform`
+> through `pl_transform_enc`, which decodes the encoding and is power-safe.
+> R3's "assert that every bucketed modulus is prime" became
+> `fb_check_prime_powers`, which enforces the transform's actual precondition
+> (prime *power*, not prime) over any loaded factor base. RESULTS.md finding 21.
 
 **R4 — Per-region checksums would close the verification gap R1 exposed.** Global record count + one-region cell replay leaves room for "right total, wrong region" errors. Extend `verify_count_updates` to also accumulate per-region (count, XOR/sum of offsets) and compare all 32K regions against the GPU cursors/records. O(same) host time, and it institutionalizes the transpose lesson: gate against *placement*, not just volume.
 
@@ -1029,6 +1068,10 @@ The one strategic risk I see is *over*-polishing the sieve. At 55.5 ms against a
 ## Factor-base reconciliation vs las — all three gaps now explained
 
 For Finding 14's table (counts las vs ours):
+
+> **Confirmed and fixed, 2026-08-02.** The −3 was exactly 59², 101², 127²;
+> restoring the projective ladder closes it (RESULTS.md finding 20). The
+> "−1,114" and "−1" remain open and are `powlim` differences, as diagnosed.
 
 - **Side-0 small, −3:** the projective *power* ideals 59², 101², 127² (the three factors of Y1 whose squares stay ≤ 2^15). `rfb.c:159` breaks out of the power loop when `p | Y1` ("no lift"), but projective roots do lift — makefb emits them; we don't.
 - **Side-0 bucketed, −1,114:** las builds side 0 on the fly with `powlim = ULONG_MAX` (PARITY.md) → 1,112 regular prime-power ideals in [2^15, 67.1M] (I counted them: exactly 1,112) plus the projective squares 281², 1259². Our `rfb` caps powers at `maxbits = 15`.
@@ -1061,6 +1104,14 @@ The evidence that the dump is rotten is good. But the project already patches CA
 ## Housekeeping
 
 - **Still no git repo.** Step 0 item 9 ("every number in this doc should be attributable to a revision") is now overdue by one full results cycle — `git init` and commit the current state before the next measurement session; the 55.5 ms configuration deserves a tag.
+
+> **Done since** — repo exists, one commit, remote `kyleaskine/cuda-sieve`.
+> Remaining: `bench/bench` and `bench/dumpcmp` are tracked binaries and should
+> be `git rm --cached`'d (they are now in `.gitignore`). A second reviewer
+> reported "858 MiB object store with the 512 MB dumps, a 110 MiB factor base
+> and object files committed" — that is not this repo: it is 476 KiB across 31
+> files, and `.gitignore` already excludes `*.dump`, `*.fb1`, `*.afb.0`, `*.o`.
+> The two binaries are the only real instance.
 - `oracle/MANIFEST.sha256` predates today's additions (fb1, dumps, PARITY.md) — regenerate.
 - This doc has grown to ~1,000 lines with measurement blocks quoted inside design sections. It still reads well because the annotations are dated, but consider making `bench/RESULTS.md` the single source of numbers and keeping only verdict-level callouts here — future sessions will load faster and misquote less.
 

@@ -232,11 +232,42 @@ PL_FN uint32_t pl_transform(uint32_t p, uint32_t r,
  * forever on gcd > 1. That is exactly what CADO's factor base triggers, since
  * makefb emits 49, 121, 169, ... alongside the plain primes.
  *
- * Solve it in general. The condition a == r*b (mod q) becomes
- *     i*D == j*N  (mod q),   D = a0 - r*a1,  N = r*b1 - b0
- * (for a projective factor-base root the condition is b == 0, i.e. D = a1,
- * N = -b1). D and N cannot both be divisible by p, or p would divide the
- * determinant, which is the special-q. So with g = gcd(D, q):
+ * ROOT ENCODING. Both CADO and GGNFS store a root of q in [0, 2q). A value
+ * r < q is AFFINE and means a == r*b (mod q). A value r >= q is PROJECTIVE
+ * with reciprocal rr = r - q, and means
+ *
+ *     a * rr == b   (mod q).
+ *
+ * rr == 0 is the classical "b == 0 (mod q)" case, and it is the ONLY case that
+ * arises for a prime q -- which is why treating every projective root as
+ * rr == 0 survives a prime-only factor base. It is wrong for prime powers.
+ * A projective ideal above p lifts to p^k as a point of P^1(Z/p^k) whose
+ * reciprocal is divisible by p but not by p^k, so the ladder above a
+ * projective prime carries NONZERO reciprocals: `c183.fb1` opens with
+ * `4:4,3: 6` (q = 4, rr = 2) and has 35 such entries, worth 4.7e8 updates and
+ * 1.54 scaled log units per cell. Forcing rr to 0 keeps the density (both are
+ * index-q sublattices) and moves every one of those updates to the wrong
+ * congruence -- invisible to a density gate like sum(logp/q), and invisible to
+ * a CPU replay that shares this function. Pass the reciprocal.
+ *
+ * Solve it in general. The condition becomes i*D == j*N (mod q) with
+ *     affine (a == r*b):      D = a0 - r*a1,     N = r*b1 - b0
+ *     projective (a*rr == b): D = rr*a0 - a1,    N = b1 - rr*b0
+ * (at rr == 0 the projective pair is (-a1, b1), the negation of the old
+ * (a1, -b1) -- same ratio, so this generalises the previous case rather than
+ * replacing it). D and N cannot both be divisible by p, or p would divide the
+ * determinant, which is the special-q: in the projective case
+ * rr*det == D*b1 + a1*N, and p | rr would force p | a1 and p | b1. So with
+ * g = gcd(D, q):
+ *
+ * PRECONDITION: q is a prime power. That is all a factor base ever contains,
+ * and the parameterisation below genuinely needs it -- the step "solutions
+ * exist only when g | j" uses gcd(N, g) == 1, which follows from "p divides at
+ * most one of D and N" and holds only for a single prime p. For a composite
+ * modulus with two prime factors (q = 200, D even, N divisible by 5) the
+ * solution set is a CRT combination and this form is wrong. `fbtest` gates
+ * both halves of that: the transform against the definition over prime-power
+ * moduli, and every loaded factor base for being prime powers only.
  *
  *     solutions exist only when g | j, and then, writing j = g*j',
  *     i == rt * j'  (mod m),   m = q/g,   rt = N * (D/g)^-1  (mod m).
@@ -256,8 +287,8 @@ PL_FN uint32_t pl_transform_gen(uint32_t q, uint32_t r, int is_proj,
                                 uint32_t *rt_out, uint32_t *g_out)
 {
     const int64_t Q = (int64_t)q;
-    int64_t D = is_proj ? (a1 % Q)      : ((a0 - (int64_t)r * a1) % Q);
-    int64_t N = is_proj ? ((-b1) % Q)   : (((int64_t)r * b1 - b0) % Q);
+    int64_t D = is_proj ? (((int64_t)r * a0 - a1) % Q) : ((a0 - (int64_t)r * a1) % Q);
+    int64_t N = is_proj ? ((b1 - (int64_t)r * b0) % Q) : (((int64_t)r * b1 - b0) % Q);
     uint32_t g, m, dg;
     if (D < 0) D += Q;
     if (N < 0) N += Q;
@@ -269,6 +300,19 @@ PL_FN uint32_t pl_transform_gen(uint32_t q, uint32_t r, int is_proj,
                           * pl_invmod_any(dg % m, m)) % (uint64_t)m);
     *g_out = g;
     return m;
+}
+
+/* Transform a root in the factor base's OWN encoding -- affine below q,
+ * projective with reciprocal r - q at or above it. Every consumer of a loaded
+ * factor base should call this and nothing else: it is the single place the
+ * encoding is decoded, it is power-safe, and it cannot hang. */
+PL_FN uint32_t pl_transform_enc(uint32_t q, uint32_t r_enc,
+                                int64_t a0, int64_t a1, int64_t b0, int64_t b1,
+                                uint32_t *rt_out, uint32_t *g_out)
+{
+    const int isp = (r_enc >= q);
+    return pl_transform_gen(q, isp ? r_enc - q : r_enc, isp,
+                            a0, a1, b0, b1, rt_out, g_out);
 }
 
 /* Projective factor-base root (GGNFS and CADO both encode it as root >= p):

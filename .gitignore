@@ -2,3 +2,6 @@
 *.afb.0
 *.fb1
 *.o
+bench/bench
+bench/fbtest
+bench/dumpcmp

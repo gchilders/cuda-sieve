@@ -314,8 +314,14 @@ one. Three tiers sized to each entry's hit count:
 | p ≥ 1024 (≤16 hits) | 3,414 | one thread |
 
 At ~330 G updates/s against a card ceiling near 3.8 T conflict-free shared
-atomics/s, this is ~9% of peak and there is real headroom left. It is not the
-first thing to spend it on: fill is still 24.5 ms of the 47.1.
+atomics/s, this is ~9% of peak and there is real headroom left.
+
+**Superseded by prime powers (finding 15).** At the time this was written fill
+was the larger half (24.5 ms of 47.1) and the small sieve was not the place to
+spend effort. Powers took the small sieve from 4.36e9 to 6.84e9 updates, and at
+55.5 ms **apply (27.45) has overtaken fill (24.77) and the small-prime sieve is
+now the largest single component of the chain.** If sieve milliseconds are ever
+worth chasing again, this is where they are.
 
 **Region choice is what makes this cheap.** With `log_region ≤ logI` a region
 lies inside one j-row, so the entry point is one multiply and one remainder —
@@ -526,21 +532,265 @@ checksums; or reporting the bug upstream.
 Everything else from `oracle/PARITY.md` — the basis, the scales, the bounds,
 the factor-base composition — came from the `-v` log and remains sound.
 
+# Review round: two placement bugs, and the gate that would have caught them
+
+*2026-08-02. Two external reviews (fable's, in `prototype.md`; codex's, quoted
+in the session log). Everything below is measured or verified on the CPU — the
+GPU was busy, so no timing in this section is new.*
+
+## Finding 18 — projective roots with a nonzero reciprocal were placed wrong
+
+**The bug.** Both CADO and GGNFS store a root of `q` in `[0, 2q)`: below `q` it
+is affine (`a ≡ r·b mod q`), at or above it is projective with reciprocal
+`rr = r − q`, meaning `a·rr ≡ b (mod q)`. For a **prime** `q` the only
+projective root is `rr = 0`, the classical `b ≡ 0 (mod q)` — so code that
+assumes `rr = 0` is correct on a prime-only factor base and wrong the moment
+prime powers arrive. `bench_kernels.cu` passed `0` where the reciprocal
+belonged, and `plattice.cuh` only implemented the `rr = 0` case.
+
+`c183.fb1` has **35 such entries** — the projective ladder above the leading
+coefficient `110880 = 2^5·3^2·5·7·11`, opening with `4:4,3: 6` (q=4, rr=2).
+Between them:
+
+| | |
+|---|---:|
+| updates per special-q | **469,482,034** |
+| scaled log units per cell (scale 1.28) | **1.538** |
+
+**Why every existing gate was blind to it.** The wrong lattice has the *same
+density* as the right one — both are index-`q` sublattices. Measured directly
+for q=4, rr=2 over a small box: 32 true hits, 32 predicted hits, **16 in
+common**. So:
+
+- `Σ logp/q` (finding 16) checks density. Same density → passes.
+- the CPU replay (`verify_apply_region`) shares `plattice.cuh` with the GPU, so
+  it made the identical error → passes.
+- record counts vs the CPU reference → same count → passes.
+- `verify_transform` as it stood checked only that each *predicted* hit
+  satisfies the congruence, one direction, and it never exercised a nonzero
+  reciprocal at all → passes.
+
+This is the same failure class as the transposed-basis bug: **right volume,
+wrong placement.** It is the third one this project has hit, which is the real
+lesson — volume gates cannot catch placement bugs, and this codebase kept
+building volume gates.
+
+**The fix.** `pl_transform_gen` now takes the reciprocal and uses
+`D = rr·a0 − a1, N = b1 − rr·b0` for the projective case (at `rr = 0` that is
+the negation of the old `(a1, −b1)`, same ratio — a generalisation, not a
+replacement). `pl_transform_enc` is the single place the encoding is decoded,
+and every consumer now goes through it.
+
+## Finding 19 — bucketed projective entries were dropped, on a wrong argument
+
+`fb_restrict` discarded every entry with `root ≥ p`. Side 0 has two:
+**38321** and **5746453**, both factors of
+`Y1 = 59·101·127·281·1259·38321·5746453`.
+
+fable's review recommended *keeping* the drop, reasoning that a bucketed
+`p > J = 16384` means a projective ideal can only hit row `j = 0`. **That
+argument is wrong, and the way it is wrong is worth recording**: the projective
+condition constrains `b`, not `j`, and `b = i·a1 + j·b1`. For a special-q of
+this size the reduced basis has b-components of order `sqrt(q/skew) ≈ 1`, and
+on this lattice it is exactly
+
+```
+(a0,a1,b0,b1) = (-7374527, 1, 120000053, 0)   ->   b = i
+```
+
+so the condition is `i ≡ 0 (mod p)` — one hit per row, on **every** row.
+**16,384 positions per entry, not one row's worth.** `fbtest` prints the
+`b(i,j)` form at startup for exactly this reason.
+
+(A consequence worth its own line: `b = i` means the entire `i = 0` column has
+`b = 0` and can never yield a relation. That is a property of this q-lattice,
+not a bug, but it caps what these two entries are worth in practice.)
+
+`fb_restrict` now keeps them and the transform handles the encoding. What the
+bucket walk still cannot express is `g > 1` — hits confined to every `g`-th row
+— so `k_transform` emits an empty walk for those and **accumulates the number
+of positions dropped**, which is printed. At the default `bkthresh = I ≥ J` it
+is exactly zero.
+
+## Finding 20 — the projective power ladder does lift
+
+`rfb.c` broke out of the power loop at `p | Y1` with the comment "no lift".
+Projective roots *do* lift: the point `(Y0 : −Y1)` of `P^1` normalises to
+reciprocal `rr = −Y1/Y0 (mod p^e)`, which is divisible by `p` but not `p^e`.
+Restoring it adds `59^2, 101^2, 127^2` — **exactly the −3 in side 0's small-part
+count against las** (3,586 vs 3,589), which fable predicted and which now
+closes. Side 0 is 3,957,374 ideals, up 3.
+
+The affine and projective ladders are now the same loop: which of `Y0`, `Y1` is
+the unit mod `p` decides the encoding, and exactly one of them is, because
+`gcd(Y0,Y1) = 1`.
+
+## Finding 21 — the device transform could hang, and would have
+
+Three latent faults in `k_transform`, all of which CADO's factor base reaches
+and GGNFS's does not, all now removed by routing through `pl_transform_enc`:
+
+| | consequence |
+|---|---|
+| `q = 2^15` sits exactly at the default `bkthresh`, so an **even** modulus reaches the device | `pl_invmod` is binary Euclid; it needs an odd modulus. Silent wrong root. |
+| projective entries reaching the affine formula | `r ≡ 0` gives a bogus affine root. Silent. |
+| raising `--maxbits` puts odd prime powers in the bucket range | non-invertible denominator → binary Euclid **spins forever on the device**. |
+
+Two silent wrong answers and one hang — none of which any gate would have
+reported as a failure.
+
+`pl_transform_gen` has a genuine precondition, now documented and enforced:
+**`q` must be a prime power.** The step "solutions exist only when `g | j`"
+needs `gcd(N,g) = 1`, which follows from "`p` divides at most one of `D`, `N`"
+and holds only for a single prime. For `q = 200` (`D` even, `N` divisible by 5)
+the solution set is a CRT combination and this form is wrong — the new
+brute-force gate found this immediately, which is how it came to be documented.
+`fb_check_prime_powers` keeps the assumption true for any factor base loaded,
+including hand-edited or third-party ones.
+
+## Finding 22 — the gates now check placement, not volume
+
+New CPU-only binary `fbtest` (`make check`), 6 seconds, **no GPU** — so it runs
+on a busy box and on machines without the card:
+
+| gate | what it catches |
+|---|---|
+| transform vs definition by **set equality**, every prime power `q ≤ 200` and every root in `[0,2q)` | placement. Both directions, so a proper sublattice fails too. Covers primes, powers, even moduli, affine, projective with zero and nonzero reciprocal. |
+| the same, driven by the **real** factor bases | a loader that mangles the encoding, even where the algebra is right |
+| every modulus is a prime power | the transform's precondition |
+| `Σ logp/q` per side | parse, powers, log deltas, scale — one number |
+
+The first gate is the one that matters. The old `verify_transform` compared
+predicted hits against the congruence in **one direction only**; a transform
+naming a proper sublattice — right congruence, half the hits — passed it. Set
+equality against the definition, with `(a,b)` computed from `(i,j)` and no
+lattice algebra involved, is what closes that. Both of this session's bugs fail
+it loudly.
+
+`verify_count_updates` also gained an optional per-region count array, so the
+fill can be gated on **placement across all 32K regions** rather than on a
+global total (fable's R4).
+
+Result:
+
+```
+PASS  synthetic moduli              primes, prime powers, even moduli, affine + projective
+PASS  side 1 small part             3839 entries checked
+PASS  side 1 moduli are prime powers 7605616 ideals
+PASS  side 1 projective entries seen 41 projective, 35 with a NONZERO reciprocal
+PASS  side 0 small part             3589 entries checked
+PASS  side 0 moduli are prime powers 3957374 ideals
+PASS  side 0 projective ladder      10 projective, 3 with a NONZERO reciprocal
+```
+
+## Finding 23 — the 16-bit cell's precision was being thrown away
+
+`k_apply` clamped the initialised norm at **255**. las clamps there because its
+cell *is* a byte — that is the entire reason `scale` exists
+(`1.28 × 196.61 = 251.7`). Ours is 16 bits with `CINIT = 4096`, so the ceiling
+is `CINIT`, and `scale` is a free parameter rather than a constraint. The clamp
+meant we inherited las's 0.39 bits of lost resolution for nothing, and would
+have silently flattened every norm above `255/scale` into one bucket the moment
+anyone raised `scale`.
+
+Now clamped at `CINIT` (16-bit cells) or 255 (8-bit), with the two real limits
+validated up front and refused rather than saturated:
+
+| limit | binds at |
+|---|---|
+| `scale × log2(maxnorm) ≤ CINIT` | scale ≈ 20 (side 1) |
+| `scale × log2(p) ≤ 255` (the uint8 per-ideal log) | **scale ≈ 9** |
+
+So production scales of 2, 4, 8 are all available and free on the GPU side.
+Whether they reduce false survivors enough to matter for CPU cofactor work is
+**unmeasured** — it needs the GPU, and it is the cheapest remaining experiment.
+
+## Also fixed
+
+- **CLI defaults were the losing configuration.** `--mode twolevel --region 15`
+  were still the defaults after two-level lost by 2.7× and 2^15 lost to 2^14,
+  so several commands in this file reproduced a path nobody would ship.
+  Defaults are now `atomic` / `region 14`.
+- **Two silent parameter failures now refuse.** `--region > 16` with 2 B or 4 B
+  records overflows the 16-bit offset field (wrong cells, no error);
+  `--region > logI` breaks the fused small sieve's one-row assumption. Both
+  produced plausible-looking output.
+- `qlat_build` moved to `poly.c` so the correctness gates link without CUDA.
+
+## Not addressed in this round
+
+- **`--maxbits > 15` is now safe but untested**: the transform handles bucketed
+  odd prime powers, and `g > 1` losses are reported, but no run has exercised
+  it. The reported-loss counter is the thing to watch when someone does.
+- The `g > 1` bucketed case emits nothing rather than routing to the small
+  tier. Correct-and-reported, not correct-and-complete. Zero at the default
+  `bkthresh`.
+- Everything under "What is not yet measured" below, unchanged.
+
 ## What is not yet measured
 
-Resieve, cofactorization, the two-sided survivor intersection, `bkthresh`
-sweep, I16e slabbing, throughput mode. Byte-exact parity is blocked on a
-trustworthy oracle, not on our side of the comparison.
+**This is a sieve measurement, not a relation-collection measurement, and the
+distinction is load-bearing.** What runs end-to-end is: transform → fill →
+apply → threshold → survivor list, per side. What does not exist at all is the
+two-sided survivor intersection, resieve, factor recovery, host transfer, the
+cofactor feed, and unique-relation accounting. The survivor *list* is also
+capped at 2^22 entries against one-sided sets of 18–30M — the count is exact
+and truncation is reported, but nothing consumes the list yet.
 
-**Caveats on the numbers above.** One side only. `rho` is still synthetic, so
-this is representative, not parity. The 1-in-413 survivor rate is one-sided
-with a generous 112-bit allowance and is *not* a claim about las's survivor
-count — the real rate comes from intersecting both sides.
+So: **kernel feasibility is demonstrated; relation-collection feasibility is
+not.** Any "3–4× whole-box speedup" is a projection from sieve-q throughput
+with the cofactor path assumed unchanged, not a measured relation rate. It
+should be stated that way everywhere it appears.
+
+The comparison constants are also still assumptions, and every graded claim
+inherits their error bars:
+
+| constant | status |
+|---|---|
+| GGNFS `N_eff` at 14–16 workers | **unmeasured** — needs the quiet box. It is the divisor in every target number. |
+| GPU watts during the chain | **never captured.** The Gate-1 metric is updates/sec/**joule** and no joules exist. ~5 s of looping plus `nvidia-smi power.draw` sampling. |
+| CADO `f ≈ 0.23` (Gate 0) | assumed to generalise from GGNFS |
+| the "200× root-transform speedup" (finding 4) | GGNFS's Sieve-Change timer also covers small-sieve setup, transformed-polynomial work and report-bound setup, so this is an **upper bound**, not a like-for-like stage comparison. |
+
+Also unmeasured: `bkthresh` sweep, I16e slabbing, throughput mode, production
+scales 2/4/8 (finding 23), and the per-q host-side small-FB transform and sort
+(`bench_kernels.cu`), which runs outside every timed number.
+
+Byte-exact parity is blocked on a trustworthy oracle, not on our side of the
+comparison.
+
+**Caveats on the numbers above.** *(Written against the Path-2 configuration;
+the sections from "Small-prime sieve, rational side" onward run both sides on
+the real `q=120000053, rho=112625526`, so "one side only, synthetic rho" no
+longer applies to those. It still applies to findings 1–10.)* The 1-in-413
+survivor rate is one-sided with a generous 112-bit allowance and is *not* a
+claim about las's survivor count — the real rate comes from intersecting both
+sides, which is not implemented.
 
 ## Reproduce
 
+**The 55.5 ms configuration of record** — this is the command every number
+downstream quotes, and the one the CLI defaults now reproduce:
+
 ```
 cd bench && make
+./bench --cadofb ../oracle/c183.fb1 --side 1 --scale 1.28 \
+        --q 120000053 --rho 112625526 --allowance 112     # 32.8 ms
+./bench --side 0 --scale 1.93 \
+        --q 120000053 --rho 112625526 --allowance 72.85   # 22.7 ms
+```
+
+Defaults are `--mode atomic --record-bytes 4 --region 14 --apply-threads 512`
+as of 2026-08-02; before that they were `twolevel` and `--region 15`, so
+commands below that omit those flags reproduced a path that had already lost.
+
+**CPU-only gates** (no GPU, safe to run on a busy box):
+
+```
+make check                                       # == ./fbtest --cadofb ../oracle/c183.fb1
+```
+
+```
 ./bench --verify --logI 12 --J 512 --region 12   # correctness vs CPU reference
 ./bench --verify --region 14 --mode atomic --record-bytes 4 --apply-threads 512
 ./bench --mode atomic --record-bytes 4 --region 14 --apply-threads 512   # best

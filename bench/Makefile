@@ -19,8 +19,18 @@ CU_OBJS = $(CU_SRCS:.cu=.o)
 C_OBJS  = $(C_SRCS:.c=.o)
 OBJS    = $(CU_OBJS) $(C_OBJS)
 
+all: bench fbtest dumpcmp
+
 bench: $(OBJS)
 	$(NVCC) $(NVCC_ARCH) -o $@ $^ -lcudart -lm
+
+# CPU-only correctness gates. No CUDA, so these run on a busy box and on
+# machines without the card.
+fbtest: fbtest.c $(C_OBJS) bench.h plattice.cuh
+	$(CC) $(CFLAGS) -o $@ fbtest.c $(C_OBJS) -lm
+
+dumpcmp: dumpcmp.c
+	$(CC) $(CFLAGS) -o $@ $< -lm
 
 %.o: %.cu bench.h plattice.cuh
 	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
@@ -29,6 +39,9 @@ bench: $(OBJS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f bench *.o
+	rm -f bench fbtest dumpcmp *.o
 
-.PHONY: clean
+.PHONY: all clean check
+
+check: fbtest
+	./fbtest --cadofb ../oracle/c183.fb1
