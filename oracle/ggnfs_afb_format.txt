@@ -1,0 +1,26 @@
+GGNFS .afb.0 binary format (decoded 2026-08-01 from input.job.afb.0)
+========================================================================
+  word 0        : uint32 n           = 7605406   (matches 'FBsize (deg 5)' in the las log)
+  words 1..n    : uint32 primes[n]   non-decreasing, max = 134199991 (alim=134200000)
+  words n+1..2n : uint32 roots[n]    root of the poly mod primes[i]
+  words 2n+1..  : 6 trailer words = [0, 2947547140, 134200000, 83028701, 4002597664, 3682466343]
+  file size     : 60843276 bytes = 4*(1 + 2n) + 24
+
+ALREADY IN THE SoA LAYOUT THE DESIGN DOC ASKS FOR: primes[] and roots[] are
+separate contiguous uint32 arrays. No conversion needed for a GPU load.
+
+STATISTICS (these confirm the sizing table in prototype.md)
+  (p,r) pairs                : 7605406
+  distinct primes            : 4817761
+  pairs per distinct prime   : 1.579   (S5 prediction was 1.58)
+  entries with root >= p     : 4  (projective / prime-power encodings)
+  first few projective idx   : [(3, 3), (5, 5), (7, 7), (11, 11)]
+  all projective have r == p : True
+  entries above bkthresh 2^15: 7601775
+  algebraic updates/q @ A=5.37e8 : 3.152e+08
+  -> doc's 6.1e8 both-sides total implies ~2.9e8 from the rational side. Consistent.
+
+MODINV COUNT PER SPECIAL-Q (root transform), using CADO's per-prime batching:
+  algebraic distinct primes  : 4817761
+  rational  entries (1 root) : 3957294  (from the las log)
+  total modular inversions/q : 8775055  -- vs the 11.6M this doc originally assumed

@@ -1,0 +1,40 @@
+gnfs-lasieve4I15e fine-grain timings, C183 target job, single core, 2026-08-01
+Source: log.<q>M.txt 'milliseconds total:' blocks. Rational FB is 3,957,294 entries at every q.
+
+SHARE OF WALL TIME  (parts sum to wall to within 0.01% at every q -- complete accounting)
+   q0  wall_s  close |  Sieve  -large  -small medsch  SvChg     TD  -MPQS |    algFB
+   50   164.4 100.0% |  61.2%   38.3%   18.8%   7.9%   9.6%  21.4%   8.1% |  3001128
+   90   126.7 100.0% |  56.0%   35.6%   16.7%   8.8%  11.2%  24.1%  10.7% |  5218803
+  130   148.8 100.0% |  54.3%   34.3%   16.5%  10.0%  12.0%  23.7%   9.9% |  7380860
+  170   165.5 100.0% |  53.9%   34.0%   16.3%  10.0%  13.2%  23.0%   9.3% |  7605406
+  210   167.6 100.0% |  54.0%   34.1%   16.3%  10.1%  13.6%  22.3%   9.0% |  7605406
+
+PER SPECIAL-Q, SINGLE CORE (ms)
+   q0   total   Sieve  -large  -small  -init  medsch   SvChg      TD   -MPQS  surv/q
+   50    2695    1649    1031     507     18     212     258     577     217
+   90    3090    1729    1100     517     19     271     347     744     330
+  130    3100    1683    1062     510     18     309     373     734     306
+  170    3122    1681    1062     508     18     313     411     717     291
+  210    3104    1677    1059     507     18     312     423     692     280
+
+f = FRACTION THAT DOES NOT GO AWAY WITH A GPU SIEVE
+   q0   f (all TD stays)   f (only MPQS stays)
+   50              0.214                 0.081
+   90              0.241                 0.107
+  130              0.237                 0.099
+  170              0.230                 0.093
+  210              0.223                 0.090
+
+NOTES
+ * Sieve-Change = per-special-q root transform into the q-lattice. This doc's
+   'second cost pillar'. ~373 ms/q at q=130M over ~11.3M FB entries = ~33 ns/entry
+   ~= 85 cycles, the right cost for one modular inverse. Pillar confirmed.
+ * medsched = bucket fill for the medium range. 'Sched' (large) reports 0, so the
+   large-prime fill is folded into 'sieve: large' or 'Sieve-Change'. Accounting
+   still closes, so it is counted somewhere -- do not double-count it.
+ * norm init ('sieve: init', both sides) is ~18 ms/q = 0.6% of wall. Nearly free.
+ * ALGEBRAIC FB IS TRUNCATED AT q ('lowering FB_bound to <q>'): 3.0M entries at
+   q=50M rising to the full 7.6M at q>=170M. Updates/q, bucket memory and transform
+   cost therefore roughly DOUBLE across the job's q-range. Check whether CADO does
+   the same -- if it does not, the two sievers are not doing equal work per q.
+ * Survivors reaching cofactorization: ~1900/special-q (COF tests / special-q).

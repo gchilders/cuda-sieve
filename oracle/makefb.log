@@ -1,0 +1,4 @@
+# (0574bc39d) /home/kylea/cado-nfs/build/DESKTOP-3J4UC68/sieve/makefb -poly c183.poly -lim 134200000 -maxbits 15 -t 6 -out c183.fb1
+# Compiled with gcc 13.3.0
+# Compilation flags (C) -Werror=all -Werror=extra -std=c99 -Wall -Wextra -O3 -march=native -funroll-loops -DNDEBUG -DSIZEOF_P_R_VALUES=8
+# Compilation flags (C++) -Werror=extra -Werror=all -export-dynamic -std=c++20 -Wno-c++11-compat -Wall -Wextra -O3 -march=native -funroll-loops -DNDEBUG -DSIZEOF_P_R_VALUES=8 -Wno-stringop-overflow -Wno-literal-suffix

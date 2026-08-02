@@ -1,0 +1,60 @@
+GGNFS test sieve of the C183 target job — captured 2026-08-01
+Siever: gnfs-lasieve4I15e      Side: algebraic      qintsize: 1000
+Host:   Ryzen 7 9800X3D (8C/16T, 96 MB V-Cache), WSL2
+
+IMPORTANT: test_sieve.sh:187 launches ONE siever process with no backgrounding.
+Every rate below is SINGLE-CORE, and the "ETA: 315d" is a one-core ETA.
+
+==========================================
+All test sieves completed!
+==========================================
+
+q0           qintsize   expq     specq    yield    n-yld    speed           exp_rel
+50000000     1000       56.4     61       2919     2699     0.056 sec/rel
+90000000     1000       54.6     41       2025     2697     0.063 sec/rel   107922206
+130000000    1000       53.5     48       2138     2384     0.070 sec/rel   101615082
+170000000    1000       52.8     53       2304     2294     0.072 sec/rel   93558335
+210000000    1000       52.2     54       2186     2113     0.077 sec/rel   88128700
+
+--- Test Configuration ---
+Siever: gnfs-lasieve4I15e
+Side: algebraic
+
+Suggested rlambda: 2.29 (mfbr=60 / log2(rlim=67100000))
+Suggested alambda: 3.39 (mfba=92 / log2(alim=134200000))
+
+--- Shortened Table ---
+q0           yield    n-yld    exp_rel      speed
+--------     ------   ------   --------     -----------
+50000000     2919     2699                  17.755 rel/sec
+90000000     2025     2697     107922206    15.984 rel/sec
+130000000    2138     2384     101615082    14.367 rel/sec
+170000000    2304     2294     93558335     13.925 rel/sec
+210000000    2186     2113     88128700     13.041 rel/sec
+                      Total:   391224323    14.329 rel/sec  ETA: 315d 23h 40m
+
+
+================================================================
+DERIVED — this is what prototype.md is built on
+================================================================
+
+core-sec/special-q = yield * sec_per_rel / specq
+
+  q0      specq   yield   rel/q   sec/rel   core-sec/q
+  50M      61     2919    47.9     0.056      2.68
+  90M      41     2025    49.4     0.063      3.11
+  130M     48     2138    44.5     0.070      3.12
+  170M     53     2304    43.5     0.072      3.13
+  210M*    54     2186    40.5     0.077      3.12      (* outside job range)
+
+  => ~3.1 core-seconds per special-q, flat to +/-1% across the entire range.
+     Yield drifts (48 -> 41 rel/q); per-q cost does not.
+
+Job scale, q in [50M, 190M]:
+  special-q count   ~ 140e6 / ln(1.2e8) ~ 7.6M
+  core-time         ~ 7.6e6 * 3.1 s     ~ 273 core-days
+  relations         ~ 7.6e6 * 45        ~ 340M      (script estimate: 391M)
+
+Whole-box per-q = 3.1 s / N_effective.  N_effective is UNMEASURED — it is the
+output of the Path-0 configuration sweep, and it sets the GPU's entire budget.
+At 16 threads with 0.7-0.9 scaling: ~0.22-0.28 s per special-q.
