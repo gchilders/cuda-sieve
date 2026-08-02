@@ -64,9 +64,31 @@ static int hits_def(uint32_t q, uint32_t r_enc, const qlat_t *L,
 {
     const int64_t a = (int64_t)i * L->a0 + (int64_t)j * L->b0;
     const int64_t b = (int64_t)i * L->a1 + (int64_t)j * L->b1;
-    const int64_t lhs = (r_enc >= q) ? (a * (int64_t)(r_enc - q) - b)
-                                     : (a - (int64_t)r_enc * b);
-    return lhs % (int64_t)q == 0;
+    const int64_t Q = (int64_t)q;
+    /* Reduce BEFORE multiplying. Over the whole sieve area |a| reaches ~2e12,
+     * and a bucketed q reaches 1.3e8, so the direct product a*(r-q) overflows
+     * int64 by two orders of magnitude -- which would silently corrupt the one
+     * function every gate here treats as ground truth. */
+    int64_t am = a % Q, bm = b % Q;
+    uint64_t lhs;
+    if (am < 0) am += Q;
+    if (bm < 0) bm += Q;
+    if (r_enc >= q) {                      /* projective: a*rr == b */
+        lhs = ((uint64_t)am * (uint64_t)(r_enc - q)
+               + (uint64_t)(Q - bm)) % (uint64_t)Q;
+    } else {                               /* affine: a == r*b */
+        const uint64_t rb = ((uint64_t)bm * (uint64_t)r_enc) % (uint64_t)Q;
+        lhs = ((uint64_t)am + (uint64_t)Q - rb) % (uint64_t)Q;
+    }
+    return lhs == 0;
+}
+
+/* Same predicate, exported: `fbtest --trace` needs it to list every ideal that
+ * hits a position, which is our half of gate 5. */
+int hits_def_pub(uint32_t q, uint32_t r_enc, const qlat_t *L,
+                 int32_t i, int32_t j)
+{
+    return hits_def(q, r_enc, L, i, j);
 }
 
 /* What pl_transform_enc claims: solutions exist only on rows j == 0 (mod g),

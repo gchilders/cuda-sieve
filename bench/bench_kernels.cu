@@ -655,7 +655,13 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     /* las's survivor test is S = max(T - sum, 0) <= bound with
      * bound = round(scale * lambda * lpb). Ours holds CINIT - T + sum, so
      * S = CINIT - cell and the test becomes cell >= CINIT - bound. */
-    const uint32_t BOUND = (uint32_t)(cfg->scale * cfg->allowance + 0.5);
+    /* las: bound = (unsigned char)(lambda*lpb*scale + LOGNORM_GUARD_BITS),
+     * las-norms.cpp:270 -- a TRUNCATING cast plus a guard bit, not a round.
+     * With the exact scales (1.275 / 1.925, not the 2-dp values las prints)
+     * this reproduces both of las's bounds exactly: 143 and 141. The old
+     * round(scale*allowance) matched only because the rounded scales happened
+     * to compensate. */
+    const uint32_t BOUND = (uint32_t)(cfg->scale * cfg->allowance + 1.0);
     uint32_t tconst;
     {
         float t = norm_target_host(&N, 0, cfg->J / 2);

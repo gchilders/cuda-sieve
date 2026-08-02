@@ -183,7 +183,8 @@ int main(int argc, char **argv)
     if (fb_split_small(&fb, bkthresh, &fbs) != 0) return 1;
     fb_restrict(&fb, bkthresh, fbbound);
     printf("  bucketed  %u <= p < %u : %u entries\n", bkthresh, fbbound, fb.n);
-    printf("  line-sieved       p < %u : %u entries\n", bkthresh, fbs.n);
+    printf("  line-sieved       p < %u (plus every p^k, k>=2) : %u entries\n",
+           bkthresh, fbs.n);
     if (!fb.n) { fprintf(stderr, "empty factor base after restriction\n"); return 1; }
 
     qlat_build(&L, q, rho ? rho : (uint64_t)(0x9E3779B97F4A7C15ull % q), POLY.skew);

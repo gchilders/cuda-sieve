@@ -30,20 +30,30 @@
 #include <string.h>
 #include <math.h>
 
-/* If q = p^k with k > 1 maximal, return p and set *kk; else return 0. */
+/* If q = p^k with k > 1, return the BASE PRIME p and set *kk = k; else 0.
+ *
+ * It must be the base prime, i.e. k maximal. The previous version searched k
+ * upward from 2 and returned the first that worked, which is k MINIMAL and so
+ * the largest base: it read 81 as 9^2 and 729 as 27^2. The exponents in the
+ * file are relative to the base prime (`81:5,4: 114` means 3^5 over 3^4), so a
+ * wrong base silently inflates the log increment -- 4 instead of 2 for 81, 6
+ * instead of 2 for 729, 3 instead of 1 for 16. Placement was unaffected, which
+ * is why only a byte-level trace against las found it (gate 5, 2026-08-02).
+ *
+ * Trial division for the smallest prime factor is exact and, with 97 long-form
+ * lines in the file, free. */
 static uint32_t is_power(uint32_t q, int *kk)
 {
-    int k;
-    for (k = 2; (1u << k) <= q; k++) {
-        double const d = pow((double)q, 1.0 / (double)k);
-        uint32_t p = (uint32_t)(d + 0.5);
-        uint64_t v = 1;
-        int i;
-        if (p < 2) break;
-        for (i = 0; i < k; i++) v *= p;
-        if (v == (uint64_t)q) { *kk = k; return p; }
+    uint32_t d;
+    for (d = 2; (uint64_t)d * d <= (uint64_t)q; d++) {
+        uint32_t t;
+        int k = 0;
+        if (q % d) continue;
+        for (t = q; t % d == 0; t /= d) k++;
+        if (t == 1 && k > 1) { *kk = k; return d; }
+        return 0;                     /* not a pure power of its least factor */
     }
-    return 0;
+    return 0;                         /* prime */
 }
 
 static uint8_t log_delta(uint32_t p, int nexp, int oldexp, double scale)

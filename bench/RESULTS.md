@@ -717,8 +717,121 @@ Whether they reduce false survivors enough to matter for CPU cofactor work is
   produced plausible-looking output.
 - `qlat_build` moved to `poly.c` so the correctness gates link without CUDA.
 
+## Finding 24 — the makefb parser read 81 as 9², and it cost log accuracy
+
+`fb_cado.c`'s `is_power` searched the exponent **upward** from 2 and returned
+the first that worked. That is k *minimal*, i.e. the *largest* base — it read
+`81` as `9^2` and `729` as `27^2`, despite its own comment saying "k > 1
+maximal".
+
+The exponents in the file are relative to the base prime (`81:5,4: 114` means
+3^5 over 3^4), so a wrong base inflates the log increment:
+
+| q | read as | logp | correct | logp |
+|---|---|---:|---|---:|
+| 16 | 4² | 3 | **2⁴** | **1** |
+| 64 | 8² | 4 | **2⁶** | **1** |
+| 81 | 9² | 4 | **3⁴** | **2** |
+| 729 | 27² | 6 | **3⁶** | **2** |
+
+It hits every q whose exponent is composite. Placement was unaffected, which is
+why nothing before gate 5 saw it — and note it is the mirror image of findings
+18–19: those were right-value/wrong-place, this is right-place/wrong-value.
+Between them they cover both ways a sieve can be wrong while looking healthy.
+
+Fixed by trial-dividing for the least prime factor, which is exact and, with 97
+long-form lines in the file, free.
+
+## Finding 25 — las's printed `scale` is rounded, and the bound is a truncation
+
+Two constants taken from las's `-v` log were subtly wrong, and both were
+recorded in `oracle/PARITY.md` and used by every run since.
+
+**The scale.** las prints `scale=1.28`, rounded to 2 dp. It also prints
+`logbase` to 7 figures, and `logbase = 2^(1/scale)`, so:
+
+| side | printed | exact |
+|---|---:|---:|
+| 0 | 1.93 | **1.925** |
+| 1 | 1.28 | **1.275** |
+
+That is enough to move `fb_log` by one unit for a band of primes: p = 25811171
+gives 32 at 1.28 and **31**, which is what las applies, at 1.275. This was the
+last surviving discrepancy in the gate-5 trace.
+
+**The bound.** We used `round(scale * lambda * lpb)`. las (`las-norms.cpp:270`)
+uses
+
+```
+bound = (unsigned char) (r * scale + LOGNORM_GUARD_BITS);     r = lambda * lpb
+```
+
+— a **truncating** cast plus a guard bit. With the exact scales,
+`trunc(3.5*32*1.275 + 1) = 143` and `trunc(2.35*31*1.925 + 1) = 141`, both
+exact. Our old formula agreed on these two only because the rounded scales
+happened to compensate; it would have diverged on any other parameter set. The
+agreement reported in finding 14 was therefore luckier than it looked.
+
+## Finding 26 — GATE 5 PASSED: byte-exact sieve parity against las
+
+`las_tracek` is a **stock CADO target** (`sieve/CMakeLists.txt:111`,
+`TRACE_K=1`) — no patch needed, unlike `-dumpfile`. It follows one position
+through the pipeline and prints every ideal applied to it with its log, which is
+strictly more informative than a byte dump.
+
+Use `-traceab a,b`, not `-traceij`: it is basis-independent, so the i-mirroring
+never enters. It also confirmed the mirroring directly — our `(4999,8192)` is
+las's `(-4999,8192)` for the same `(a,b)`.
+
+Four positions, both sides, `q=120000053, rho=112625526`:
+
+| (i,j) ours | side | las sum | ours sum | ideals |
+|---|---|---:|---:|---:|
+| (4999, 8192) | 1 | 22 | **22** | 5 |
+| (4999, 8192) | 0 | 58 | **58** | 6 |
+| (9237, 15022) | 1 | 94 | **94** | 15 |
+| (9237, 15022) | 0 | 65 | **65** | 6 |
+| (2978, 8393) | 1 | 46 | **46** | 14 |
+| (2978, 8393) | 0 | 94 | **94** | 2 |
+| (13198, 9151) | 1 | 51 | **51** | 13 |
+| (13198, 9151) | 0 | 63 | **63** | 4 |
+
+**8 of 8 exact — and the ideal lists agree entry by entry, not just the
+totals.** Two positions were chosen because long projective power ladders hit
+them (3,9,27,81,243,729,2187 and 2,4,8,16,32,64), making this the direct gate on
+the nonzero-reciprocal bug rather than an aggregate one.
+
+This closes the design doc's Path 3 gate 2, which had been marked BLOCKED on the
+grounds that no trustworthy oracle existed. The oracle existed; it was simply a
+different one, and it was in the tree the whole time.
+
+**Norm initialisation still differs, and should.** las runs 0 to +2 above the
+exact value, scattered: one unit is `LOGNORM_GUARD_BITS` (which las prints in
+its own banner), and the rest is its norm *approximation* — it interpolates
+log|F| along a row rather than evaluating at every position, computing the exact
+norm only later for survivors. **Our fp32 Horner is the more accurate of the
+two.** The gap is bounded and one-directional (las over-estimates, so it is
+slightly more permissive), which also means a byte-for-byte region diff could
+never have reached zero even with a working dumpfile. Gate 5 was the right
+instrument, not merely an available one.
+
+Reproduce:
+
+```
+cd ~/cado-nfs/build/<host> && make las_tracek
+cd ~/code/cuda-sieve/oracle && las_tracek -poly c183.poly -fb1 c183.fb1 \
+    -lim0 67100000 -lim1 134200000 -lpb0 31 -lpb1 32 -mfb0 60 -mfb1 92 \
+    -lambda0 2.35 -lambda1 3.5 -A 29 -sqside 1 -q0 120000011 -nq 1 \
+    -adjust-strategy 0 -B 14 -t 1 -traceab 946175173703,4999
+
+cd ~/code/cuda-sieve/bench && ./fbtest --cadofb ../oracle/c183.fb1 --trace 4999,8192
+```
+
 ## Not addressed in this round
 
+- **Timings in this session are not comparable.** The GPU was shared with an
+  ECM job throughout; every millisecond figure printed on 2026-08-02 is inflated
+  and none should be quoted. Correctness results are unaffected.
 - **`--maxbits > 15` is now safe but untested**: the transform handles bucketed
   odd prime powers, and `g > 1` losses are reported, but no run has exercised
   it. The reported-loss counter is the thing to watch when someone does.

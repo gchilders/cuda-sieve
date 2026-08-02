@@ -63,9 +63,33 @@ negated: **the same reduced basis. Gate passed.**
 | 0 (rational) | 131.86 | 1.93 | 1.433439 | **141** |
 | 1 (algebraic) | 196.61 | 1.28 | 1.722273 | **143** |
 
-`logbase = 2^(1/scale)`, and `log p` in sieve units is `round(log2(p) * scale)`.
-The bound is exactly `round(scale * lambda * lpb)`:
-`1.28 * 3.5 * 32 = 143.4 → 143`, and `1.93 * 2.35 * 31 = 140.6 → 141`.
+**The printed `scale` is rounded to 2 dp and using it is wrong.** `logbase` is
+printed to 7 figures and `logbase = 2^(1/scale)`, so the exact scale is
+`1/log2(logbase)`:
+
+| side | printed | **exact** |
+|---|---:|---:|
+| 0 | 1.93 | **1.925** |
+| 1 | 1.28 | **1.275** |
+
+The difference moves `fb_log` by one unit for a band of primes — p = 25811171
+gives 32 at scale 1.28 and 31, which is what las actually applies, at 1.275.
+Found by the gate-5 trace below; every run before 2026-08-02 used the 2-dp
+values.
+
+`fb_log(n) = floor(log2(n) * scale + 0.5)` (`fb.cpp:86`), and for a factor-base
+entry the increment is `fb_log(p^nexp) - fb_log(p^oldexp)`.
+
+The bound is **not** a round. `las-norms.cpp:270`:
+
+```
+bound = (unsigned char) (r * scale + LOGNORM_GUARD_BITS);     r = lambda * lpb
+```
+
+a truncating cast plus a guard bit. With the exact scales that is
+`trunc(3.5*32*1.275 + 1) = 143` and `trunc(2.35*31*1.925 + 1) = 141`, both
+exact. The old `round(scale*lambda*lpb)` agreed only because the rounded scales
+happened to compensate.
 
 `scale` exists only so that `scale * log2(maxnorm)` fits in a byte
 (`1.28 * 196.61 = 251.7`). **We use 16-bit cells and do not need it** — we can
@@ -77,30 +101,86 @@ Independent check of our norm setup: with the q-lattice above, our A (max |a|)
 and B (max |b|) give `log2|Y1*A| = 116.4`, `log2|Y0*B| = 132.2`, so
 `log2(maxnorm) ≈ 132.2` on side 0 against las's **131.86**.
 
-## ⚠ The dumps are NOT usable as a byte-diff oracle
+## Gate 5 — byte-exact parity via TRACE_K. **PASSED 2026-08-02.**
 
-Measured 2026-08-01, after the sieve was brought onto CADO's factor base and
-scale. Two independent signs that the dump is wrong, not us:
+`las_tracek` is a stock CADO target (`sieve/CMakeLists.txt:111`, built with
+`TRACE_K=1`) and needs no patching. It follows one position through the whole
+pipeline and prints **every ideal applied to it, with its log** — strictly more
+informative than a byte dump, and independent of the broken dumpfile path.
 
-| | mean sieved log / position |
-|---|---:|
-| analytic over the whole factor base (from `c183.fb1`) | 54.65 |
-| our sieve | 54.2 |
-| analytic, small part only | 39.31 |
-| **these dumps** | **41.1** |
+```
+cd build/<host> && make las_tracek
+las_tracek <the same flags as above, minus -dumpfile> -traceab 946175173703,4999
+```
 
-The dump carries roughly the small-sieve contribution and not the
-bucket-sieved one, although `las-process-bucket-region.cpp` calls
-`apply_buckets()` before `SminusS()` and the write. And it does not line up
-positionally: correlation with our region is **+0.033** direct and **+0.016**
-i-mirrored (both orientations checked, since our basis is las's with the first
-vector negated), against a **+0.636** control correlating two of our own dumps
-at the same positions.
+Use **`-traceab`**, not `-traceij`: it is basis-independent, so the i-mirroring
+between our basis and las's never enters. (Confirmed by the trace header: our
+`(i,j) = (4999,8192)` is las's `(-4999,8192)` for the same `(a,b)`, exactly as
+expected from our basis being las's with the first vector negated.)
 
-That is consistent with how the flag was found — dead behind an
-`ASSERT_ALWAYS` that made its only `open()` call unreachable. Use
-`las_tracek`/`TRACE_K` to follow a single `(i,j)` instead, or report upstream.
-Everything else in this file comes from the `-v` log and is sound.
+Output to read:
+
+```
+# Tracing relation (a,b)=(...) (i,j)=(-9237,15022), (N,x)=(30044,7147)
+# After side 1 init_norms_bucket_region, N=30044 S[7147]=248
+# Add log(hint=227,side 1) = 24 to S[7147] = 0, ... -> 24
+# Add log(3,side 1) = 4 to S[7147] = 59, ... -> 63
+...
+# Final value on side 1, N=30044 S[7147]=154
+```
+
+so the **sieved log sum is `init - final`**, and the per-ideal lines name every
+contributor. `hint=` marks a bucketed entry (the number is the slice index); a
+bare number is the line-sieved modulus.
+
+### Result
+
+Four positions, both sides, `q=120000053, rho=112625526`. Our side comes from
+`bench/fbtest --trace i,j`.
+
+| (i,j) ours | side | las sum | ours sum | ideals |
+|---|---|---:|---:|---:|
+| (4999, 8192) | 1 | 22 | **22** | 5 |
+| (4999, 8192) | 0 | 58 | **58** | 6 |
+| (9237, 15022) | 1 | 94 | **94** | 15 |
+| (9237, 15022) | 0 | 65 | **65** | 6 |
+| (2978, 8393) | 1 | 46 | **46** | 14 |
+| (2978, 8393) | 0 | 94 | **94** | 2 |
+| (13198, 9151) | 1 | 51 | **51** | 13 |
+| (13198, 9151) | 0 | 63 | **63** | 4 |
+
+**8 of 8 exact**, and not only the totals — the *ideal lists* agree entry by
+entry. Two positions were picked because long projective power ladders hit them
+(the 3-ladder 3,9,27,81,243,729,2187 and the 2-ladder 2,4,8,16,32,64), which is
+the direct gate on the nonzero-reciprocal bug.
+
+Getting here took two real fixes, both found by this trace and by nothing else:
+the exact scale above, and a base-prime bug in the makefb parser (RESULTS.md
+findings 18–25).
+
+### The one thing that does NOT match: norm initialisation
+
+| (i,j) | side 1 exact / las | side 0 exact / las |
+|---|---|---|
+| (4999, 8192) | 241 / 243 | 251 / 251 |
+| (9237, 15022) | 247 / 248 | 252 / 253 |
+| (2978, 8393) | 241 / 242 | 249 / 249 |
+| (13198, 9151) | 246 / 246 | 253 / 254 |
+
+las is **0 to +2 above** the exact value, scattered. One unit of that is
+`LOGNORM_GUARD_BITS`, which las prints in its own banner (`# las flags:
+BUCKET_SIEVE_POWERS TRACE_K LOGNORM_GUARD_BITS=1.00`) and adds deliberately so
+the byte cannot wrap below zero. The rest is las's norm *approximation*: it
+interpolates log|F| along a row instead of evaluating the polynomial at every
+position, and computes the exact norm only later, for survivors.
+
+So our fp32 Horner is the **more accurate** of the two, and the gap is bounded
+and one-directional — las over-estimates, so it is slightly more permissive and
+passes slightly more false survivors. This is a difference in what las *chooses*
+to compute, not an error on either side, and it is why a byte-for-byte region
+diff could never have reached zero even with a working dumpfile.
+
+## ⚠ The `-dumpfile` oracle is still not usable (superseded by gate 5)
 
 ## What the dump contains
 

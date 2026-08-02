@@ -61,6 +61,43 @@ static uint32_t count_proj(const fb_t *fb, uint32_t *nonzero)
     return n;
 }
 
+/* Trace one position: every factor-base ideal that hits (i,j), and the log
+ * sum they contribute. This is the half of gate 5 that lives on our side --
+ * `las_tracek -traceab a,b` prints the same thing from las's pipeline, and
+ * `-traceab` is basis-independent, so the two are directly comparable without
+ * worrying that our basis is las's with the first vector negated. */
+static void trace_side(const char *name, const fb_t *fb, const qlat_t *L,
+                       const poly_t *P, int32_t i, int32_t j,
+                       uint32_t bkthresh, int logI, uint32_t J,
+                       double scale, int is_sq, uint64_t sq, int maxlist)
+{
+    uint64_t sum = 0;
+    uint32_t k, nhit = 0;
+    norm_t N;
+    long T;
+    memset(&N, 0, sizeof N);
+    norm_setup(&N, P, L, logI, J, scale, is_sq);
+    T = (long)floorf(norm_target_host(&N, i, j) + 0.5f);
+    if (T < 0) T = 0;
+
+    printf("  %s (scale %.2f): ideals hitting (i=%d, j=%d)\n", name, scale, i, j);
+    for (k = 0; k < fb->n; k++) {
+        const uint32_t q = fb->primes[k], r = fb->roots[k];
+        if ((uint64_t)q == sq) continue;      /* the special-q is divided out */
+        if (!hits_def_pub(q, r, L, i, j)) continue;
+        sum += fb->logp[k];
+        if ((int)nhit < maxlist)
+            printf("      q=%-10u %-11s logp=%-4u %s\n", q,
+                   r >= q ? "projective" : "affine", fb->logp[k],
+                   q < bkthresh || fb_is_proper_power(q) ? "line-sieved" : "bucketed");
+        nhit++;
+    }
+    if ((int)nhit > maxlist) printf("      ... %u more\n", nhit - maxlist);
+    printf("  %s: %u ideals, init norm S = %ld, log sum = %llu,"
+           "  S - sum = %ld\n\n",
+           name, nhit, T, (unsigned long long)sum, T - (long)sum);
+}
+
 int main(int argc, char **argv)
 {
     const char *polypath = "../oracle/c183.poly";
@@ -68,6 +105,13 @@ int main(int argc, char **argv)
     uint64_t q = 120000053ull, rho = 112625526ull;
     uint32_t rlim = 67100000, bkthresh = 1u << 15;
     int maxbits = 15, qmax = 200;
+    int32_t ti = 0, tj = 0; int do_trace = 0;
+    /* las's EXACT scales. It prints them rounded to 2 dp ("scale=1.28"), but also
+ * prints logbase = 2^(1/scale) to 7 figures, from which scale = 1/log2(logbase)
+ * comes out at exactly 1.275 and 1.925. The 2-dp values are wrong by enough to
+ * move fb_log by one unit for some primes -- p=25811171 gives 32 at 1.28 and
+ * 31, which is what las applies, at 1.275. */
+    double scale1 = 1.275, scale0 = 1.925;
     double scale = 1.0;
     poly_t P; qlat_t L; fb_t fb, fbs;
     int i, n;
@@ -80,8 +124,16 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--q") && i + 1 < argc) q = strtoull(argv[++i], 0, 10);
         else if (!strcmp(argv[i], "--rho") && i + 1 < argc) rho = strtoull(argv[++i], 0, 10);
         else if (!strcmp(argv[i], "--scale") && i + 1 < argc) scale = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--scale1") && i + 1 < argc) scale1 = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--scale0") && i + 1 < argc) scale0 = atof(argv[++i]);
         else if (!strcmp(argv[i], "--qmax") && i + 1 < argc) qmax = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--bkthresh") && i + 1 < argc) bkthresh = (uint32_t)strtoul(argv[++i], 0, 10);
+        else if (!strcmp(argv[i], "--trace") && i + 1 < argc) {
+            if (sscanf(argv[++i], "%d,%d", &ti, &tj) != 2) {
+                fprintf(stderr, "--trace wants i,j\n"); return 2;
+            }
+            do_trace = 1;
+        }
         else { fprintf(stderr, "unknown option %s\n", argv[i]); return 2; }
     }
 
@@ -101,6 +153,33 @@ int main(int argc, char **argv)
            " in [0,2q)\n", qmax);
     ok("synthetic moduli", verify_transform(&L, qmax) == 0,
        "primes, prime powers, even moduli, affine + projective");
+
+    if (do_trace) {
+        const int64_t a = (int64_t)ti * L.a0 + (int64_t)tj * L.b0;
+        const int64_t b = (int64_t)ti * L.a1 + (int64_t)tj * L.b1;
+        printf("[trace] (i,j) = (%d,%d)  ->  (a,b) = (%lld,%lld)\n",
+               ti, tj, (long long)a, (long long)b);
+        printf("        compare with:  las_tracek ... -traceab %lld,%lld\n"
+               "        (-traceab is basis-independent, so the i-mirroring\n"
+               "         between our basis and las's does not matter here)\n\n",
+               (long long)a, (long long)b);
+        if (cadofb) {
+            if (fb_load_cado(cadofb, scale1, &fb) != 0) return 1;
+            trace_side("side 1", &fb, &L, &P, ti, tj, bkthresh, 15, 16384,
+                       scale1, 1, q, 40);
+            fb_free(&fb);
+        }
+        {
+            poly_t R = P;
+            if (rfb_build(&R, rlim, maxbits, scale0, &fb) != 0) return 1;
+            R.deg = 1; R.c[0] = R.y0; R.c[1] = R.y1;
+            for (int z = 2; z < 8; z++) R.c[z] = 0.0;
+            trace_side("side 0", &fb, &L, &R, ti, tj, bkthresh, 15, 16384,
+                       scale0, 0, 0, 40);
+            fb_free(&fb);
+        }
+        return 0;
+    }
 
     printf("\n[2] transform vs definition, driven by the real factor bases\n");
 

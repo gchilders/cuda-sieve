@@ -91,6 +91,13 @@ int fb_is_prime_power(uint32_t q)
     return 0;                    /* composite with no factor <= sqrt: impossible */
 }
 
+/* p^k with k >= 2. These are the entries whose transform can come out
+ * row-confined (g > 1), which the bucket walk cannot express. */
+int fb_is_proper_power(uint32_t q)
+{
+    return q >= 4 && !is_prime32(q) && fb_is_prime_power(q);
+}
+
 /* Every modulus in a factor base must be a prime power: the root transform's
  * "solutions exist only when g | j" step depends on it (see plattice.cuh), and
  * a composite modulus with two prime factors would be silently mis-placed
@@ -127,13 +134,24 @@ void fb_fill_logp(fb_t *fb, double scale)
  * is exactly b = i. So a projective ideal hits i == 0 (mod p) on EVERY row:
  * 16,384 positions per entry here, not one row's worth. Side 0 has two of them
  * (38321 and 5746453, both dividing Y1). Let the transform decide -- it now
- * handles the encoding, and reports what it genuinely cannot walk. */
+ * handles the encoding, and reports what it genuinely cannot walk.
+ *
+ * Proper prime powers are EXCLUDED and line-sieved instead, whatever their
+ * size. Their transform can be row-confined (g > 1), which is not a plat_t
+ * walk, and the bucket path would have to drop them: measured, q = 2^15 sits
+ * exactly at the default bkthresh and lost its 16,384 positions that way. The
+ * small sieve carries the row divisor natively, so routing every power there
+ * removes the whole class rather than the one instance -- which matters the
+ * moment anyone raises --maxbits and creates powers well above bkthresh. It
+ * costs ~200 extra entries in the small tier, each with a large modulus and so
+ * at most one hit per region. */
 void fb_restrict(fb_t *fb, uint32_t bkthresh, uint32_t fb_bound)
 {
     uint32_t i, k = 0;
     for (i = 0; i < fb->n; i++) {
         uint32_t p = fb->primes[i], r = fb->roots[i];
         if (p < bkthresh || p >= fb_bound) continue;
+        if (fb_is_proper_power(p)) continue;      /* line-sieved instead */
         fb->primes[k] = p; fb->roots[k] = r;
         if (fb->logp) fb->logp[k] = fb->logp[i];
         k++;
@@ -141,25 +159,34 @@ void fb_restrict(fb_t *fb, uint32_t bkthresh, uint32_t fb_bound)
     fb->n = k;
 }
 
-/* Copy out the entries below bkthresh -- these are line-sieved per region, not
- * bucketed. Projective entries (r == p) are KEPT here: all four of them on this
- * job have p < 12, and between them they account for ~0.77*A updates, more than
- * the entire bucket-sieve volume. Dropping them is not an option. */
+/* Copy out the entries the bucket path does not take: everything below
+ * bkthresh, plus every proper prime power at any size (see fb_restrict).
+ * These are line-sieved per region.
+ *
+ * Projective entries (r >= p) are KEPT here: the four with p < 12 account for
+ * ~0.77*A updates between them, more than the entire bucket-sieve volume, and
+ * dropping them is not an option. The entries are already ascending in p, and
+ * appending the powers in the same pass preserves that. */
 int fb_split_small(const fb_t *fb, uint32_t bkthresh, fb_t *small)
 {
-    uint32_t i, k = 0;
+    uint32_t i, k = 0, cap = 0;
     memset(small, 0, sizeof(*small));
-    for (i = 0; i < fb->n && fb->primes[i] < bkthresh; i++) k++;
-    small->n = k;
-    small->primes = (uint32_t *)malloc((size_t)(k ? k : 1) * 4);
-    small->roots  = (uint32_t *)malloc((size_t)(k ? k : 1) * 4);
+    for (i = 0; i < fb->n; i++)
+        if (fb->primes[i] < bkthresh || fb_is_proper_power(fb->primes[i])) cap++;
+    small->primes = (uint32_t *)malloc((size_t)(cap ? cap : 1) * 4);
+    small->roots  = (uint32_t *)malloc((size_t)(cap ? cap : 1) * 4);
     if (!small->primes || !small->roots) return -1;
-    memcpy(small->primes, fb->primes, (size_t)k * 4);
-    memcpy(small->roots,  fb->roots,  (size_t)k * 4);
     if (fb->logp) {
-        small->logp = (uint8_t *)malloc((size_t)(k ? k : 1));
+        small->logp = (uint8_t *)malloc((size_t)(cap ? cap : 1));
         if (!small->logp) return -1;
-        memcpy(small->logp, fb->logp, (size_t)k);
     }
+    for (i = 0; i < fb->n; i++) {
+        if (fb->primes[i] >= bkthresh && !fb_is_proper_power(fb->primes[i])) continue;
+        small->primes[k] = fb->primes[i];
+        small->roots[k]  = fb->roots[i];
+        if (fb->logp) small->logp[k] = fb->logp[i];
+        k++;
+    }
+    small->n = k;
     return 0;
 }
