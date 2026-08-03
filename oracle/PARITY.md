@@ -154,6 +154,39 @@ entry. Two positions were picked because long projective power ladders hit them
 (the 3-ladder 3,9,27,81,243,729,2187 and the 2-ladder 2,4,8,16,32,64), which is
 the direct gate on the nonzero-reciprocal bug.
 
+### …and the same eight, through the actual sieve
+
+The table above compares las against a direct enumeration of the factor base:
+`fbtest --trace` walks every entry and tests the congruence. That gates our
+*factor base, roots and logs* — which is what found the bugs — but it does not
+run `pl_transform_enc`, the walk, the tiering, the fill, the small sieve or the
+GPU apply, so on its own it is **not** sieve parity.
+
+`bench --probe i,j` reads the cell back out of `k_apply` after the run, so its
+number has been through all of that:
+
+| (i,j) ours | side 1 las / GPU | side 0 las / GPU |
+|---|---|---|
+| (4999, 8192) | 22 / **22** | 58 / **58** |
+| (9237, 15022) | 94 / **94** | 65 / **65** |
+| (2978, 8393) | 46 / **46** | 94 / **94** |
+| (13198, 9151) | 51 / **51** | 63 / **63** |
+
+```
+./bench --cadofb ../oracle/c183.fb1 --side 1 --scale 1.275 --allowance 112 \
+        --q 120000053 --rho 112625526 --probe 4999,8192
+./bench --side 0 --scale 1.925 --allowance 72.85 \
+        --q 120000053 --rho 112625526 --probe 4999,8192
+```
+
+**Caveat on coverage.** The timed configuration truncates side 1 at the
+special-q (6,840,490 bucketed entries) while las runs to `alim` (7,601,777), and
+side 0 caps powers at `--maxbits 15` against las's `powlim = ULONG_MAX`. The
+probes agree anyway because no ideal in `[q, alim)` hits these four positions —
+which the agreement itself shows, since the GPU excludes that band and would
+otherwise read low. That is evidence for these positions, not a general
+equivalence: pin one profile before comparing survivor *sets*.
+
 Getting here took two real fixes, both found by this trace and by nothing else:
 the exact scale above, and a base-prime bug in the makefb parser (RESULTS.md
 findings 18–25).

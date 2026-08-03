@@ -78,6 +78,11 @@ void norm_setup(norm_t *N, const poly_t *P, const qlat_t *L,
     }
     for (; k < 8; k++) N->d[k] = 0.0f;
 
+    for (k = 0; k <= P->deg; k++) N->dd[k] = d[k] / M;
+    for (; k < 8; k++) N->dd[k] = 0.0;
+    N->A = A; N->B = B;
+    N->a0 = L->a0; N->a1 = L->a1; N->b0 = L->b0; N->b1 = L->b1;
+
     N->ua  = (float)((double)L->a0 / A);   /* u = ua*i + ub*j */
     N->ub  = (float)((double)L->b0 / A);
     N->va  = (float)((double)L->a1 / B);   /* v = va*i + vb*j */
@@ -103,15 +108,40 @@ void norm_setup(norm_t *N, const poly_t *P, const qlat_t *L,
 }
 
 /* Host mirror of the device norm evaluation, used by the correctness gate. */
+/* Exact-in-fp64 evaluation of the same normalised form. (a,b) are formed in
+ * int64, so they are exact; only the polynomial sum rounds, at 2^-53 instead of
+ * fp32's 2^-24. */
+double norm_acc_fp64(const norm_t *N, int32_t i, uint32_t j)
+{
+    const double a = (double)((int64_t)i * N->a0 + (int64_t)j * N->b0);
+    const double b = (double)((int64_t)i * N->a1 + (int64_t)j * N->b1);
+    const double u = a / N->A, v = b / N->B;
+    double acc = N->dd[N->deg], vp = 1.0;
+    int k;
+    for (k = N->deg - 1; k >= 0; k--) { vp *= v; acc = acc * u + N->dd[k] * vp; }
+    return acc;
+}
+
 float norm_target_host(const norm_t *N, int32_t i, uint32_t j)
 {
     float u = N->ua * (float)i + N->ub * (float)j;
     float v = N->va * (float)i + N->vb * (float)j;
-    float acc = N->d[N->deg], vp = 1.0f, s;
+    float acc = N->d[N->deg], vp = 1.0f;
+    /* the same Horner on |.|, which bounds the cancellation: the fp32 error is
+     * ~deg*2^-24*aabs, so |acc| << aabs means the result is mostly noise */
+    float aabs = fabsf(N->d[N->deg]), vpa = 1.0f, av = fabsf(v), au = fabsf(u);
+    float s;
     int k;
-    /* horner in u with ascending powers of v: sum d_k u^k v^(deg-k) */
-    for (k = N->deg - 1; k >= 0; k--) { vp *= v; acc = acc * u + N->d[k] * vp; }
+    for (k = N->deg - 1; k >= 0; k--) {
+        vp  *= v;   acc   = acc * u + N->d[k] * vp;
+        vpa *= av;  aabs  = aabs * au + fabsf(N->d[k]) * vpa;
+    }
+    /* Mirror the DEVICE expression exactly -- same float type, same clamp, same
+     * log2f -- because this function is the reference the GPU is gated against.
+     * Being more accurate here than the kernel would make "0 cells differ"
+     * meaningless: it would be comparing two different functions. */
     s = fabsf(acc);
+    if (s < NORM_CANCEL_TOL * aabs) s = (float)fabs(norm_acc_fp64(N, i, j));
     if (s < 1e-30f) s = 1e-30f;
     /* las: fb_log(n) = floor(log2(n)*scale + 0.5) */
     return N->scale * (N->log2M + log2f(s) - N->bias);

@@ -25,7 +25,13 @@ int fb_load(const char *path, fb_t *fb)
     fb->n      = n;
     fb->primes = (uint32_t *)malloc((size_t)n * 4);
     fb->roots  = (uint32_t *)malloc((size_t)n * 4);
-    if (!fb->primes || !fb->roots) { fclose(f); return -1; }
+    /* .afb.0 has no prime powers at all -- that is one of the two reasons the
+     * CADO loader exists. Say so explicitly with a zeroed flag array rather
+     * than leaving it NULL: NULL makes FB_ISPOW fall back to a primality test
+     * per entry, which cost 7.8 s on this file and applied to the DEFAULT
+     * invocation, the one path not exercised while fixing finding 29. */
+    fb->ispow  = (uint8_t *)calloc((size_t)n, 1);
+    if (!fb->primes || !fb->roots || !fb->ispow) { fclose(f); return -1; }
 
     got  = fread(fb->primes, 4, n, f);
     got += fread(fb->roots,  4, n, f);
@@ -36,8 +42,8 @@ int fb_load(const char *path, fb_t *fb)
 
 void fb_free(fb_t *fb)
 {
-    free(fb->primes); free(fb->roots); free(fb->logp);
-    fb->primes = fb->roots = NULL; fb->logp = NULL; fb->n = 0;
+    free(fb->primes); free(fb->roots); free(fb->logp); free(fb->ispow);
+    fb->primes = fb->roots = NULL; fb->logp = NULL; fb->ispow = NULL; fb->n = 0;
 }
 
 static uint32_t mulmod32(uint32_t a, uint32_t b, uint32_t m)
@@ -151,9 +157,10 @@ void fb_restrict(fb_t *fb, uint32_t bkthresh, uint32_t fb_bound)
     for (i = 0; i < fb->n; i++) {
         uint32_t p = fb->primes[i], r = fb->roots[i];
         if (p < bkthresh || p >= fb_bound) continue;
-        if (fb_is_proper_power(p)) continue;      /* line-sieved instead */
+        if (FB_ISPOW(fb, i)) continue;            /* line-sieved instead */
         fb->primes[k] = p; fb->roots[k] = r;
-        if (fb->logp) fb->logp[k] = fb->logp[i];
+        if (fb->logp)  fb->logp[k]  = fb->logp[i];
+        if (fb->ispow) fb->ispow[k] = fb->ispow[i];
         k++;
     }
     fb->n = k;
@@ -172,7 +179,7 @@ int fb_split_small(const fb_t *fb, uint32_t bkthresh, fb_t *small)
     uint32_t i, k = 0, cap = 0;
     memset(small, 0, sizeof(*small));
     for (i = 0; i < fb->n; i++)
-        if (fb->primes[i] < bkthresh || fb_is_proper_power(fb->primes[i])) cap++;
+        if (fb->primes[i] < bkthresh || FB_ISPOW(fb, i)) cap++;
     small->primes = (uint32_t *)malloc((size_t)(cap ? cap : 1) * 4);
     small->roots  = (uint32_t *)malloc((size_t)(cap ? cap : 1) * 4);
     if (!small->primes || !small->roots) return -1;
@@ -180,11 +187,16 @@ int fb_split_small(const fb_t *fb, uint32_t bkthresh, fb_t *small)
         small->logp = (uint8_t *)malloc((size_t)(cap ? cap : 1));
         if (!small->logp) return -1;
     }
+    if (fb->ispow) {
+        small->ispow = (uint8_t *)malloc((size_t)(cap ? cap : 1));
+        if (!small->ispow) return -1;
+    }
     for (i = 0; i < fb->n; i++) {
-        if (fb->primes[i] >= bkthresh && !fb_is_proper_power(fb->primes[i])) continue;
+        if (fb->primes[i] >= bkthresh && !FB_ISPOW(fb, i)) continue;
         small->primes[k] = fb->primes[i];
         small->roots[k]  = fb->roots[i];
-        if (fb->logp) small->logp[k] = fb->logp[i];
+        if (fb->logp)  small->logp[k]  = fb->logp[i];
+        if (fb->ispow) small->ispow[k] = fb->ispow[i];
         k++;
     }
     small->n = k;

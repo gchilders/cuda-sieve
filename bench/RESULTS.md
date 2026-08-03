@@ -801,9 +801,14 @@ totals.** Two positions were chosen because long projective power ladders hit
 them (3,9,27,81,243,729,2187 and 2,4,8,16,32,64), making this the direct gate on
 the nonzero-reciprocal bug rather than an aggregate one.
 
-This closes the design doc's Path 3 gate 2, which had been marked BLOCKED on the
-grounds that no trustworthy oracle existed. The oracle existed; it was simply a
-different one, and it was in the tree the whole time.
+> **Correction, later the same day.** As first written this table came from
+> `fbtest --trace`, which enumerates the factor base directly with
+> `hits_def_pub` and **does not run the sieve** — not `pl_transform_enc`, not
+> the walk, not the tiering, the bucket fill, the small sieve or the GPU apply.
+> So it established that our *factor base, roots and logs* agree with las, which
+> is what found the bugs above, but it did not establish sieve parity, and
+> calling it "byte-exact sieve parity" was an overclaim. Finding 27 closes the
+> gap properly; the numbers below stand as the ideal/log half of it.
 
 **Norm initialisation still differs, and should.** las runs 0 to +2 above the
 exact value, scattered: one unit is `LOGNORM_GUARD_BITS` (which las prints in
@@ -827,8 +832,215 @@ cd ~/code/cuda-sieve/oracle && las_tracek -poly c183.poly -fb1 c183.fb1 \
 cd ~/code/cuda-sieve/bench && ./fbtest --cadofb ../oracle/c183.fb1 --trace 4999,8192
 ```
 
+## Finding 27 — gate 5, done properly: the *pipeline* reproduces las
+
+Finding 26's table compared las against a direct enumeration of the factor base.
+The thing we actually want to gate is the sieve. `bench --probe i,j` now reads
+the cell back out of `k_apply` after the run, so the number it prints has been
+through the root transform, the Franke-Kleinjung walk, the three-tier split, the
+bucket fill, the small-prime line sieve and the GPU apply:
+
+```
+[gate 5] probe (i=4999, j=8192)  x=268456839  region 16385 offset 4999
+         init norm S   = 241
+         final cell    = 3877
+         SIEVED LOG SUM = 22   <- produced by transform + walk + fill + small sieve + apply
+```
+
+Same four positions, both sides, `q=120000053, rho=112625526`:
+
+| (i,j) | side 1 las / GPU | side 0 las / GPU |
+|---|---|---|
+| (4999, 8192) | 22 / **22** | 58 / **58** |
+| (9237, 15022) | 94 / **94** | 65 / **65** |
+| (2978, 8393) | 46 / **46** | 94 / **94** |
+| (13198, 9151) | 51 / **51** | 63 / **63** |
+
+**8 of 8, through the whole pipeline.** *This* is what closes Path 3 gate 2.
+
+The probe costs one comparison per cell against a sentinel and is compiled in
+unconditionally; it is off unless `--probe` is passed.
+
+## Finding 28 — fp32 norms are wrong near root lines, in both directions
+
+The normalisation gives fp32 ample dynamic *range* — that is what finding 10
+bought. It does not give precision. Near a real root line of `F` the Horner
+terms are O(1) and cancel to something tiny, so what survives is mostly rounding
+noise. Measured against an fp64 evaluation over a band along the three real root
+lines:
+
+| | before | after |
+|---|---:|---:|
+| positions sampled | 63,497 | 63,497 |
+| rounded-log mismatches | **144** | **1** |
+| error range (sieve units) | **−3.31 .. +2.57** | −0.00 |
+| worst relative error on the sum | 2.59 | 4.8e-4 |
+
+A random control over 200,000 positions shows 1 mismatch either way, so this is
+specific to the root lines and not a general precision problem.
+
+**Both signs occur**, so it costs relations as well as wasting cofactor time —
+and raising `scale` (finding 23) amplifies it in sieve units, which makes it a
+blocker for that experiment rather than an independent issue.
+
+The fix is an error bound, not more precision everywhere: run the same Horner on
+`|.|` alongside the real one, and when `|acc| < 4.9e-4 * sum|terms|` recompute
+that cell in fp64 with `(a,b)` formed exactly in int64. The bound costs one extra
+FMA chain per cell; the fp64 path fires on well under one cell in a thousand, so
+even at 1/64 double rate it is noise. The one residual mismatch is a genuine tie
+at the rounding boundary.
+
+Credit where due: this was codex's finding, and my first attempt to reproduce it
+sampled too sparsely and came back with 1 mismatch instead of 144. Sampling every
+row at closest approach to each root line reproduced it exactly.
+
+## Finding 29 — factor-base preprocessing cost 6.7 s, 120x the sieve chain
+
+Self-inflicted, on 2026-08-02: `fb_restrict` and `fb_split_small` called
+`fb_is_proper_power` per entry, which runs Miller-Rabin, over 11.5M ideals.
+
+| stage | before | after |
+|---|---:|---:|
+| load | 0.42 s | 0.25 s |
+| `fb_split_small` | **4.63 s** | **0.005 s** |
+| `fb_restrict` | **2.05 s** | **0.008 s** |
+
+Every loader already knows which entries are powers — `fb_cado.c` literally
+separates them into their own stream before merging, and `rfb.c` generates them
+in a loop with the exponent in hand. `fb_t` now carries an `ispow` flag set at
+load, and nothing downstream re-derives it. The independent primality check
+survives where it belongs, in `fbtest`'s prime-power gate, where being
+independent is the point.
+
+## Finding 30 — the gates are now assertions, not printouts
+
+Three things that were computed and printed but could not fail a run:
+
+- **Per-region record counts.** `verify_count_updates` gained the array in the
+  last round but `bench` passed `NULL`. It now compares all 32,768 regions
+  against the GPU cursors and **returns non-zero** on any mismatch. A global
+  total cannot distinguish "right total, wrong region" — and every placement bug
+  this project has hit had exactly the right total. Currently: *all 32,768
+  regions match the CPU reference exactly*, both sides.
+- **`sum(logp/q)`.** Now a PASS/FAIL in `make check`, against expectations
+  computed by **separate implementations** (a re-parse of `c183.fb1` that
+  re-derives base primes independently; a fresh sieve to `rlim` plus the power
+  ladder, which also reproduces the 3,957,374 ideal count exactly). Wiring it up
+  immediately caught that the constant I had was the stale pre-finding-24 value:
+  42.744 against the correct **42.2913**.
+- **Parameter validation.** `--record-bytes` outside {2,4,8} used to fall through
+  to the 8-byte kernel while allocating the requested size — an out-of-bounds
+  write. Two-level mode accepted 8-byte records but launches the 4-byte level-2
+  specialisation. Both now refuse, along with zero/negative `J`, `reps`,
+  `threads`, and an area that does not divide evenly into regions.
+
+## Finding 31 — the parity profile and the timed profile are not the same set
+
+Worth stating plainly, because it limits what the gate-5 numbers cover:
+
+| | timed `bench` run | las |
+|---|---|---|
+| side 1 upper bound | truncated at the special-q (GGNFS convention), **6,840,490** bucketed | runs to `alim`, **7,601,777** |
+| side 0 powers | capped at `--maxbits 15` | `powlim = ULONG_MAX` |
+
+The eight probes still agree because no ideal in `[q, alim)` happens to hit those
+four positions — which the agreement itself demonstrates, since the GPU excludes
+that band and would otherwise have come out low. That is evidence for these
+positions, **not** a general equivalence.
+
+Before any survivor-set comparison, pin one profile. The cheap direction is to
+pin las *down* to ours (`-powlim0 32767 -powlim1 32767`, and a `q0` above `alim`
+so no truncation applies) rather than chase it up; `bench --fbbound 134200000`
+goes the other way but then re-includes the special-q ideal, which las divides
+out.
+
+## Finding 32 — `--verify` could exit 0 on a sieve that was demonstrably wrong
+
+Two independent false-success paths, both of which made the verification suite
+decorative rather than load-bearing.
+
+**Cell mismatches printed but did not fail.** `verify_apply_region` counted
+differing cells, printed the count, and returned normally. Demonstrated with the
+deliberately racy `--apply-mode plain`:
+
+```
+[verify] region 16384: 9576 records replayed on CPU, 518 cells differ
+                       (first at cell 0: gpu 3946 ref 3966)
+exit=255      <- was 0
+```
+
+20 sieve-log units lost at cell 0 alone, and the old code reported success.
+
+**Bucket overflow was invisible to the per-region gate, by construction.**
+`cursor[b]` is incremented *before* the cap test, so it counts records
+**attempted**, not stored — and `verify_count_updates` counts the same thing.
+The two therefore agree exactly while `k_apply` truncates each bucket at `cap`
+and silently drops the excess. Finding 30's per-region assertion, added
+specifically to catch placement errors, cannot see this class at all. Overflow is
+now failed explicitly under `--verify`, and the per-region OK line says what its
+counts do and do not cover.
+
+The general lesson is the one this project keeps re-learning: a gate that cannot
+fail is not a gate. Findings 30 and 32 are the same mistake in two forms —
+computing the right comparison and then not acting on it.
+
+## Finding 33 — the CPU reference was not evaluating the kernel's expression
+
+`k_apply` used `__log2f`, the fast intrinsic (~2 ulp, no host equivalent);
+`norm_target_host` kept full `double` through `log2` with a `1e-300` clamp
+against the device's `1e-30f`. So "0 cells differ" was comparing two slightly
+different functions, and an emulation over 127k root-line samples found three
+rounded disagreements between the two expressions.
+
+The device now uses accurate `log2f` and the host mirrors it float-for-float,
+including the clamp. Norm init was 1.76 ms of a 27 ms apply, so the intrinsic was
+not worth the loss of a meaningful reference. **The reference must be the same
+function, not a better one** — being more accurate on the host would make the
+comparison meaningless in exactly the same way.
+
+Re-measured after the change: still 1 residual mismatch in the 63,497-position
+root-line band (the rounding tie from finding 28), and region 16384 still gives
+0 cells differ — but now that number is a statement about the device path.
+
+## Finding 34 — the default invocation never got finding 29's fix
+
+`fb_load` (GGNFS `.afb.0`, the **default** `--fb` path) left `ispow` NULL, so
+`FB_ISPOW` fell back to a primality test per entry — the exact 7.8 s that
+finding 29 removed, still present on the one path not exercised while fixing it.
+
+| stage | before | after |
+|---|---:|---:|
+| `fb_split_small` | 5.39 s | **0.069 s** |
+| `fb_restrict` | 2.39 s | **0.024 s** |
+
+`.afb.0` contains no prime powers at all — that is one of the two reasons the
+CADO loader exists — so the fix is a zeroed flag array, stating that fact rather
+than rediscovering it 7.6M times.
+
+## Finding 35 — three more parameter combinations that failed silently
+
+- **`--apply-threads` was never validated** (only `--threads` was). The small
+  sieve strides its warp tier by `nwarps = threads >> 5`: below 32 that is
+  **zero — an infinite loop on the device**, and a non-multiple of 32 leaves a
+  partial warp whose lanes re-run warp-tier entries and double-add their logs.
+  Now requires 0 or a multiple of 32 in [32,1024].
+- **`1u << log_region` happened before `log_region` was bounded**; UBSan flags
+  `--region 32`. Both `logI` and `log_region` are now bounded before anything
+  shifts by them.
+- **Probe coordinates were unchecked**, so `--probe 16384,0` aliased the real
+  cell `(-16384,1)` and would have certified a position nobody asked about —
+  the worst possible failure mode for a parity instrument.
+
 ## Not addressed in this round
 
+- **The survivor-set gate.** Gate 5 is *sampled* pipeline parity: four
+  positions, and on profiles that differ (finding 31). The decisive test is a
+  profile-pinned survivor-set comparison, or failing that per-region **offset
+  hashes** rather than counts — counts cannot see a permutation within a region.
+  This is the next correctness step and it is not done.
+- **The hybrid norm kernel has not been timed on a quiet GPU.** The extra
+  absolute-value FMA chain runs on every cell and the fp64 branch diverges;
+  calling that "noise" (finding 28) is reasoning, not measurement.
 - **Timings in this session are not comparable.** The GPU was shared with an
   ECM job throughout; every millisecond figure printed on 2026-08-02 is inflated
   and none should be quoted. Correctness results are unaffected.

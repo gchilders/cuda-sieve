@@ -35,7 +35,8 @@ static void usage(void)
 "  --scale S        las byte scale for the side [1.0 = raw bits]\n"
 "  --cadofb PATH    CADO makefb factor base (has prime powers)\n"
 "  --maxbits N      prime powers below 2^N      [15]\n"
-"  --dump PATH      write the sieve region in las byte convention\n");
+"  --dump PATH      write the sieve region in las byte convention\n"
+"  --probe i,j      read back that cell after apply (gate 5)\n");
 }
 
 int main(int argc, char **argv)
@@ -61,6 +62,7 @@ int main(int argc, char **argv)
     cfg.apply_atomic = 1; cfg.apply_threads = 0; cfg.allowance = 3.5 * 32.0;
     cfg.small_sieve = 1; cfg.side = 1;
     cfg.scale = 1.0; cfg.dump = NULL; cfg.cadofb = NULL;
+    cfg.probe_i = 0; cfg.probe_j = 0xFFFFFFFFu;
     int maxbits = 15;
     int allowance_set = 0;
 
@@ -104,9 +106,19 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc) cfg.dump = argv[++i];
         else if (!strcmp(argv[i], "--cadofb") && i + 1 < argc) cfg.cadofb = argv[++i];
         else if (!strcmp(argv[i], "--maxbits") && i + 1 < argc) maxbits = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--probe") && i + 1 < argc) {
+            int pi; unsigned pj;
+            if (sscanf(argv[++i], "%d,%u", &pi, &pj) != 2) {
+                fprintf(stderr, "--probe wants i,j\n"); return 1;
+            }
+            cfg.probe_i = pi; cfg.probe_j = pj;
+        }
         else { usage(); return 1; }
     }
     if (cfg.cell_bits != 8 && cfg.cell_bits != 16) { usage(); return 1; }
+    /* logI bounds FIRST: every default below shifts by it (bkthresh, the area
+     * check, the probe range), and an out-of-range shift is undefined. */
+    if (cfg.logI < 2 || cfg.logI > 20) { usage(); return 1; }
     /* las's survivor bound is scale*lambda*lpb per side; ours is the same
      * quantity in unscaled bits (16-bit cells need no scale). */
     if (!allowance_set && cfg.side == 0) cfg.allowance = 2.35 * 31.0;
@@ -114,7 +126,23 @@ int main(int argc, char **argv)
     if (!fbbound && cfg.side == 1)
         fbbound = (q > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (uint32_t)q;
 
-    if (cfg.logI < 2 || cfg.logI > 20) { usage(); return 1; }
+    /* Bound log_region before ANY 1u << log_region: the shift is undefined for
+     * >= 32 and UBSan flags --region 32 on the old ordering. */
+    if (cfg.log_region < 1 || cfg.log_region > 30) {
+        fprintf(stderr, "--region must be in [1,30] (got %d)\n", cfg.log_region);
+        return 1;
+    }
+    /* An out-of-range probe silently ALIASES another cell -- --probe 16384,0
+     * lands on the real (-16384,1) -- so it would certify a coordinate nobody
+     * asked about. */
+    if (cfg.probe_j != 0xFFFFFFFFu) {
+        const int32_t half = 1 << (cfg.logI - 1);
+        if (cfg.probe_i < -half || cfg.probe_i >= half || cfg.probe_j >= cfg.J) {
+            fprintf(stderr, "--probe i,j out of range: i must be in [%d,%d) and"
+                    " j in [0,%u)\n", -half, half, cfg.J);
+            return 1;
+        }
+    }
     if ((uint64_t)(1u << cfg.logI) * cfg.J > 0x80000000ull) {
         fprintf(stderr, "I*J must fit in 31 bits (uint32 positions)\n"); return 1;
     }
@@ -123,6 +151,38 @@ int main(int argc, char **argv)
      * record past the wrap lands on the wrong cell; and the fused small sieve
      * derives j from a single shift, which assumes a region lies inside one
      * j-row. Both produced plausible-looking output rather than an error. */
+    if (cfg.record_bytes != 2 && cfg.record_bytes != 4 && cfg.record_bytes != 8) {
+        fprintf(stderr, "--record-bytes must be 2, 4 or 8 (got %d): any other"
+                " value falls through to the 8-byte kernel while allocating the"
+                " requested size, which writes out of bounds\n", cfg.record_bytes);
+        return 1;
+    }
+    if (cfg.fill_mode == FILL_TWOLEVEL && cfg.record_bytes != 4) {
+        fprintf(stderr, "--mode twolevel only has a 4-byte level-2 kernel;"
+                " --record-bytes %d would launch the wrong specialisation\n",
+                cfg.record_bytes);
+        return 1;
+    }
+    if (cfg.J == 0 || cfg.reps < 1 || cfg.threads < 32 || cfg.threads > 1024) {
+        fprintf(stderr, "--J must be > 0, --reps >= 1, --threads in [32,1024]\n");
+        return 1;
+    }
+    /* The small sieve's warp tier strides by nwarps = threads >> 5. Below 32
+     * that is ZERO -- an infinite loop on the device. A non-multiple of 32
+     * leaves a partial warp whose lanes re-run warp-tier entries, double-adding
+     * their logs. Neither is diagnosable from the output. */
+    if (cfg.apply_threads != 0 &&
+        (cfg.apply_threads < 32 || cfg.apply_threads > 1024
+         || (cfg.apply_threads & 31))) {
+        fprintf(stderr, "--apply-threads must be 0 (auto) or a multiple of 32 in"
+                " [32,1024]: the small sieve strides by threads/32, so under 32"
+                " hangs and a partial warp double-counts\n");
+        return 1;
+    }
+    if ((uint64_t)(1u << cfg.logI) * cfg.J % (1u << cfg.log_region)) {
+        fprintf(stderr, "I*J must divide evenly into 2^%d regions\n", cfg.log_region);
+        return 1;
+    }
     if (cfg.log_region > 16 && cfg.record_bytes < 8) {
         fprintf(stderr, "--region %d needs --record-bytes 8: a %d B record has"
                 " only a 16-bit offset field\n", cfg.log_region, cfg.record_bytes);
@@ -223,13 +283,6 @@ int main(int argc, char **argv)
         nc = verify_fb_transform(&fbs, &L, bkthresh);
         if (nc < 0) { printf("[verify] FAILED\n"); return 1; }
         printf("[verify] OK: %d small-part entries agree with the definition\n", nc);
-    }
-
-    if (cfg.verify) {
-        printf("[verify] counting updates on the CPU (single-threaded, slow)...\n");
-        uint64_t n = verify_count_updates(&fb, &L, cfg.logI, cfg.J,
-                                          cfg.log_region, NULL);
-        printf("[verify] CPU reference records: %llu\n", (unsigned long long)n);
     }
 
     int rc = run_bench(&fb, &fbs, &L, &POLY, &cfg);

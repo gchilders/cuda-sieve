@@ -162,11 +162,17 @@ int fb_load_cado(const char *path, double scale, fb_t *fb)
     fb->primes = (uint32_t *)malloc((size_t)fb->n * 4);
     fb->roots  = (uint32_t *)malloc((size_t)fb->n * 4);
     fb->logp   = (uint8_t  *)malloc((size_t)fb->n);
-    if (!fb->primes || !fb->roots || !fb->logp) goto fail2;
+    fb->ispow  = (uint8_t  *)malloc((size_t)fb->n);
+    if (!fb->primes || !fb->roots || !fb->logp || !fb->ispow) goto fail2;
+    /* The merge already knows which stream an entry came from: the qb stream IS
+     * the proper prime powers. Record it, so nothing downstream ever has to
+     * re-derive it with a primality test. */
     for (i = j = k = 0; k < fb->n; k++) {
         int takea = (i < na) && (j >= nb || qa[i] <= qb[j]);
-        if (takea) { fb->primes[k] = qa[i]; fb->roots[k] = ra[i]; fb->logp[k] = la[i]; i++; }
-        else       { fb->primes[k] = qb[j]; fb->roots[k] = rb[j]; fb->logp[k] = lb[j]; j++; }
+        if (takea) { fb->primes[k] = qa[i]; fb->roots[k] = ra[i]; fb->logp[k] = la[i];
+                     fb->ispow[k] = 0; i++; }
+        else       { fb->primes[k] = qb[j]; fb->roots[k] = rb[j]; fb->logp[k] = lb[j];
+                     fb->ispow[k] = 1; j++; }
     }
     printf("CADO factor base %s: %u ideals (%u prime, %u prime-power)"
            " at scale %.3f\n", path, fb->n, na, nb, scale);

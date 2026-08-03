@@ -217,7 +217,8 @@ __global__ void k_apply(const uint32_t *__restrict buckets,
                         uint32_t dbg_region,
                         const uint32_t *__restrict sp, const uint32_t *__restrict srt,
                         const uint32_t *__restrict sg, const uint16_t *__restrict slp,
-                        uint32_t nsmall, uint32_t nblk, uint32_t nwrp)
+                        uint32_t nsmall, uint32_t nblk, uint32_t nwrp,
+                        uint32_t probe_x, uint32_t *__restrict probe_out)
 {
     extern __shared__ uint32_t sm[];
     const uint32_t ncell  = 1u << log_region;
@@ -243,15 +244,43 @@ __global__ void k_apply(const uint32_t *__restrict buckets,
                 t = tconst;
             } else {
                 const uint32_t x = xbase + w * CPW + c;
-                const float fi = (float)((int32_t)(x & Imask) - Ihalf);
-                const float fj = (float)(x >> logI);
+                const int32_t  ii = (int32_t)(x & Imask) - Ihalf;
+                const uint32_t jj = x >> logI;
+                const float fi = (float)ii;
+                const float fj = (float)jj;
                 const float u = fmaf(N.ua, fi, N.ub * fj);
                 const float v = fmaf(N.va, fi, N.vb * fj);
                 float acc = N.d[N.deg], vp = 1.0f;
+                /* The same Horner on |.|, which bounds the cancellation. The
+                 * normalisation gives fp32 ample dynamic RANGE, but near a root
+                 * line of F the terms are O(1) and cancel to something tiny, so
+                 * what is left is mostly rounding noise. Measured before this
+                 * guard: 144 of 63,497 positions in a band along the three real
+                 * root lines rounded to the wrong sieve-log value, -3.31 to
+                 * +2.57 units and BOTH SIGNS -- false survivors and lost
+                 * relations alike. */
+                float aabs = fabsf(N.d[N.deg]), vpa = 1.0f;
+                const float au = fabsf(u), av = fabsf(v);
                 #pragma unroll
                 for (int k = 6; k >= 0; k--)
-                    if (k < N.deg) { vp *= v; acc = fmaf(acc, u, N.d[k] * vp); }
+                    if (k < N.deg) {
+                        vp  *= v;  acc  = fmaf(acc,  u,  N.d[k] * vp);
+                        vpa *= av; aabs = fmaf(aabs, au, fabsf(N.d[k]) * vpa);
+                    }
                 float s = fabsf(acc);
+                if (s < NORM_CANCEL_TOL * aabs) {
+                    /* redo in fp64: (a,b) exactly in int64, sum at 2^-53.
+                     * Doubles are 1/64 rate on this part, but this fires on
+                     * well under one cell in a thousand. */
+                    const double a = (double)((int64_t)ii * N.a0 + (int64_t)jj * N.b0);
+                    const double b = (double)((int64_t)ii * N.a1 + (int64_t)jj * N.b1);
+                    const double ud = a / N.A, vd = b / N.B;
+                    double accd = N.dd[N.deg], vpd = 1.0;
+                    #pragma unroll
+                    for (int k = 6; k >= 0; k--)
+                        if (k < N.deg) { vpd *= vd; accd = accd * ud + N.dd[k] * vpd; }
+                    s = (float)fabs(accd);
+                }
                 /* las: S = fb_log(|F|) = floor(log2|F| * scale + 0.5).
                  * las clamps here at 255 because its cell IS a byte, and that
                  * is the whole reason `scale` exists (1.28 * 196.61 = 251.7).
@@ -261,11 +290,18 @@ __global__ void k_apply(const uint32_t *__restrict buckets,
                  * position that we can keep. Clamping at 255 threw that away
                  * and, worse, would have silently flattened every norm above
                  * 255/scale into one bucket the moment anyone raised scale. */
-                float lg = N.scale * (N.log2M + __log2f(fmaxf(s, 1e-30f)) - N.bias);
+                /* log2f, NOT __log2f. The fast intrinsic is ~2 ulp and has no
+                 * host equivalent, so the CPU replay could not mirror this
+                 * expression exactly and "0 cells differ" was measuring two
+                 * slightly different functions. Accurate log2f is reproducible
+                 * on both sides; norm init was 1.76 ms of a 27 ms apply, so the
+                 * difference is affordable and correctness is not. */
+                float lg = N.scale * (N.log2M + log2f(fmaxf(s, 1e-30f)) - N.bias);
                 int ti = (int)floorf(lg + 0.5f);
                 const uint32_t TMAX = (CELLBITS == 8) ? 255u : CINIT;
                 t = (ti < 0) ? 0u : ((uint32_t)ti > TMAX ? TMAX : (uint32_t)ti);
             }
+            if (probe_out && (xbase + w * CPW + c) == probe_x) probe_out[0] = t;
             word |= (CINIT - t) << (c * CELLBITS);
         }
         S[w] = word;
@@ -298,6 +334,14 @@ __global__ void k_apply(const uint32_t *__restrict buckets,
         #pragma unroll
         for (uint32_t c = 0; c < CPW; c++) {
             const uint32_t v = (word >> (c * CELLBITS)) & CMASK;
+            if (probe_out && (xbase + w * CPW + c) == probe_x) {
+                /* Gate 5's GPU half: this value has been through the root
+                 * transform, the FK walk, the tiering, the bucket fill, the
+                 * small sieve and this kernel's apply. probe_out[0] is the
+                 * initialised norm, so the sieved log sum the PIPELINE actually
+                 * produced is v - (CINIT - probe_out[0]). */
+                probe_out[1] = v;
+            }
             if (v >= THRESH) {
                 uint32_t at = atomicAdd(nsurv, 1u);
                 if (at < maxsurv) surv[at] = xbase + w * CPW + c;
@@ -524,7 +568,7 @@ struct dev_bufs {
     plat_t   *plat;
     uint8_t  *out;
     uint16_t *slice, *slice_logp;
-    uint32_t *surv, *nsurv;
+    uint32_t *surv, *nsurv, *probe;
     uint16_t *dbg;
     uint32_t *sp, *srt, *sg;
     uint16_t *slp;
@@ -806,9 +850,46 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
         printf("  records landed   : %llu   (max bucket %u, mean %.0f -> imbalance %.2fx)\n",
                (unsigned long long)landed, mx, (double)landed / nregion,
                mx / ((double)landed / nregion));
+        /* PER-REGION assertion, not just the total. A global count cannot tell
+         * "right total, wrong region" from "right" -- and every placement bug
+         * this project has hit (transposed basis, projective reciprocal) had
+         * exactly the right total. This FAILS the run rather than printing. */
+        if (cfg->verify) {
+            uint32_t *ref = (uint32_t *)malloc((size_t)nregion * 4);
+            uint64_t tot;
+            uint32_t bad = 0, first = 0;
+            printf("  [verify] per-region reference (single-threaded)...\n");
+            tot = verify_count_updates(fb, L, cfg->logI, cfg->J, log_region, ref);
+            for (uint32_t i = 0; i < nregion; i++)
+                if (ref[i] != h[i]) { if (!bad) first = i; bad++; }
+            if (bad || tot != landed) {
+                printf("  [verify] FAILED: %u of %u regions differ (first: region %u,"
+                       " gpu %u ref %u); totals gpu %llu ref %llu\n",
+                       bad, nregion, first, h[first], ref[first],
+                       (unsigned long long)landed, (unsigned long long)tot);
+                free(ref); free(h); return -1;
+            }
+            printf("  [verify] OK: all %u regions match the CPU reference exactly\n"
+                   "           (counts are of records ATTEMPTED; bucket overflow is\n"
+                   "            gated separately, above)\n", nregion);
+            free(ref);
+        }
         free(h);
     }
-    if (ovf) printf("  ** OVERFLOW: %u records dropped -- resize and re-run **\n", ovf);
+    if (ovf) {
+        printf("  ** OVERFLOW: %u records dropped -- resize and re-run **\n", ovf);
+        /* The per-region gate CANNOT see this. cursor[] is incremented before
+         * the cap test, so it counts records ATTEMPTED, and the CPU reference
+         * counts the same thing -- they agree exactly while apply silently
+         * truncates each bucket at cap and drops the excess. Overflow has to be
+         * fatal on its own, or verification certifies a sieve that lost data. */
+        if (cfg->verify) {
+            fprintf(stderr, "[verify] FAILED: %u records overflowed their bucket."
+                    " The per-region count gate cannot detect this (cursors count\n"
+                    "         attempts, not stores), so it is failed explicitly.\n", ovf);
+            return -1;
+        }
+    }
 
     /* ---- stage A: apply ---- */
     float t_apply = 0;
@@ -821,12 +902,19 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
             const uint32_t ncell = 1u << log_region;
             const size_t smem = (size_t)ncell * CB / 8 + (size_t)nslice_pow2 * 2;
             const uint32_t maxsurv = 1u << 22;
+            /* gate 5: the one position whose pipeline-produced cell we read back */
+            const uint32_t probe_x = (cfg->probe_j != 0xFFFFFFFFu)
+                ? (uint32_t)((cfg->probe_i + (1 << (cfg->logI - 1)))
+                             + ((uint64_t)cfg->probe_j << cfg->logI))
+                : 0xFFFFFFFFu;
             int athr = cfg->apply_threads ? cfg->apply_threads : 512;
             /* region 0 is the j=0 row and is legitimately almost empty --
              * gating on it would check nothing. Use a mid-range region. */
             const uint32_t dbgreg = nregion / 2;
 
             CK(cudaMalloc(&D.surv, (size_t)maxsurv * 4));
+            CK(cudaMalloc(&D.probe, 8));
+            CK(cudaMemset(D.probe, 0, 8));
             CK(cudaMalloc(&D.nsurv, 4));
             if (cfg->dump) {
                 CK(cudaMalloc(&D.dumpbuf, (size_t)xmax));
@@ -857,8 +945,8 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                         cfg->logI, log_region, D.slice_logp, nslice_pow2,      \
                         N, CINIT, CINIT - BOUND, tconst, D.dumpbuf,            \
                         D.surv, D.nsurv, maxsurv,                              \
-                        D.dbg, dbgreg, D.sp, D.srt, D.sg, D.slp,                     \
-                        nsmall, nblk, nwrp);                                   \
+                        D.dbg, dbgreg, D.sp, D.srt, D.sg, D.slp,             \
+                        nsmall, nblk, nwrp, probe_x, D.probe);                 \
                 }                                                              \
                 cudaEventRecord(e4);                                           \
                 CK(cudaEventSynchronize(e4));                                  \
@@ -894,6 +982,21 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                 free(h);
             }
             uint32_t hs = 0;
+            if (probe_x != 0xFFFFFFFFu) {
+                uint32_t pr[2] = {0, 0};
+                CK(cudaMemcpy(pr, D.probe, 8, cudaMemcpyDeviceToHost));
+                printf("\n  [gate 5] probe (i=%d, j=%u)  x=%u  region %u offset %u\n"
+                       "           init norm S   = %u\n"
+                       "           final cell    = %u\n"
+                       "           SIEVED LOG SUM = %d   <- produced by transform +"
+                       " walk + fill + small sieve + apply\n"
+                       "           las byte S-sum = %d\n",
+                       cfg->probe_i, cfg->probe_j, probe_x,
+                       probe_x >> log_region, probe_x & ((1u << log_region) - 1),
+                       pr[0], pr[1],
+                       (int)pr[1] - ((int)CINIT - (int)pr[0]),
+                       (int)CINIT - (int)pr[1]);
+            }
             CK(cudaMemcpy(&hs, D.nsurv, 4, cudaMemcpyDeviceToHost));
             printf("  survivors: %u of %u positions (1 in %.3e)%s\n", hs, xmax,
                    hs ? (double)xmax / hs : 0.0,
@@ -921,6 +1024,14 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                                 first, hgpu[first], href[first]);
                 printf("\n  [verify] region %u survivors: cpu %u\n", dbgreg, rs);
                 free(hrec); free(hcnt); free(hgpu); free(href);
+                /* A differing cell is a failed run, not a log line. This used
+                 * to print and return 0, so `--verify && echo ok` reported
+                 * success on a sieve that disagreed with its own reference. */
+                if (bad) {
+                    fprintf(stderr, "[verify] FAILED: %u cells differ in region %u\n",
+                            bad, dbgreg);
+                    return -1;
+                }
             }
         }
     }
@@ -948,7 +1059,7 @@ after_apply:
     cudaFree(D.primes); cudaFree(D.roots); cudaFree(D.plat); cudaFree(D.cursor);
     cudaFree(D.out); cudaFree(D.overflow); cudaFree(D.nproj); cudaFree(D.nlost);
     cudaFree(D.l1); cudaFree(D.l1cnt); cudaFree(D.slice); cudaFree(D.slice_logp);
-    cudaFree(D.surv); cudaFree(D.nsurv); cudaFree(D.dbg);
+    cudaFree(D.surv); cudaFree(D.nsurv); cudaFree(D.dbg); cudaFree(D.probe);
     cudaFree(D.sp); cudaFree(D.srt); cudaFree(D.sg); cudaFree(D.slp); cudaFree(D.dumpbuf);
     return 0;
 }

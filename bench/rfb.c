@@ -99,7 +99,8 @@ int rfb_build(const poly_t *P, uint32_t lim, int maxbits, double scale, fb_t *fb
     fb->primes = (uint32_t *)malloc((size_t)cap * 4);
     fb->roots  = (uint32_t *)malloc((size_t)cap * 4);
     fb->logp   = (uint8_t  *)malloc((size_t)cap);
-    if (!fb->primes || !fb->roots || !fb->logp) { free(sieve); return -1; }
+    fb->ispow  = (uint8_t  *)malloc((size_t)cap);
+    if (!fb->primes || !fb->roots || !fb->logp || !fb->ispow) { free(sieve); return -1; }
 
     /* p = 2 first, then the odd primes in order -- fb_split_small and
      * fb_restrict both assume non-decreasing p. pl_invmod_any dispatches on
@@ -122,6 +123,7 @@ int rfb_build(const poly_t *P, uint32_t lim, int maxbits, double scale, fb_t *fb
          * rung of the ladder, so both ladders are the same loop. */
         proj = (y1 == 0);
         fb->primes[k] = p;
+        fb->ispow[k]  = 0;                 /* e == 1 */
         fb->logp[k]   = fb_log_delta(p, 1, 0, scale);
         if (proj) {
             /* rr == 0 mod p: the classical "b == 0 (mod p)" case */
@@ -158,6 +160,7 @@ int rfb_build(const poly_t *P, uint32_t lim, int maxbits, double scale, fb_t *fb
                                         * pl_invmod_any(den, qk)) % (uint64_t)qk)
                             + (proj ? qk : 0u);
             fb->logp[k]   = fb_log_delta(p, e, e - 1, scale);
+            fb->ispow[k]  = 1;             /* e >= 2 by construction */
             k++; npow++; if (proj) nprojpow++;
         }
     }
@@ -167,14 +170,16 @@ int rfb_build(const poly_t *P, uint32_t lim, int maxbits, double scale, fb_t *fb
     {
         uint32_t a;
         for (a = 1; a < fb->n; a++) {
-            uint32_t q = fb->primes[a], r = fb->roots[a]; uint8_t l = fb->logp[a];
+            uint32_t q = fb->primes[a], r = fb->roots[a];
+            uint8_t l = fb->logp[a], w = fb->ispow[a];
             int32_t m = (int32_t)a - 1;
             if (fb->primes[m] <= q) continue;
             while (m >= 0 && fb->primes[m] > q) {
                 fb->primes[m+1] = fb->primes[m]; fb->roots[m+1] = fb->roots[m];
-                fb->logp[m+1] = fb->logp[m]; m--;
+                fb->logp[m+1] = fb->logp[m]; fb->ispow[m+1] = fb->ispow[m]; m--;
             }
-            fb->primes[m+1] = q; fb->roots[m+1] = r; fb->logp[m+1] = l;
+            fb->primes[m+1] = q; fb->roots[m+1] = r;
+            fb->logp[m+1] = l; fb->ispow[m+1] = w;
         }
     }
     printf("rational factor base: %u ideals up to %u (%u prime-power of which"

@@ -195,8 +195,23 @@ int main(int argc, char **argv)
            "%u ideals", fb.n);
         ok("side 1 projective entries seen", np > 0,
            "%u projective, %u with a NONZERO reciprocal", np, nzp);
-        printf("       sum(logp/q) over the whole side-1 base: %.3f"
-               "  (scale %.3f)\n", log_density(&fb), scale);
+        {   /* The oracle-free density gate, as a PASS/FAIL rather than a
+             * print, so a log-parser or scale regression fails `make check`.
+             *
+             * 42.2913 was computed INDEPENDENTLY from c183.fb1 -- a separate
+             * implementation that re-derives each entry's base prime and log
+             * delta from the file -- not read off our own loader. It is the
+             * post-2026-08-02 value: before the is_power fix it was 42.744, and
+             * wiring this gate is what caught that the constant was stale.
+             * fb_log's rounding is not linear in scale, so gate only at 1.0. */
+            const double got = log_density(&fb);
+            if (scale == 1.0)
+                ok("side 1 sum(logp/q)", fabs(got - 42.2913) < 0.002,
+                   "%.4f (independent expectation 42.2913)", got);
+            else
+                printf("       side 1 sum(logp/q) = %.4f at scale %.3f"
+                       " (gate runs at scale 1.0 only)\n", got, scale);
+        }
         fb_free(&fbs); fb_free(&fb);
     } else {
         printf("       (skipped: pass --cadofb ../oracle/c183.fb1)\n");
@@ -218,8 +233,16 @@ int main(int argc, char **argv)
         ok("side 0 projective ladder", nzp >= 3,
            "%u projective, %u with a NONZERO reciprocal (expect >= 3: 59^2,"
            " 101^2, 127^2)", np, nzp);
-        printf("       sum(logp/q) over the whole side-0 base: %.3f"
-               "  (scale %.3f)\n", log_density(&fb), scale);
+        {   /* likewise independent: a separate sieve to rlim plus the power
+             * ladder, which also reproduces the ideal count 3,957,374 exactly */
+            const double got = log_density(&fb);
+            if (scale == 1.0)
+                ok("side 0 sum(logp/q)", fabs(got - 25.2037) < 0.002,
+                   "%.4f (independent expectation 25.2037)", got);
+            else
+                printf("       side 0 sum(logp/q) = %.4f at scale %.3f"
+                       " (gate runs at scale 1.0 only)\n", got, scale);
+        }
         fb_free(&fbs); fb_free(&fb);
     }
 

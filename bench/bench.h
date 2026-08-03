@@ -23,7 +23,14 @@ typedef struct {
     uint32_t *primes;   /* the walk modulus: p, or p^k for a prime power */
     uint32_t *roots;    /* root mod that modulus; >= modulus means projective */
     uint8_t  *logp;     /* las's log increment for this ideal, at a given scale */
+    uint8_t  *ispow;    /* 1 if the modulus is p^k with k >= 2; may be NULL */
 } fb_t;
+
+/* Is entry i a proper prime power? Uses the flag the loader already set --
+ * every loader knows this for free, since it parses or generates the ladder.
+ * Re-deriving it with primality tests cost 6.7 s per run over 11.5M ideals,
+ * against a 55 ms sieve chain, until 2026-08-02. */
+#define FB_ISPOW(fb, i)  ((fb)->ispow ? (fb)->ispow[i] : fb_is_proper_power((fb)->primes[i]))
 
 int  fb_load(const char *path, fb_t *fb);          /* 0 on success */
 /* CADO's makefb text format: carries prime powers and the exact per-ideal log
@@ -79,7 +86,25 @@ typedef struct {
     float bias;                  /* log2(q) on the sq side only, else 0      */
     float scale;                 /* las's per-side byte scale; 1.0 = bits    */
     int   deg;
+    /* fp64 fallback state. The fp32 Horner has ample dynamic range (that is
+     * what the normalisation buys) but NOT ample precision near a root line of
+     * F, where the terms are O(1) and cancel to something tiny. Measured on
+     * this job: 144 positions in a 63,497-position band along the three real
+     * root lines round to the wrong sieve-log value, error -3.31 to +2.57
+     * units, BOTH SIGNS -- so both false survivors and lost relations. Cells
+     * that cancel are recomputed from these. */
+    double dd[8];                /* the same normalised coefficients, fp64    */
+    double A, B;                 /* u = a/A, v = b/B                          */
+    int64_t a0, a1, b0, b1;      /* so (a,b) can be formed exactly in int64   */
 } norm_t;
+
+/* Recompute a cell in fp64 when the fp32 Horner cancels below this fraction of
+ * the sum of |terms|. 2^-11 leaves ~13 good fp32 bits, i.e. a relative error
+ * around 1e-4 -- far tighter than the ~0.3 needed to round the sieve log
+ * correctly, and it fires on well under 1 cell in 1000. */
+#define NORM_CANCEL_TOL 4.9e-4f
+
+double norm_acc_fp64(const norm_t *N, int32_t i, uint32_t j);
 
 void  norm_setup(norm_t *N, const poly_t *P, const qlat_t *L,
                  int logI, uint32_t J, double scale, int is_sqside);
@@ -120,7 +145,9 @@ typedef struct {
     int      side;          /* 1 = algebraic (special-q side), 0 = rational     */
     double   allowance;     /* bits of cofactor tolerated (lambda*lpb)         */
     double   scale;         /* las byte scale for this side; 1.0 = raw bits    */
-    const char *dump;       /* write the region in las byte convention here    */
+    const char *dump;
+    int32_t  probe_i;            /* gate 5: read back this cell after apply  */
+    uint32_t probe_j;            /* 0xFFFFFFFF = no probe                    */       /* write the region in las byte convention here    */
     const char *cadofb;     /* CADO makefb text factor base (has powers)       */
 } bench_cfg_t;
 
