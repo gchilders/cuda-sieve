@@ -68,6 +68,10 @@ typedef struct {
     double c[8];              /* algebraic coefficients, as doubles           */
     double skew, y0, y1;      /* doubles are fine for norms (a logarithm)...  */
     char   y0s[80], y1s[80];  /* ...but roots need Y0,Y1 exactly. See rfb.c.  */
+    char   cs[8][80];         /* ...and so does TRIAL DIVISION, which factors */
+                              /* the exact integer F(a,b), not its log. c0 is */
+                              /* 147 bits on this job, so the double is only  */
+                              /* good to 53 of them. See bigint.cuh.          */
 } poly_t;
 
 /* Build the rational factor base: G(x) = Y1*x + Y0 has one root per prime,
@@ -158,6 +162,15 @@ typedef struct {
     const char *cadofb;     /* CADO makefb text factor base (has powers)       */
     const char *survbits;   /* write a 1-bit-per-position survivor bitmap here  */
     int      not_both_even; /* apply las's not_both_even filter (see k_apply)   */
+    const char *other_bits; /* the OTHER side's bitmap; enables device intersect */
+    const char *emit;       /* write the compacted survivor list here           */
+    int      td;            /* run exact norms + trial division on survivors    */
+    int      ab_resieve;    /* re-run the settled layout A/B resieve experiment  */
+    uint32_t lim;           /* factor-base bound for this side (rlim / alim)    */
+    uint32_t lpb;           /* large-prime bound, in bits                       */
+    uint32_t mfb;           /* max cofactor bits carried into cofactorisation   */
+    const char *cofgate;    /* CADO cofactor file to gate trial division against */
+    const char *emit_cof;   /* write (a, b, cofactor) for every survivor here    */
 } bench_cfg_t;
 
 #define FILL_ATOMIC   0     /* (a) direct global atomicAdd per record   */

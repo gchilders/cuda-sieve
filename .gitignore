@@ -16,3 +16,4 @@
 bench/bench
 bench/fbtest
 bench/dumpcmp
+*.d

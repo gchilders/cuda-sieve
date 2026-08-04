@@ -32,6 +32,10 @@ int poly_load(const char *path, poly_t *P)
         if (line[0] == 'c' && line[1] >= '0' && line[1] <= '9' && line[2] == ':') {
             int k = line[1] - '0';
             P->c[k] = strtod(line + 3, NULL);
+            /* Keep the exact decimal too. The double is what the norm-init
+             * needs (it is taking a logarithm); trial division needs the
+             * integer, and c0 here is 147 bits. */
+            sscanf(line + 3, " %79s", P->cs[k]);
             if (P->c[k] != 0.0 && k > P->deg) P->deg = k;
         } else if (!strncmp(line, "skew:", 5)) {
             P->skew = strtod(line + 5, NULL);

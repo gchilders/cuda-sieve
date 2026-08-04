@@ -1805,6 +1805,42 @@ Three things follow, in order of effort:
 1. **Bill it.** Time the block and report it in the chain. It is currently
    invisible, and the previous review already flagged it as unmeasured; it is
    still unmeasured.
+
+> **DONE 2026-08-04, and the billing found something the sort never was.**
+> `bench` now prints a `host per-q work` line splitting transform / sort / H2D.
+> First measurement, q=120000053, both sides:
+>
+> | | transform | sort | **H2D** | total |
+> |---|---:|---:|---:|---:|
+> | side 1, before | 0.40 | (insertion) | **6.16** | 6.59 ms |
+> | side 0, before | 0.37 | (insertion) | **6.21** | 6.61 ms |
+> | side 1, after | 0.47 | 0.035 | **0.43** | **0.94 ms** |
+> | side 0, after | 0.44 | 0.046 | **0.29** | **0.78 ms** |
+>
+> **13.2 ms/q → 1.7 ms/q**, and almost none of it came from the sort. The
+> transfer was the cost: four `cudaMemcpy` calls totalling 54 KB were taking
+> **6.2 ms** because the staging arrays were `malloc`'d, i.e. pageable. Isolated
+> in a standalone microbenchmark on this box (WSL2, 4 x 15 KB H2D):
+>
+> ```
+> rep 0: pageable 4.653 ms   pinned 0.436 ms
+> rep 1: pageable 6.029 ms   pinned 0.464 ms
+> rep 2: pageable 5.986 ms   pinned 0.218 ms
+> ```
+>
+> ~1.5 ms per pageable call regardless of size — a per-call cost, not
+> bandwidth. Switching the four arrays to `cudaHostAlloc` is the whole fix.
+> **This is a Goal-1 result, not a micro-optimisation:** 11.5 ms/q of pure host
+> overhead was being spent, invisibly, on 54 KB, against a sieve chain of
+> 53–83 ms. Anything else in the design that stages small per-q buffers through
+> pageable memory will pay the same toll, and the only reason this one was
+> found is that the block got a timer.
+>
+> Both changes are output-neutral: the survivor bitmaps at q=120000053 are
+> **bit-identical on both sides** to the pre-change binary (22,499,522 and
+> 24,301,359). `std::stable_sort` was used rather than `std::sort` precisely so
+> that this test means something — ties in `m` are common and the insertion sort
+> it replaces was stable.
 2. **Fix the sort.** A comparison sort makes it ~43K comparisons instead of
    3.3M and removes the entire item. There is no design question here — but
    **it is not the one-line `qsort` swap this originally said it was**
@@ -2397,17 +2433,24 @@ path.
    exposed that PARITY.md's q-lattice basis claim holds at only 47 of 67
    lattices; restate it and add a basis-agreement check to any per-q parity
    comparison.
-2. **Bill and fix the per-q host work** (`bench_kernels.cu:677`). Index-permutation
-   sort, not `qsort` (four parallel arrays); bill transform, sort and transfer
-   separately. The timing report is the part that matters. Goal-1 evidence.
-3. **Device intersect + compact + primitive filter, emitting `(a,b)`**, gated
-   by item 1. One deliverable, not two.
+2. ~~**Bill and fix the per-q host work**~~ **Done 2026-08-04.** Index-permutation
+   `stable_sort` replaced the O(n^2) insertion sort, and transform/sort/H2D are
+   now billed separately. The billing is what mattered: the sort was never the
+   cost (0.03 ms) — **pageable staging buffers were**, at 6.2 ms/side for 54 KB.
+   Pinned host memory takes per-q host work from **13.2 ms to 1.7 ms**, output
+   bit-identical. See the block under "Also next" above.
+3. ~~**Device intersect + compact + primitive filter**~~ **Done 2026-08-04.**
+   `bench --other-bits FILE [--emit FILE]` runs it on the device and emits
+   **both** `x` and `(a,b)`. Measured **0.448 ms/q** — see below.
 4. **Survivor-bound sweep downward** on las over the band (CPU-side, concurrent
    with 3). It sizes resieve and TD, which are the binding stages.
 4b. **Capture the target cofactor population** with `-batch-print-survivors`
    over ~50–500 q. No patch needed; feeds item 6.
-5. **Resieve + TD** — **REVISED 2026-08-04, see the correction above.** Not a
-   single design to implement but an **A/B to run**: layout A (re-walk +
+5. ~~**Resieve + TD**~~ **A/B RUN 2026-08-04 — layout A wins, 20.8 ms vs 53.8 ms
+   for fill+recovery.** Layout B was fully built (segmented fill + prime-naming
+   purge) and recovers an identical `(x,p)` set, but segmentation costs ~0.3 ms
+   per pass in bucket-array write amplification. See "Item 5 RESOLVED" below.
+   Original framing: layout A (re-walk +
    hierarchical survivor filter) against layout B (slice-segmented records with
    an exact within-slice offset + CADO-style purge), measured as
    `fill + apply + recovery` end to end, with batch/product-tree recovery on the
@@ -2434,18 +2477,718 @@ contend.
   discard them. Recovery — under either layout — is indexed by `x`; a design
   that throws `x` away at compaction has to reconstruct it, and `(a,b) → x`
   requires inverting the lattice basis per survivor. Emit both.
-- Item 4 is **closed, at bound 128.** The six missing probes were run and the
+- Item 4 is **REOPENED — see "The survivor bound is 131 on side 0" in the
+  2026-08-04 build log.** Bound 128 loses one of las's 37 relations at
+  q=120000053 on our own sieve; the working pair is 128 on side 1 and 132 on
+  side 0. The sweep below was run over CADO's bytes, and our bytes differ at
+  exactly the positions that matter — a norm carrying a high power of a small
+  prime is under-credited by the sieve, because the factor base stops at
+  p^k < 2^15 while trial division divides out full multiplicity.
+  Original text: The six missing probes were run and the
   true zero-loss floor is 128, not 131. The containment gate was then rerun on
   our own bitmaps at that bound and passes 3,026/3,026 — so the tightening is
   validated on our norms, not just CADO's. Hard-code **128**: 2.46× fewer
   survivors on CADO's count, 2.35× on ours, zero relations lost. Do not go
   below it; 127 costs a relation in CADO's own sweep.
 
-**One loose end I did not close:** side 1's 722 missing survivors and side 0's
-residual 266 have no confirmed cause. Not truncation (disproved), not `powlim`
-(side 1 unchanged under it). Finding 28's two-directional norm error is the
-leading candidate. Since relation containment passes, this is a diagnostic to
-run — a handful of `las_tracek` probes at missing positions — not a blocker.
+**The loose end, diagnosed 2026-08-04 — and it splits cleanly in two.** Side 1's
+722 and side 0's 266 missing survivors turn out to have *different* causes, and
+neither is a sieving defect. See "The missing-survivor residue" below.
+
+## The missing-survivor residue — diagnosed, and it is not a sieve defect
+
+Run with `las_tracek -traceab` (the tool `oracle/PARITY.md` already prescribed),
+against our own dumps at the same q. The 988 missing positions split into two
+populations with unrelated causes.
+
+### Side 1: every one is exactly `bound + 1`
+
+Our sieve byte at all 88 side-1 misses in the sample is **144**, against a bound
+of 143. Not one is further out:
+
+```
+our side-1 byte at the missing positions (bound 143):
+   144 :   88
+```
+
+A traced example confirms the other half of the picture — las's own value at the
+same `(a,b)` is **exactly 143**, i.e. exactly on the bound, since a survivor is
+`S[x] <= bound`:
+
+```
+# Final value on side 1, N=998 S[14126]=143
+# When entering factor_survivors for bucket 998: S[0][14126]=136, S[1][14126]=143
+```
+
+So these are pure boundary cases: our norm rounds one unit high, las lands on
+the bound, we land one over. This is finding 28's one-unit difference, and at
+the boundary it is the *only* thing that matters. **Benign, and quantified:** it
+costs us 722 of 795,845 survivors at this q, 0.09%, and relation containment
+says none of them carried a relation.
+
+### Side 0: our bytes are *identical* to las's — the difference is the test
+
+The side-0 misses look nothing like side 1. They spread from 142 to 155:
+
+```
+our side-0 byte at the missing positions (bound 141):
+   142:12  143:5  144:21  145:12  146:11  147:15  148:10
+   149:16  150:4   151:9   152:11  153:12  154:1   155:4
+```
+
+That spread is far too wide for a rounding effect, so the obvious reading is
+that we under-subtract on the rational side. **That reading is wrong.** Two
+traced cases, chosen independently:
+
+| `(a, b)` | las: init − adds | las final | **ours** |
+|---|---|---:|---:|
+| `(-18587524911, 10201)` | 253 − 103 | **150** | **150** |
+| `(144147912218, 10443)` | 253 − 107 | **146** | **146** |
+
+**Our side-0 sieve byte equals las's exactly, in both cases.** The norms agree
+and the sieving agrees; there is nothing missing from our rational factor base.
+
+What does not agree is what happens next. Both positions have a side-0 value
+well above the bound `-v` prints (141), and **las still lists them as
+`after_sieve` survivors** — both are in `c183.q120000053.after_sieve_ab.powlim.txt.gz`,
+and las's own trace confirms the coordinates (`i = -10201, j = 472` for the
+first, matching our mirrored `i = +10201, j = 472`).
+
+CADO's survivor test is unambiguous (`sieve/las-unsieve.cpp:382`):
+
+```cpp
+return SS[0][x] <= bound[0] && SS[1][x] <= bound[1];
+```
+
+so the `bound[0]` actually handed to `search_survivors_in_line` is **not** the
+141 that `-v` reports. **That is the open question, and it is now a narrow one:**
+find where `bound[]` is populated for the survivor search and what it holds for
+side 0. Everything upstream of it is confirmed equal.
+
+**Why this matters more than the count suggests.** If las's effective side-0
+threshold is looser than ours, then our survivor test is *stricter* than las's,
+and we discard positions las keeps. Relation containment says none of those
+carried a relation in this band (3,026/3,026), so nothing is lost today — but it
+is a yield risk that scales with the band, and it points the opposite way from
+the "+5.6% survivor excess" the project has been tracking. Both can be true at
+once: looser than las on side 1's boundary, stricter than las on side 0.
+
+**Blocked step, and how to unblock it.** `las_tracek` **aborts** (`SIGABRT`) on
+both sampled side-0 points before printing its final value — a TRACE_K-only
+consistency assert in the unsieving path (`FAILED test_divisible(p=10201, ...)`,
+and the `verify_gcd` `ASSERT_ALWAYS` next to it). The per-add trace still prints,
+which is what made the table above possible, but closing the question needs
+either an assert-relaxed TRACE_K build or simply reading off where `bound[]` is
+filled. That is a source question, not a measurement.
+
+### By-product: finding 17 is stronger than recorded
+
+Finding 17 says the `-dumpfile` oracle "is not usable as captured", which reads
+as a capture problem. It is not. A **fresh** dump was taken at exactly the
+config of the `(a,b)` capture (`-powlim0/1 32767`, `-bkmult 2.0` so no
+`redoing ... buckets are full`, matching `survivors after_sieve: 795845`), and
+it is still unusable:
+
+| mapping tried | of 862,171 dump positions, found in las's own list |
+|---|---:|
+| `a0=+7374527, b=-i` (las's printed convention) | 1,930 (0.22%) |
+| `a0=-7374527, b=-i` | 0 |
+| `a0=+7374527, b=+i` | 0 |
+| `a0=-7374527, b=+i` | 1,775 (0.21%) |
+
+The aggregate statistics are right — 862,171 not-both-even two-sided against
+las's 795,845 reported — but **the positions do not correspond under any sign
+convention, in either direction.** So the dump cannot be indexed by `x` at all,
+and `-dumpfile` is unusable *by construction*, not as captured. Restate finding
+17 accordingly, and do not spend time on another capture.
+
+For contrast, our own pipeline is internally exact — the same filters applied to
+our dump reproduce the bitmap and finding 41 to the digit:
+
+| | raw two-sided | not-both-even | `gcd(i,j)=1` |
+|---|---:|---:|---:|
+| **ours** | 2,176,787 | **1,386,939** | **841,418** |
+| las (unusable positionally) | 1,314,595 | 862,171 | 706,212 |
+
+## Item 3 delivered: device intersect + compact, and it is ~0.4% of the chain
+
+`k_intersect_compact` ANDs the two per-side survivor bitmaps, drops
+`gcd(i,j) != 1`, and compacts what remains into a dense list. Driven by
+`bench --other-bits <other side's bitmap> [--emit FILE]`.
+
+**It emits `x` as well as `(a,b)`**, which was the one design note attached to
+this item. Every downstream stage — resieve under either layout, trial
+division, the cofactor queue — is indexed by `x`, and recovering `x` from
+`(a,b)` means inverting the lattice basis per survivor. `x` costs 4 bytes.
+
+**Both correctness gates pass.**
+
+| gate | expected | got |
+|---|---:|---:|
+| two-sided, pre-gcd | 1,386,939 (finding 41) | **1,386,939** |
+| primitive `gcd(i,j)=1` | 841,418 (finding 41) | **841,418** |
+| las's relations present in the emitted `(a,b)` | 37 | **37 / 37** |
+
+The first two reproduce finding 41 exactly, so the device path agrees with the
+host computation bit for bit; the third confirms the `(a,b)` arithmetic, not
+just the count. 60.7% of two-sided survivors are primitive.
+
+### Cost: 0.448 ms/q, and two measurement traps on the way
+
+| variant | steady state |
+|---|---:|
+| **warp-aggregated allocation** | **0.447 ms** |
+| one global atomic per non-empty word | 0.567 ms |
+
+**Trap 1 — first-launch cost.** The first timing was **4.6 ms**, and it is not
+real: it is module-load cost on the first launch of this kernel. Repeat and the
+same kernel runs in 0.449 ms. A 10x error, and the only thing that exposed it
+was timing more than once. Anything in this project that reports a kernel from a
+single launch is reporting the same artefact — `bench` now takes the best of 3
+here for exactly that reason.
+
+**Trap 2 — I predicted the wrong bottleneck.** 841,418 atomics on one counter
+looked like the obvious cost, so warp aggregation went in first. It bought 21%,
+not the 10x that a serialised-atomic story would predict. At 0.447 ms the kernel
+moves 134 MB of bitmap at ~300 GB/s, so it is bandwidth-shaped, not
+atomic-shaped. Keep the aggregation — 21% for ten lines is a good trade — but
+the lesson is that the atomic count was never the thing to reason about.
+
+**Against the budget:** 0.448 ms on a sieve chain of 53–84 ms is **~0.5%**.
+Intersection and compaction are free, which is what the sparsity argument
+assumed and now no longer has to assume. The 67 MB-per-side bitmaps are the
+real resource here, not the time.
+
+**Caveat on how this is wired.** `bench` sieves one side per process, so the
+other side's bitmap arrives from a file and is uploaded (pinned) before the
+kernel runs. That upload is *not* counted in the 0.448 ms, and it should not be:
+in the production path both bitmaps are already device-resident and no transfer
+happens at all. What the number measures is the kernel, which is the part that
+carries over.
+
+## Item 5 RESOLVED: layout B was built, and layout A wins
+
+Both paths are implemented in `bench` and run back to back on the same
+special-q. **Layout B is built for real** — segmented fill at the 65,536 cap,
+per-(bucket, slice) boundary snapshots, and a purge that names the prime via
+`primes[starts[slice] + offset]`. It is not a cost proxy.
+
+### Correctness first: B recovers exactly what A does
+
+```
+B: recovered (x,p)          1932951  vs A's 1932951   MATCH
+A vs B (x,p) set equality  IDENTICAL (0 of 1932951 pairs differ)
+```
+
+Two entirely different traversals — one walking the factor base, one streaming
+the retained bucket array and reconstructing the prime from segmentation —
+produce the **same 1,932,951 `(x, p)` pairs**. Layout B works. It is simply not
+worth what it costs.
+
+### The numbers (quiet GPU, q=120000053, side 1)
+
+| stage | A: re-walk | B: segment + purge |
+|---|---:|---:|
+| fill | **12.25 ms** | **50.5 ms** |
+| recovery | **8.55 ms** | **3.26 ms** |
+| **fill + recovery** | **20.8 ms** | **53.8 ms** |
+
+**A wins by 2.6x.** B's recovery really is 2.6x cheaper than A's — that part of
+the earlier reasoning held — but it buys that by making fill **4.1x more
+expensive**, and fill is the larger stage.
+
+### Why segmentation costs so much, and why it cannot be fixed cheaply
+
+The 38 ms is not launch overhead, not the boundary snapshots, and not
+per-launch occupancy. All three were ruled out directly:
+
+| variant | fill |
+|---|---:|
+| 126 launches, with boundary snapshots | 51.2 ms |
+| 126 launches, no snapshots | 50.5 ms |
+| 126 launches, grid sized per slice | 50.4 ms |
+
+Merging the slices into `G` super-segments — identical total work, only the
+number of passes over the bucket array changes — isolates it:
+
+| passes | 1 | 2 | 4 | 8 | 16 | 32 | 63 | 126 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| fill (ms) | 12.26 | 13.24 | 14.92 | 17.67 | 21.81 | 26.98 | 35.12 | 50.5 |
+
+**The cost is linear in the number of passes, at ~0.3 ms per pass.** The
+mechanism is write amplification on the bucket array. With one cursor per
+bucket shared across launches, consecutive slots in a bucket — the same cache
+line — are written by *different* passes, so each line is fetched and dirtied
+many times instead of once. The monolithic fill interleaves hits from the whole
+factor base, so a line fills in one go.
+
+**This is exactly the idea recorded above as "segmentation without a counting
+pass", and it is the part that does not work.** Sharing one cursor per bucket is
+what makes the boundary table free, and it is also what destroys write
+locality. The fix — per-(bucket, slice) sub-allocation, so each pass writes a
+contiguous run — requires knowing the counts in advance, i.e. **the counting
+pass this design was constructed to avoid.** That pass costs about a full walk,
+which is A's entire recovery cost. There is no cheap version.
+
+### And the slice cap makes it worse, for a reason CADO shares
+
+Layout B needs the within-slice offset to fit the record's high 16 bits, so
+slices cap at **65,536**, not the 262,144 the current `build_slices` uses. CADO
+has the identical constraint and asserts on it (`sieve/fb.hpp:356`:
+`ASSERT(size() <= numeric_limits<slice_offset_t>::max())`). For this factor base
+that is **126 slices, not 44** — so the earlier "~64 segments" estimate in this
+document was wrong on two counts, and the "~120" figure quoted in review was
+right. More segments, more passes, more amplification.
+
+### Standing correction to this section's own history
+
+- **The original conclusion — re-walk, no record format change — was right.**
+  It is restored on measurement.
+- **The factual error that prompted reopening it was real and the correction
+  stands.** CADO's shorthint *is* a within-slice offset, CADO *does* recover
+  large primes by purging retained buckets rather than resieving, and the
+  comment at `bench_kernels.cu:88` claiming our slice-index field matches it is
+  still wrong. Being wrong about the mechanism did not make the conclusion wrong.
+- **Reopening it was still the right call.** The original text asserted the
+  answer with a supporting argument that did not hold; it is now a measurement
+  with a mechanism, and B is eliminated on evidence rather than on assertion.
+- **My 8-14 ms estimate for A was accurate** — it measures **8.55 ms**. The
+  17.7 ms reported earlier in this section was GPU contention, not a bad
+  estimate. See the contamination note below.
+
+### Measurement hazard: a busy GPU silently doubled everything
+
+An earlier pass of this A/B was run while another job held the GPU, and
+**every** number was inflated roughly 2x — fill 23-28 ms against 12.25, apply 49
+against 23.6, A's recovery 17.7 against 8.55. The *ratios* between A and B
+survived, which is exactly why it was not obvious, but the conclusion did not:
+that pass reported "layout B wins" and this one, on a quiet GPU, reports the
+opposite by 2.6x. Nothing in the output flags contention. **Check GPU
+utilisation before trusting any timing in this document**, and prefer
+same-run comparisons to cross-run ones.
+
+### The chain as it now stands (quiet GPU, side 1)
+
+| stage | ms |
+|---|---:|
+| transform + plattice | 2.42 |
+| fill | 12.25 |
+| apply | 23.62 |
+| intersect + compact + primitive filter | 0.46 |
+| build survivor filter | 0.11 |
+| recovery (layout A) | 8.55 |
+| host per-q | 0.84 |
+| **total** | **~48.3** |
+
+**apply is now the largest single stage at 23.6 ms — 49% of the chain**, and it
+is the one stage that has not been revisited since prime powers were added.
+Recovery, the feared unknown, is 8.55 ms. Item 5b (the small/large split sweep)
+is untouched and belongs inside layout A.
+
+## Cofactorization harnessed: the baseline runs, our data does not feed yet
+
+`~/code/nfs_3lp_batch_factor` (bbuhrow's 3LP batch cofactorizer) was built and
+run on this box. Two results: a **working same-machine baseline**, and a precise
+statement of why the C183 capture cannot be fed to it yet.
+
+### Getting it to run at all: a real bug on sm_120
+
+`gpu_cofactorization.c:1567` selects the PTX by compute-capability major, and
+Blackwell consumer reports **major 12**, which fell into the `>= 9` branch and
+loaded the *shipped* `cuda_ecm90.ptx`. That file predates `cuda_ecm64.cu` and
+lacks `gbl_pm196`, so startup died with `CUDA_ERROR_NOT_FOUND` — even though the
+Makefile had just built a correct `cuda_ecm120.ptx`. A `major >= 12` branch ahead
+of the `>= 9` one fixes it. **Worth sending upstream**: any RTX 50-series user
+hits this, and the failure looks like a missing kernel rather than a stale file.
+
+Build settings that worked: `TOOLKIT_VERSION=12`, `CUDA_PATH=/usr/local/cuda-12.8`
+(12.8 is the first toolkit with `compute_120`), `SM=120`, GMP from
+`~/gmp-zen3`, `make all ICELAKE=1`.
+
+### The baseline, and the number that matters is not the one advertised
+
+1,000,000 bundled GGNFS relations, `-m 0 -b1 205 -b2 50 -c 100 -s 10`:
+
+| | |
+|---|---:|
+| wall time | **73.18 s** |
+| relations produced | 10,257 |
+| **sum of all reported GPU kernel times** | **~2.19 s** |
+
+| kernel | ms |
+|---|---:|
+| 64-bit ECM, r-side 2LP | 75.6 |
+| 96-bit P-1 | 386.0 |
+| 96-bit ECM (7.86M curves) | 1700.6 |
+| 2LP retests | 24.2 |
+
+**The GPU is busy for 3% of the run.** The other ~71 s is host work — batch
+setup, validation, primality checks, MPQS tails, output sorting. That is 73 us
+of CPU per relation, and at 1,939 records/q it is **~142 ms of host time per
+special-q**, against a GPU sieve chain of ~48 ms.
+
+This does not invalidate finding 47's ~4.92 ms/q sizing datum — that datum is
+plainly a *GPU-kernel* number, and the kernel times here are consistent with it
+(2.19 s for 1M records is 2.2 us/record, ~4.3 ms/q). **What it says is that the
+kernel number was never the whole cost**, and the gap is exactly the category
+Goal 1 is about. Any deployment that keeps this harness as-is is host-bound, not
+GPU-bound, by a factor of 33.
+
+### Why the C183 capture does not feed, stated precisely
+
+The `res1,res2` sign convention was inferred from the reference file rather than
+guessed, by histogramming 400,000 of its relations:
+
+| field | sign | sizes present |
+|---|---|---|
+| `res1` (rational) | positive, 63.2% | value 1, or 24–31 bits |
+| `res1` | negative, 36.8% | **48–63 bits only** |
+| `res2` (algebraic) | negative, **100%** | 72–95 bits |
+
+So negative means "still needs splitting", which is the rule the adapter used
+(`negative iff > 2^lpb`) and it is correct. The mismatch is elsewhere:
+**the reference cofactors are already classified, ours are raw.**
+
+A GGNFS siever emits `rels.raw` *after* deciding which cofactors are worth
+cofactorizing — negative `res1` values occupy a narrow 48–63 bit band, never
+32–47. CADO's `-batch-print-survivors` emits the cofactor as it stands after
+trial division, with no primality test and no viability filter. Our rational
+cofactors therefore spread across 32–62 bits, and a large share of the 32–47 bit
+ones are **single primes above 2^31** — unusable by construction, which CADO
+itself would discard later.
+
+The consequence is visible in the run:
+
+| | reference | C183 capture |
+|---|---:|---:|
+| r-side 2LP inputs | 367,684 | 544,987 |
+| **valid 2LP factorizations** | **270,984 (73.7%)** | 379,974 (69.7%) |
+| restricted to both-sides-need-work | — | **11,328 of 540,157 (2.1%)** |
+
+and in a hard failure: 34.4% of the 96-bit moduli arrive zero or even, which is
+fatal (`mpz_tdiv_r` on a zero modulus raises SIGFPE — the run core-dumped before
+a guard was added at `gpu_cofactorization.c:1210`).
+
+### What this actually costs to close
+
+Not "a small input adapter", which is how this document previously described it.
+The adapter has to reproduce the classification a siever does before calling
+cofactorization: **primality-test each cofactor, drop those that are prime and
+above `lpb`, drop those that cannot split within `mfb`, and only then emit.**
+That is real work but it is well-defined, and it is work the GPU siever will
+have to do anyway — so it belongs in our pipeline, not in a throwaway adapter.
+
+**Until that exists, no C183 `31/32` cofactorization throughput number should be
+quoted from this harness**, including any derived from the run above. The
+stage-mix projection (~5.5 ms/q, ~11.7x headroom) remains a projection, and it
+now has a second caveat: it models GPU kernel time only, and the measured host
+overhead around those kernels is 33x larger.
+
+### Standing item
+
+The 34.4% bad-modulus rate is not explained by the classification gap alone —
+`gpu_cofactorization.c:1454` fills the 96-bit array indexed by *relation* index
+while `residues_a_in` is populated on the 2LP path, and our workload has 48.7%
+of relations skipping that path entirely. That is a plausible aliasing bug under
+a workload shape the code was not written for, and it is the first thing to
+check once the classification adapter exists.
+
+# Build log — Opus, 2026-08-04 (implementation, not review)
+
+## Trial division is built and it agrees with CADO exactly, on both sides
+
+`bench --td` computes the exact integer norm for every survivor, divides out
+the special-q, the large primes recovered by the layout-A re-walk, and the
+small primes found by direct test, and emits the residual cofactor.
+`--cofgate` checks that residual against
+`oracle/c183.q120000053.cofac_candidates.txt`, which holds CADO's own
+post-trial-division cofactor for each of the 1,851 positions it carried into
+cofactoring.
+
+| side | reference records | matched to a survivor | **cofactors identical** |
+|---|---:|---:|---:|
+| 1 (algebraic) | 1,851 | 1,851 | **1,851 — PASS** |
+| 0 (rational) | 1,851 | 1,851 | **1,851 — PASS** |
+
+This is an exact agreement on 96-bit integers, not a count, and it gates the
+whole chain at once: the exact norms, the rank map, the resieve scatter, the
+small-prime congruence test, and the multiplicity handling. It is also the
+first point at which this project has produced a *factorisation* rather than a
+survivor.
+
+Implementation notes worth carrying:
+
+- **256-bit sign-magnitude big integers** (`bigint.cuh`), host and device from
+  one header so the reference and the kernel run the same arithmetic. Measured
+  on the real lattice: |a| 41 bits, |b| 15, |F| 224, |G| 132 — so 256 leaves
+  ~28 bits of headroom, and `bn_mul_u64` reports overflow rather than wrapping.
+- **The rational side is not a special case.** `G(a,b) = Y1*a + Y0*b` is the
+  degree-1 member of the same homogeneous family, so one norm kernel serves
+  both sides.
+- **Exact coefficients had to be added to `poly_t`.** c0 is 147 bits on this
+  job; the existing `double` is good for 53 of them. Norm-init takes a
+  logarithm and never noticed.
+- **The compaction is now rank-ordered** (prefix sum over the two-sided
+  bitmap). That is what lets the resieve scatter a recovered prime straight
+  into its survivor's slot — no sort of 1.9M (x,p) pairs, no 2 GB
+  position-indexed map — and it makes the emitted list reproducible run to run.
+- **Proper prime powers are skipped in both directions.** `fb_restrict`
+  already keeps them out of the bucketed factor base, and the small table
+  filters them out, because multiplicity is recovered by repeated division by
+  the base prime. Dividing by a recorded `p^2` as though it were prime is
+  wrong whenever the true multiplicity is odd.
+
+## The special-q factor-base truncation costs relations, and the gate found it
+
+The first gate run failed 30 of 1,781 — and **every one of the 30 differed from
+CADO's cofactor by exactly one prime factor in (q, alim]**: 121716281,
+123120331, 133854251, 133849943, 128998913, 125436139, 123160313, all prime,
+all 27 bits. A further 70 of CADO's records were missing from our survivor list
+entirely.
+
+The cause is `--fbbound 120000053`, the GGNFS convention of truncating the
+algebraic factor base at the special-q, which the canonical profile in
+RESULTS.md uses. CADO sieves to `alim = 134200000`. Rerunning at
+`--fbbound 134200000`:
+
+| | truncated at q | full to alim |
+|---|---:|---:|
+| CADO records absent from our survivors | 70 | **0** |
+| cofactors identical | 1,751 / 1,781 | **1,851 / 1,851** |
+| two-sided primitive survivors | 818,840 | **841,418** (finding 41) |
+
+**Both failures had the same single cause**, which is worth stating plainly:
+the missing 70 were not a sieve defect either — the extra factor base lowers
+those norms enough to bring the positions under the bound. **Any parity
+comparison against CADO must use `--fbbound 134200000`.** The GGNFS truncation
+is a legitimate configuration, but it is a different one, and it costs
+relations rather than merely costing cofactor size.
+
+## The survivor bound is 131 on side 0, not 128 — and item 4 is reopened
+
+`prototype.md` records item 4 as **closed at bound 128**: "the true zero-loss
+floor is 128, not 131 ... Hard-code 128 ... zero relations lost." Run against
+our own sieve at q=120000053, **bound 128 loses one of las's 37 relations.**
+
+| bounds (side 1 / side 0) | survivors | las's 37 recovered |
+|---|---:|---:|
+| 143 / 141 (the loose profile) | 841,418 | 37 |
+| **128 / 128** | 202,670 | **36 — one lost** |
+| **128 / 132** | **239,446** | **37** |
+
+The lost relation is `(a,b) = (-372574502414, 14251)`, lattice `(i,j) =
+(-14251, 2229)`. Side 1 keeps it at 128; **side 0 drops it**, and `--probe`
+gives the reason directly:
+
+```
+[gate 5] probe (i=-14251, j=2229)  x=73042005
+         init norm S   = 253
+         SIEVED LOG SUM = 122
+         las byte S-sum = 131
+```
+
+**131, against a residual cofactor of 58 bits that implies 1.925 x 58 = 112.**
+A 20-unit gap between what the sieve credits and what trial division actually
+removes, on a position that carries a real relation.
+
+### Why the gap exists, and why it is not a bug
+
+The factor base contains prime powers only while `p^k < 2^maxbits = 2^15`. The
+sieve therefore credits a prime with **at most** the multiplicity its ladder
+reaches — `2^14` is the last power of two in the table — while trial division
+divides out the **full** multiplicity. Any position whose norm carries a high
+power of a small prime is under-credited by the sieve by exactly the excess.
+
+las has the same `maxbits`/`powlim` structure and the same behaviour, so this
+is not a defect. What it means is that **the sieve byte is an upper bound on
+`scale * log2(cofactor)`, not an estimate of it**, and positions with heavy
+prime-power multiplicity sit well above where their cofactor size would put
+them. A survivor bound tuned on the cofactor distribution will cut exactly
+those positions, and they are not rare enough to ignore — one in 37 relations
+at this q.
+
+### What to use, and what to re-run
+
+**Use 128 on side 1 and 132 on side 0** until a band-wide sweep says otherwise.
+That recovers 37 of 37 here and still cuts survivors 3.5x against the loose
+profile. The recorded "128 both sides" figure came from a sweep of *CADO's* `-v`
+bound over CADO's own bytes; the correction is that **our bytes are not las's
+bytes at these positions**, which the earlier review had already half-found
+from the other direction — its note that las's effective `bound[0]` is looser
+than the 141 it prints is the same phenomenon seen from las's side.
+
+**The band-wide bound sweep should be redone on our own sieve**, over the 67
+lattices and 3,026 relations the containment gate already uses, rather than
+inherited from CADO's sweep. One q is one q; it establishes that 128 is wrong
+on side 0, not that 132 is right.
+
+## The post-sieve chain, measured on a quiet GPU
+
+At the working bounds (side 1: 128, side 0: 132), 239,446 two-sided primitive
+survivors, best-of-3 per kernel:
+
+| stage | side 1 | side 0 | notes |
+|---|---:|---:|---|
+| transform + plattice | 2.76 | 1.74 | |
+| fill | 12.28 | 11.92 | |
+| apply | 23.61 | 15.03 | |
+| **sieve subtotal** | **38.06** | **26.94** | |
+| intersect + gcd + compact | 0.42 | — | shared, once |
+| rank scan + emit + filter | 0.46 | — | shared, once |
+| resieve + scatter | 6.68 | 6.00 | |
+| norms + trial division | 2.80 | 2.54 | |
+| classify | 1.01 | 0.70 | |
+| host per-q | 0.54 | 0.55 | |
+
+**Post-sieve total: 21.7 ms/q**, everything except cofactorisation.
+
+### Against finding 46
+
+| goal | post-sieve budget | where we are |
+|---|---:|---|
+| throughput parity | ~220 ms | not binding |
+| energy parity | ~106–114 ms | **comfortable, 5x of headroom** |
+| **2x energy win** | **~21–25 ms** | **21.7 ms before cofactorisation** |
+
+So the answer to finding 46's question — "where in the 21–114 ms band does the
+post-sieve path land" — is **21.7 ms plus cofactorisation**. Energy parity is
+not in doubt. The 2x win is *just* out of reach: finding 47's ~4.9 ms/q of GPU
+cofactor kernel time puts the total near 26.6 ms against a 21–25 ms allowance,
+about 10% over, and that ignores the 33x host overhead the harness work
+measured around those kernels.
+
+**The lever is resieve + scatter at 12.7 ms, 58% of the post-sieve chain.** It
+is now the largest post-sieve stage by a factor of two, and unlike trial
+division it does *not* shrink with the survivor bound — it walks the whole
+factor base and filters, so its cost is set by the update volume, not by the
+survivor count. Item 5b (the small/large split sweep) is the untried lever
+that acts directly on it.
+
+### Two estimates settled, one of my own claims withdrawn
+
+**The doc's trial-division estimate was right and my contended measurement of
+it was wrong.** I recorded earlier in this log that the small-prime direct test
+"does not hold up" against the doc's "~1 ms at peak and plausibly 3–5 ms
+achieved". On a quiet GPU it is **1.33 ms (side 1) and 1.49 ms (side 0)** at
+the working bound, and 5.6 ms at the loose bound with 3.5x the survivors —
+inside the predicted range at both. The 10–11 ms I measured was GPU contention,
+and the doc's own standing warning ("**Check GPU utilisation before trusting
+any timing in this document**") is there precisely because this keeps
+happening. It caught me despite being written down.
+
+**The division finding survives the re-measurement and is the real one.**
+Replacing `u64/u32` with a Barrett reciprocal took the division phase from 29.9
+to 11.8 ms contended, and it stands at 0.85–0.96 ms quiet. nvcc expands a
+64-bit division by a runtime divisor into a ~100-instruction software routine;
+trial division ran eight per pass, three passes per factor. Anything in this
+project doing that is paying the same toll.
+
+**Two hypotheses that were wrong, recorded so they are not retried:** staging
+the small-prime table in shared memory changed nothing (the reads are
+warp-uniform and already broadcast), and buffering hits to remove warp
+divergence changed nothing. The cost was arithmetic, in the divisions.
+
+## Cofactor classification: 1,852 candidates against CADO's 1,851
+
+`k_classify` implements CADO's `check_leftover_norm`
+(`sieve/las-cofactor.cpp:118`) verbatim rather than from memory — the mfb cut,
+the "too few factors possible" gap test `L^k < n < B^(k+1)`, and a base-2
+strong probable prime test. CADO's own comment justifies base 2 alone: calling
+a composite prime loses a relation, it never emits a relation with a composite
+ideal, so the failure mode is a miss at ~2^-40, not a wrong answer.
+
+Per side, over all 841,418 two-sided primitive survivors:
+
+| outcome | side 1 | side 0 |
+|---|---:|---:|
+| rejected, more than mfb bits | 674,774 (80.2%) | 555,712 (66.0%) |
+| rejected, too few factors possible | 55,797 (6.6%) | 132,442 (15.7%) |
+| rejected, probable prime above 2^lpb | 63,296 (7.5%) | 118,578 (14.1%) |
+| accepted for cofactorisation | 47,481 | 30,651 |
+| already fully split | 70 | 4,035 |
+| **this side's candidates** | **47,550** | **34,685** |
+
+A candidate needs BOTH sides, and the joint result is the gate:
+
+| | |
+|---|---:|
+| our joint candidates | **1,852** |
+| CADO's candidates at this q | 1,851 |
+| **CADO candidates we drop** | **0** |
+| ours CADO does not have | 1 |
+| cofactor mismatches on the shared set | **0** |
+
+**And all 37 of las's relations at this q survive the whole chain** — sieve,
+intersect, gcd filter, trial division, classification. That is every stage
+except cofactorisation itself, gated end to end on the one q where we have
+las's own answer.
+
+### The two discrepancies, both understood
+
+The first run produced 1,853, and the two extras had different causes.
+
+**`(a,b) = (120000053, 0)` is the lattice point `(i,j) = (0,1)`.** With this
+basis `b = i`, so `i = 0` gives `b = 0` and `a = q`. It passes `gcd(i,j) = 1`,
+passes both norm bounds, and its cofactors classify cleanly — `q` on side 0,
+which is under `2^31`, and 1 on side 1. **But `(a, 0)` is not a relation at any
+cofactor size.** las carries it through `after_sieve` too and drops it later.
+It is now rejected explicitly (`COF_DEGENERATE`); leaving it to be caught
+downstream would have meant one fake candidate per special-q forever.
+
+**`(-1657184928927, 16384)` is at `i = -I/2`, the extreme edge, and is NOT in
+las's `after_sieve` list at all.** Its cofactors are 59 and 90 bits, both
+inside mfb, so it is a legitimate candidate that las never tried. This is the
+documented +5.6% survivor excess showing up as a *bonus* rather than a cost:
+our norms are exact where las's are approximate, and the position las discarded
+may well carry a relation. One extra candidate per q against 1,851 is 0.05%.
+
+## The first relation
+
+`(a, b) = (-138913230134, 433)`, at q=120000053, produced by the GPU pipeline
+with no cofactorisation at all — both residual cofactors came out of trial
+division equal to 1:
+
+```
+rational   G(a,b) = 3 . 11 . 53 . 17497 . 74413 . 87443 . 2198473 . 13555187 . 22065019
+algebraic  F(a,b) = 2^3 . 5^2 . 7 . 97 . 191 . 211 . 353 . 5821 . 10753 . 245881
+                    . 776563 . 1353809 . 9157051 . 92871839 . 120000053
+```
+
+Both products were re-derived independently in Python from `(a,b)` and the
+polynomial and match the norms exactly; every factor is inside its side's large
+prime bound; and the special-q appears in the algebraic factorisation where it
+must. **It is one of las's 37 relations at this q.**
+
+That is the end-to-end existence proof this project did not have. The other 36
+of las's 37 are all present as candidates with correct partial factorisations —
+they need the cofactor stage to finish, which is the next item and is not built
+yet.
+
+### The factor list is gated, not just the cofactor
+
+Recording factors during trial division (multiplicity as repetition) allows a
+reconstruction gate that the CADO cofactor comparison cannot give: **the
+recorded factors times the residual cofactor must rebuild the exact norm.**
+
+| | side 1 | side 0 |
+|---|---:|---:|
+| candidates checked | 47,550 | 34,685 |
+| **factors x cofactor == norm** | **47,550 PASS** | **34,685 PASS** |
+
+and independently in Python over the 1,852 joint candidates, both sides at
+once: **1,852 of 1,852**. The CADO gate validates the residual; this validates
+the list that produced it. Both were needed — a wrong factor list with a
+compensating residual would pass the first and fail the second.
+
+## Lazy module loading bit again
+
+The rank scan first reported **10.7 ms**; timed best-of-3 it is **0.17 ms**, a
+63x error. Same cause as the intersect kernel's 4.6 ms in the review above —
+CUDA loads a kernel's code on its first launch, and these four kernels had
+never run. The sieve having already executed dozens of launches does not help;
+the loading is per-kernel, not per-module. **Every new kernel added to this
+project needs best-of-N timing from the first measurement, not after someone
+notices the number is implausible.**
 
 ## Two things I would not do yet
 
@@ -2454,9 +3197,11 @@ run — a handful of `las_tracek` probes at missing positions — not a blocker.
   avoid a stage that the sparsity argument already makes cheap. Revisit only if
   the measured re-walk badly misses the ~8–14 ms estimate — and note that if it
   does miss, the 2× budget is gone either way, so the decision will be made on
-  evidence rather than on this trade. **Layout B is the thing to try before 8 B
-  records**: it buys exact prime recovery inside the existing 4 B, which is
-  precisely what the 8 B record was going to be spent on.
+  evidence rather than on this trade. ~~**Layout B is the thing to try before 8 B
+  records**~~ — **superseded: layout B was built and lost by 2.6x** (see "Item 5
+  RESOLVED" above). The re-walk did not miss its estimate; it measures 8.55 ms
+  against the 8–14 ms predicted, so the condition for revisiting the 8 B record
+  has not been met from either direction.
 - **Do not chase the remaining +5.6% survivor excess.** It is las's
   approximation, not our error (PARITY.md), and its whole cost is a 5.6% larger
   input to the post-sieve stages — which the bound sweep in item 2 may make
@@ -2479,9 +3224,11 @@ basis agreement); the cofactor bit-size histogram over all 1,062,811 captured
 records; and the side-1 slice count, bucket geometry and device memory
 (39 slices, 32,768 buckets, 1.37 GB, 10.76 GB free) read off `bench`'s startup
 output. All of these are **counts and sizes, which are load-independent** —
-that is the only reason they were run while the box was busy. Everything in the
-resieve A/B remains **derived, not measured**; that is precisely why it is
-written as a benchmark to run rather than a decision.
+that is the only reason they were run while the box was busy. ~~Everything in
+the resieve A/B remains **derived, not measured**~~ — **superseded: the A/B was
+built and run on a quiet GPU** (see "Item 5 RESOLVED" and the 2026-08-04 build
+log). Layout A wins on measurement, and the whole post-sieve chain now has
+quiet-GPU numbers.
 
 Except for those, the record layout, the CADO source behaviour, the counts
 already in RESULTS.md, and finding 47's measured cofactor figure, every number

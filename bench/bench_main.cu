@@ -22,6 +22,14 @@ static void usage(void)
 "  --blocks N       0 = auto (6 per SM)        [0]\n"
 "  --reps N         timing repetitions         [3]\n"
 "  --survbits FILE  write a survivor bitmap (1 bit/position, x order)\n"
+"  --other-bits F   the other side's bitmap -> device intersect+gcd+compact\n"
+"  --emit FILE      write the compacted survivor list (x, a, b) here\n"
+"  --td             exact norms + trial division on the survivors\n"
+"  --ab-resieve     re-run the settled layout A/B resieve experiment (slow)\n"
+"  --lpb N          large-prime bound in bits  [32 side 1, 31 side 0]\n"
+"  --mfb N          max cofactor bits          [92 side 1, 60 side 0]\n"
+"  --cofgate FILE   gate --td against CADO's own cofactors (a b cof0 cof1)\n"
+"  --emit-cof FILE  write (a, b, cofactor, bits) for every survivor here\n"
 "  --not-both-even  apply las's filter: i,j both even can never survive\n"
 "  --verify         run the CPU cross-check (slow)\n"
 "  --poly PATH      algebraic polynomial       [../oracle/c183.poly]\n"
@@ -66,6 +74,10 @@ int main(int argc, char **argv)
     cfg.scale = 1.0; cfg.dump = NULL; cfg.cadofb = NULL;
     cfg.probe_i = 0; cfg.probe_j = 0xFFFFFFFFu;
     cfg.survbits = NULL; cfg.not_both_even = 0;
+    cfg.other_bits = NULL; cfg.emit = NULL;
+    cfg.td = 0; cfg.cofgate = NULL; cfg.emit_cof = NULL;
+    cfg.lim = 0; cfg.lpb = 0; cfg.mfb = 0;   /* 0 == take the side's default */
+    cfg.ab_resieve = 0;
     int maxbits = 15;
     int allowance_set = 0;
 
@@ -109,6 +121,14 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc) cfg.dump = argv[++i];
         else if (!strcmp(argv[i], "--cadofb") && i + 1 < argc) cfg.cadofb = argv[++i];
         else if (!strcmp(argv[i], "--survbits") && i + 1 < argc) cfg.survbits = argv[++i];
+        else if (!strcmp(argv[i], "--other-bits") && i + 1 < argc) cfg.other_bits = argv[++i];
+        else if (!strcmp(argv[i], "--emit") && i + 1 < argc) cfg.emit = argv[++i];
+        else if (!strcmp(argv[i], "--td")) cfg.td = 1;
+        else if (!strcmp(argv[i], "--ab-resieve")) cfg.ab_resieve = 1;
+        else if (!strcmp(argv[i], "--lpb") && i + 1 < argc) cfg.lpb = (uint32_t)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--mfb") && i + 1 < argc) cfg.mfb = (uint32_t)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--cofgate") && i + 1 < argc) cfg.cofgate = argv[++i];
+        else if (!strcmp(argv[i], "--emit-cof") && i + 1 < argc) cfg.emit_cof = argv[++i];
         else if (!strcmp(argv[i], "--not-both-even")) cfg.not_both_even = 1;
         else if (!strcmp(argv[i], "--maxbits") && i + 1 < argc) maxbits = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--probe") && i + 1 < argc) {
@@ -248,6 +268,22 @@ int main(int argc, char **argv)
     if (fb_split_small(&fb, bkthresh, &fbs) != 0) return 1;
     fb_restrict(&fb, bkthresh, fbbound);
     printf("  bucketed  %u <= p < %u : %u entries\n", bkthresh, fbbound, fb.n);
+
+    /* Cofactor-classification parameters, from oracle/input.job. `lim` is the
+     * factor-base bound actually sieved, which is what CADO's gap test uses --
+     * so truncating the factor base tightens the classification too. */
+    /* --td runs inside the two-sided intersection, so without the other
+     * side's bitmap it would silently do nothing at all. */
+    if (cfg.td && !cfg.other_bits) {
+        fprintf(stderr, "bench: --td needs --other-bits FILE (the other side's"
+                        " survivor bitmap); trial division runs on the\n"
+                        "       two-sided survivor list, which does not exist"
+                        " without it.\n");
+        return 2;
+    }
+    if (!cfg.lim) cfg.lim = fbbound;
+    if (!cfg.lpb) cfg.lpb = (cfg.side == 1) ? 32u : 31u;
+    if (!cfg.mfb) cfg.mfb = (cfg.side == 1) ? 92u : 60u;
     printf("  line-sieved       p < %u (plus every p^k, k>=2) : %u entries\n",
            bkthresh, fbs.n);
     if (!fb.n) { fprintf(stderr, "empty factor base after restriction\n"); return 1; }

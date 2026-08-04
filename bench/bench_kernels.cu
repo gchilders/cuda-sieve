@@ -13,9 +13,25 @@
  */
 #include "bench.h"
 #include "plattice.cuh"
+#include "bigint.cuh"
+#include "td.cuh"
 #include <cuda_runtime.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <math.h>
+#include <algorithm>
+#include <time.h>
+
+/* Host-side wall clock, for the per-q work that runs off the GPU and so is
+ * invisible to cudaEvent timing. Goal 1 is about host demand, so this has to
+ * be billed rather than assumed small. */
+static double host_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1e3 + t.tv_nsec * 1e-6;
+}
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
     fprintf(stderr, "CUDA %s at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); \
@@ -588,6 +604,314 @@ struct dev_bufs {
 static float time_kernel(cudaEvent_t a, cudaEvent_t b)
 { float ms = 0; cudaEventElapsedTime(&ms, a, b); return ms; }
 
+/* ---- intersect + primitive filter + compaction ------------------------- *
+ *
+ * The two per-side survivor bitmaps are ANDed, positions with gcd(i,j) != 1
+ * are dropped (they cannot give a relation: a and b would share a factor),
+ * and what remains is compacted into a dense list.
+ *
+ * The list carries BOTH the sieve index x and the pair (a,b). Emitting only
+ * (a,b) would be the natural-looking choice and it is the wrong one: every
+ * downstream stage -- resieve under either layout, trial division, the
+ * cofactor queue -- is indexed by x, and recovering x from (a,b) means
+ * inverting the lattice basis per survivor. x is 4 bytes; keep it.
+ *
+ * Bit-order note: bit k of word w is position x = 32*w + k, which is the
+ * order k_apply writes with atomicOr(&survbits[x >> 5], 1u << (x & 31)).
+ */
+__device__ __forceinline__ uint32_t bgcd(uint32_t u, uint32_t v)
+{
+    /* gcd(u,0) = u, which is what makes j = 0 fall out correctly: only
+     * i = +-1 is primitive on that row. */
+    if (!u) return v;
+    if (!v) return u;
+    int s = __ffs(u | v) - 1;
+    u >>= __ffs(u) - 1;
+    do {
+        v >>= __ffs(v) - 1;
+        if (u > v) { uint32_t t = u; u = v; v = t; }
+        v -= u;
+    } while (v);
+    return u << s;
+}
+
+
+/* ---- recovery: the A/B ------------------------------------------------- *
+ *
+ * A: re-walk the factor base and test each hit against a hierarchical
+ *    survivor filter. Touches no bucket memory at all.
+ * B: stream the retained bucket array and keep the records that land on a
+ *    survivor -- CADO's `purge`. Our 4 B record carries a slice index rather
+ *    than a within-slice offset, so it cannot name the prime; that is a
+ *    correctness gap, NOT a cost one. The memory traffic being measured here
+ *    is exactly the traffic layout B would have, because the record is 4 B
+ *    either way and every record is read exactly once.
+ */
+__global__ void k_build_summary(const uint32_t *__restrict bits,
+                                uint32_t nword, uint32_t *__restrict summary)
+{
+    /* one summary bit per 64 positions == per 2 words of the full bitmap */
+    uint32_t stride = gridDim.x * blockDim.x;
+    for (uint32_t s = blockIdx.x * blockDim.x + threadIdx.x; s < nword / 2; s += stride) {
+        uint32_t occupied = (bits[2 * s] | bits[2 * s + 1]) != 0u;
+        if (occupied) atomicOr(&summary[s >> 5], 1u << (s & 31u));
+    }
+}
+
+__global__ void k_resieve_rewalk(const plat_t *__restrict plat,
+                                 const uint32_t *__restrict primes,
+                                 uint32_t n, uint32_t xmax, int logI,
+                                 const uint32_t *__restrict summary,
+                                 const uint32_t *__restrict bits,
+                                 uint32_t *__restrict out_x,
+                                 uint32_t *__restrict out_p,
+                                 uint32_t cap, uint32_t *__restrict nout,
+                                 unsigned long long *__restrict nprobe,
+                                 unsigned long long *__restrict npass1)
+{
+    const uint32_t Imask = (1u << logI) - 1;
+    uint32_t stride = gridDim.x * blockDim.x;
+    unsigned long long probes = 0, pass1 = 0;
+    for (uint32_t k = blockIdx.x * blockDim.x + threadIdx.x; k < n; k += stride) {
+        plat_t P = plat[k];
+        if (P.inc_warp == 0xFFFFFFFFu) continue;
+        uint32_t p = primes[k];
+        for (uint32_t x = pl_first(&P, logI); x < xmax; x = pl_next(x, &P, Imask)) {
+            probes++;
+            uint32_t sb = x >> 6;
+            if (!((summary[sb >> 5] >> (sb & 31u)) & 1u)) continue;
+            pass1++;
+            if (!((bits[x >> 5] >> (x & 31u)) & 1u)) continue;
+            uint32_t slot = atomicAdd(nout, 1u);
+            if (slot < cap) { out_x[slot] = x; out_p[slot] = p; }
+        }
+    }
+    if (probes) atomicAdd(nprobe, probes);
+    if (pass1)  atomicAdd(npass1, pass1);
+}
+
+__global__ void k_purge(const uint32_t *__restrict recs,
+                        const uint32_t *__restrict cursor,
+                        uint32_t nregion, uint32_t cap, int log_region,
+                        const uint32_t *__restrict bits,
+                        uint32_t *__restrict out_x, uint32_t cap_out,
+                        uint32_t *__restrict nout,
+                        unsigned long long *__restrict nread)
+{
+    const uint32_t offmask = (1u << log_region) - 1;
+    unsigned long long rd = 0;
+    for (uint32_t b = blockIdx.x; b < nregion; b += gridDim.x) {
+        uint32_t nrec = cursor[b];
+        if (nrec > cap) nrec = cap;
+        rd += (threadIdx.x == 0) ? nrec : 0;
+        for (uint32_t t = threadIdx.x; t < nrec; t += blockDim.x) {
+            uint32_t rec = recs[(size_t)b * cap + t];
+            uint32_t x = (b << log_region) | (rec & offmask);
+            if (!((bits[x >> 5] >> (x & 31u)) & 1u)) continue;
+            uint32_t slot = atomicAdd(nout, 1u);
+            if (slot < cap_out) out_x[slot] = x;
+        }
+    }
+    if (rd) atomicAdd(nread, rd);
+}
+
+
+/* Slice cut for LAYOUT B. Two differences from build_slices() above, and both
+ * are forced by the record format rather than chosen:
+ *
+ *  - the cap is 65536, not 262144, because the record's high 16 bits hold the
+ *    offset WITHIN the slice. CADO has the same constraint and asserts on it
+ *    (`fb.hpp:356`: size() <= numeric_limits<slice_offset_t>::max()).
+ *  - the slice start indices are kept, because the fill is launched one slice
+ *    at a time and the purge needs them to turn (slice, offset) back into a
+ *    factor-base index.
+ *
+ * The tighter cap is what makes B's segment count ~3x the 39 that the looser
+ * cut produces -- see the launch-cost discussion.
+ */
+static uint32_t build_slices_b(const fb_t *fb, uint32_t **starts_out)
+{
+    uint32_t ns = 0, k, capacity = 256;
+    uint32_t *starts = (uint32_t *)malloc(capacity * 4);
+    int cur = -1;
+    uint32_t cut = 0;
+    for (k = 0; k < fb->n; k++) {
+        int lp = fb->logp[k];
+        if (lp != cur || (ns && (k - cut) >= 65536u)) {
+            if (ns + 2 > capacity) { capacity *= 2; starts = (uint32_t *)realloc(starts, capacity * 4); }
+            cur = lp; cut = k; starts[ns++] = k;
+        }
+    }
+    starts[ns] = fb->n;          /* sentinel: slice s is [starts[s], starts[s+1]) */
+    *starts_out = starts;
+    return ns;
+}
+
+/* Fill one slice. Identical walk to k_fill_atomic<4>, but the record carries
+ * the offset of the prime within this slice instead of a slice index, which is
+ * what lets the purge name the prime. Slice identity comes from segmentation:
+ * the driver snapshots cursor[] after each launch, giving per-(bucket, slice)
+ * boundaries for free -- no counting pass. */
+__global__ void k_fill_segmented(const plat_t *__restrict plat,
+                                 uint32_t kbeg, uint32_t kend,
+                                 uint32_t xmax, int logI, int log_region,
+                                 uint32_t *__restrict cursor,
+                                 uint32_t *__restrict out, uint32_t cap,
+                                 uint32_t *__restrict overflow)
+{
+    const uint32_t Imask = (1u << logI) - 1;
+    const uint32_t offmask = (1u << log_region) - 1;
+    uint32_t stride = gridDim.x * blockDim.x;
+    for (uint32_t k = kbeg + blockIdx.x * blockDim.x + threadIdx.x; k < kend; k += stride) {
+        plat_t P = plat[k];
+        if (P.inc_warp == 0xFFFFFFFFu) continue;
+        const uint32_t soff = k - kbeg;          /* < 65536 by construction */
+        for (uint32_t x = pl_first(&P, logI); x < xmax; x = pl_next(x, &P, Imask)) {
+            uint32_t b = x >> log_region;
+            uint32_t slot = atomicAdd(&cursor[b], 1u);
+            if (slot >= cap) { atomicAdd(overflow, 1u); continue; }
+            out[(size_t)b * cap + slot] = (x & offmask) | (soff << 16);
+        }
+    }
+}
+
+/* Snapshot cursor[] into column `sl` of the bucket-major boundary table.
+ * This replaced a cudaMemcpy2D: a 2D copy 4 bytes wide over 32768 rows is
+ * pathological (it was costing ~0.7 ms per slice, 88 ms over 126 slices),
+ * whereas this is a plain coalesced read and a strided write. */
+__global__ void k_snapshot_bounds(const uint32_t *__restrict cursor,
+                                  uint32_t *__restrict bounds,
+                                  uint32_t nregion, uint32_t nslice, uint32_t sl)
+{
+    uint32_t stride = gridDim.x * blockDim.x;
+    for (uint32_t b = blockIdx.x * blockDim.x + threadIdx.x; b < nregion; b += stride)
+        bounds[(size_t)b * nslice + sl] = cursor[b];
+}
+
+/* Purge, layout B: stream the retained records, keep the ones on a survivor,
+ * and name the prime. bounds[b*nslice + s] is the cursor value after slice s
+ * finished bucket b, so the slice a slot belongs to is found by binary search
+ * over that row -- contiguous per bucket, which is why the table is laid out
+ * bucket-major. */
+__global__ void k_purge_prime(const uint32_t *__restrict recs,
+                              const uint32_t *__restrict cursor,
+                              const uint32_t *__restrict bounds,
+                              const uint32_t *__restrict starts,
+                              const uint32_t *__restrict primes,
+                              uint32_t nregion, uint32_t cap, uint32_t nslice,
+                              int log_region,
+                              const uint32_t *__restrict bits,
+                              uint32_t *__restrict out_x,
+                              uint32_t *__restrict out_p,
+                              uint32_t cap_out, uint32_t *__restrict nout)
+{
+    const uint32_t offmask = (1u << log_region) - 1;
+    for (uint32_t b = blockIdx.x; b < nregion; b += gridDim.x) {
+        uint32_t nrec = cursor[b];
+        if (nrec > cap) nrec = cap;
+        const uint32_t *row = bounds + (size_t)b * nslice;
+        for (uint32_t t = threadIdx.x; t < nrec; t += blockDim.x) {
+            uint32_t rec = recs[(size_t)b * cap + t];
+            uint32_t x = (b << log_region) | (rec & offmask);
+            if (!((bits[x >> 5] >> (x & 31u)) & 1u)) continue;
+            /* which slice does slot t belong to? row[] is non-decreasing. */
+            uint32_t lo = 0, hi = nslice - 1;
+            while (lo < hi) { uint32_t mid = (lo + hi) >> 1;
+                              if (row[mid] <= t) lo = mid + 1; else hi = mid; }
+            uint32_t p = primes[starts[lo] + (rec >> 16)];
+            uint32_t slot = atomicAdd(nout, 1u);
+            if (slot < cap_out) { out_x[slot] = x; out_p[slot] = p; }
+        }
+    }
+}
+
+template <int AGG>
+__global__ void k_intersect_compact(const uint32_t *__restrict A,
+                                    const uint32_t *__restrict B,
+                                    uint32_t nword, uint32_t logI,
+                                    int64_t a0, int64_t a1, int64_t b0, int64_t b1,
+                                    uint32_t *__restrict out_x,
+                                    int64_t  *__restrict out_a,
+                                    int64_t  *__restrict out_b,
+                                    uint32_t cap,
+                                    uint32_t *__restrict nout,
+                                    unsigned long long *__restrict npre,
+                                    uint32_t *__restrict twosided)
+{
+    const uint32_t Imask = (1u << logI) - 1;
+    const int32_t  Ihalf = (int32_t)(1u << (logI - 1));
+    const uint32_t stride = gridDim.x * blockDim.x;
+    const uint32_t lane = threadIdx.x & 31u;
+    unsigned long long pre = 0;
+
+    /* Round the trip count up so every lane of a warp runs the same number of
+     * iterations: the warp-aggregated atomic below needs a converged warp, and
+     * lanes past the end simply contribute nothing. */
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t iters = (nword + stride - 1) / stride;
+
+    for (uint32_t it = 0; it < iters; it++) {
+        uint32_t w = tid + it * stride;
+        uint32_t m = (w < nword) ? (A[w] & B[w]) : 0u;
+        uint32_t keep = 0;
+        pre += __popc(m);
+        while (m) {
+            uint32_t k = __ffs(m) - 1;
+            m &= m - 1;
+            uint32_t x = (w << 5) + k;
+            int32_t  i = (int32_t)(x & Imask) - Ihalf;
+            uint32_t j = x >> logI;
+            uint32_t ai = (uint32_t)(i < 0 ? -i : i);
+            if (bgcd(ai, j) == 1) keep |= 1u << k;
+        }
+
+        /* Warp-aggregated allocation: one atomicAdd per warp instead of one
+         * per survivor. Survivors are ~1 in 400 positions, so a warp covering
+         * 32 words holds only a few -- but they all serialise on the same
+         * global counter, and that, not the 134 MB of bitmap, is what this
+         * kernel spends its time on. */
+        /* Each thread owns a whole 32-position word, so the primitive
+         * two-sided bitmap can be stored outright -- no atomics needed. This
+         * is what the resieve filters against. */
+        if (twosided && w < nword) twosided[w] = keep;
+
+        uint32_t slot;
+        if (AGG) {
+            uint32_t n = __popc(keep), scan = n;
+            for (int off = 1; off < 32; off <<= 1) {
+                uint32_t v = __shfl_up_sync(0xffffffffu, scan, off);
+                if (lane >= (uint32_t)off) scan += v;
+            }
+            uint32_t total = __shfl_sync(0xffffffffu, scan, 31);
+            uint32_t base = 0;
+            if (lane == 31 && total) base = atomicAdd(nout, total);
+            base = __shfl_sync(0xffffffffu, base, 31);
+            slot = base + (scan - n);   /* exclusive prefix */
+        } else {
+            /* the naive form, kept for the A/B: one global atomic per
+             * non-empty word. Measured 0.567 ms against 0.447 ms aggregated,
+             * so the ~10 lines above buy 21%. */
+            slot = keep ? atomicAdd(nout, __popc(keep)) : 0;
+        }
+
+        while (keep) {
+            uint32_t k = __ffs(keep) - 1;
+            keep &= keep - 1;
+            uint32_t x = (w << 5) + k;
+            int32_t  i = (int32_t)(x & Imask) - Ihalf;
+            uint32_t j = x >> logI;
+            if (slot < cap) {
+                out_x[slot] = x;
+                out_a[slot] = (int64_t)i * a0 + (int64_t)j * b0;
+                out_b[slot] = (int64_t)i * a1 + (int64_t)j * b1;
+            }
+            slot++;
+        }
+    }
+    /* one atomic per thread, not one per survivor */
+    if (pre) atomicAdd(npre, pre);
+}
+
 /* Cut the (sorted) factor base into slices of constant log p. This is CADO's
  * scheme: the bucket record carries a slice index, and log p is a property of
  * the slice, so the apply kernel needs only a tiny shared-memory table. Slices
@@ -611,6 +935,507 @@ static uint32_t build_slices(const fb_t *fb, uint16_t *slice,
     return ns;
 }
 
+/* ======================= trial division, host side ======================= */
+
+/* The exact homogeneous form for one side. The rational side is not a special
+ * case: G(a,b) = Y1*a + Y0*b is the degree-1 member of the same family, so the
+ * norm kernel is shared. */
+static int td_build_poly(tdpoly_t *T, const poly_t *P, int side)
+{
+    memset(T, 0, sizeof(*T));
+    for (int k = 0; k < 8; k++) T->sign[k] = 1;
+    if (side == 0) {
+        int s0 = 1, s1 = 1;
+        T->deg = 1;
+        if (bn_from_dec(&T->c[0], P->y0s, &s0)) return -1;
+        if (bn_from_dec(&T->c[1], P->y1s, &s1)) return -1;
+        T->sign[0] = s0; T->sign[1] = s1;
+        return 0;
+    }
+    T->deg = P->deg;
+    for (int k = 0; k <= P->deg; k++) {
+        int s = 1;
+        if (!P->cs[k][0]) continue;                 /* absent == zero */
+        if (bn_from_dec(&T->c[k], P->cs[k], &s)) return -1;
+        T->sign[k] = s;
+    }
+    return 0;
+}
+
+/* Direct-test table for p < bkthresh.
+ *
+ * PROPER PRIME POWERS ARE EXCLUDED. fb_split_small puts every power in this
+ * table regardless of size, but trial division recovers multiplicity by
+ * repeated division by the base prime -- which is always present here too,
+ * since a power p^k below the factor-base bound forces p well below bkthresh.
+ * Keeping the powers would divide a norm by p^2 as though p^2 were prime.
+ *
+ * For a PRIME modulus the transform's row divisor g can only be 1 or p (it is
+ * gcd(D, p)), so p == m*g always holds and the prime never has to be carried
+ * separately. */
+static uint32_t td_build_small(const fb_t *fbs, const qlat_t *L, int logI,
+                               tdsmall_t **out)
+{
+    const uint32_t Ihalf = 1u << (logI - 1);
+    uint32_t n = 0;
+    tdsmall_t *t;
+    if (!fbs || !fbs->n) { *out = NULL; return 0; }
+    t = (tdsmall_t *)malloc((size_t)fbs->n * sizeof(tdsmall_t));
+    if (!t) { *out = NULL; return 0; }
+    for (uint32_t i = 0; i < fbs->n; i++) {
+        uint32_t rt, g, m;
+        if (FB_ISPOW(fbs, i)) continue;
+        m = pl_transform_enc(fbs->primes[i], fbs->roots[i],
+                             L->a0, L->a1, L->b0, L->b1, &rt, &g);
+        if (m * g != fbs->primes[i]) {          /* the invariant above */
+            fprintf(stderr, "td_build_small: m*g != p at entry %u"
+                            " (p=%u m=%u g=%u)\n", i, fbs->primes[i], m, g);
+            free(t); *out = NULL; return 0;
+        }
+        t[n].m = m; t[n].rt = rt; t[n].g = g;
+        t[n].cst = Ihalf % m;
+        t[n].recip = bn_recip_u32(fbs->primes[i]);
+        td_magic_build(m, &t[n].magic, &t[n].sh);
+        n++;
+    }
+    *out = t;
+    return n;
+}
+
+/* ---- the gate: our cofactors against CADO's ---------------------------- */
+
+typedef struct { int64_t a, b; uint32_t idx; } td_ab_t;
+
+static bool td_ab_less(const td_ab_t &x, const td_ab_t &y)
+{ return x.b != y.b ? x.b < y.b : x.a < y.a; }
+
+/* oracle/c183.q*.cofac_candidates.txt holds `a b cofac0 cofac1` for every
+ * position CADO carried into cofactoring, i.e. its residual after its own
+ * trial division. Ours must agree exactly, which is a far stronger statement
+ * than agreeing on a count. */
+static int td_gate_cofactors(const char *path, uint32_t n,
+                             const int64_t *ha, const int64_t *hb,
+                             const bn_t *hcof, int side)
+{
+    FILE *f = fopen(path, "r");
+    char line[512];
+    uint32_t nref = 0, found = 0, match = 0, absent = 0;
+    td_ab_t *tab;
+    if (!f) { perror(path); return -1; }
+
+    /* our list, keyed on (a,b) normalised to b > 0 -- our b is i, and las
+     * reports the mirrored point (-a, -i) whenever i < 0. */
+    tab = (td_ab_t *)malloc((size_t)n * sizeof(td_ab_t));
+    if (!tab) { fclose(f); return -1; }
+    for (uint32_t k = 0; k < n; k++) {
+        int64_t a = ha[k], b = hb[k];
+        if (b < 0) { a = -a; b = -b; }
+        tab[k].a = a; tab[k].b = b; tab[k].idx = k;
+    }
+    std::sort(tab, tab + n, td_ab_less);
+
+    printf("\n  --- trial-division gate vs %s (side %d) ---\n", path, side);
+    while (fgets(line, sizeof line, f)) {
+        char c0[128], c1[128];
+        long long ra, rb;
+        td_ab_t key, *lo;
+        if (line[0] == '#') continue;
+        if (sscanf(line, "%lld %lld %127s %127s", &ra, &rb, c0, c1) != 4) continue;
+        nref++;
+        key.a = ra; key.b = rb; key.idx = 0;
+        lo = std::lower_bound(tab, tab + n, key, td_ab_less);
+        if (lo == tab + n || lo->a != key.a || lo->b != key.b) { absent++; continue; }
+        found++;
+        {
+            char buf[80];
+            bn_to_dec(&hcof[lo->idx], buf);
+            if (!strcmp(buf, side ? c1 : c0)) match++;
+            else if (match + 8 > found)      /* show the first few only */
+                printf("    MISMATCH (a,b)=(%lld,%lld)  ours %s  CADO %s\n",
+                       ra, rb, buf, side ? c1 : c0);
+        }
+    }
+    fclose(f);
+    printf("  %-30s %8u\n", "reference records", nref);
+    printf("  %-30s %8u  (%u not in our survivor list)\n",
+           "matched to a survivor", found, absent);
+    printf("  %-30s %8u of %u   %s\n", "cofactors identical", match, found,
+           (found && match == found) ? "PASS" : "FAIL");
+    free(tab);
+    /* A gate that only prints FAIL is not a gate: every caller of this binary
+     * is a script. Report the shortfall so the process can exit nonzero. */
+    return (int)(found - match) + (found ? 0 : 1);
+}
+
+/* ---- the stage ---------------------------------------------------------- */
+
+static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
+                        const poly_t *POLY, const bench_cfg_t *cfg,
+                        const plat_t *d_plat, const uint32_t *d_primes,
+                        const uint32_t *d_two, uint32_t nbitword,
+                        uint32_t xmax, int blocks, int threads)
+{
+    const uint32_t K = 16;          /* large primes kept per survivor */
+    const uint32_t ngroup = nbitword / TD_GROUP_W;
+    const uint32_t nb = (ngroup + TD_SCAN_BLK - 1) / TD_SCAN_BLK;
+    const uint32_t nsum = nbitword / 2;
+    const uint32_t nsumword = (nsum + 31) / 32;
+
+    uint32_t *d_cnt = NULL, *d_gbase = NULL, *d_bsum = NULL, *d_sum = NULL;
+    uint32_t *d_x = NULL, *d_plist = NULL, *d_pcnt = NULL, *d_flags = NULL;
+    uint8_t  *d_status = NULL;
+    uint32_t *d_fac = NULL, *d_faccnt = NULL;
+    int64_t  *d_a = NULL, *d_b = NULL;
+    bn_t     *d_cof = NULL;
+    uint8_t  *d_cofbits = NULL;
+    tdpoly_t *d_poly = NULL;
+    tdsmall_t *d_sm = NULL, *h_sm = NULL;
+    unsigned long long *d_ovf = NULL;
+    tdpoly_t h_poly;
+    int rc = 0;
+    uint32_t n = 0, nsm = 0, hflags = 0;
+    unsigned long long hovf = 0;
+    cudaEvent_t t0, t1;
+    float ms_rank = 0, ms_emit = 0, ms_sum = 0, ms_scatter = 1e30f, ms_td = 1e30f;
+    float ms_td_nosm = 1e30f, ms_td_nodiv = 1e30f, ms_class = 0;
+    unsigned long long hhits = 0;
+
+    if (nbitword % TD_GROUP_W) {
+        fprintf(stderr, "  --td: %u bitmap words is not a multiple of %d\n",
+                nbitword, TD_GROUP_W);
+        return -1;
+    }
+    if (L->q >> 32) {
+        fprintf(stderr, "  --td: special-q %llu exceeds 32 bits; the divide-out"
+                " path assumes it fits\n", (unsigned long long)L->q);
+        return -1;
+    }
+    if (td_build_poly(&h_poly, POLY, cfg->side)) {
+        fprintf(stderr, "  --td: could not parse exact polynomial coefficients\n");
+        return -1;
+    }
+    nsm = td_build_small(fbs, L, cfg->logI, &h_sm);
+
+    printf("\n  --- exact norms + trial division (side %d) ---\n", cfg->side);
+    printf("  form: degree %d, |c| up to %d bits;"
+           " small direct-test table %u entries (%.1f KB)\n",
+           h_poly.deg, bn_bits(&h_poly.c[0]), nsm,
+           nsm * sizeof(tdsmall_t) / 1024.0);
+
+    cudaEventCreate(&t0); cudaEventCreate(&t1);
+
+    /* ---- survivor rank over the two-sided bitmap ---- */
+    CK(cudaMalloc(&d_cnt, (size_t)ngroup * 4));
+    CK(cudaMalloc(&d_gbase, (size_t)ngroup * 4));
+    CK(cudaMalloc(&d_bsum, (size_t)nb * 4));
+    /* Best of 3, like every other timed block here: CUDA loads a kernel's code
+     * on its FIRST launch (lazy module loading), and these four kernels have
+     * never run at this point. Timing the first launch reported 10.7 ms for
+     * what steady-state measurement puts an order of magnitude below. */
+    ms_rank = 1e30f;
+    for (int rep = 0; rep < 3; rep++) {
+        cudaEventRecord(t0);
+        k_group_counts<<<blocks, threads>>>(d_two, ngroup, d_cnt);
+        k_scan_pass1<<<nb, TD_SCAN_BLK>>>(d_cnt, ngroup, d_gbase, d_bsum);
+        k_scan_pass2<<<1, 1024>>>(d_bsum, nb);
+        k_scan_pass3<<<nb, TD_SCAN_BLK>>>(d_gbase, ngroup, d_bsum);
+        cudaEventRecord(t1);
+        CK(cudaEventSynchronize(t1)); CK(cudaGetLastError());
+        { float t = time_kernel(t0, t1); if (t < ms_rank) ms_rank = t; }
+    }
+    {
+        uint32_t base = 0, cnt = 0;
+        CK(cudaMemcpy(&base, d_gbase + ngroup - 1, 4, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(&cnt,  d_cnt   + ngroup - 1, 4, cudaMemcpyDeviceToHost));
+        n = base + cnt;
+    }
+    printf("  %-30s %8u\n", "survivors (rank scan)", n);
+    if (!n) { fprintf(stderr, "  --td: no survivors to divide\n"); rc = -1; goto done; }
+
+    /* ---- rank-ordered (x, a, b) ---- */
+    CK(cudaMalloc(&d_x, (size_t)n * 4));
+    CK(cudaMalloc(&d_a, (size_t)n * 8));
+    CK(cudaMalloc(&d_b, (size_t)n * 8));
+    ms_emit = 1e30f;
+    for (int rep = 0; rep < 3; rep++) {
+        cudaEventRecord(t0);
+        k_emit_ranked<<<blocks, threads>>>(d_two, d_gbase, nbitword, cfg->logI,
+                                           L->a0, L->a1, L->b0, L->b1,
+                                           d_x, d_a, d_b, n);
+        cudaEventRecord(t1);
+        CK(cudaEventSynchronize(t1)); CK(cudaGetLastError());
+        { float t = time_kernel(t0, t1); if (t < ms_emit) ms_emit = t; }
+    }
+
+    /* ---- large primes: re-walk, filtered, scattered per survivor ---- */
+    CK(cudaMalloc(&d_sum, (size_t)nsumword * 4));
+    CK(cudaMalloc(&d_plist, (size_t)n * K * 4));
+    CK(cudaMalloc(&d_pcnt, (size_t)n * 4));
+    CK(cudaMalloc(&d_ovf, 8));
+    cudaEventRecord(t0);
+    CK(cudaMemset(d_sum, 0, (size_t)nsumword * 4));
+    k_build_summary<<<blocks, threads>>>(d_two, nbitword, d_sum);
+    cudaEventRecord(t1);
+    CK(cudaEventSynchronize(t1)); CK(cudaGetLastError());
+    ms_sum = time_kernel(t0, t1);
+
+    for (int rep = 0; rep < 3; rep++) {
+        CK(cudaMemset(d_pcnt, 0, (size_t)n * 4));
+        CK(cudaMemset(d_ovf, 0, 8));
+        cudaEventRecord(t0);
+        k_resieve_scatter<<<blocks, threads>>>(
+            d_plat, d_primes, NULL, fb->n, xmax, cfg->logI,
+            d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf);
+        cudaEventRecord(t1);
+        CK(cudaEventSynchronize(t1)); CK(cudaGetLastError());
+        { float t = time_kernel(t0, t1); if (t < ms_scatter) ms_scatter = t; }
+    }
+    CK(cudaMemcpy(&hovf, d_ovf, 8, cudaMemcpyDeviceToHost));
+
+    /* ---- the trial division itself ---- */
+    CK(cudaMalloc(&d_poly, sizeof(tdpoly_t)));
+    CK(cudaMemcpy(d_poly, &h_poly, sizeof(tdpoly_t), cudaMemcpyHostToDevice));
+    if (nsm) {
+        CK(cudaMalloc(&d_sm, (size_t)nsm * sizeof(tdsmall_t)));
+        CK(cudaMemcpy(d_sm, h_sm, (size_t)nsm * sizeof(tdsmall_t),
+                      cudaMemcpyHostToDevice));
+    }
+    CK(cudaMalloc(&d_cof, (size_t)n * sizeof(bn_t)));
+    CK(cudaMalloc(&d_cofbits, (size_t)n));
+    CK(cudaMalloc(&d_flags, 4));
+
+    /* Same kernel with the small-prime table empty. The direct test is the
+     * part with no prior measurement behind it -- 3,500 entries against every
+     * survivor -- so it is worth separating from the norm and the recovered
+     * large primes rather than reporting one fused number. Run FIRST so the
+     * full pass overwrites its output. */
+    for (int rep = 0; rep < 3; rep++) {
+        cudaEventRecord(t0);
+        k_td<1, 0><<<blocks, threads>>>(d_a, d_b, d_x, n, cfg->logI, d_poly,
+                                        cfg->side == 1 ? (uint32_t)L->q : 0u,
+                                        d_plist, d_pcnt, K, d_sm, 0u,
+                                        d_cof, d_cofbits, d_flags, NULL,
+                                        NULL, NULL, 0);
+        cudaEventRecord(t1);
+        CK(cudaEventSynchronize(t1)); CK(cudaGetLastError());
+        { float t = time_kernel(t0, t1); if (t < ms_td_nosm) ms_td_nosm = t; }
+    }
+
+    /* the same walk with the divisions removed: separates the 3e9 congruence
+     * tests from the big-integer divisions they trigger */
+    CK(cudaMemset(d_ovf, 0, 8));
+    for (int rep = 0; rep < 3; rep++) {
+        cudaEventRecord(t0);
+        k_td<0, 0><<<blocks, threads>>>(d_a, d_b, d_x, n, cfg->logI, d_poly,
+                                        cfg->side == 1 ? (uint32_t)L->q : 0u,
+                                        d_plist, d_pcnt, K, d_sm, nsm,
+                                        d_cof, d_cofbits, d_flags, d_ovf,
+                                        NULL, NULL, 0);
+        cudaEventRecord(t1);
+        CK(cudaEventSynchronize(t1)); CK(cudaGetLastError());
+        { float t = time_kernel(t0, t1); if (t < ms_td_nodiv) ms_td_nodiv = t; }
+    }
+    CK(cudaMemcpy(&hhits, d_ovf, 8, cudaMemcpyDeviceToHost));
+    hhits /= 3;                      /* three reps accumulated into it */
+
+    for (int rep = 0; rep < 3; rep++) {
+        CK(cudaMemset(d_flags, 0, 4));
+        cudaEventRecord(t0);
+        k_td<1, 0><<<blocks, threads>>>(d_a, d_b, d_x, n, cfg->logI, d_poly,
+                                        cfg->side == 1 ? (uint32_t)L->q : 0u,
+                                        d_plist, d_pcnt, K, d_sm, nsm,
+                                        d_cof, d_cofbits, d_flags, NULL,
+                                        NULL, NULL, 0);
+        cudaEventRecord(t1);
+        CK(cudaEventSynchronize(t1)); CK(cudaGetLastError());
+        { float t = time_kernel(t0, t1); if (t < ms_td) ms_td = t; }
+    }
+    CK(cudaMemcpy(&hflags, d_flags, 4, cudaMemcpyDeviceToHost));
+
+    printf("  %-30s %8.3f ms\n", "rank scan", ms_rank);
+    printf("  %-30s %8.3f ms\n", "emit (x,a,b) in rank order", ms_emit);
+    printf("  %-30s %8.3f ms\n", "build survivor filter", ms_sum);
+    printf("  %-30s %8.3f ms%s\n", "resieve + scatter", ms_scatter,
+           hovf ? "   ** list overflow" : "");
+    printf("  %-30s %8.3f ms   (norm + special-q + %u recovered large primes)\n",
+           "  ...without small primes", ms_td_nosm, K);
+    printf("  %-30s %8.3f ms   (%llu hits, %.2f per survivor)\n",
+           "  ...test only, no division", ms_td_nodiv, hhits, (double)hhits / n);
+    printf("  %-30s %8.3f ms   (%u-entry test %.3f + division %.3f)\n",
+           "norms + trial division", ms_td, nsm,
+           ms_td_nodiv - ms_td_nosm, ms_td - ms_td_nodiv);
+    printf("  %-30s %8.3f ms\n", "TD chain total",
+           ms_rank + ms_emit + ms_sum + ms_scatter + ms_td);
+    /* Both of these silently corrupt factorisations rather than crashing, so
+     * they must fail the run. A norm that overflowed 256 bits is wrong, and a
+     * truncated prime list leaves factors undivided. */
+    if (hflags & TDF_NORM_OVERFLOW) {
+        fprintf(stderr, "  ** NORM OVERFLOW: a norm exceeded %d bits\n", BN_LIMBS * 32);
+        rc = -1;
+    }
+    if (hflags & TDF_LIST_TRUNCATED) {
+        fprintf(stderr, "  ** %llu large-prime records past the %u/survivor cap\n",
+                hovf, K);
+        rc = -1;
+    }
+
+    /* ---- factorisation record, for relation output ----
+     * A separate untimed pass with RECORD=1 rather than stores in the measured
+     * kernel: the factors are only wanted when a run is emitting, and the hot
+     * path should not carry writes it does not need. */
+    if (cfg->emit_cof) {
+        CK(cudaMalloc(&d_fac, (size_t)n * TD_FMAX * 4));
+        CK(cudaMalloc(&d_faccnt, (size_t)n * 4));
+        k_td<1, 1><<<blocks, threads>>>(d_a, d_b, d_x, n, cfg->logI, d_poly,
+                                        cfg->side == 1 ? (uint32_t)L->q : 0u,
+                                        d_plist, d_pcnt, K, d_sm, nsm,
+                                        d_cof, d_cofbits, d_flags, NULL,
+                                        d_fac, d_faccnt, TD_FMAX);
+        CK(cudaDeviceSynchronize()); CK(cudaGetLastError());
+    }
+
+    /* ---- classification: CADO's check_leftover_norm ---- */
+    CK(cudaMalloc(&d_status, (size_t)n));
+    ms_class = 1e30f;
+    for (int rep = 0; rep < 3; rep++) {
+        cudaEventRecord(t0);
+        k_classify<<<blocks, threads>>>(d_cof, d_cofbits, d_b, n,
+                                        cfg->lpb, cfg->mfb, (double)cfg->lim,
+                                        d_status);
+        cudaEventRecord(t1);
+        CK(cudaEventSynchronize(t1)); CK(cudaGetLastError());
+        { float t = time_kernel(t0, t1); if (t < ms_class) ms_class = t; }
+    }
+
+    /* ---- readback: cofactor sizes, gate, emission ---- */
+    {
+        bn_t *hcof = (bn_t *)malloc((size_t)n * sizeof(bn_t));
+        uint8_t *hbits = (uint8_t *)malloc((size_t)n);
+        uint8_t *hstat = (uint8_t *)malloc((size_t)n);
+        int64_t *ha = (int64_t *)malloc((size_t)n * 8);
+        int64_t *hb = (int64_t *)malloc((size_t)n * 8);
+        uint32_t hist[257]; uint32_t nfully = 0;
+        memset(hist, 0, sizeof hist);
+        CK(cudaMemcpy(hcof, d_cof, (size_t)n * sizeof(bn_t), cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(hbits, d_cofbits, (size_t)n, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(hstat, d_status, (size_t)n, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(ha, d_a, (size_t)n * 8, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(hb, d_b, (size_t)n * 8, cudaMemcpyDeviceToHost));
+        for (uint32_t k = 0; k < n; k++) {
+            hist[hbits[k]]++;
+            if (hbits[k] <= 1) nfully++;
+        }
+        printf("  %-30s %8u  (%.2f%% of survivors)\n",
+               "cofactor == 1 (fully split)", nfully, 100.0 * nfully / n);
+        printf("  cofactor bits:");
+        for (int b = 0; b <= 256; b++)
+            if (hist[b] && (b % 16 == 0 || hist[b] > n / 64))
+                printf(" %d:%u", b, hist[b]);
+        printf("\n");
+
+        {
+            uint32_t cs[6] = {0, 0, 0, 0, 0, 0};
+            static const char *nm[6] = {"rejected: > mfb bits",
+                                        "rejected: too few factors possible",
+                                        "rejected: prime above 2^lpb",
+                                        "ACCEPTED for cofactorisation",
+                                        "already fully split",
+                                        "rejected: b == 0, not a relation"};
+            for (uint32_t k = 0; k < n; k++) if (hstat[k] < 6) cs[hstat[k]]++;
+            printf("  %-30s %8.3f ms   (lpb %u, mfb %u, lim %u)\n",
+                   "classify", ms_class, cfg->lpb, cfg->mfb, cfg->lim);
+            for (int k = 0; k < 6; k++)
+                printf("    %-32s %8u  (%.3f%%)\n", nm[k], cs[k],
+                       100.0 * cs[k] / n);
+            printf("    %-32s %8u\n", "-> this side's candidates",
+                   cs[COF_ACCEPT] + cs[COF_SPLIT]);
+        }
+
+        if (cfg->cofgate &&
+            td_gate_cofactors(cfg->cofgate, n, ha, hb, hcof, cfg->side) != 0)
+            rc = -1;
+
+        if (cfg->emit_cof) {
+            FILE *fo = fopen(cfg->emit_cof, "w");
+            uint32_t *hfac = (uint32_t *)malloc((size_t)n * TD_FMAX * 4);
+            uint32_t *hfn = (uint32_t *)malloc((size_t)n * 4);
+            uint32_t checked = 0, bad = 0, overflowed = 0;
+            CK(cudaMemcpy(hfac, d_fac, (size_t)n * TD_FMAX * 4, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(hfn, d_faccnt, (size_t)n * 4, cudaMemcpyDeviceToHost));
+
+            /* Reconstruction gate: the recorded factors times the residual
+             * cofactor must rebuild the exact norm. The CADO gate above checks
+             * only the residual, so it would pass even if the factor list were
+             * wrong; this checks the list. Run over the candidates, which are
+             * the records that will actually be emitted. */
+            for (uint32_t k = 0; k < n; k++) {
+                bns_t acc; bn_t t;
+                int64_t a, b;
+                uint64_t ua, ub;
+                int sa, sb;
+                if (hstat[k] != COF_ACCEPT && hstat[k] != COF_SPLIT) continue;
+                if (hfn[k] > TD_FMAX) { overflowed++; continue; }
+                checked++;
+                a = ha[k]; b = hb[k];
+                ua = (uint64_t)(a < 0 ? -a : a); ub = (uint64_t)(b < 0 ? -b : b);
+                sa = (a < 0) ? -1 : 1; sb = (b < 0) ? -1 : 1;
+                bns_zero(&acc);
+                for (int d = 0; d <= h_poly.deg; d++) {
+                    int sgn = h_poly.sign[d];
+                    t = h_poly.c[d];
+                    if (bn_is_zero(&t)) continue;
+                    for (int e = 0; e < d; e++) { bn_mul_u64(&t, ua); sgn *= sa; }
+                    for (int e = 0; e < h_poly.deg - d; e++) { bn_mul_u64(&t, ub); sgn *= sb; }
+                    bns_addmag(&acc, &t, sgn);
+                }
+                /* rebuild: cofactor * prod(factors) */
+                t = hcof[k];
+                for (uint32_t z = 0; z < hfn[k]; z++)
+                    bn_mul_u64(&t, (uint64_t)hfac[(size_t)k * TD_FMAX + z]);
+                if (bn_cmp(&t, &acc.m) != 0) bad++;
+            }
+            printf("  %-30s %8u of %u   %s\n",
+                   "factors x cofactor == norm", checked - bad, checked,
+                   bad ? "FAIL" : "PASS");
+            if (bad) rc = -1;
+            if (overflowed) {
+                fprintf(stderr, "  ** %u candidates had more than %d factors\n",
+                        overflowed, TD_FMAX);
+                rc = -1;
+            }
+
+            if (!fo) perror(cfg->emit_cof);
+            else {
+                char buf[80];
+                for (uint32_t k = 0; k < n; k++) {
+                    int64_t a = ha[k], b = hb[k];
+                    if (b < 0) { a = -a; b = -b; }
+                    fprintf(fo, "%lld %lld %s %u %u %u", (long long)a, (long long)b,
+                            bn_to_dec(&hcof[k], buf), hbits[k], hstat[k], hfn[k]);
+                    for (uint32_t z = 0; z < hfn[k] && z < TD_FMAX; z++)
+                        fprintf(fo, " %u", hfac[(size_t)k * TD_FMAX + z]);
+                    fputc('\n', fo);
+                }
+                fclose(fo);
+                printf("  wrote %u (a, b, cofactor, bits, status, factors) to %s\n",
+                       n, cfg->emit_cof);
+            }
+            free(hfac); free(hfn);
+        }
+        free(hcof); free(hbits); free(hstat); free(ha); free(hb);
+    }
+
+done:
+    cudaEventDestroy(t0); cudaEventDestroy(t1);
+    free(h_sm);
+    cudaFree(d_cnt); cudaFree(d_gbase); cudaFree(d_bsum); cudaFree(d_sum);
+    cudaFree(d_x); cudaFree(d_a); cudaFree(d_b);
+    cudaFree(d_plist); cudaFree(d_pcnt); cudaFree(d_flags);
+    cudaFree(d_cof); cudaFree(d_cofbits); cudaFree(d_poly); cudaFree(d_sm);
+    cudaFree(d_ovf); cudaFree(d_status); cudaFree(d_fac); cudaFree(d_faccnt);
+    return rc;
+}
+
 extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                          const poly_t *POLY, const bench_cfg_t *cfg)
 {
@@ -627,6 +1452,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     printf("  device memory: %.2f GB free of %.2f GB\n",
            freeB / 1073741824.0, totalB / 1073741824.0);
 
+    int td_failed = 0;      /* a failed gate must reach the exit status */
     dev_bufs D; memset(&D, 0, sizeof(D));
     CK(cudaMalloc(&D.primes, (size_t)fb->n * 4));
     CK(cudaMalloc(&D.roots,  (size_t)fb->n * 4));
@@ -653,12 +1479,22 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
      * the tier boundaries are just two indices. ---- */
     uint32_t nsmall = 0, nblk = 0, nwrp = 0;
     uint32_t *hsp = NULL, *hsrt = NULL, *hsg = NULL; uint16_t *hslp = NULL;
+    /* per-q HOST work, billed separately: it is invisible to cudaEvent timing
+     * and Goal 1 is a claim about host demand. */
+    double h_ms_transform = 0, h_ms_sort = 0, h_ms_xfer = 0;
     if (cfg->small_sieve && fbs && fbs->n) {
         uint32_t i, k = 0, nrow = 0, nprj = 0;
-        hsp  = (uint32_t *)malloc((size_t)fbs->n * 4);
-        hsrt = (uint32_t *)malloc((size_t)fbs->n * 4);
-        hslp = (uint16_t *)malloc((size_t)fbs->n * 2);
-        hsg = (uint32_t *)malloc((size_t)fbs->n * 4);
+        /* PINNED, not malloc'd. These four are the only per-special-q host->
+         * device transfer, and on this box (WSL2) a pageable cudaMemcpy of
+         * this size costs ~1.5 ms per call against ~0.1 ms pinned -- measured
+         * at 6.0 ms vs 0.3 ms for the four together. That is per side, so
+         * ~12 ms per special-q of pure host overhead, which dwarfs everything
+         * else in this block and is a Goal-1 cost. */
+        CK(cudaHostAlloc((void **)&hsp,  (size_t)fbs->n * 4, cudaHostAllocDefault));
+        CK(cudaHostAlloc((void **)&hsrt, (size_t)fbs->n * 4, cudaHostAllocDefault));
+        CK(cudaHostAlloc((void **)&hslp, (size_t)fbs->n * 2, cudaHostAllocDefault));
+        CK(cudaHostAlloc((void **)&hsg,  (size_t)fbs->n * 4, cudaHostAllocDefault));
+        h_ms_transform = host_ms();
         for (i = 0; i < fbs->n; i++) {
             uint32_t q = fbs->primes[i], r = fbs->roots[i], rt, g, m;
             m = pl_transform_enc(q, r, L->a0, L->a1, L->b0, L->b1, &rt, &g);
@@ -669,30 +1505,64 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
             k++;
         }
         nsmall = k;
+        h_ms_transform = host_ms() - h_ms_transform;
+
         /* Tier by the EFFECTIVE modulus m, not by q: an entry with q = 32768
          * and g = 32768 has m = 1 and hits every position in its rows, so
          * leaving it in the thread-per-entry tier would hand one thread the
          * whole region. Sorting by m puts every entry in the tier sized for
-         * the number of hits it actually produces. */
-        for (i = 1; i < nsmall; i++) {
-            uint32_t mm = hsp[i], rr = hsrt[i], gg = hsg[i]; uint16_t ll = hslp[i];
-            int32_t z = (int32_t)i - 1;
-            while (z >= 0 && hsp[z] > mm) {
-                hsp[z+1] = hsp[z]; hsrt[z+1] = hsrt[z];
-                hsg[z+1] = hsg[z]; hslp[z+1] = hslp[z]; z--;
+         * the number of hits it actually produces.
+         *
+         * This was an insertion sort, which is O(n^2) and ran ~3.3M
+         * comparisons at nsmall ~3.6K. `qsort` is NOT a drop-in replacement:
+         * the four arrays below are parallel and must be permuted together,
+         * and no C library sort can do that. Sort a permutation of indices by
+         * the key, then scatter -- which also keeps the device side SoA, which
+         * is what the small-sieve kernel wants. */
+        h_ms_sort = host_ms();
+        {
+            uint32_t *idx = (uint32_t *)malloc((size_t)nsmall * 4);
+            uint32_t *tp  = (uint32_t *)malloc((size_t)nsmall * 4);
+            uint32_t *trt = (uint32_t *)malloc((size_t)nsmall * 4);
+            uint32_t *tg  = (uint32_t *)malloc((size_t)nsmall * 4);
+            uint16_t *tlp = (uint16_t *)malloc((size_t)nsmall * 2);
+            for (i = 0; i < nsmall; i++) idx[i] = i;
+            /* stable_sort, not sort: the insertion sort this replaces was
+             * stable, and ties in m are common (many entries share a modulus).
+             * Stability keeps the output bit-identical to the old code, which
+             * is what makes the bitmap regression test meaningful. */
+            std::stable_sort(idx, idx + nsmall,
+                             [hsp](uint32_t a, uint32_t b) { return hsp[a] < hsp[b]; });
+            for (i = 0; i < nsmall; i++) {
+                uint32_t s = idx[i];
+                tp[i] = hsp[s]; trt[i] = hsrt[s]; tg[i] = hsg[s]; tlp[i] = hslp[s];
             }
-            hsp[z+1] = mm; hsrt[z+1] = rr; hsg[z+1] = gg; hslp[z+1] = ll;
+            memcpy(hsp,  tp,  (size_t)nsmall * 4);
+            memcpy(hsrt, trt, (size_t)nsmall * 4);
+            memcpy(hsg,  tg,  (size_t)nsmall * 4);
+            memcpy(hslp, tlp, (size_t)nsmall * 2);
+            free(idx); free(tp); free(trt); free(tg); free(tlp);
         }
+        h_ms_sort = host_ms() - h_ms_sort;
+
         for (i = 0; i < nsmall && hsp[i] < SS_BLOCK_CUT; i++) nblk = i + 1;
         for (i = 0; i < nsmall && hsp[i] < SS_WARP_CUT;  i++) nwrp = i + 1;
         CK(cudaMalloc(&D.sp,  (size_t)nsmall * 4));
         CK(cudaMalloc(&D.srt, (size_t)nsmall * 4));
         CK(cudaMalloc(&D.sg,  (size_t)nsmall * 4));
         CK(cudaMalloc(&D.slp, (size_t)nsmall * 2));
+        /* Drain everything queued earlier (the factor-base uploads above are
+         * large and asynchronous) BEFORE starting the clock -- otherwise the
+         * trailing sync below bills their tail to this transfer and reports
+         * milliseconds for 54 KB. */
+        CK(cudaDeviceSynchronize());
+        h_ms_xfer = host_ms();
         CK(cudaMemcpy(D.sp,  hsp,  (size_t)nsmall * 4, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(D.srt, hsrt, (size_t)nsmall * 4, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(D.sg,  hsg,  (size_t)nsmall * 4, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(D.slp, hslp, (size_t)nsmall * 2, cudaMemcpyHostToDevice));
+        CK(cudaDeviceSynchronize());
+        h_ms_xfer = host_ms() - h_ms_xfer;
         {   double upd = 0; uint32_t xm = (1u << cfg->logI) * cfg->J;
             for (i = 0; i < nsmall; i++) upd += (double)xm / hsp[i] / hsg[i];
             printf("  small sieve: %u entries (%u block-tier m<%u, %u warp-tier m<%u,"
@@ -927,11 +1797,12 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
             CK(cudaMalloc(&D.probe, 8));
             CK(cudaMemset(D.probe, 0, 8));
             CK(cudaMalloc(&D.nsurv, 4));
-            if (cfg->survbits) {
+            if (cfg->survbits || cfg->other_bits) {
                 CK(cudaMalloc(&D.survbits, (size_t)nbitword * 4));
-                printf("  writing a survivor bitmap (1 bit per position, x"
-                       " order) to %s (%.0f MB)\n",
-                       cfg->survbits, nbitword * 4 / 1048576.0);
+                if (cfg->survbits)
+                    printf("  writing a survivor bitmap (1 bit per position, x"
+                           " order) to %s (%.0f MB)\n",
+                           cfg->survbits, nbitword * 4 / 1048576.0);
             }
             if (cfg->not_both_even)
                 printf("  las `not_both_even` filter ON: positions with i and j"
@@ -1004,6 +1875,391 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                 if (!fo) { perror(cfg->survbits); }
                 else { fwrite(h, 4, (size_t)nbitword, fo); fclose(fo); }
                 free(h);
+            }
+
+            /* ---- device intersect + primitive filter + compaction -------- */
+            if (cfg->other_bits) {
+                uint32_t *hother = NULL, *dother = NULL;
+                uint32_t *d_x = NULL, *d_n = NULL, hn = 0;
+                int64_t *d_a = NULL, *d_b = NULL;
+                unsigned long long *d_pre = NULL, hpre = 0;
+                uint32_t *d_two = NULL;
+                /* cap: the two-sided count is ~1 in 400 of the area, but size
+                 * it off the one-sided count so a bad pairing cannot overflow
+                 * silently. */
+                const uint32_t icap = maxsurv;
+                FILE *fi = fopen(cfg->other_bits, "rb");
+                float t_isect = 0;
+
+                if (!fi) { perror(cfg->other_bits); }
+                else {
+                    CK(cudaHostAlloc((void **)&hother, (size_t)nbitword * 4,
+                                     cudaHostAllocDefault));
+                    size_t got = fread(hother, 4, (size_t)nbitword, fi);
+                    fclose(fi);
+                    if (got != (size_t)nbitword) {
+                        fprintf(stderr, "  --other-bits: short read (%zu of %u words)\n",
+                                got, nbitword);
+                    } else {
+                        CK(cudaMalloc(&dother, (size_t)nbitword * 4));
+                        CK(cudaMemcpy(dother, hother, (size_t)nbitword * 4,
+                                      cudaMemcpyHostToDevice));
+                        CK(cudaMalloc(&d_x, (size_t)icap * 4));
+                        CK(cudaMalloc(&d_a, (size_t)icap * 8));
+                        CK(cudaMalloc(&d_b, (size_t)icap * 8));
+                        CK(cudaMalloc(&d_n, 4));   CK(cudaMemset(d_n, 0, 4));
+                        CK(cudaMalloc(&d_pre, 8)); CK(cudaMemset(d_pre, 0, 8));
+                        CK(cudaMalloc(&d_two, (size_t)nbitword * 4));
+                        CK(cudaMemset(d_two, 0, (size_t)nbitword * 4));
+
+                        /* Time it repeatedly: the first launch of any kernel
+                         * carries module/context cost that is not part of the
+                         * steady-state per-q price. Report the best. */
+                        t_isect = 1e30f;
+                        for (int rep = 0; rep < 3; rep++) {
+                            CK(cudaMemset(d_n, 0, 4));
+                            CK(cudaMemset(d_pre, 0, 8));
+                            cudaEventRecord(e3);
+                            k_intersect_compact<1><<<blocks, cfg->threads>>>(
+                                D.survbits, dother, nbitword, cfg->logI,
+                                L->a0, L->a1, L->b0, L->b1,
+                                d_x, d_a, d_b, icap, d_n, d_pre, d_two);
+                            cudaEventRecord(e4);
+                            CK(cudaEventSynchronize(e4));
+                            CK(cudaGetLastError());
+                            float t = time_kernel(e3, e4);
+
+                            if (t < t_isect) t_isect = t;
+                        }
+
+                        CK(cudaMemcpy(&hn, d_n, 4, cudaMemcpyDeviceToHost));
+                        CK(cudaMemcpy(&hpre, d_pre, 8, cudaMemcpyDeviceToHost));
+
+                        printf("\n  intersect+gcd+compact vs %s\n", cfg->other_bits);
+                        printf("  %-26s %8llu\n", "two-sided, pre-gcd",
+                               (unsigned long long)hpre);
+                        printf("  %-26s %8u  (%.1f%% of pre-gcd survive)\n",
+                               "primitive gcd(i,j)=1", hn,
+                               hpre ? 100.0 * hn / (double)hpre : 0.0);
+                        if (hn > icap)
+                            printf("  ** OVERFLOW: %u > cap %u, list truncated\n", hn, icap);
+                        printf("  %-26s %8.3f ms  (best of 3; the first launch of any kernel\n"
+       "                                       carries module-load cost -- 4.6 ms here)\n",
+       "intersect+compact", t_isect);
+
+                        if (cfg->emit && hn && hn <= icap) {
+                            uint32_t *hx = (uint32_t *)malloc((size_t)hn * 4);
+                            int64_t *ha = (int64_t *)malloc((size_t)hn * 8);
+                            int64_t *hb = (int64_t *)malloc((size_t)hn * 8);
+                            FILE *fo = fopen(cfg->emit, "w");
+                            CK(cudaMemcpy(hx, d_x, (size_t)hn * 4, cudaMemcpyDeviceToHost));
+                            CK(cudaMemcpy(ha, d_a, (size_t)hn * 8, cudaMemcpyDeviceToHost));
+                            CK(cudaMemcpy(hb, d_b, (size_t)hn * 8, cudaMemcpyDeviceToHost));
+                            if (!fo) perror(cfg->emit);
+                            else {
+                                for (uint32_t z = 0; z < hn; z++)
+                                    fprintf(fo, "%u %lld %lld\n", hx[z],
+                                            (long long)ha[z], (long long)hb[z]);
+                                fclose(fo);
+                                printf("  wrote %u (x, a, b) to %s\n", hn, cfg->emit);
+                            }
+                            free(hx); free(ha); free(hb);
+                        }
+                    }
+                    /* ---- recovery A/B ------------------------------------ */
+                    if (d_two && hn && hn <= icap) {
+                        const uint32_t nsum = nbitword / 2;          /* bits */
+                        const uint32_t nsumword = (nsum + 31) / 32;
+                        uint32_t *d_sum = NULL, *d_rx = NULL, *d_rp = NULL, *d_rn = NULL;
+                        uint32_t *d_scratch = NULL;   /* so the plain purge cannot
+                                                       * clobber A's (x,p) output */
+                        unsigned long long *d_probe = NULL, *d_p1 = NULL, *d_rd = NULL;
+                        /* recovery output: one (x, p) per survivor-hit. Size it
+                         * generously -- the whole point is that it is small. */
+                        const uint32_t rcap = 8u * 1024u * 1024u;
+                        uint32_t hrn = 0; unsigned long long hprobe = 0, hp1 = 0, hrd = 0;
+                        float tA = 1e30f, tB = 1e30f, tsum = 1e30f;
+                        uint32_t hrnB = 0;
+
+                        CK(cudaMalloc(&d_sum, (size_t)nsumword * 4));
+                        CK(cudaMalloc(&d_rx, (size_t)rcap * 4));
+                        CK(cudaMalloc(&d_rp, (size_t)rcap * 4));
+                        CK(cudaMalloc(&d_rn, 4));
+                        CK(cudaMalloc(&d_scratch, (size_t)rcap * 4));
+                        CK(cudaMalloc(&d_probe, 8)); CK(cudaMalloc(&d_p1, 8));
+                        CK(cudaMalloc(&d_rd, 8));
+
+                        printf("\n  --- recovery A/B (side %d) ---\n", cfg->side);
+                        printf("  survivor filter: %u summary bits (1 per 64 positions),"
+                               " %.2f MB\n", nsum, nsumword * 4 / 1048576.0);
+
+                        for (int rep = 0; rep < 3; rep++) {
+                            CK(cudaMemset(d_sum, 0, (size_t)nsumword * 4));
+                            cudaEventRecord(e3);
+                            k_build_summary<<<blocks, cfg->threads>>>(d_two, nbitword, d_sum);
+                            cudaEventRecord(e4);
+                            CK(cudaEventSynchronize(e4)); CK(cudaGetLastError());
+                            float t = time_kernel(e3, e4); if (t < tsum) tsum = t;
+                        }
+                        /* occupancy of the summary table, measured not assumed */
+                        {
+                            uint32_t *hs = (uint32_t *)malloc((size_t)nsumword * 4);
+                            CK(cudaMemcpy(hs, d_sum, (size_t)nsumword * 4,
+                                          cudaMemcpyDeviceToHost));
+                            unsigned long long occ = 0;
+                            for (uint32_t z = 0; z < nsumword; z++)
+                                occ += __builtin_popcount(hs[z]);
+                            printf("  %-26s %8llu  (%.2f%% occupied)\n",
+                                   "summary bits set", occ, 100.0 * occ / (double)nsum);
+                            free(hs);
+                        }
+
+                        for (int rep = 0; rep < 3; rep++) {
+                            CK(cudaMemset(d_rn, 0, 4)); CK(cudaMemset(d_probe, 0, 8));
+                            CK(cudaMemset(d_p1, 0, 8));
+                            cudaEventRecord(e3);
+                            k_resieve_rewalk<<<blocks, cfg->threads>>>(
+                                D.plat, D.primes, fb->n, xmax, cfg->logI,
+                                d_sum, d_two, d_rx, d_rp, rcap, d_rn, d_probe, d_p1);
+                            cudaEventRecord(e4);
+                            CK(cudaEventSynchronize(e4)); CK(cudaGetLastError());
+                            float t = time_kernel(e3, e4); if (t < tA) tA = t;
+                        }
+                        CK(cudaMemcpy(&hrn, d_rn, 4, cudaMemcpyDeviceToHost));
+                        CK(cudaMemcpy(&hprobe, d_probe, 8, cudaMemcpyDeviceToHost));
+                        CK(cudaMemcpy(&hp1, d_p1, 8, cudaMemcpyDeviceToHost));
+
+                        if (D.out && D.cursor && cap) {
+                            for (int rep = 0; rep < 3; rep++) {
+                                CK(cudaMemset(d_rn, 0, 4)); CK(cudaMemset(d_rd, 0, 8));
+                                cudaEventRecord(e3);
+                                k_purge<<<blocks, cfg->threads>>>(
+                                    (const uint32_t *)D.out, D.cursor, nregion,
+                                    cap, log_region, d_two, d_scratch, rcap,
+                                    d_rn, d_rd);
+                                cudaEventRecord(e4);
+                                CK(cudaEventSynchronize(e4)); CK(cudaGetLastError());
+                                float t = time_kernel(e3, e4); if (t < tB) tB = t;
+                            }
+                            CK(cudaMemcpy(&hrnB, d_rn, 4, cudaMemcpyDeviceToHost));
+                            CK(cudaMemcpy(&hrd, d_rd, 8, cudaMemcpyDeviceToHost));
+                        }
+
+                        printf("  %-26s %8.3f ms\n", "build survivor filter", tsum);
+                        printf("  A: re-walk %llu hits, %llu passed the summary"
+                               " (%.2f%%), %u landed on a survivor\n",
+                               hprobe, hp1, hprobe ? 100.0 * hp1 / (double)hprobe : 0.0, hrn);
+                        printf("  %-26s %8.3f ms\n", "A: re-walk + filter", tA);
+                        if (hrnB || hrd) {
+                            printf("  B: purged %llu retained records, %u landed"
+                                   " on a survivor\n", hrd, hrnB);
+                            printf("  %-26s %8.3f ms\n", "B: purge retained buckets", tB);
+                        }
+                        if (hrn && hrnB)
+                            printf("  %-26s %s\n", "A and B agree on count",
+                                   hrn == hrnB ? "YES" : "NO  <-- investigate");
+
+                        /* ---- LAYOUT B, built for real: segmented fill +
+                         * purge that names the prime ---------------------- */
+                        /* Layout B is a SETTLED experiment -- layout A won by
+                         * 2.6x -- so it is opt-in. Two reasons beyond the
+                         * wasted seconds. It refills D.out and D.cursor with
+                         * segmented records in a different format, and the
+                         * --verify replay at the end of this function reads
+                         * exactly those buffers, so leaving it on by default
+                         * made `--verify --other-bits` report thousands of
+                         * differing cells and exit nonzero for a reason that
+                         * had nothing to do with the fill under test. */
+                        if (cfg->ab_resieve && cfg->verify) {
+                            printf("\n  --ab-resieve skipped: it overwrites the"
+                                   " bucket array that --verify replays\n");
+                        } else if (cfg->ab_resieve &&
+                                   D.out && D.cursor && cap && cfg->record_bytes == 4) {
+                            uint32_t *hstarts = NULL;
+                            uint32_t nsl = build_slices_b(fb, &hstarts);
+                            uint32_t *d_starts = NULL, *d_bounds = NULL;
+                            uint32_t *d_bx = NULL, *d_bp = NULL;
+                            uint32_t hbn = 0, hov = 0;
+                            float tfillB = 1e30f, tpurgeB = 1e30f;
+
+                            printf("\n  --- layout B, built ---\n");
+                            printf("  slices at the 65536 cap: %u  (the 262144 cut"
+                                   " gives %u, but a 16-bit within-slice offset\n"
+                                   "    cannot address it -- CADO asserts the same"
+                                   " bound at fb.hpp:356)\n", nsl, nslice);
+                            CK(cudaMalloc(&d_starts, (size_t)(nsl + 1) * 4));
+                            CK(cudaMemcpy(d_starts, hstarts, (size_t)(nsl + 1) * 4,
+                                          cudaMemcpyHostToDevice));
+                            CK(cudaMalloc(&d_bounds, (size_t)nregion * nsl * 4));
+                            CK(cudaMalloc(&d_bx, (size_t)rcap * 4));
+                            CK(cudaMalloc(&d_bp, (size_t)rcap * 4));
+                            printf("  boundary table: %u buckets x %u slices x 4 B"
+                                   " = %.1f MB\n", nregion, nsl,
+                                   (double)nregion * nsl * 4 / 1048576.0);
+
+                            for (int rep = 0; rep < 3; rep++) {
+                                CK(cudaMemset(D.cursor, 0, (size_t)nregion * 4));
+                                CK(cudaMemset(D.overflow, 0, 4));
+                                cudaEventRecord(e3);
+                                for (uint32_t sl = 0; sl < nsl; sl++) {
+                                    k_fill_segmented<<<blocks, cfg->threads>>>(
+                                        D.plat, hstarts[sl], hstarts[sl + 1], xmax,
+                                        cfg->logI, log_region, D.cursor,
+                                        (uint32_t *)D.out, cap, D.overflow);
+                                    /* snapshot cursor[] -> this slice's boundary.
+                                     * Bucket-major so the purge's binary search
+                                     * reads contiguously. */
+                                    k_snapshot_bounds<<<blocks, cfg->threads>>>(
+                                        D.cursor, d_bounds, nregion, nsl, sl);
+                                }
+                                cudaEventRecord(e4);
+                                CK(cudaEventSynchronize(e4)); CK(cudaGetLastError());
+                                float t = time_kernel(e3, e4);
+                                if (t < tfillB) tfillB = t;
+                            }
+                            CK(cudaMemcpy(&hov, D.overflow, 4, cudaMemcpyDeviceToHost));
+                            /* Merge slices into G super-segments and refill.
+                             * Total work is identical; only the number of
+                             * passes over the bucket array changes. If the cost
+                             * tracks G, the price of segmentation is write
+                             * amplification on the bucket array -- adjacent
+                             * slots in a cache line being written by different
+                             * passes -- and not anything about launches. */
+                            for (uint32_t G : {1u, 2u, 4u, 8u, 16u, 32u, 63u}) {
+                                float tg = 1e30f;
+                                for (int rep = 0; rep < 3; rep++) {
+                                    CK(cudaMemset(D.cursor, 0, (size_t)nregion * 4));
+                                    cudaEventRecord(e3);
+                                    for (uint32_t g = 0; g < G; g++) {
+                                        uint32_t s0 = (uint32_t)((uint64_t)g * nsl / G);
+                                        uint32_t s1 = (uint32_t)((uint64_t)(g + 1) * nsl / G);
+                                        if (s1 <= s0) continue;
+                                        k_fill_segmented<<<blocks, cfg->threads>>>(
+                                            D.plat, hstarts[s0], hstarts[s1], xmax,
+                                            cfg->logI, log_region, D.cursor,
+                                            (uint32_t *)D.out, cap, D.overflow);
+                                    }
+                                    cudaEventRecord(e4);
+                                    CK(cudaEventSynchronize(e4)); CK(cudaGetLastError());
+                                    float t = time_kernel(e3, e4); if (t < tg) tg = t;
+                                }
+                                printf("  %-26s %8.3f ms   (%u passes over the bucket array)\n",
+                                       "B: fill in G passes", tg, G);
+                            }
+                            /* Split the cost: same 126 fill launches, no
+                             * boundary snapshots. The difference is what the
+                             * segmentation bookkeeping costs; what remains
+                             * above the monolithic fill is the launches
+                             * themselves plus per-launch occupancy loss. */
+                            float tfillNS = 1e30f;
+                            for (int rep = 0; rep < 3; rep++) {
+                                CK(cudaMemset(D.cursor, 0, (size_t)nregion * 4));
+                                cudaEventRecord(e3);
+                                for (uint32_t sl = 0; sl < nsl; sl++)
+                                    k_fill_segmented<<<blocks, cfg->threads>>>(
+                                        D.plat, hstarts[sl], hstarts[sl + 1], xmax,
+                                        cfg->logI, log_region, D.cursor,
+                                        (uint32_t *)D.out, cap, D.overflow);
+                                cudaEventRecord(e4);
+                                CK(cudaEventSynchronize(e4)); CK(cudaGetLastError());
+                                float t = time_kernel(e3, e4);
+                                if (t < tfillNS) tfillNS = t;
+                            }
+                            /* and: one launch per slice but sized to the slice,
+                             * to separate launch count from occupancy loss */
+                            float tfillSized = 1e30f;
+                            for (int rep = 0; rep < 3; rep++) {
+                                CK(cudaMemset(D.cursor, 0, (size_t)nregion * 4));
+                                cudaEventRecord(e3);
+                                for (uint32_t sl = 0; sl < nsl; sl++) {
+                                    uint32_t nent = hstarts[sl + 1] - hstarts[sl];
+                                    int bl = (int)((nent + cfg->threads - 1) / cfg->threads);
+                                    if (bl < 1) bl = 1;
+                                    if (bl > blocks) bl = blocks;
+                                    k_fill_segmented<<<bl, cfg->threads>>>(
+                                        D.plat, hstarts[sl], hstarts[sl + 1], xmax,
+                                        cfg->logI, log_region, D.cursor,
+                                        (uint32_t *)D.out, cap, D.overflow);
+                                }
+                                cudaEventRecord(e4);
+                                CK(cudaEventSynchronize(e4)); CK(cudaGetLastError());
+                                float t = time_kernel(e3, e4);
+                                if (t < tfillSized) tfillSized = t;
+                            }
+                            printf("  %-26s %8.3f ms   (no boundary snapshots)\n",
+                                   "B: segmented fill", tfillNS);
+                            printf("  %-26s %8.3f ms   (grid sized per slice)\n",
+                                   "B: segmented fill", tfillSized);
+
+                            for (int rep = 0; rep < 3; rep++) {
+                                CK(cudaMemset(d_rn, 0, 4));
+                                cudaEventRecord(e3);
+                                k_purge_prime<<<blocks, cfg->threads>>>(
+                                    (const uint32_t *)D.out, D.cursor, d_bounds,
+                                    d_starts, D.primes, nregion, cap, nsl,
+                                    log_region, d_two, d_bx, d_bp, rcap, d_rn);
+                                cudaEventRecord(e4);
+                                CK(cudaEventSynchronize(e4)); CK(cudaGetLastError());
+                                float t = time_kernel(e3, e4);
+                                if (t < tpurgeB) tpurgeB = t;
+                            }
+                            CK(cudaMemcpy(&hbn, d_rn, 4, cudaMemcpyDeviceToHost));
+
+                            printf("  %-26s %8.3f ms   (%u launches%s)\n",
+                                   "B: segmented fill", tfillB, nsl,
+                                   hov ? ", OVERFLOWED" : "");
+                            printf("  %-26s %8.3f ms\n", "B: purge + name the prime",
+                                   tpurgeB);
+                            printf("  %-26s %8u  vs A's %u   %s\n",
+                                   "B: recovered (x,p)", hbn, hrn,
+                                   hbn == hrn ? "MATCH" : "MISMATCH <-- investigate");
+
+                            /* set-equality gate: A and B must recover the same
+                             * (x, p) multiset, not merely the same count. */
+                            if (hbn == hrn && hrn && hrn <= rcap) {
+                                uint32_t *ax = (uint32_t *)malloc((size_t)hrn * 4);
+                                uint32_t *ap = (uint32_t *)malloc((size_t)hrn * 4);
+                                uint32_t *bx = (uint32_t *)malloc((size_t)hrn * 4);
+                                uint32_t *bp = (uint32_t *)malloc((size_t)hrn * 4);
+                                CK(cudaMemcpy(ax, d_rx, (size_t)hrn * 4, cudaMemcpyDeviceToHost));
+                                CK(cudaMemcpy(ap, d_rp, (size_t)hrn * 4, cudaMemcpyDeviceToHost));
+                                CK(cudaMemcpy(bx, d_bx, (size_t)hrn * 4, cudaMemcpyDeviceToHost));
+                                CK(cudaMemcpy(bp, d_bp, (size_t)hrn * 4, cudaMemcpyDeviceToHost));
+                                /* compare as sorted (x,p) pairs */
+                                uint64_t *A64 = (uint64_t *)malloc((size_t)hrn * 8);
+                                uint64_t *B64 = (uint64_t *)malloc((size_t)hrn * 8);
+                                for (uint32_t z = 0; z < hrn; z++) {
+                                    A64[z] = ((uint64_t)ax[z] << 32) | ap[z];
+                                    B64[z] = ((uint64_t)bx[z] << 32) | bp[z];
+                                }
+                                std::sort(A64, A64 + hrn); std::sort(B64, B64 + hrn);
+                                uint32_t diff = 0;
+                                for (uint32_t z = 0; z < hrn; z++) if (A64[z] != B64[z]) diff++;
+                                printf("  %-26s %s (%u of %u pairs differ)\n",
+                                       "A vs B (x,p) set equality",
+                                       diff ? "FAIL" : "IDENTICAL", diff, hrn);
+                                free(ax); free(ap); free(bx); free(bp); free(A64); free(B64);
+                            }
+                            free(hstarts);
+                            cudaFree(d_starts); cudaFree(d_bounds);
+                            cudaFree(d_bx); cudaFree(d_bp);
+                        }
+
+                        cudaFree(d_sum); cudaFree(d_rx); cudaFree(d_rp); cudaFree(d_rn);
+                        cudaFree(d_scratch);
+                        cudaFree(d_probe); cudaFree(d_p1); cudaFree(d_rd);
+                    }
+
+                    /* ---- exact norms + trial division --------------------- */
+                    if (cfg->td && d_two &&
+                        run_td_stage(fb, fbs, L, POLY, cfg, D.plat, D.primes,
+                                     d_two, nbitword, xmax, blocks, cfg->threads))
+                        td_failed = 1;
+
+                    if (hother) cudaFreeHost(hother);
+                    cudaFree(dother); cudaFree(d_x); cudaFree(d_a);
+                    cudaFree(d_b); cudaFree(d_n); cudaFree(d_pre); cudaFree(d_two);
+                }
             }
             if (cfg->dump) {
                 uint8_t *h = (uint8_t *)malloc((size_t)xmax);
@@ -1087,17 +2343,27 @@ after_apply:
      * the old numbers made the sieve look done when it is one stage of five. */
     printf("  %-26s %8.3f ms  <-- vs ~225 ms replaceable / ~71 ms hybrid-retained\n",
            "SIEVE CHAIN ms/special-q", t_trans + t_fill + t_apply);
+    /* Per-q HOST work. Not part of the sieve chain above -- it runs on the CPU,
+     * once per special-q per side, and cudaEvent timing cannot see it. Goal 1
+     * is about host demand, so it is billed here rather than left implicit. */
+    printf("  %-26s %8.3f ms  (transform %.3f + sort %.3f + H2D %.3f)\n",
+           "host per-q work", h_ms_transform + h_ms_sort + h_ms_xfer,
+           h_ms_transform, h_ms_sort, h_ms_xfer);
     if (landed) {
         printf("  %-26s %8.2f\n", "ns per record (fill)", t_fill * 1e6 / landed);
         if (t_apply > 0)
             printf("  %-26s %8.2f\n", "ns per record (apply)", t_apply * 1e6 / landed);
     }
 
-    free(hslice); free(hlogp); free(hsp); free(hsrt); free(hsg); free(hslp);
+    free(hslice); free(hlogp);
+    if (hsp)  cudaFreeHost(hsp);
+    if (hsrt) cudaFreeHost(hsrt);
+    if (hsg)  cudaFreeHost(hsg);
+    if (hslp) cudaFreeHost(hslp);
     cudaFree(D.primes); cudaFree(D.roots); cudaFree(D.plat); cudaFree(D.cursor);
     cudaFree(D.out); cudaFree(D.overflow); cudaFree(D.nproj); cudaFree(D.nlost);
     cudaFree(D.l1); cudaFree(D.l1cnt); cudaFree(D.slice); cudaFree(D.slice_logp);
     cudaFree(D.surv); cudaFree(D.nsurv); cudaFree(D.dbg); cudaFree(D.probe);
     cudaFree(D.sp); cudaFree(D.srt); cudaFree(D.sg); cudaFree(D.slp); cudaFree(D.dumpbuf); cudaFree(D.survbits);
-    return 0;
+    return td_failed ? -1 : 0;
 }

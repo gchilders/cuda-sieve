@@ -14,8 +14,12 @@ NVCC_ARCH ?= -gencode arch=compute_120,code=sm_120 \
 # without editing a header and forgetting to put it back.
 DEFS      ?=
 
-NVCC_FLAGS = $(NVCC_ARCH) -O3 -std=c++17 -lineinfo -Xcompiler "-O3 -Wall" $(DEFS)
-CFLAGS     = -O3 -march=native -Wall -Wextra -std=c11 $(DEFS)
+# -MMD -MP: generate header dependencies. Without them the pattern rules below
+# listed only bench.h and plattice.cuh, so editing bigint.cuh, prp.cuh or
+# td.cuh left a stale bench_kernels.o and the binary silently did not contain
+# the change under test.
+NVCC_FLAGS = $(NVCC_ARCH) -O3 -std=c++17 -lineinfo -MMD -MP -Xcompiler "-O3 -Wall" $(DEFS)
+CFLAGS     = -O3 -march=native -Wall -Wextra -std=c11 -MMD -MP $(DEFS)
 
 CU_SRCS = bench_main.cu bench_kernels.cu
 C_SRCS  = fb_load.c verify_cpu.c poly.c rfb.c fb_cado.c
@@ -31,20 +35,22 @@ bench: $(OBJS)
 
 # CPU-only correctness gates. No CUDA, so these run on a busy box and on
 # machines without the card.
-fbtest: fbtest.c $(C_OBJS) bench.h plattice.cuh
+fbtest: fbtest.c $(C_OBJS)
 	$(CC) $(CFLAGS) -o $@ fbtest.c $(C_OBJS) -lm
 
 dumpcmp: dumpcmp.c
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
-%.o: %.cu bench.h plattice.cuh
+%.o: %.cu
 	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
 
-%.o: %.c bench.h
+%.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+-include $(OBJS:.o=.d)
+
 clean:
-	rm -f bench fbtest dumpcmp *.o
+	rm -f bench fbtest dumpcmp *.o *.d
 
 .PHONY: all clean check
 
