@@ -1,0 +1,17 @@
+# Relation containment at the tightened survivor bound (2026-08-04)
+# bench --side 1 --scale 1.275 --allowance 100  ->  survivor bound = 128
+# side 0 unchanged at bound 141 (lambda0 fixed); las reference = default bound 143
+
+lattices: 67  (basis matches las: 47, differs: 20)
+relations: 3162   unattributed: 0
+  CONTAINED (in our region, is a survivor): 3026
+  outside our sieve region (basis differs): 136
+  in region but NOT a survivor  <-- real : 0
+
+  basis-matching lattices: 2195 relations, 2195 contained (100.000%)
+  basis-differing lattices: 967 relations, 831 contained, 136 outside region
+
+# survivor popcounts, q=120000053 rho=112625526
+#              side0        side1     two-sided (pre-gcd)
+#  bound 143  24301359     22499522     1386939
+#  bound 128  24301359      9521087      590665

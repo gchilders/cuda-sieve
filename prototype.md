@@ -1,14 +1,39 @@
-# GPU Bucket Siever for NFS — Prototyping Paths
+# GPU-Resident NFS Relation Collection — Prototyping Paths
 
 ## What we're actually testing
 
-Not "build a GPU NFS." The single open question:
+Not "build a GPU NFS." The primary question is narrower, but it is broader than
+the bucket sieve alone:
 
-> **Can a GPU bucket-sieve for relation collection compete with CPU `las` on the economics we care about?**
+> **Can NFS relation collection be made GPU-resident end to end, and what are
+> its real relations/sec/watt and relations/sec/GPU?**
 
-If yes, the rentable-consumer-GPU case tips and it's worth pursuing. If a well-structured version trails by an order of magnitude with the main levers exhausted, the idea is dead — and we want to find that out cheaply, not after months. **Between those two outcomes there is a wide gray zone, and landing in it is not failure** (see "The verdict" below).
+"GPU-resident" means that the sustained per-special-q data path does not need
+CPU compute throughput proportional to GPU count: root transform, both sieve
+sides, survivor intersection and compaction, resieve/factor recovery, trial
+division, and cofactorization should run on the GPU wherever practical. A CPU
+may orchestrate, perform I/O, and handle a genuinely rare fallback tail; a
+high-end CPU busy on every q is not part of the primary target. This makes the
+result relevant both to dense nodes such as 8-GPU H200 systems and to machines
+with a useful GPU behind a weak or old host CPU.
 
-Everything below is scoped to **relation collection only**. Poly-select, filtering, linear algebra, and sqrt come from CADO unchanged.
+The first experiment was the bucket sieve because it is the largest regular
+stage and the cheapest feasibility gate. It is now measured; that does not
+turn the sieve-only benchmark into the final architecture.
+
+A **hybrid GPU-sieve + CPU-cofactor pipeline is a secondary deployment option**.
+It may be excellent on a balanced machine such as the 9800X3D + RTX 5070, and
+it is a useful near-term cross-check, but it must be reported separately. Its
+CPU/GPU ratio and power result do not set the roadmap or the ceiling for the
+primary GPU-resident design.
+
+If a well-structured GPU-resident version trails by an order of magnitude with
+the main levers exhausted, the idea is dead — and we want to find that out
+cheaply, not after months. **Between those outcomes there is a wide gray zone,
+and landing in it is not failure** (see "The verdict" below).
+
+Everything below is scoped to **relation collection only**. Poly-select,
+filtering, linear algebra, and sqrt come from CADO unchanged.
 
 ### Decisions locked (don't relitigate; build against these)
 
@@ -25,18 +50,30 @@ Everything below is scoped to **relation collection only**. Poly-select, filteri
   traffic to solve a solved problem. **Single-level is the design; revisit only if the open-line
   footprint approaches L2 size (I16e, or a small-L2 card).**
 - **Language: C++17 host, CUDA C++ device (sm_120, CUDA 13.2 — verified on this box), Python for the harness only, never in the data path.**
-- **Reuse, don't reinvent:** CADO for everything but the sieve. `las` is a *subprocess oracle* — nothing links against CADO before Path 4, and possibly not even then.
+- **Reuse algorithms and implementations, not a CPU runtime requirement.** CADO
+  and GGNFS are the oracle and baseline. YAFU's existing CUDA/OpenCL NFS
+  cofactorization, its 64/96-bit GPU ECM kernels, lasieve5 batch factoring, and
+  CADO's batch tools are references and candidate components for Path 4. A CPU
+  subprocess may bootstrap correctness, but it is not the primary endpoint.
+- **Host-independence is an architectural metric.** Report host cores and host
+  watts per GPU, and test whether throughput scales with GPU count without a
+  matching increase in CPU compute. A result that requires roughly one strong
+  CPU per GPU is the hybrid result, not the GPU-resident result.
 - **Baseline ≠ oracle.** **GGNFS `gnfs-lasieve4I15e` is the performance baseline** (AVX-512 lattice-siever asm; ~20% faster than CADO on this owner's jobs). **CADO `las` is the correctness oracle** (`-dumpfile`, `-batch-print-survivors`, `las_tracek`, checksums — GGNFS has none of these). Grade speed against GGNFS; grade correctness against CADO. See "Which siever is the opponent".
 - **Grade on *unique* relations**, not raw relations. The two sievers use different factor-base conventions and therefore have different duplicate rates; raw relations/sec is not comparable across them. See the same section.
 
 ### Open questions the ladder must answer
 
-1. Cofactorization share of `las` time on this job (Gate 0 — can kill the project in an afternoon).
+1. How much work reaches resieve, trial division, and hard cofactorization on
+   this job, and what throughput each GPU stage must sustain (Gate 0).
 2. Best achievable **updates/sec/joule** across kernel-structure × record-size, vs. CPU `las` (Gate 1).
 3. **Root-transform cost per special-q on GPU** — a second per-q cost pillar the original plan omitted; see its section below.
 4. Single- vs. two-level crossover, and where the GPU's `bkthresh` optimum sits (above CADO's).
-5. Can batch cofactorization sustain the survivor rate a fast GPU sieve produces?
-6. Real rental $/relation at Path 5, with prices written down, not assumed.
+5. Can GPU-resident resieve/factor recovery sustain the compacted-survivor
+   rate, and does the preliminary YAFU C164 cofactor result survive a
+   persistent, target-equivalent C183 run?
+6. How does the completed path scale across strong-host, weak-host, and
+   multi-GPU systems, and what is the real rental $/relation at Path 5?
 
 ---
 
@@ -44,31 +81,55 @@ Everything below is scoped to **relation collection only**. Poly-select, filteri
 
 The headline metric is **relations/sec/watt**, not wall-clock and not raw throughput. A GPU that's 2× faster at 4× the power loses.
 
-But "2–3× of CPU per watt" is an asserted threshold, not a derived one. Derive it from this box:
+The Windows-side power run on 2026-08-03 replaces the planning estimates with
+a same-session component proxy:
 
-| | Device | Power under load |
-|---|---|---|
-| CPU | Ryzen 7 9800X3D (8C/16T, 96 MB L3; 120 W TDP, 162 W PPT) | **~110 W planning estimate** — owner's estimate is "just north of 100 W" at full bore; sieving is integer/memory-bound, not AVX-bound, so it should sit well under PPT. Measure with LibreHardwareMonitor. |
-| GPU | RTX 5070 (48 SM, 12 GB GDDR7, 672 GB/s) | **~220 W planning estimate** — 250 W cap, but measured 216–218 W under a compute-saturating ECM load. A bandwidth-bound fill kernel may draw less. Measure with NVML. |
+| configuration | measured load power | full component proxy |
+|---|---:|---:|
+| 16-worker GGNFS | 125.1 W CPU PPT + 5.2 W DIMMs | **158.7 W**, including the idle RTX 5070 |
+| two-side GPU sieve | 206.7 W stage-weighted GPU board average | **262.1 W**, including host CPU PPT and DIMMs |
 
-GPU perf-per-watt relative to CPU is `(P_cpu/P_gpu) × speedup`, where *speedup* is measured against the **whole 16-thread box**, not one core. That prefactor is more fragile than it looks:
+The proxy is `CPU PPT + GPU board + both DIMM PMICs`; same-session idle is
+68.3 W. Full method and stage weighting are in `bench/RESULTS.md` finding 44.
+GPU perf-per-watt relative to CPU is still `(P_cpu/P_gpu) × speedup`, where
+*speedup* is measured against the **whole 16-thread box**, not one core. The
+measured **sieve-only** proxy ratio is `158.7 / 262.1 = 0.606`:
 
-| Goal | @ `P_cpu/P_gpu = 0.50` (110 W vs 220 W, package vs board) | @ `0.57` (CPU + DRAM ≈ 125 W) |
-|---|---|---|
-| Within 3× on perf/watt | **0.67×** | 0.59× |
-| Within 2× on perf/watt | 1.00× | 0.88× |
-| Actually beat CPU on perf/watt | 2.00× | 1.76× |
+| Goal | required speedup at measured component power |
+|---|---:|
+| Within 3× on perf/watt | **0.55×** |
+| Within 2× on perf/watt | **0.83×** |
+| Actually beat CPU on perf/watt | **1.65×** |
 
-**The measurement asymmetry is as large as the correction it's competing with.** `nvidia-smi`'s `power.draw` is total *board* power — it includes GDDR7. LibreHardwareMonitor's "CPU Package Power" is socket power — it excludes the DIMMs, and CPU sieving is exactly the workload that hammers them (~12–16 W for two DDR5 sticks under load). So the honest CPU-side number for a fair comparison is package **plus** a DRAM estimate, and that swing (0.50 → 0.57) is bigger than the gap between the owner's ~110 W estimate and this doc's original 120–160 W band.
+This is a sieve-stage ratio, not a frozen Path-5 boundary. The primary
+GPU-resident path must add the power and time of its GPU post-sieve stages plus
+the host power it actually consumes. A future hybrid path must instead add the
+power of sustained CPU cofactor workers and report its CPU/GPU pairing
+explicitly.
 
-Consequences: **quote the zone boundaries as a band (0.6×–0.7× for green), not to two significant figures**, and don't let a gray-zone verdict turn on the third digit. A wall-plug meter is the only thing that collapses this uncertainty — it measures both sides inclusive of DRAM and VRM. Not needed for Gate 0 or Gate 1; worth buying before the Path-5 verdict if the result lands in the gray zone.
+For the measured portions, the complete CPU q costs 44.61 proxy J and the
+two-side GPU sieve costs 16.87 proxy J (37.8% as much, a 2.64× advantage), or
+25.41 vs 12.48 J above idle (49.1% as much, a 2.04× advantage). **That is not
+the Path-5 verdict:** the CPU number is a complete GGNFS q, while the GPU number
+still omits intersection, primitive filtering, transfer, resieve/factor
+recovery and the cofactor feed.
+
+The proxy also excludes motherboard/chipset, storage, fans, VRM losses and PSU
+conversion losses. Keep a modest band around the derived zone boundary and do
+not let a gray-zone verdict turn on the third digit. A wall-plug meter remains
+the only instrument that collapses the final economics uncertainty.
 
 ### The zones — how to read a result
 
-- **Green — ≥ ~0.6–0.7× the full CPU box.** Clears the 3×-perf/watt bar. Go. (The band, not a point, for the power-accounting reason above.)
+- **Green — ≥ ~0.55× the full CPU box on the measured component proxy.** Clears the 3×-perf/watt bar. Carry a broader ~0.5–0.7 band until whole-box wall power exists.
 - **Gray — roughly 0.1× up to the green band.** Not a fail. Decide on evidence, specifically:
   - *Remaining levers:* if we're at 0.3× with 4 B records, single-level fan-out, or unbatched cofactorization still on the table, keep pulling. If every lever in this doc is exhausted, what's left is the economics call.
-  - *Rental economics:* the real metric for rented boxes is **$/relation**, and a rented GPU instance includes a CPU — so the marginal question is "does the GPU add relations/hour beyond what the bundled CPU produces, per marginal dollar?" Compute `(R_cpu_bundled + R_gpu) / $·hr_gpu_instance` vs. `R_cpu_box / $·hr_cpu_instance` with actual marketplace prices (vast.ai / RunPod, written down at Path-5 time). This can rescue a result that perf/watt alone wouldn't.
+  - *Rental economics:* the real metric for rented boxes is **$/relation**. For
+    the primary result, measure relations produced by the GPU-resident path and
+    charge the instance's actual host use. Separately, a hybrid deployment may
+    add relations from the bundled CPU while it services the GPU. Compare both
+    against `R_cpu_box / $·hr_cpu_instance` using written-down marketplace
+    prices (vast.ai / RunPod) at Path-5 time.
   - *Strength of the baseline:* the 9800X3D's 96 MB V-Cache makes it an unusually strong sieving CPU — bucket regions and much of the working set stay resident. We are grading against a best-case opponent; a near-miss here can still beat a generic rented CPU. Report the ratio *with this caveat attached*, not bare.
 - **Red — below ~0.1× with record size, fan-out, and the cofactor path all already exploited.** Orders-of-magnitude territory. Dead, or pivot to offloading only cofactorization / linear algebra (which we already know works).
 
@@ -101,12 +162,16 @@ Job scale: q ∈ [50M, 190M] → ~7.6M special-q → ~273 core-days → ~340M re
 
 #### The GPU's per-special-q budget
 
-Whole-box CPU per-q is `3.1 s ÷ N_effective`. At 16 workers with realistic 0.7–0.9 scaling (memory and cache contention — this is what the configuration sweep measures), that is **~0.22–0.28 s per special-q**. Against the verdict zones:
+The scaling sweep now measures `N_effective = 10.24` at 16 workers, so the
+production-equivalent whole-box CPU cost at q=130M is **~0.295 s per
+special-q**. Against the measured component-power ratio above:
 
 | | GPU must deliver one special-q in |
 |---|---|
-| Green (≥0.67× box) | **≤ 0.32–0.41 s** |
-| Beat CPU on perf/watt (2.0×) | **≤ 0.11–0.14 s** |
+| Green (≥0.55× box) | **≤ 0.54 s** |
+| Beat CPU on perf/watt (≥1.65× box) | **≤ 0.179 s** |
+
+Those are end-to-end pipeline budgets. A sieve-only timing cannot close them.
 
 Now cost the GPU sieve from this doc's own models, at I15e with 4 B records and a pessimistic 30% of peak bandwidth:
 
@@ -132,12 +197,13 @@ Now cost the GPU sieve from this doc's own models, at I15e with 4 B records and 
 > **Revised 2026-08-01 (later): 55.5 ms** once the sieve runs on CADO's own
 > factor base, which includes prime powers. Powers add 2.5e9 small-sieve
 > updates (6.84e9 total), taking side 1 to 32.8 ms and side 0 to 22.7 ms. The
-> complete two-sided sieve now sits **right at the 56 ms trial-division
-> floor**, and the small-prime sieve is half the chain.
+> complete two-sided sieve now sits **right at the then-used 56 ms retained-TD
+> line for the optional hybrid**, and the small-prime sieve is half the chain.
 >
 > **Scope of this number, 2026-08-02.** It is a *sieve* measurement: transform,
 > fill, apply, threshold, survivor list. The two-sided survivor intersection,
-> resieve, factor recovery, host transfer and the cofactor feed do not exist.
+> GPU resieve/factor recovery/TD, GPU cofactorization, and final relation output
+> do not exist.
 > **Kernel feasibility is demonstrated; relation-collection feasibility is
 > not**, and any whole-box speedup quoted from it is a projection with the
 > cofactor path assumed unchanged, not a measured relation rate. Two placement
@@ -149,10 +215,12 @@ Now cost the GPU sieve from this doc's own models, at I15e with 4 B records and 
 > already contains norm init (1.76 ms) and the small-prime sieve (13.17 ms
 > across both sides); they are not additional.
 >
-> **47 ms for the complete two-sided sieve**, against a CPU box that must
-> deliver one q in 220–280 ms, and against this document's own 56 ms
-> trial-division floor. The 30%-of-peak assumption was wrong in both
-> directions: fill runs at 17–18% of peak, apply at 58%.
+> **Latest clean run, 2026-08-03:** **64.371 ms** for the complete two-sided
+> equal-work sieve (38.177 algebraic + 26.194 rational), against a measured
+> ~295 ms CPU-box q and ~70 ms retained CPU stage in the optional hybrid.
+> Stage-weighted component
+> energy is 16.874 J/q. The older 47/55.5 ms figures above predate the later
+> correctness and norm work and are retained only as dated development history.
 >
 > The one line the model badly underestimated is the **small-prime sieve: 1–3 ms
 > budgeted, 13.2 ms measured** (4.36e9 updates, 2.9× the modelled count, and
@@ -177,33 +245,59 @@ Per special-q, single core, at q=130M (3100 ms total): Sieve 1683 ms (large 1062
 
 Four things fall out of this:
 
-1. **`f ≈ 0.23`, not 0.5–0.6.** The fraction that does *not* go away with a GPU sieve is **0.21–0.24** across the whole range if all of trial division stays on the CPU, and **0.08–0.11** if only the hard cofactorization (MPQS) does. Despite `mfba=92` and three large primes, **cofactorization does not dominate this job.** The Amdahl fear this document was built around is, on GGNFS at least, not borne out.
+1. **`f ≈ 0.23`, not 0.5–0.6.** Trial division plus cofactorization is
+   **0.21–0.24** of GGNFS wall time across the range; hard MPQS alone is
+   **0.08–0.11**. Those fractions are a CPU Amdahl floor only for architectures
+   that retain those stages on the CPU. For the primary GPU-resident design
+   they instead size the work that still has to be ported and measured.
 2. **The root-transform cost pillar is confirmed, independently and precisely.** "Sieve-Change" is exactly the per-q q-lattice root transform, and it is **12% of wall** — 373 ms/q over ~11.3M FB entries = ~33 ns/entry ≈ 85 cycles, which is the right cost for one modular inverse. The doc predicted this stage was real and co-equal with fill; the measurement agrees. A GPU doing ~8.6M modinvs in 1–5 ms wins this stage by roughly 100×.
 3. **Norm initialization is nearly free** — ~18 ms/q, 0.6% of wall. Path 3 can implement it naively without a performance concern. It remains the main *parity* obstacle, but not a performance one.
 4. **The algebraic factor base is truncated at q** (`Warning: lowering FB_bound to <q>`): 3.0M entries at q=50M rising to the full 7.6M at q≥170M. So updates/q, bucket memory, and transform cost all roughly **double across the job's q-range** — the sizing table's numbers are the *high* end. **Check whether CADO does the same truncation**; if it does not, the two sievers are not doing equal work per q and the baseline comparison needs adjusting.
 
 #### What this does to the verdict
 
-Box per-q at `N_eff ≈ 13` is ~238 ms. The CPU-resident floor is `f × 238 ms` = **56 ms** (all TD) or **24 ms** (MPQS only). Modeled GPU sieve is 45–75 ms. Those are the *same size*.
+Box per-q at the measured `N_eff = 10.24` is ~295 ms. If a deployment leaves
+all trial division on that CPU, its retained stage is `f × 295 ms` = **~70
+ms/q**; if only MPQS remains, it is **~29 ms/q**. The latest clean two-side GPU
+sieve is **64.371 ms/q**. These are useful capacity points, not unavoidable
+floors for a GPU-resident pipeline.
 
 | | per-q | implication |
 |---|---:|---|
-| CPU box | 238 ms | the thing to beat |
-| GPU sieve (modeled) | 45–75 ms | |
-| CPU floor, all TD stays | 56 ms | pipeline ≈ `max(60, 56)` ≈ 60 ms → **4.0× box** → perf/watt **1.33** |
-| CPU floor, resieve also on GPU | 24 ms | pipeline ≈ 60 ms, sieve-bound → same 4.0× until the sieve improves |
-| hard ceiling from `f` | — | `1/0.237` = **4.2×** — and reaching it means the CPU is 100% busy on TD |
+| CPU box | 295 ms | measured scaling sweep; the thing to beat |
+| GPU sieve | 64.371 ms | measured, both sides, equal-work profile |
+| preliminary external GPU cofactor stages | ~4.92 ms | C164 `31/31` stage-timer estimate at the target feed; not yet C183, persistent, powered or integrated |
+| hybrid: all TD stays on CPU | ~70 ms | ideal overlap ≈ `max(64.4, 70)` ≈ 70 ms; roughly one strong CPU per GPU |
+| GPU-heavy: only MPQS stays on CPU | ~29 ms | CPU capacity might cover about two GPUs; unbuilt and unmeasured |
+| primary GPU-resident path | unknown | add measured GPU intersection, recovery/TD, and cofactor stages to 64.4 ms |
+| hybrid-only Amdahl ceiling from `f` | — | `1/0.237` = **4.2×** if all TD remains on CPU |
 
-At 4× with CPU+GPU drawing ~330 W, perf/watt ≈ **1.33× the CPU box — green, and past the "beat CPU" line.**
+For the measured portions, the component proxy gives a 2.64× total-energy
+advantage (2.04× above idle). It is premature to turn that into pipeline
+perf/watt: intersection, primitive filtering, transfer, resieve/factor
+recovery and the target-equivalent cofactor feed have no integrated time or
+power measurement yet.
 
-**This reverses the previous reading of this section.** With `f` assumed at 0.5–0.6, the cofactor floor sat above the GPU sieve time and sieve optimization was worthless. With `f` measured at 0.23, the floor sits *below* it, and **the GPU sieve is the binding constraint again.** Both stages now matter and they are balanced within ~10%:
+**This separates two conclusions that were previously conflated.** For the
+hybrid option, the measured sieve and retained CPU stage are balanced within
+about 10%, so the 9800X3D + RTX 5070 may be an unusually good pairing. For the
+primary design, there is no measured end-to-end critical path yet: Path 1 is
+ready to feed Path 4, and Path 4 is now the central experiment. Pause sieve
+micro-tuning until the missing GPU stages reveal the real bottleneck; do not
+declare the CPU floor to be the project's floor.
 
-- Path 1 matters. If the sieve lands at 150 ms instead of 60 ms, speedup drops to 1.6× and perf/watt to 0.53 — gray. The bandwidth assumption is load-bearing and must be measured.
-- Path 4 still matters, but as a *ceiling raiser*, not a rescue: moving resieve/TD to the GPU lifts the cap from 4.2× to ~10×. That is the second lever, not the first.
+Caveats: this is **GGNFS lasieve4, not CADO las**, and CADO's cofactorization
+strategy differs (ECM chains, and `-batch` if enabled). Gate 0 on CADO is still
+required and may land elsewhere. `N_eff`, the sieve timing and the component
+power proxy are now measured; end-to-end throughput and whole-box wall power
+are not.
 
-Caveats: this is **GGNFS lasieve4, not CADO las**, and CADO's cofactorization strategy differs (ECM chains, and `-batch` if enabled). Gate 0 on CADO is still required and may land elsewhere. The 30%-of-peak bandwidth assumption and `N_eff` are both still unmeasured. But `f` is no longer a guess on this job, and the direction it moved is favourable.
-
-**Concrete Path-4 throughput target, now derivable:** ~1,900 survivors reach cofactorization per special-q. At 4× box speedup the pipeline runs ~16.8 special-q/s, so cofactorization must sustain **~32,000 survivors/sec**. At the measured 0.16 ms/survivor/core that needs ~5 of 16 threads — feasible, and now a number to test rather than a hope.
+**Concrete Path-4 throughput targets, now derivable:** the sieve intersection
+contains about 0.8M primitive candidates/q, or roughly **12M candidates/s** at
+the measured 15.5 q/s sieve pace. GGNFS's recovery/TD funnel leaves about 1,900
+hard-cofactor candidates/q, or roughly **30,000/s**. Those are the two GPU
+batch rates to test. CPU capacity remains useful as a hybrid control, not as
+the acceptance criterion.
 
 ### Which siever is the opponent — and why it isn't CADO
 
@@ -458,23 +552,59 @@ Measure shared-memory bank-conflict rate: with two positions per word, random of
 
 ---
 
-## Amdahl: cofactorization is co-equal, not a footnote
+## Post-sieve work is co-equal, not a footnote
 
-This is the largest structural risk in the plan and the original ladder under-weighted it. **With the test-sieve data in hand it is no longer just a risk — the arithmetic in "Concrete target" shows the verdict lands on the cofactor share `f` and on essentially nothing else.**
+The original ladder under-weighted resieve, factor recovery, trial division,
+and cofactorization. GGNFS measures them at 21–24% of CPU wall time, including
+8–11% in hard MPQS. That creates a 4.2× Amdahl ceiling for a **hybrid that
+leaves all of TD on the CPU**. It does not create an irreducible floor for the
+primary project: it identifies the next GPU workload.
 
-If `las` splits 60/40 sieve/cofactor, then a **10× faster sieve gives 2.2× overall**. A *perfect, free* sieve gives 2.5×. The GPU win is eaten almost entirely, and no amount of kernel tuning recovers it. The modeled GPU sieve time (~45–75 ms/q) is already below the CPU cofactor floor (~0.12 s/q at `f=0.5`), which means we are plausibly *starting* in the regime where this paragraph binds.
+This distinction matters across machines. The measured 9800X3D and RTX 5070
+are almost balanced for the hybrid split, so that deployment is worth keeping.
+A dense multi-GPU node or an old CPU paired with a modern GPU is not: requiring
+CPU TD throughput for every GPU would strand devices or require proportional
+host expansion.
 
-On this job — `lpba=32`, `mfba=92`, three large primes — the cofactor share will be large. **Measure it before writing any CUDA.** That single measurement bounds the entire project's ceiling and costs an afternoon.
+There is already substantial implementation evidence to build from:
 
-The mitigation is already built into CADO and is better than the original "use GMP-ECM's CUDA path" plan:
+- **YAFU has an NFS-facing CUDA/OpenCL cofactorization path**, including
+  batched 64- and 96-bit ECM kernels in `factor/gpu_cofactorization.c` and a
+  call site in `factor/nfs/nfs_sieving.c`. It is a real starting point, not a
+  proof for this job; current code explicitly rejects some layouts, including
+  3LP cofactors on both sides.
+- **lasieve5** (`~/yafu/factor/lasieve5_64/batch_factor.c`) is an independent
+  reference for the production 3LP batch-cofactor architecture.
+- **CADO `las -batch`** and `precompbatch` / `finishbatch` / `finishecm` expose
+  a product-tree implementation and a CPU reference result. Product/remainder
+  tree work is itself a candidate for GPU batching.
+- **`las -batch-print-survivors <basename>`** dumps the post-sieve population
+  and **`las -stats-cofact`** records the funnel, making CADO an oracle for each
+  GPU stage without making it the production runtime.
 
-- **`las -batch`** — batch cofactorization via prime product trees. Extract everything below `2^batchlpb` with a batch remainder tree, leaving only hard cofactors for ECM. Remainder trees are bignum multiply chains: highly parallel and genuinely GPU-mappable, unlike divergent per-cofactor ECM.
-- **`las -batch-print-survivors <basename>`** — dumps survivors to files for external cofactorization. This is precisely the architecture the GPU project wants (GPU sieves → emits survivors → separate cofactor stage), and CADO supports the split natively.
-- **`precompbatch` / `finishbatch` / `finishecm`** are already built in `sieve/ecm/`.
-- **`las -stats-cofact <file>`** writes cofactorization statistics directly.
-- **lasieve5 (`~/yafu/factor/lasieve5_64/batch_factor.c`)** is a second, independent reference for exactly this 3LP batch-cofactor architecture — the Franke/Kleinjung code that production 3LP jobs actually use.
+There is now one preliminary rate measurement. An owner-supplied February log
+from Ben Buhrow's standalone `nfs_3lp_batch_factor` suite processed one million
+C164 `lpbr=lpba=31` inputs on the RTX 5070. Its three printed 64/96-bit stages
+sum to **2.5901 s, or 386,084 inputs/s**—13.1x the current 29,500/s Path-4
+feed estimate and, if the workload transferred directly, about **4.92 ms/q**.
+The cold outer invocation was 11.9524 s; the CPU batch-GCD path on the 9800X3D
+was 22.7166 s. GPU yield was 10,246 complete relations versus 10,257 on the
+CPU (99.893%). Full provenance, arithmetic, and harness-audit caveats are in
+`bench/RESULTS.md`, finding 47.
 
-Plan for cofactorization as a first-class component with its own throughput target: it must sustain the survivor rate the GPU sieve produces, or the sieve speedup is wasted.
+Treat this as a **positive fail-fast signal, not a closed stage**. The source
+data are C164 `31/31`, not the target C183 `31/32`; the GPU path still performs
+recurring preparation, validation, compaction, and possible fallback work on
+the CPU; and 2.5901 s is the sum of printed stage timers rather than a
+persistent end-to-end wall time. If a controlled target run holds near
+4.92 ms/q, hard cofactorization leaves about 16–20 ms/q for intersection plus
+resieve/recovery/TD inside the aggressive 2x-energy budget. That would move
+the largest performance risk to recovery/TD rather than close Path 4.
+
+Plan for every post-sieve stage as a first-class component with a throughput
+and energy target. CPU implementations remain valuable for parity and as an
+optional hybrid/fallback mode, but the primary acceptance test is that GPU
+throughput does not require host compute to scale one-for-one with GPU count.
 
 ---
 
@@ -511,7 +641,7 @@ Everything below was audited on this box on **2026-08-01**. Path 0's numbers are
 
    **But that build is tuned for AMD K8.** `~/gmp-6.3.0/gmp-mparam.h` is a symlink to `mpn/x86_64/k8/gmp-mparam.h`, and `config.log` records only `build='x86_64-pc-linux-gnu'` — generic. This CPU is family 26 (0x1A, Zen 5); GMP 6.3.0 predates it, `config.guess` didn't recognize it, and configure fell back to the 2003-era K8 path. Meanwhile `mpn/x86_64/zen3/` ships tuned `mul_basecase`, `sqr_basecase`, `addmul_1`, `mul_1`, `sbpi1_bdiv_r` — **exactly the routines that dominate bignum product trees** — and they are sitting unused.
 
-   Why this matters more than it looks: **CADO's batch cofactorization is GMP product trees**, and cofactorization is now the number the entire verdict rests on. (Non-batch `las` is largely unaffected — 92-bit cofactors go through CADO's own `modredc`, not GMP.) The bias runs *against* the project: a slow GMP inflates `f`, and pipeline speedup ≈ `1/f`.
+   Why this matters for the CPU reference: **CADO's batch cofactorization is GMP product trees**. (Non-batch `las` is largely unaffected — 92-bit cofactors go through CADO's own `modredc`, not GMP.) A slow GMP inflates the optional hybrid's `f` and distorts the CPU oracle timing; it does not set the GPU-resident architecture's ceiling.
 
    **Root cause, precisely:** the original configure line was `./configure --prefix=/usr/local --enable-cxx CFLAGS="-O3 -march=native" CXXFLAGS="-O3 -march=native"`. `-march=native` looks like it should cover this — **it does not.** GMP's speed comes from hand-written `.asm` in `mpn/`, and which of those files gets compiled is chosen by the **config triplet**, not by compiler flags. `config.guess` returned bare `x86_64-pc-linux-gnu`, so the assembly came from the generic/K8 path while the surrounding C got Zen 5 codegen.
 
@@ -583,7 +713,7 @@ Nothing in Path 1 or Path 2 is blocked. Record the substitution so nobody later 
 
 ### Resolved with the owner (2026-08-01)
 
-- **CPU power: LibreHardwareMonitor** on the Windows host (Ryzen Master also available as a cross-check). RAPL is confirmed dead inside the guest — `/sys/class/powercap` does not exist, so `turbostat` and `perf` energy counters are out with no software fix. Log "CPU Package Power" to CSV and align by timestamp. Expected ~110 W; see the power section for why the DRAM exclusion matters more than the exact value.
+- **CPU power: measured 2026-08-03 with HWiNFO64 on Windows.** RAPL remains unavailable inside the guest. The 16-worker plateau was 125.1 W CPU PPT + 5.2 W across the two DIMMs; including the idle GPU gives a 158.7 W component proxy. See `bench/RESULTS.md` finding 44.
 - **Operating point: `-A 29` (= I=15), `-adjust-strategy 0`, `-sqside 1`.** Locked; see "Concrete target".
 - **Two jobs:** C183 for every graded number, a ~C120 for Path-3 parity debugging only. See "Concrete target".
 - **Quiet box:** GPU frees up ~45 min from the audit (it was at 100% / 216 W running `/ecm`, alongside four `python3` processes at ~95% CPU and ~45 GB RSS). Nothing is measurable until then, and the CPU side needs the python jobs stopped too.
@@ -600,7 +730,7 @@ The box is running long jobs the owner does not want to lose (four `python3` pro
 **Runs now — GPU free, CPU busy, no CADO needed:**
 
 1. Scaffold `bench/`; copy the `gerbicz_bench` Makefile (`-gencode arch=compute_120,code=sm_120 -O3 -std=c++17`).
-2. **Path 1.** Load `oracle/input.job.afb.0` directly (format decoded, already SoA), walk real `(p,r)` progressions, implement variants (a)–(d) and (T), sweep record size. Grade in **ms/q** against the 182 ms / 56 ms lines above.
+2. **Path 1.** Load `oracle/input.job.afb.0` directly (format decoded, already SoA), walk real `(p,r)` progressions, implement variants (a)–(d) and (T), sweep record size. Grade in **ms/q** against the measured ~225 ms / ~70 ms lines above.
 3. Path 2 (apply kernel, shared-memory region, bank-conflict rate) follows immediately — same inputs, same harness.
 
 **Waits for a quiet box:**
@@ -608,9 +738,10 @@ The box is running long jobs the owner does not want to lose (four `python3` pro
 4. CADO Gate 0 — confirm `f ≈ 0.23` on `las`, and check whether it truncates the factor base at `q` (GGNFS does; CADO reportedly does not).
 5. `makefb` both sides for `oracle/c183.poly`; `-fbc` cache. *(Only needed for CADO parity work in Path 3, not for Paths 1–2.)*
 6. Second `las` build at `SIZEOF_P_R_VALUES=4`; A/B against the Zen3 GMP. *(Baseline-fairness work — and note the baseline is now GGNFS, so this only matters for the CADO oracle's own speed, which demotes it.)*
-7. `N_eff` configuration sweep — but for **GGNFS** (14–16 single-threaded workers) now that it is the baseline, not just for CADO.
+7. ~~`N_eff` configuration sweep for **GGNFS**~~ — **done 2026-08-03:** 16 workers win, `N_eff = 10.24`; `bench/RESULTS.md` finding 43.
 
-Item 7 is the highest-value CPU measurement, because `N_eff` is the divisor in every target number on this page and is currently an assumption.
+Item 7 was the highest-value CPU measurement because `N_eff` is the divisor in
+every target number on this page. It is no longer an assumption.
 
 ### Superseded ordering (retained for the record)
 
@@ -629,13 +760,25 @@ Step 4 is the one that can move the verdict, because both handicaps bias in the 
 
 ## The ladder (fail-fast order)
 
-**Ordering, after the GGNFS timing breakdown:** with `f ≈ 0.23` measured rather than feared, the ladder's original order stands — the GPU sieve is the binding constraint and Path 1 is the right next step. Path 4 is a *ceiling raiser* (moving resieve/TD to the GPU lifts the cap from 4.2× to ~10×), not a rescue, so it stays after Paths 1–3. The one thing worth pulling forward is the **CADO** `f` measurement in Path 0, since the whole ordering rests on `f` being ~0.23 on CADO too and not just on GGNFS.
+**Current ordering:** Paths 1–3 have established the GPU sieve's timing and
+most of its correctness basis. Close exact survivor-set containment, then make
+Path 4 GPU-resident stage by stage: device intersection/compaction, primitive
+filtering, resieve/factor recovery/TD, and GPU cofactorization. The preliminary
+C164 cofactor microbenchmark clears the raw rate gate by 13.1x, but its
+target-equivalent persistent rerun remains an independent checkpoint when the
+box is idle. Path 5 measures the resulting relation producer and its host
+independence. CADO Gate 0 remains useful workload characterization, but the
+primary design no longer rests on a CPU cofactor fraction generalising from
+GGNFS.
 
-### Path 0 — Baseline, oracle, and the Amdahl gate — **do this first, it is a decision point**
+### Path 0 — Baseline, oracle, and post-sieve workload characterization
 
 Prerequisite: **Step 0 above is closed.** In particular the baseline `las` build is the faster of the two `SIZEOF_P_R_VALUES` variants, the FB cache exists, and the box is idle.
 
-This is not just a baseline. It is the cheapest, highest-information measurement in the whole project, and it can kill the idea before a line of CUDA is written.
+This establishes the CPU opponent, correctness oracle, and the volume entering
+each post-sieve stage. Its Amdahl fraction determines the ceiling of a hybrid
+deployment; for the primary GPU-resident goal it sizes Path 4 rather than
+deciding whether Path 4 exists.
 
 #### Baseline siever configuration — sweep it, don't assume `-t 16`
 
@@ -663,14 +806,17 @@ Record aggregate relations/sec **and** package power for each — they don't pea
 
 1. Run CADO `las` on one special-q range at the locked operating point, using the winning configuration from the sweep, `-production` for the timing runs. Record relations/sec and CPU package power (LibreHardwareMonitor on the Windows host — RAPL is *not available* under WSL2).
    - For oracle and parity work, always use **one process, `-t 1`, one q**: deterministic, no thread interleaving in dumps.
-2. **Capture the sieve-vs-cofactorization split** from the end-of-run timing report, `-T -T` (fine-grain timings, per-q at two `T`s), and `-stats-cofact`. *Decision:* if cofactorization dominates, the sieve ceiling is low — either commit to solving cofactorization too (see above) or stop here.
+2. **Capture the sieve-vs-cofactorization split** from the end-of-run timing report, `-T -T` (fine-grain timings, per-q at two `T`s), and `-stats-cofact`. This sizes the GPU post-sieve batches and separately gives the hybrid Amdahl ceiling; a large fraction increases Path 4's importance rather than killing the primary design.
 3. **Extract the CPU-side Gate-1 comparator while you're here:** updates/sec/joule for `las`'s fill phase ≈ (6.1e8 updates/q) ÷ (fill seconds per q from `-T -T`) ÷ (package watts during the run). Approximate is fine; write down how it was computed.
 4. **Sweep the CPU-side cost structure.** `las` exposes `bkthresh`, `bkthresh1`, `bkthresh2` (2- and 3-level bucket sieving), `-B` (log bucket region), `-Bi` (log fan-out per level), `bkmult` — all verified present in the local build. Sweeping these on the CPU teaches the fill/apply cost structure *for this exact job* in a day, and every knob has a direct GPU analogue. Do this before designing the GPU fan-out.
 5. Dump the factor base — **both sides**, freshly generated for the C183 (Step 0 items 1–2); the staged `cado_roots1.gz` is for a different number and side 0 has never been materialized at all. Plus a known survivor set for one special-q via `-batch-print-survivors`. This is the correctness oracle.
 6. Capture per-q `las -v` output: it prints `# Sieving <q-lattice basis>; I=...; J=...` and `# Checksums over sieve region: after all sieving: ...`. The basis and J are needed to replicate a q exactly; the checksums are a cheap correctness summary.
 7. Grab a **byte-exact sieve-region dump** for one or two special-q via `-dumpfile <stem>` (writes `<stem>.<side>.sq<q>.rho<r>.side<N>.dump`). This is a *stronger and more debuggable* oracle than checksums — you can diff to the first divergent byte.
 
-Cross-check against `gnfs-lasieve4I15e` using the existing `test_sieve.sh` tooling, since that's the pipeline you already trust. Use CADO as the primary oracle — it's better instrumented and it's what the reuse map depends on.
+Cross-check against `gnfs-lasieve4I15e` using the existing `test_sieve.sh`
+tooling, since that is the CPU pipeline already trusted. Use CADO as the primary
+oracle because it is better instrumented; that does not make it the production
+cofactor runtime.
 
 ### Path 1 — Fill-kernel microbenchmark — highest info per unit effort
 
@@ -721,10 +867,9 @@ predicted "mild"; confirmed, and the slowest-block-bound trap does not bite here
 | **total** | **13.87** |
 | *both sides, extrapolated* | *≈ 28* |
 
-Against **182 ms** (tie the box) and **56 ms** (TD floor). Apply, small-prime
-sieve, norm init and threshold scan are **not yet measured**, so this is not yet
-a Gate-1 answer — but the fill and transform stages together are using a quarter
-of the floor budget.
+At the time this first pass was compared against the old **182 ms / 56 ms**
+guideposts. Those are superseded by the measured **~225 ms / ~70 ms** lines;
+apply, small-prime sieve, norm init and threshold were added later.
 
 Two design decisions were overturned (2 B records, two-level fan-out) and two
 predictions confirmed (run-aggregation worth **2.3×**; the transform is a
@@ -734,15 +879,18 @@ section for the corrections.
 
 #### The number Path 1 must produce
 
-Not a bandwidth percentage. **Milliseconds per special-q for the full GPU sieve chain** (transform + fill + apply + small-sieve + threshold), against two lines derived from the GGNFS breakdown at `N_eff ≈ 13`:
+Not a bandwidth percentage. **Milliseconds per special-q for the full GPU sieve chain** (transform + fill + apply + small-sieve + threshold), against two lines derived from the GGNFS breakdown at the measured `N_eff = 10.24`:
 
 | | ms/q | meaning |
 |---|---:|---|
-| GPU-replaceable CPU work (Sieve + medsched + Sieve-Change) | **182 ms** | match this and the GPU merely ties the box on the sieve |
-| CPU-resident floor (TD stays on host) | **56 ms** | get below this and the sieve is no longer the constraint |
-| modelled GPU sieve | 45–75 ms | the hypothesis under test |
+| GPU-replaceable CPU work (Sieve + medsched + Sieve-Change) | **~225 ms** | match this and the GPU merely ties the box on the sieve |
+| hybrid retained CPU stage (TD stays on host) | **~70 ms** | constrains the optional hybrid, not the GPU-resident design |
+| measured GPU sieve | **64.371 ms** | the two stages are well matched for the hybrid option |
 
-Land under ~60 ms → 4.0× box, perf/watt ≈ 1.33, green. Land at 150 ms → 1.6×, perf/watt 0.53, gray. **That factor of 2.5 in kernel quality is the whole question**, and it is measurable without a single CPU cycle from the busy box.
+The sieve component target is met. The primary question has moved to device
+intersection/compaction, primitive filtering, resieve/factor recovery, GPU
+cofactorization, and final relation output; bare sieve-kernel speed no longer
+decides the result.
 
 Implement fill several ways and measure all of them:
 
@@ -770,7 +918,8 @@ Given filled buckets, accumulate logs into a shared-memory region. Use the 16-bi
 >
 > Best config: **region 2^14, 4 B records, 16-bit cells, 512 apply threads.**
 > Apply **3.08 ms/special-q**; algebraic-side chain now **17.4 ms** (T 1.80 +
-> fill 12.30 + apply 3.08) against 182 ms to tie and 56 ms to reach the TD floor.
+> fill 12.30 + apply 3.08) against the then-current 182/56 ms guideposts
+> (superseded by ~225/~70 ms in finding 43).
 > Correctness: region 16384 at full I15e, 9,483 records replayed on the CPU,
 > **0 cells differ** — that gate covers norm init, smem atomics, the log p
 > lookup and the threshold test at once.
@@ -798,11 +947,14 @@ Given filled buckets, accumulate logs into a shared-memory region. Use the 16-bi
 >   is the bucket read plus ~5 MB. That is the structural edge over CPU `las`,
 >   which must stream the region through cache.
 
-### Path 3 — Single special-q, end-to-end
+### Path 3 — Single special-q, complete sieve stage
 
-Wire fill + apply on the real dumped poly/FB. Sieve one special-q and threshold to survivors.
+Wire fill + apply on the real dumped poly/FB. Sieve one special-q and threshold
+to survivors. This is end-to-end for the **sieve stage**, not for relation
+collection.
 
-Be explicit about what "end-to-end for one q" requires beyond Paths 1–2 — this is where the hidden scope lives:
+Be explicit about what a complete sieve stage for one q requires beyond Paths
+1–2—this is where the hidden scope originally lived:
 
 1. **q-lattice basis reduction** per special-q (host, microseconds; cross-check against the basis `las -v` prints). **Reduce under the *skewed* norm** `|(a,b)|² = (a/√s)² + (b√s)²`, not the plain one — measured 2026-08-01, this is not a refinement, it is required for the norms to be computable at all. An unskewed reduction gives |a| ~ |b| ~ √q, the homogeneous terms `c_k a^k b^(d−k)` then span **10³⁹**, `log2|F|` is set by `c₀b⁵` alone and the leading term underflows fp32 outright. Skewed: A = 2.33e12, B = 1.64e4, normalised coefficients all O(1) (`-0.0136, -0.0605, 1, -0.419, -0.0054, 0.381`). That balance is what the skew parameter is *for*, and it is the only thing that makes fp32 norm evaluation possible.
 2. **Norm initialization** — the sieve array starts at the log-norm bound per position, not zero. A simple float evaluation of `log|F(i,j)|` per position is fine to start, **but exact parity with las requires reproducing its per-q log scale** (las rescales so norms fit a byte) and its piecewise approximation + rounding. Budget this; it's the main obstacle to byte-exact matching.
@@ -814,7 +966,10 @@ Be explicit about what "end-to-end for one q" requires beyond Paths 1–2 — th
 2. **PASSED 2026-08-02, by a different instrument.** The dumpfile route stays dead — las's dump carries ~41 log units per position, matching the *small-sieve-only* expectation (39.31) rather than the whole factor base (54.65), and correlates with our region at **+0.03** in either i-orientation against a **+0.64** control; it sits behind an `ASSERT_ALWAYS` that made its only `open()` call unreachable, so it has rotted. **Gate 5 replaced it outright and is strictly better:** `las_tracek` is a *stock* CADO target needing no patch, and it prints every ideal applied to a position with its log, rather than one byte. Result: **8 of 8 exact log sums**, four positions × two sides, with the *ideal lists* agreeing entry by entry — two of the positions chosen because long projective power ladders hit them. The comparison is made twice: once against a direct enumeration of the factor base (which gates roots and logs, and is what found the bugs), and once against the value read back out of `k_apply` via `bench --probe`, which has been through the transform, the walk, the tiering, the fill, the small sieve and the GPU apply. **The second is the one that closes the gate**; the first alone is ideal/log agreement, and describing it as sieve parity was an overclaim held for about an hour. Full detail in `oracle/PARITY.md` and RESULTS.md finding 26.
 
    Getting there cost two real fixes that nothing else would have found: las's printed `scale` is rounded to 2 dp and the exact values are **1.275 / 1.925** (enough to move `fb_log` by one for a band of primes), and the survivor bound is a *truncating* cast plus a guard bit, not a round. Norm initialisation still differs by 0..+2 — that is las's own approximation plus `LOGNORM_GUARD_BITS`, and **our fp32 evaluation is the more accurate of the two**, which is also why a byte-for-byte region diff could never have reached zero even with a working dumpfile.
-3. Match the `-batch-print-survivors` survivor set (start as superset/subset stats with a threshold tolerance band; tighten to exact).
+3. Compare against the `-batch-print-survivors` survivor set on canonical
+   `(a,b)` pairs. Require **`CADO \ GPU = 0`** at the locked profile; report
+   `GPU \ CADO` separately as false-survivor pressure rather than forcing equal
+   counts across different norm approximations.
 4. `las -v` checksums — once gate 2 passes these are free; use them as the cheap regression check thereafter.
 5. `TRACE_K` / `las_tracek` follows a single `(i,j)` through las's pipeline — the right tool when one position mismatches.
 
@@ -841,25 +996,71 @@ Two traps worth writing down. **las groups the q-lattice basis by coordinate** (
 
 Then measure GPU sieve time for that q vs `las` for the same q.
 
-### Path 4 — Cofactorization — reuse, don't reinvent (but do invest)
+### Path 4 — GPU-resident post-sieve and cofactorization — the primary next path
 
-Recover FB primes on survivors via **resieve** (a second pass over survivors only — tiny), not re-division by the whole FB.
+Build this as measured stages, keeping candidates on device between them:
 
-Route the large-prime remainder through CADO's batch path (`-batch` / `finishbatch`) rather than per-cofactor ECM — **as subprocesses first**; only link if the process boundary measurably hurts. If batch cofactorization becomes the bottleneck, the product-tree remainder step is the GPU-mappable part; GMP-ECM's CUDA/CGBN path handles the residual hard cofactors. lasieve5's `batch_factor.c` is the second reference implementation.
+1. Keep both survivor bitmaps resident, AND them, compact the intersection,
+   and apply the full primitive `gcd(i,j) == 1` filter. First close exact CADO
+   containment on canonical `(a,b)` pairs; then keep the production path off
+   disk and off the host.
+2. Recover factor-base primes via **GPU resieve** over compact survivors, then
+   recompute norms and perform the regular factor-recovery/trial-division
+   checks. This bulk stage is part of the primary GPU deliverable even though
+   GGNFS accounts for it inside its CPU TD timer. **Design settled 2026-08-03**
+   — re-walk the factor base against a 1 MB hierarchical survivor filter, side 0
+   first, direct per-survivor testing for `p < bkthresh`, and no change to the
+   4 B record. See the review notes at the end of this document.
+3. Batch the remaining large cofactors into the existing YAFU GPU
+   cofactorization design. Start from its NFS `relation_batch_t` interface and
+   CUDA 64/96-bit ECM kernels; use its unsupported cases as an explicit test
+   matrix, not as assumptions. Finding 47's preliminary C164 run is a positive
+   rate gate, not the integration measurement. Before the controlled rerun,
+   zero all batch accounting, fix the CUDA-version/context setup, select
+   native sm_120 PTX, and retain the context, module, and buffers. Then sweep
+   batch size and queue depth on the actual C183 `31/32` population, compare
+   every batch with CADO/lasieve5 CPU results, and measure recurring host work
+   and CPU/GPU power. One million inputs are about 34 seconds of arrivals at
+   the projected feed, so a million-record-only result is insufficient.
+   **Assume a device-resident cofactor queue spanning many special-q from the
+   start**: ~1,851 cofactors/q fills 2.5% of this device's resident threads, so
+   per-q lockstep cannot work, and batching across q rather than running curves
+   in parallel is what preserves the early-exit stopping rule. This is the one
+   hard-to-reverse decision in the post-sieve path. This stage can be developed
+   entirely against a `-batch-print-survivors` capture, before stages 1–2 exist.
+4. Validate, deduplicate, and emit complete relations. Returning compact final
+   relations to the host is expected; returning every sieve survivor for
+   sustained CPU processing is the hybrid architecture.
 
-Per Amdahl above: this needs a throughput target, not just a "confirm it isn't the bottleneck" check — it must sustain the survivor rate Path 5's sieve produces.
+Each stage needs throughput, joules, candidate-in/candidate-out counts, and a
+correctness oracle. A temporary CPU fallback is acceptable while bringing up a
+stage, but record its frequency and cost. It is compatible with the primary
+goal only if it remains rare enough that host demand does not scale materially
+with GPU count.
 
-### Path 5 — Throughput mode — the real number
+### Path 5 — GPU-resident throughput mode — the real number
 
-Batch many special-q; overlap transform/fill/apply/cofactor with CUDA streams + graph capture (cuda-mpqs does exactly this; the per-slice launch structure from the 2 B record path is graph-friendly too). Slab the sieve area if running I16e. Cofactorization overlaps on the CPU while the GPU sieves the next q's.
+Batch many special-q and overlap transform, fill, apply, survivor processing,
+resieve/TD, and cofactorization with CUDA streams and graph capture. Slab the
+sieve area if running I16e. Keep the steady-state candidate path on the GPU and
+transfer final relations plus telemetry.
 
-Measure aggregate relations/sec/watt vs. the Path-0 baseline, **and compute $/relation with written-down rental prices**. This is the verdict, graded on the zones.
+Measure aggregate unique relations/sec/watt, relations/sec/GPU, required host
+cores/GPU, and scaling from one to multiple GPUs where hardware is available.
+Include a weak-host test or CPU-throttled proxy so a good result cannot depend
+silently on the 9800X3D. Compute $/relation with written-down rental prices.
+This is the primary verdict, graded on the zones.
+
+After that result exists, measure the **hybrid deployment option** separately:
+GPU sieve with GGNFS/CADO CPU factor recovery and cofactoring, overlapped across
+q. Finding 45 projects that this could suit the 9800X3D + RTX 5070; it is a
+valuable product mode, not the definition of Path 5.
 
 ---
 
 ## Instrument from day one
 
-- **relations/sec/watt** (verdict) — NVML for GPU power, package power for CPU. Sample continuously, not at endpoints.
+- **relations/sec/watt** (verdict) — log CPU PPT, GPU board power and both DIMM PMICs together; use whole-box wall power for the final economics. Sample continuously, not at endpoints.
 - **updates/sec/joule** — the Path-1 proxy for the verdict. Report this instead of bare bandwidth percentages.
 - **transactions per update** = `lts__t_sectors.sum ÷ n_updates` — the lever that actually moves the answer, and directly comparable to msieve-s's results. **Bytes per update must be derived, not measured**: absolute `dram__bytes_*` counters return `n/a` under WSL2 (see Step 0).
 - Achieved memory bandwidth as % of peak — `dram__throughput.avg.pct_of_peak_sustained_elapsed` works. A diagnostic for "is this kernel well written," *not* a gate.
@@ -870,10 +1071,14 @@ Measure aggregate relations/sec/watt vs. the Path-0 baseline, **and compute $/re
 
 - **GPU: works.** `nvidia-smi --query-gpu=power.draw --format=csv --loop-ms=100` (WSL passthrough at `/usr/lib/wsl/lib/nvidia-smi`) or pynvml in the harness.
 - **CPU: RAPL is absent under WSL2.** `/sys/class/powercap` doesn't exist here; `turbostat`/`perf` energy counters need MSR access the guest doesn't have. Options, best first:
-  1. **HWiNFO64 (or LibreHardwareMonitor) on the Windows host**, logging "CPU Package Power" to CSV during the run; align by timestamp.
+  1. **HWiNFO64 on the Windows host — done 2026-08-03.** Log CPU PPT, NVIDIA GPU Power and each DIMM's Total Power to one CSV and align by timestamp. The measured proxy is 158.7 W for 16-worker GGNFS and 262.1 W stage-weighted for the two-side GPU sieve; finding 44.
   2. **Wall-plug meter** for whole-box draw — arguably the *honest* number for $/relation anyway (it includes DRAM/VRM/fans). Report total draw, not delta-over-idle, for the economics; note idle separately.
-  3. Last resort: carry a 120–160 W band as explicit uncertainty. Acceptable for early gates, not for the Path-5 verdict.
-- For the final verdict, charge the GPU pipeline for the host cores it keeps busy (cofactor threads included), and the CPU baseline for its whole package. Whole-box wall power for both runs sidesteps the allocation argument entirely.
+  3. Until then, carry the unmeasured motherboard/VRM/storage/fan/PSU contribution as explicit uncertainty. Acceptable for early gates, not for the Path-5 verdict.
+- For the primary verdict, charge the GPU-resident pipeline for every host core
+  it actually uses and report host cores/GPU alongside whole-box wall power.
+  Repeat with reduced host capacity or multiple GPUs to expose hidden CPU
+  scaling. For the optional hybrid result, charge all sustained cofactor
+  threads explicitly. The CPU baseline always pays for its whole package.
 
 ---
 
@@ -891,7 +1096,9 @@ Measure aggregate relations/sec/watt vs. the Path-0 baseline, **and compute $/re
 
 **Resieve, don't re-divide.** Trial-dividing survivors by the whole FB throws the win away.
 
-**Scope creep.** Dump poly-select, filtering, linear algebra, and sqrt from CADO and use them as-is. Touch only the sieve.
+**Scope boundary.** Keep poly-select, filtering, linear algebra, and sqrt from
+CADO and use them as-is. The GPU project owns **relation collection**, including
+the post-sieve factor-recovery and cofactor stages—not merely bucket sieving.
 
 ---
 
@@ -916,20 +1123,49 @@ The pattern across all six: **micro-optimizing the scatter kernel does not work.
 
 Three changes from the original version: bandwidth percentage is demoted from gate to diagnostic, the Amdahl check is promoted to a gate, and **the gates are graded green/gray/red rather than pass/fail** — a shortfall of 2× is a decision point with named options, not a kill. Only order-of-magnitude shortfalls with the levers exhausted kill the project.
 
-**Gate 0 (Path 0) — cofactorization share. Partially answered already, on GGNFS: `f ≈ 0.23`.** The GGNFS fine-grain timings (complete accounting, see "Concrete target") put trial division + cofactorization at 21–24% of wall across the whole q-range, with hard cofactorization (MPQS) at only 8–11%. **This gate is provisionally passed** — the Amdahl ceiling is ~4.2×, not the ~1.7× a 60/40 split would have implied.
+**Gate 0 (Path 0) — post-sieve workload. Partially answered already, on
+GGNFS: `f ≈ 0.23`.** The fine-grain timings put trial division plus
+cofactorization at 21–24% of wall across the q-range, with hard MPQS at 8–11%.
+That gives a hybrid retaining all TD on the CPU an Amdahl ceiling of ~4.2×. For
+the primary design, Gate 0 records candidate volumes, sizes GPU stages, and
+identifies the algorithms that must move; it is not a reason to leave them on
+the CPU or to kill the project.
 
-What remains is to confirm it on **CADO**, whose cofactorization strategy differs (ECM chains, `-batch` if enabled) and which may not truncate the factor base at `q` the way lasieve4 does. If CADO returns `f ≈ 0.23` too, proceed with the sieve as the primary target. If CADO returns `f > 0.5`, the discrepancy is itself the finding — it would mean CADO is the wrong baseline for this job and GGNFS is the siever to beat.
+Confirming the split on **CADO** remains useful because its explicit resieve,
+ECM chains, batch mode, and factor-base policy differ. A discrepancy changes
+the oracle workload and the optional hybrid projection, but GGNFS remains the
+performance baseline and the GPU-resident roadmap remains stage-driven.
 
-**Read Gate 0 as a property of the parameter regime, not of NFS.** The C183's cofactor share is driven by `mfba=92` with `lpba=32` — three large primes. A 2LP job (`mfba≈64`) spends far less time there. So while measuring the C183 split, spend one extra sweep point measuring it at `mfb1=64` as well. If the answer comes back "the GPU sieve only pays off in the 2LP regime," that is a **finding about where this technique applies**, not a kill — and it is cheap to learn at the same time as the primary measurement rather than after Path 5.
+**Read Gate 0 as a property of the parameter regime, not of NFS.** The C183's
+`mfba=92`, `lpba=32` three-large-prime side is deliberately demanding. Also
+measure a 2LP point (`mfb1≈64`): the comparison tells us where GPU
+cofactorization has the most value and whether one implementation strategy can
+cover both regimes.
 
-**Gate 1 (Path 1) — updates/sec/joule, GPU fill+transform vs. CPU `las` fill.** Re-scoped, given the per-q budget derived from the test-sieve data: this gate's job is no longer "is the GPU fast enough" — the model says it has 4–8× of headroom — but **"is the model wrong by 5×?"**
-- Modeled GPU sieve time (~45–75 ms/q) confirmed within ~2× → the sieve is off the critical path. **Stop optimizing it** and spend the effort on Path 4. Do *not* pull the 2 B-record or two-level levers just because they're written down; they buy nothing below the cofactor floor.
-- 2–5× worse than modeled → gray: now the named levers (2 B records, fan-out shape, `bkthresh` sweep, run-aggregation) actually matter. Pull them and re-grade.
-- \>5× worse than modeled, across the entire record-size × fan-out grid → the sieve *is* the constraint after all, and the original framing of this document applies. Re-grade against the zones directly.
+**Gate 1 (Paths 1–3) — updates/sec/joule and complete GPU sieve time. PASSED as
+a component gate.** The measured 64.371 ms/q is within the planned range. Freeze
+the current operating point and spend the next effort on Path 4. This is a
+sequencing decision: resume sieve optimization if the completed GPU-resident
+pipeline shows it on the critical path. It is not based on treating a CPU TD
+floor as irreducible.
 
 The cheapest useful output of Path 1 is therefore a single number — **milliseconds per special-q for the full GPU sieve chain** — not a bandwidth percentage.
 
-**Gate 2 (Path 5) — relations/sec/watt and $/relation, graded on the verdict zones above.** Green: go. Gray: the rental-$/relation calculation and the best-case-opponent caveat decide, in writing. Red: stop, or pivot to offloading only cofactorization / linear algebra (which we already know works).
+**Measured status, 2026-08-03:** 64.371 ms/q for the two-side equal-work sieve.
+The stage-weighted component proxy is 262.1 W and 16.874 J/q, against 158.7 W,
+3.558 q/s and 44.609 J/q for the simultaneous 16-worker GGNFS power run.
+That closes the early component-energy proxy, not Gate 2: the GPU path still
+stops before intersection, primitive filtering, GPU resieve/factor recovery,
+integrated target-equivalent GPU cofactorization, final relation transfer, and
+unique-relation accounting. Finding 47's external C164 microbenchmark is a
+promising rate datum for the cofactor stage; it does not change that pipeline
+status.
+
+**Gate 2 (Path 5) — GPU-resident unique relations/sec/watt, relations/sec/GPU,
+host cores/GPU, and $/relation, graded on the verdict zones above.** Green: go.
+Gray: rental economics, hardware-shape sensitivity, and the best-case CPU
+opponent decide in writing. Red: stop or narrow the useful GPU stages. Report
+the optional hybrid mode beside this result, never in place of it.
 
 **Not a kill criterion:** achieved bandwidth as a percentage of peak. If a variant lands at 30% but moves 2 B/record, it beats a variant at 60% moving 8 B. Low bandwidth efficiency means *go optimize*, not *stop the project*. Report it, act on it, don't gate on it.
 
@@ -942,9 +1178,19 @@ The cheapest useful output of Path 1 is therefore a single number — **millisec
 The reasoning:
 
 - Kernels are CUDA C++ regardless. That's ~95% of the runtime and most of the intellectual work. Host language buys nothing where the risk actually lives.
-- The host is never in a per-update or per-survivor inner loop. It does per-special-q lattice reduction (microseconds), buffer/stream orchestration, and calls into GMP. Host language has no measurable performance effect.
-- **Through Path 3, nothing links against anything.** `las` is a subprocess oracle driven by the Python harness; GMP enters only for host-side q-lattice/norm setup. The first real integration decision is Path 4, and the cheap answer there is *also* subprocesses (`finishbatch` et al.). "FFI burden" is nearly zero in this plan — which is exactly why it should stay C/C++-shaped: every reuse target (CADO C++, GMP-ECM C, GMP C+asm, lasieve5 C) is a C-ABI-adjacent codebase, and Rust would reintroduce a boundary the plan otherwise never pays for. The safety benefit doesn't reach the kernels, which are CUDA C++ either way.
-- Where the CPU *could* become performance-relevant: cofactorization feeding, if it stays host-side and the GPU paces it. That's a threading-design problem (per-thread batches, SPSC queues), routine in C++ and not a language argument.
+- In the primary runtime, the host is not in a per-update or per-survivor inner
+  loop. It performs control, buffer/stream orchestration, and I/O. Temporary
+  CPU parity and fallback paths must be timed so they do not silently become a
+  proportional host requirement.
+- **Through Path 3, nothing links against anything.** `las` is a subprocess
+  oracle driven by the Python harness; GMP enters only for host-side setup.
+  Path 4's first integration target is the local YAFU GPU cofactor interface,
+  with CADO/lasieve5 subprocesses as result oracles. Every reuse target (YAFU
+  C/CUDA, CADO C++, GMP-ECM C, GMP C+asm, lasieve5 C) is C-ABI-adjacent; C++
+  remains the low-friction host language.
+- A sustained CPU cofactor queue is intentionally a **separate hybrid mode**.
+  It still wants routine C++ queueing machinery, but its throughput, power, and
+  CPU/GPU ratio must not be attributed to the GPU-resident mode.
 - **Precedent:** `gerbicz_bench` in msieve-s used exactly this shape — standalone Makefile, nvcc, engine exported behind a 3-function C ABI (`collision_engine_init/free/run`), a C reference implementation as ground truth, and a CLI-driven sweep. It worked well enough to land a 2.75× kernel win and integrate cleanly. Repeat it.
 - Python's job: run `las`, parse `-v`/`-T`/`-stats-cofact` output, drive parameter sweeps, sample `nvidia-smi`, diff oracles, plot. It never touches a record.
 
@@ -1024,6 +1270,15 @@ The one strategic risk I see is *over*-polishing the sieve. At 55.5 ms against a
 3. **CADO Gate 0** (`f` on `las`, quiet box) — the 4.2× ceiling rests on GGNFS's `f ≈ 0.23` generalizing.
 4. **Path 4 skeleton** (resieve + survivor intersection + batch-cofactor feed) — the ceiling raiser. The two-sided intersection is cheap on GPU: keep per-side survivor bitmaps (I·J/8 = 67 MB each), AND them, resieve only the intersection.
 5. Small-prime sieve levers (below) — only after the above, and only if the sieve is ever the constraint again.
+
+> **Update 2026-08-03:** items 1 and 2 are complete. Sixteen GGNFS workers
+> give `N_eff = 10.24`; the clean two-side sieve is 64.371 ms/q and the
+> Windows-side component proxy gives 16.874 GPU-sieve J/q versus 44.609 J/q
+> for the complete CPU q. The scope mismatch means this is not yet a Path-5
+> relation-per-watt result. With the primary goal clarified as GPU-resident
+> relation collection, item 4 means device intersection, recovery/TD, and GPU
+> cofactorization—not merely feeding a permanent CPU cofactor pool. Exact
+> survivor-set parity is the entry gate.
 
 ## Correctness findings (fix before parity work; none invalidate the timings)
 
@@ -1119,4 +1374,1121 @@ The evidence that the dump is rotten is good. But the project already patches CA
 
 ## What I'd write on the scoreboard
 
-The central hypothesis has survived its first real contact: **the complete two-sided sieve runs at the CPU's trial-division floor (55.5 vs 56 ms), a 3–4× whole-box speedup with the cofactor path untouched, on measured kernels with independent correctness gates.** The remaining risk has moved decisively from "can the GPU sieve fast enough" to (a) the untested `N_eff`/CADO-side baselines and (b) whether Path 4 can raise the 4.2× ceiling. That is a much better place than this document started.
+The central hypothesis has survived its first real contact: **the complete
+two-sided sieve stage runs in 64.371 ms/q with encouraging component energy and
+independent correctness gates.** Kernel feasibility is demonstrated. A
+GPU-resident relation collector is not.
+
+> **Primary scoreboard, 2026-08-03:** Goal 1 is a GPU-resident relation path
+> whose sustained CPU demand does not grow roughly one-for-one with GPU count.
+> Measured: root transform through two-sided thresholding, **64.371 ms/q** and
+> **16.874 component-proxy J/q**. Unbuilt: exact device intersection and
+> compaction, primitive filtering, GPU resieve/factor recovery/TD, GPU
+> cofactor integration, relation emission, and multi-GPU/weak-host scaling.
+> Preliminary external evidence: YAFU's C164 `31/31` GPU cofactor stages imply
+> **4.92 ms/q at the target feed (13.1x rate headroom)**, but the C183 `31/32`
+> persistent, powered, host-accounted run remains open. Exact CADO survivor
+> containment is the next correctness gate. These missing stages, not the CPU
+> TD timer, define the live roadmap.
+>
+> **Secondary hybrid projection:** if GGNFS keeps factor recovery, TD, and
+> cofactoring on the 9800X3D while the RTX 5070 sieves the next q, the measured
+> inputs project **71.1 ms/q, ~4× CPU-only throughput, and ~1.9× component
+> energy efficiency** under perfect overlap. This is promising for this
+> balanced pair, but it consumes approximately one strong CPU per GPU and is
+> therefore not a substitute for Goal 1 on dense-GPU or weak-host systems.
+>
+> **Optimization rule:** freeze sieve micro-tuning while Path 4 is built. Resume
+> it if the measured GPU-resident pipeline makes the sieve critical. The claim
+> that further sieve work has "exactly zero" value applies only to the idealized
+> hybrid max(64.4, 71.1) model, not to the project as a whole.
+
+---
+
+# Review notes — from Claude (the reviewer), 2026-08-03
+
+Third pass, at the owner's request. Question put to me: *"next couple steps
+should be exact survivor containment, then the design for GPU resieve and trial
+division"*. Read: `bench/RESULTS.md` findings 38–46, `oracle/PARITY.md`, the
+bucket record layout in `bench_kernels.cu`, and CADO's
+`las-process-bucket-region.cpp` / `las.cpp` survivor-printing path. Analysis
+only; no code changed.
+
+> ## Read first — what a 2026-08-04 cross-review changed in this section
+>
+> An independent review of these notes found two substantive errors and several
+> loose ends. Corrections are inline and dated below; this is the index.
+>
+> | claim as written | status |
+> |---|---|
+> | "GPU resieve design is settled: re-walk, no record change" | **wrong — reopened.** I mis-read CADO's shorthint. It is a *within-slice offset* that names the prime exactly, not a slice index, and CADO recovers large primes by **purging retained buckets**, not by resieving. Re-walk is now one of three candidates in an A/B that has to be run. |
+> | "bound 131 — adopt unconditionally" | **right conclusion, wrong number.** The sweep's resolution was 4 units and never sampled the edge. The six missing bounds were run: **the zero-loss floor is 128**, and the containment gate was rerun on our own bitmaps at 128 and passes 3,026/3,026. **Adopt 128** — 2.46× on CADO's survivors, 2.35× on ours, zero relations lost. |
+> | "`qsort` — a one-line change" | **not one line.** Four parallel arrays; needs an index-permutation sort plus a scatter. |
+> | "1,062,811 records over 544 q, 1,957/q" | **548 q, 1,939/q.** Bit-size mix now measured; it is heavier than finding 47's C164 set and moves that projection ~12% slower. |
+> | artifacts "Committed to `oracle/`" | **untracked**, and absent from `MANIFEST.sha256`. |
+> | `PARITY.md`'s basis gate, `RESULTS.md`'s "set comparison not done" | both **stale**; corrected in place in those files. |
+>
+> Unchanged by the cross-review: the containment result (3,026/3,026), the
+> survivor-filter occupancy table, the `enter_cofactoring` indicator, the
+> 2× survivor reduction, and the shape of the budget.
+
+## Short answer: yes, with one reordering and one addition
+
+The proposed order is right, and finding 46 has made it the *only* order that
+makes sense — the post-sieve budget is now a number, so every remaining
+decision is a cost fit rather than a guess. Two changes:
+
+1. **Containment and the device intersect/compact stage are one deliverable,
+   not two.** The set you compare against las is the output of the stage you
+   have to build anyway. Doing them separately means writing the compaction
+   twice.
+2. **Everything that runs on the CPU should run concurrently, and the
+   containment oracle needs a CADO patch that `-batch-print-survivors` does not
+   substitute for.** I proposed that flag as the oracle, ran it, and it emits
+   the 1,851-element `enter_cofactoring` set rather than the 797,028 `after_sieve`
+   set — see the next section for why no flag combination fixes that. The
+   capture is still valuable, as the target-population cofactor workload finding
+   47 needs. Neither it nor the survivor-bound sweep requires any of our GPU
+   pipeline to exist.
+
+Sizing below — written before finding 47 landed and revised after — says
+resieve and TD clear energy parity comfortably, and that **they, not
+cofactorisation, are what now sits on the boundary of a 2× energy win.**
+
+## The containment gate — `-batch-print-survivors` will not do it (measured)
+
+**Ran it; the recipe I first proposed is wrong.** Reading the source I concluded
+that `-batch-print-survivors` takes the `else if (batch || batch_print_survivors)`
+branch at `las-process-bucket-region.cpp:702`, which does no trial division and
+no `check_leftover_norm`, and therefore emits the full `after_sieve` set. It
+does not. On the parity q:
+
+```
+# survivors after_sieve: 797028
+# survivors trial_divided_on_side[0]: 33355
+# survivors trial_divided_on_side[1]: 1851
+# survivors enter_cofactoring: 1851
+```
+
+and the file contains **1,851 lines, not 797,028**.
+
+The branch is guarded. `las.cpp:914` asserts
+`batch || batch_print_survivors || needs_resieving()` — a disjunction, not an
+override — and `siever_config::needs_resieving()`
+(`las-siever-config.hpp:116`) returns false **only if some side has `lim == 0`**.
+With both sides sieved normally it is true, so las takes the *first* branch,
+does full trial division, and `-batch-print-survivors` prints only what survives
+to `enter_cofactoring`. The source comment above `needs_resieving` says this is
+deliberate: with two real sides, removing known primes is worth doing even in
+batch mode. There is no flag combination that yields the `after_sieve` set while
+still sieving both sides.
+
+**So the exact containment gate needs a CADO patch, and it is a small one.**
+`rep.survivors.after_sieve++` is at `las-process-bucket-region.cpp:552`; the
+`cofac_standalone cur` carrying `(a,b)` is constructed ~15 lines below it,
+still before any trial division. Printing `cur.a, cur.b` there is about three
+lines and yields exactly the 797,028. The survivor vector reaching that loop is
+already primitive-filtered upstream by the unsieve step, which is why finding 41's
+gcd filter closed the gap. This repo already carries a local CADO patch (the
+`-dumpfile` ASSERT), so the precedent and the revert procedure both exist —
+`oracle/PARITY.md` documents the pattern.
+
+**The run was not wasted, and this is worth acting on.** The 1,851-line file is
+kept as `oracle/c183.q120000053.cofac_candidates.txt` (log:
+`oracle/las_q120000053_batchsurv.log`; both untracked, and `MANIFEST.sha256`
+needs regenerating either way). It is
+`a b <cofactor…>` on the **real C183 `lpb 31/32` population** — precisely the
+target-equivalent cofactor workload finding 47 says its controlled rerun needs,
+and which the C164 `31/31` dataset is not. It requires no patch and no GPU
+pipeline. At 1,851/q, a `-nq` sweep of ~540 special-q produces the million-record
+scale finding 47 benchmarked at; a few dozen q are enough to start the coverage
+matrix. **Capture this while the containment patch is being written**, not after.
+
+One consequence of the original recipe does survive:
+
+- **Compare on `(a,b)`, not `(i,j)`.** las prints `(a,b)`, and more usefully,
+  `(a,b)` is invariant under the i-mirroring this project already flagged
+  ("negate our first basis vector to match las's"). If our basis vector is
+  negated relative to las's, our `(i,j)` maps through *our own* basis to the
+  same `(a,b)` las gets from `(-i,j)` through its basis. Comparing on `(a,b)`
+  makes the gate independent of a convention that has already cost time once.
+
+**The gate should be run at bound 143/141 — our natural setting — and it has a
+falsifiable prediction.** Finding 41 established that las is `+1` and only `+1`
+at every traced position. If that holds everywhere, then ours = las − 1
+pointwise, the test `S ≤ bound` gives us everything las has plus exactly the
+positions where las reads `bound+1`, and therefore:
+
+> **|las \ ours| = 0, exactly.** Not "small" — zero. Any element of las's set
+> that we do not have is a bug, not a calibration difference.
+
+The reverse difference should be ≈44,000 (841,418 − 797,028), and it should be
+*entirely* accounted for by positions whose las-side byte is exactly one over
+bound on the binding side. That second check is what turns the gate from
+descriptive into diagnostic: if the excess is not concentrated at `bound+1`,
+the `+1` model is wrong somewhere the fifteen traced positions did not reach.
+
+## The gate was built and run: strict containment fails, relation containment passes
+
+The patch above was applied, `las` rebuilt, the capture taken, and CADO restored
+byte-for-byte (source and binary md5s verified against pre-patch copies; the
+only remaining local modification is the pre-existing `-dumpfile` one). The
+patched binary is kept outside the CADO tree. The capture is
+**797,028 unique `(a,b)` pairs, exactly matching `survivors after_sieve`**, and
+the run still produced 37 relations, so the patch does not perturb the sieve.
+
+Intersecting the existing `surv.side{0,1}.bits` bitmaps from the finding-40
+session, gcd-filtering, mapping to `(a,b)` through our own basis, and comparing:
+
+| quantity | value |
+|---|---:|
+| las `after_sieve` | 797,028 |
+| ours (primitive, two-sided) | 841,418 |
+| \|ours ∩ las\| | 794,866 |
+| **\|las \ ours\|** | **2,162** — predicted 0 |
+| \|ours \ las\| | 46,552 |
+
+**The prediction was wrong and the `+1` model does not hold universally.**
+0.27% of las's survivors are missing from ours. Attributing each missing element
+to the side whose bitmap bit is clear:
+
+| | count |
+|---|---:|
+| fails side 1 only | 722 |
+| fails side 0 only | 1,422 |
+| fails both | 1 |
+| unmappable to an `(i,j)` in our region | 17 |
+
+Chasing each cause, with everything re-measured rather than assumed:
+
+**1. Pinning `powlim` removes more than half of it — and this document had
+already prescribed that fix.** The 2026-08-01 review notes say las builds side 0
+with `powlim = ULONG_MAX`, giving 1,112 prime-power ideals in [2^15, 67.1M] our
+`maxbits = 15` factor base lacks, and then say in bold: *"don't chase las
+upward — pin las downward … pass `-powlim0 32767 -powlim1 32767`."* I ran the
+first capture without them. Re-running with them:
+
+| | first capture | `-powlim0/1 32767` |
+|---|---:|---:|
+| las `after_sieve` | 797,028 | 795,845 |
+| **\|las \ ours\|** | **2,162** | **1,005** |
+| fails side 1 only | 722 | **722 (unchanged)** |
+| fails side 0 only | 1,422 | **266** |
+| fails both | 1 | 0 |
+| unmappable | 17 | 17 |
+
+las subtracts logs for ideals we never had, so those positions survive for it
+and not for us — the observed direction and the observed side. Side 1 is
+*exactly* unchanged because our `c183.fb1` was already built with
+`makefb -maxbits 15`, so `-powlim1` is a no-op there. **Every parity capture
+from here on must carry `-powlim0 32767 -powlim1 32767`.**
+
+**2. The 17 unmappable are all at `b = 16384 = I/2` exactly — and this corrects
+something I asserted two sections above.** Comparing on `(a,b)` removes the
+*remapping* ambiguity from the i-mirroring, but it does **not** make the gate
+mirror-independent: the two conventions sieve different half-open intervals.
+Our `i ∈ [−I/2, I/2)` maps under the mirror to las's `i ∈ (−I/2, I/2]`, so one
+boundary column of 16,384 positions is sieved by las and not by us. A convention
+fix, not an arithmetic one, but it is a real gap and it recurs at every q.
+
+**3. The obvious explanation for side 1's 722 is wrong, and disproving it
+produced a better result.** `--fbbound` defaults to `q`, so the natural
+hypothesis was that the finding-40 bitmaps used the truncated equal-work profile
+and were missing the ~720K primes in (q, 134.2M]. Regenerating side 1 with
+`--fbbound 134200000` produced a file **byte-identical** to the one already on
+disk. So that bitmap was always full-`alim`, the truncation hypothesis is dead,
+and side 1's 722 remains unexplained. The by-product is worth more than the
+hypothesis was: **the GPU sieve reproduces a 64 MB survivor bitmap bit-exactly
+across sessions and rebuilds.** That is a determinism guarantee this project had
+not established, and it is what makes bitmap artifacts safe to compare across
+sessions at all.
+
+**A documentation defect fell out of the same check.** Popcounting the two
+bitmaps gives one-sided survivor counts of **22,499,522 (side 1)** and
+**24,301,359 (side 0)**. RESULTS.md finding 40's table reports 14,888,741 and
+18,936,923 — while its *two-sided* row, 841,418, and finding 41's pre-gcd
+1,386,939 both reproduce from these same two files **exactly**. The two-sided
+numbers are trustworthy and the one-sided rows in that table were measured on a
+different configuration than the row beneath them. Finding 40's one-sided rows
+should be re-derived or struck.
+
+**The `alim` convention is not the explanation, and can be excluded
+arithmetically.** Full `alim` adds only 3,256,348 side-1 records, so it can
+touch at most ~3.3M positions — while finding 40's one-sided side-1 figure sits
+**7.6M** below the bitmap's popcount. The gap is more than twice what the
+convention could possibly move, so the difference is in some other parameter
+(`--allowance`/bound being the obvious candidate, since one bound unit moves
+that count ~5.5%). Whoever re-derives those rows should record the full command,
+which is the reason this was ambiguous at all.
+
+## What the residue actually costs: nothing measurable
+
+Strict set containment is a *proxy*. The property it stands in for is that we do
+not lose relations. That is directly testable: the patched run emitted las's 37
+relations, and every one maps into our region.
+
+> **All 37 las relations at this q are present in our survivor set.**
+> 37 of 37, zero missing, zero unmappable.
+
+So the 988 missing survivors are 0.12% of las's set and cost **zero relations**
+here. Combined with finding 40's result that tripling the survivor count also
+yields zero extra relations, the picture is that las's survivor boundary is
+loose relative to what actually factors, in both directions.
+
+**This reframes the gate, and the reframing is the deliverable.** Set
+containment is sufficient but not necessary. The operative gate is **relation
+containment**, and it passes. Set containment stays valuable as a *diagnostic* —
+it is what surfaced the powlim omission, the boundary column, and the finding-40
+table defect, none of which counts-to-0.25% could see — but it should not be a
+blocker. Two caveats before leaning on this: 37 relations at one special-q is a
+small sample, so the relation-containment gate must run over the 31-q band; and
+the remaining 988 have no confirmed cause. Finding 28 established that our norms
+differ from las's *in both directions* near root lines, which is the leading
+candidate and would make the residue a tolerance property rather than a defect.
+
+**Standing recipe for parity captures**, all corrections folded in: patched
+`las`, `-powlim0 32767 -powlim1 32767`, our bitmaps generated in the same
+session with the command recorded, and las's `|b| = I/2` column either excluded
+or covered by extending our region. Gate on relation containment; report set
+containment alongside it as a diagnostic.
+
+### The gate at scale: 3,026 of 3,026, and a basis defect it exposed
+
+The single-q result (37/37) was too small a sample to conclude from, so it was
+re-run across the whole band: **67 special-q lattices, 3,162 las relations**,
+with our survivor bitmaps generated per lattice at bound 143/141 and las's
+relations attributed to their lattice exactly by `a ≡ rho·b (mod q)`.
+
+| | |
+|---|---:|
+| las relations in the band | 3,162 |
+| **contained in our survivor set** | **3,026** |
+| **in our region but not a survivor** | **0** |
+| outside our sieve region | 136 |
+
+> **Relation containment passes: zero misses in 3,026 in-region relations**,
+> an 82x larger sample than the single-q check. Every las relation that our
+> sieve region covers is in our survivor set.
+
+**The 136 are not a containment failure — they exposed a real defect in the
+parity gate.** `oracle/PARITY.md` records that our q-lattice basis equals las's
+with the first vector negated, and calls the gate passed. **That was verified at
+one special-q and it does not generalise.** Across the band:
+
+| | lattices | relations | contained | outside region |
+|---|---:|---:|---:|---:|
+| basis matches las (up to mirror) | **47** | 2,195 | **2,195 (100.000%)** | 0 |
+| basis differs | **20** | 967 | 831 | 136 |
+
+On those 20, bench's second basis vector is **exactly las's `v2 − v1`**:
+
+| q | las `v2` | bench `v2` |
+|---|---|---|
+| 120000169 | (76391812, 1) | (−43608357, 1) |
+| 120000193 | (64097954, 1) | (−55902239, 1) |
+| 120000341 | (80127018, 1) | (−39873323, 1) |
+
+Same lattice, unimodular transform, different basis — so the `(i,j)` rectangle
+covers a **different set of `(a,b)`**. Under the skewed norm (skew ≈ 1.15e8,
+`sqrt(skew) ≈ 10742`) bench's vector is the *shorter* one — e.g. at q=120000169,
+bench 11,484 against las 12,881 — so **our reduction is the better-reduced of
+the two, and las's basis is not Gauss-reduced there.** Neither is wrong; they
+are different valid choices, and ours may well yield slightly better norms.
+
+Three consequences, in order of importance:
+
+1. **The relation gate is passed and can be closed.** 0 in-region misses over
+   3,026 relations.
+2. **PARITY.md's basis claim must be restated.** It holds at 47/67 lattices,
+   not universally, and the document should say "verified at q=120000053" rather
+   than assert it as a property. Any future per-q parity comparison has to check
+   basis agreement *first* — otherwise a region difference reads as a
+   correctness failure, which is exactly what it did here for an hour.
+3. **Per-q yield comparisons against las are only valid on the matching 47.**
+   4.3% of las's relations in this band lie outside our region. That does not
+   mean we lose them — our region contains points las does not — but it does
+   mean "relations per special-q" is not directly comparable at those q without
+   running our own cofactorisation.
+
+4. **Added 2026-08-04 — this closes in-region sieve correctness, not yield
+   equivalence, and the distinction is load-bearing.** Containment says every
+   relation las finds inside our region is a survivor of ours. It says nothing
+   about the relations our region contains that las's does not, and on 20 of 67
+   lattices those regions genuinely differ. So **the project's final relation
+   yield cannot be read off las at all** — it has to be produced by cofactoring
+   our own survivors. Until that exists, "relations per special-q" is a borrowed
+   number, and every downstream figure that divides by it (the per-q budget, the
+   2× energy target, the ETA) inherits the borrowing. That is acceptable now and
+   will not be acceptable at the end.
+
+Worth stating plainly: this was found only because the gate compared *sets*
+rather than counts, for the third time in this review.
+
+### Artifacts and how to reproduce
+
+**Written to `oracle/`, but still untracked as of 2026-08-04** — `git status`
+shows all of these as `??` and none of them are in `oracle/MANIFEST.sha256`.
+They are not committed and the manifest is not regenerated; another session was
+live in the repo, so this review deliberately did not commit. **Whoever commits
+next must regenerate the manifest**, or `oracle/` acquires a set of oracles with
+no checksums, which is the one thing that directory exists to prevent.
+
+| file | what |
+|---|---|
+| `cado-after-sieve-survdump.patch` | the 3-line CADO patch (plus 4 includes); apply, rebuild `las`, keep the binary **outside** the CADO tree, revert the source |
+| `c183.q120000053.after_sieve_ab.powlim.txt.gz` | 795,845 `(a,b)`, `-powlim0/1 32767` — **the oracle to gate against** |
+| `c183.q120000053.after_sieve_ab.nopowlim.txt.gz` | 797,028 `(a,b)`, default powlim — kept only to reproduce the powlim finding |
+| `c183.q120000053.relations_ab.txt` | las's 37 relations at this q, the relation-containment target |
+| `c183.q120000053.cofac_candidates.txt` | 1,851 `a b <cofactor…>` from `-batch-print-survivors`, the target cofactor workload |
+| `las_q120000053_after_sieve_powlim.log` | the capture log |
+
+The dump is enabled by `CUDASIEVE_SURVDUMP=<path>`; with the variable unset the
+patched binary behaves exactly like stock `las`. CADO's working tree was
+restored and verified by md5 against pre-patch copies of both the source file
+and the `las` binary; the only local modification remaining is the pre-existing
+`-dumpfile` one.
+
+Our side of the comparison came from the `surv.side{0,1}.bits` bitmaps, which
+this review confirmed are reproducible bit-exactly by
+
+```
+./bench --cadofb ../oracle/c183.fb1 --side 1 --scale 1.275 \
+        --fbbound 134200000 --q 120000053 --rho 112625526 \
+        --allowance 112 --not-both-even --survbits <file>
+```
+
+Note `--fbbound 134200000`. **The two profiles exist because the two CPU
+sievers disagree, and the rule is simple: CADO always sieves the full `alim`;
+GGNFS always caps `alim` at the special-q when sieving `-a`.** `--fbbound`
+defaults to `q`, i.e. to the GGNFS convention. So:
+
+- **Timing against GGNFS** — leave the default. It is the equal-work profile
+  and it is correct, because GGNFS caps at q too.
+- **Any parity or containment comparison against las** — pass
+  `--fbbound <alim>` explicitly. CADO never truncates, so a truncated run is
+  comparing against a factor base las did not use.
+
+This is the trap finding 31 warns about, and it should be spelled out in every
+parity command rather than inherited from a default.
+
+**The convention costs about 1% of the sieve, measured.** Side-1 records are
+312,211,826 truncated at q against **315,468,174** at full `alim` — **+3,256,348,
+or +1.04%**. (Independently predicted: ~720K primes in (q, 134.2M], ~1 root
+each, `A/p ≈ 4.2` hits apiece ≈ 3.0M records. Observed 3.26M.) So the headline
+64.371 ms/q is not materially profile-dependent, and a CADO Gate 0 comparison
+would pay roughly 1% more side-1 fill than the GGNFS-equivalent number quoted
+throughout this document.
+
+## Also next: unbilled per-q host work is a Goal-1 risk
+
+Goal 1 is stated as *"sustained CPU demand does not grow roughly one-for-one
+with GPU count."* There is per-special-q host work sitting outside every timed
+number in this project, and it is the one measurement that speaks directly to
+that criterion rather than to throughput.
+
+`bench_kernels.cu:651–690` transforms the small factor base on the host, then
+sorts it with an **O(n²) insertion sort** over four parallel arrays
+(`bench_kernels.cu:677`), at n ≈ 3,631 (side 1) and 3,512 (side 0), **once per
+special-q per side**. It is sorted by the *effective* modulus `m` produced by
+the transform, which is essentially a random permutation of the p-order the
+entries arrive in — so it is the worst case, ~n²/4 ≈ 3.3M inner iterations per
+side, not the near-sorted best case.
+
+Replicating that exact loop standalone on this box (busy, so treat as an upper
+band): **6–27 ms per q for the sort alone, both sides.** Even the fastest
+observed run, 6.1 ms, is ~10% of the 64.4 ms two-sided sieve chain, and none of
+it appears in any number this document quotes. At 15.5 q/s that is 0.09–0.4
+host cores per GPU for a sort of 3,600 elements.
+
+Three things follow, in order of effort:
+
+1. **Bill it.** Time the block and report it in the chain. It is currently
+   invisible, and the previous review already flagged it as unmeasured; it is
+   still unmeasured.
+2. **Fix the sort.** A comparison sort makes it ~43K comparisons instead of
+   3.3M and removes the entire item. There is no design question here — but
+   **it is not the one-line `qsort` swap this originally said it was**
+   (corrected 2026-08-04). The loop at `bench_kernels.cu:677` sorts **four
+   parallel arrays** in lockstep — `hsp` (the key, effective modulus `m`),
+   `hsrt`, `hsg`, `hslp` — and `qsort` has no way to permute them together.
+   Two workable shapes:
+   - **Sort an index permutation** (`std::sort` on `uint32_t idx[]` with a
+     comparator reading `hsp`), then scatter into four fresh arrays before the
+     `cudaMemcpy`s. Least churn, and it preserves the SoA layout the small-sieve
+     kernel wants.
+   - **Sort an array of `{m, rt, g, logp}` structs** with `std::sort`, then
+     scatter into the four arrays. Marginally better cache behaviour during the
+     sort, same scatter afterwards.
+
+   Either way there is a scatter pass, because the device side is SoA and must
+   stay SoA. When billing it, **time transform, sort and transfer separately** —
+   the current single unmeasured block hides which of the three actually costs,
+   and the answer determines whether item 3 below is worth doing at all.
+3. **Then decide whether the transform itself belongs on the GPU.** It is
+   `k_transform`-shaped work and Path 5 wants it there anyway, but after (2)
+   the residual is small enough that this becomes a Path-5 tidy-up rather than
+   a Goal-1 risk.
+
+This matters more than its milliseconds because of what it is evidence *of*: the
+project's success criterion is about host demand, and the only per-q host work
+in the codebase is both quadratic and untimed. Whatever else Path 4 adds, the
+rule should be that any per-q host stage is timed and reported from the day it
+is written.
+
+## MEASURED: the survivor bound is loose by 2x, and it costs nothing
+
+Finding 40 measured the bound *upward* — 37 relations at bound, bound+6,
+bound+12. This review measured it **downward**, over 68 special-q in
+[120000000, 120001000] with `-powlim0/1 32767`, `-adjust-strategy 0`, `-t 16`,
+varying `lambda1` only (`lambda0` held at 2.35, so the side-0 bound stays 141):
+
+| `lambda1` | side-1 bound | survivors/q | TD input/q | **cofactors/q** | relations | relations lost |
+|---:|---:|---:|---:|---:|---:|---:|
+| **3.5** (default) | 143 | 781,802 | 32,932 | **1,907** | 3,162 | — |
+| 3.4 | 139 | 619,950 | 26,093 | **1,907** | 3,162 | **0** (identical set) |
+| 3.3 | 135 | 488,722 | 20,562 | **1,907** | 3,162 | **0** (identical set) |
+| **3.2** | **131** | **383,168** | **16,112** | **1,907** | **3,162** | **0** (identical set) |
+| 3.1 | 127 | 298,831 | — | 1,906 | 3,161 | 1 (0.03%) |
+| 3.0 | 123 | 231,832 | — | 1,903 | 3,159 | 3 (0.09%) |
+| 2.9 | 119 | 179,006 | — | 1,899 | 3,158 | 4 (0.13%) |
+| 2.8 | 115 | 137,561 | — | **1,458** | 2,949 | **213 (6.7%)** |
+
+**Halving the survivor count costs zero relations, and there is no cliff — only
+a very shallow slope.** Not "approximately the same count": the relation *sets*
+were extracted and compared element by element, and the symmetric difference is
+**0** down to bound 131. Applying the lesson from the containment gate above,
+counts were not trusted on their own.
+
+Past 131 the loss is barely measurable, and it stays that way far further down
+than expected. **Removing 77% of survivors costs 0.13% of relations**:
+bound 143 → 119 drops 602,796 survivors/q to lose 0.059 relations/q. So the operating point is an economic choice, not a correctness
+boundary:
+
+- **bound 131 — free**, but this was measured at 4-unit resolution and is not
+  the floor. The refinement below finds the true floor at **128** (2.46× rather
+  than 2.04×) and recommends **130** as the operating point. Read that section
+  before using any number from this list.
+- **bound 127 — costs 0.03%** of relations for a further 22% of survivors.
+- **bound 123 — costs 0.09%** for a further 40%.
+- **bound 119 — costs 0.13%** for a further 53%.
+
+If resieve and TD turn out to be the critical path, trading 0.09% of relations
+for 70% of their input is obviously correct. Decide it once those two stages are
+measured, not before. **The real cliff is at bound 115**, where 6.7% of
+relations vanish at once — so 119 is the practical limit. **The free point
+is 128, not 131** (refinement below).
+
+### REFINED (2026-08-04): the sweep's resolution was 4 units — the floor is 128
+
+**The sweep never sampled the edge.** It varied `lambda1` in steps of 0.1, and
+the bound is `(unsigned char)(scale1 * lambda1 * lpb1) + 1` with
+`scale1 = 1/log2(1.722273) = 1.274995`, i.e. `bound1 = floor(40.7998 * lambda1) + 1`.
+**A 0.1 step in `lambda1` is 4.08 units of bound.** The table above therefore has
+rows at 143, 139, 135, 131, 127 and nothing between them; 131 was the lowest
+*sampled* zero-loss bound, not the lowest one. The six missing bounds were run
+(`oracle/bound_sweep_fine.sh`, `-t 8` at `nice 19`; counts are thread- and
+load-independent, which is the only reason this was safe on a loaded box):
+
+| `lambda1` | bound | survivors/q | `enter_cofactoring` | relations | lost |
+|---:|---:|---:|---:|---:|---:|
+| 3.5 | 143 | 781,803 | 129,711 | 3,162 | — |
+| 3.28 | 134 | 460,127 | 129,705 | 3,162 | 0 |
+| 3.25 | 133 | 433,046 | 129,704 | 3,162 | 0 |
+| 3.22 | 132 | 407,412 | 129,704 | 3,162 | 0 |
+| 3.2 | 131 | 383,168 | 129,699 | 3,162 | 0 |
+| 3.17 | 130 | 360,245 | 129,693 | 3,162 | 0 |
+| 3.15 | 129 | 338,589 | 129,681 | 3,162 | 0 |
+| **3.12** | **128** | **318,141** | 129,664 | **3,162** | **0 — the floor** |
+| 3.1 | 127 | 298,832 | 129,633 | 3,161 | 1 |
+
+**The zero-loss floor is exactly 128**, and 127 is the first bound that costs
+anything — one relation in 3,162. So the reduction available for free is larger
+than reported: **781,803 → 318,141 survivors/q, 2.46×**, against the 2.04× that
+bound 131 was credited with.
+
+**A correction to my own reading of the `enter_cofactoring` column.** The claim
+above that it is "pinned at exactly 1,907 for bounds 143 → 131" is an artifact
+of rounding the per-q figure. The raw totals drift continuously from 135
+downward — 129,711 / 129,711 / 129,707 / 129,705 / 129,704 / 129,704 / 129,699 /
+129,693 / 129,681 / 129,664 / 129,633. **There is no plateau in that column.**
+
+It survives as a leading indicator, but for a different reason than I gave: it
+starts moving at bound 135, **eight units before the relation count moves at
+127**. Losing cofactor candidates is not the same as losing relations — the
+marginal candidates are overwhelmingly unproductive — so drift there is an early
+warning rather than a cost. Only the collapse at 115 (−23%) tracks a real
+relation cliff (−6.7%). Tune on it, but read it as a margin gauge, not as a
+threshold.
+
+#### The gate was rerun at bound 128 on our own bitmaps, and it passes
+
+The sweep proves *CADO's* relation set survives at 128 under *CADO's* norms.
+That is not the same claim as ours surviving, because our norm approximation is
+not bit-identical to las's — findings 40–41 record a one-unit difference and
+finding 28 records it as **two-directional**, so at the floor a position that
+rounds the wrong way behaves as if the bound were 127, which is exactly where
+relations start to go. The conservative reading was to adopt 130 and keep two
+units of margin.
+
+**That is not necessary. The gate was rerun and the margin is not needed.**
+Regenerating the 67 side-1 bitmaps at `--allowance 100` (which `bench` confirms
+gives `survivor bound = 128`) and re-running `relcontain_band` against the same
+3,162 las relations reproduces the bound-143 result exactly:
+
+```
+lattices: 67  (basis matches las: 47, differs: 20)
+relations: 3162   unattributed: 0
+  CONTAINED (in our region, is a survivor): 3026
+  outside our sieve region (basis differs): 136
+  in region but NOT a survivor  <-- real : 0
+```
+
+Only side 1 needed regenerating — the side-0 bound is set by `lambda0`, which
+the sweep held fixed at 141. Sixty-seven `bench` runs at 0.8 s each.
+
+And this is a real test, not a null one — our survivor set genuinely tightened
+by the expected factor (q=120000053, popcounts over the raw bitmaps):
+
+| | side 0 | side 1 | two-sided, pre-gcd |
+|---|---:|---:|---:|
+| bound 143 | 24,301,359 | 22,499,522 | 1,386,939 |
+| bound 128 | 24,301,359 | **9,521,087** | **590,665** |
+
+The 1,386,939 reproduces finding 41's pre-gcd count exactly, which is what says
+the two bitmaps are being compared on the same footing. **Our own two-sided
+survivor set falls 2.35× and loses zero relations** — measured on our norms,
+not inferred from CADO's.
+
+**Operating point: bound 128.**
+
+| bound | CADO survivor reduction | status |
+|---:|---:|---|
+| **128** | **2.46×** | **adopt** — the CADO floor, and our own gate passes here (3,026/3,026) |
+| 130 | 2.17× | the conservative point, no longer needed |
+| 131 | 2.04× | what was previously recommended; leaves 1.2× on the table |
+| ≤127 | more | below the floor, costs relations: 0.03% at 127, 0.13% at 119, **6.7% at 115** |
+
+The one thing this does *not* license is tightening further on the strength of
+the gate. 127 costs a relation in CADO's own sweep; the gate can only tell you
+that our norms do not lose something CADO keeps, never that a bound below the
+floor is safe.
+
+Full data, including the sensitivity of the operating-point choice, is in
+`oracle/bound_sweep_results.txt`.
+
+### `enter_cofactoring` is the leading indicator, and it is the one to tune on
+
+Read the cofactor column down the table. It is pinned at **exactly 1,907** for
+bounds 143 → 131 — the whole range where the relation set is identical — then
+drifts (1,906 / 1,903 / 1,899) across exactly the range where 1, 3 and 4
+relations are lost, then collapses to 1,458 at the cliff. That is not a
+coincidence, it is the mechanism: while the bound only removes survivors that
+would have failed trial division anyway, the cofactor population cannot move;
+the moment it starts falling, the bound is cutting into candidates that could
+have factored.
+
+That makes it a better tuning signal than the relation count itself:
+
+- It moves **~3x more** in relative terms (−0.42% vs −0.13% at bound 119), so
+  it is far better conditioned than counting 1–4 lost relations out of 3,162.
+- It is a single number available from `las -v` without needing to compare
+  relation sets element by element.
+
+**Tuning rule: take the smallest bound at which `enter_cofactoring` is still
+pinned at its plateau.** On this band that is 131, and it is exactly the free
+point found by set comparison. That rule is worth carrying into the q = 50M and
+190M sensitivity runs, since it turns each one into a single cheap `las -v`
+read rather than a full relation-set diff.
+
+Two facts make this the most useful measurement in this review:
+
+1. **It cuts exactly the stages that were binding.** Survivors −51% and TD input
+   −51%. Resieve's filter cost and TD's cost are both linear in survivor count,
+   and those two were the ~12–22 ms sitting against a ~16–20 ms allowance.
+2. **It does not touch the stage that was already fine.** `enter_cofactoring`
+   is **exactly 1,907/q at every bound**, unchanged to the last digit. The hard
+   cofactor population is already the irreducible set, so finding 47's 4.92 ms/q
+   is insensitive to this lever — and, conversely, no amount of bound tuning
+   will improve it.
+
+**Revised post-sieve budget at the free operating point, `lambda1 = 3.2`
+(bound 131):**
+
+| stage | at bound 143 | **at bound 131** |
+|---|---:|---:|
+| intersect + compact | ~0.5 | ~0.25 |
+| resieve (fixed re-walk + survivor-scaled filter) | ~8–14 | **~6.5–11** |
+| TD (scales with survivors) | ~4–8 | **~2–4** |
+| hard cofactors (finding 47, unchanged) | 4.92 | **4.92** |
+| **total** | ~18–27 | **~13.7–20.2** |
+
+Against finding 46's ~21–25 ms allowance for a **2x energy win**, the budget
+moves from *on the boundary* to *inside it*. That is a materially different
+project outlook than this document had yesterday, and it came from four `las`
+runs and no code.
+
+**Three caveats, and the first one matters.**
+
+- **This is one q-band.** 68 special-q near q = 120M, against a job range of
+  [50M, 190M]. Norm sizes shift with q, so the bound that is free here may not
+  be free at the ends. The doc's own operating point already names q0 = 50M and
+  q0 = 190M as sensitivity points; **re-run this sweep there before adopting a
+  tightened bound in production.**
+- **The slope past 131 is shallow enough to be worth re-measuring with more
+  relations.** A 1-relation difference in 3,162 is a 0.03% effect measured on a
+  single band; it is directionally right but it is one relation. Widen the band
+  before treating bound 127 or 123 as characterised.
+- **`lambda0` was never swept.** The rational bound stayed at 141 throughout.
+  There may be a second, independent lever there, and the same experiment sizes
+  it.
+
+### Item 6 delivered: the target cofactor workload, at scale
+
+The same window produced the input finding 47's controlled rerun has been
+waiting for: **1,062,811 cofactor candidates over 544 special-q** in
+[120000000, 120010000], captured with `-batch-print-survivors` at default
+`lambda` with `powlim` pinned (61 MB, six files, 370 s at `-t 16`). That is
+1,957 records/q, and it is the **real C183 `lpb 31/32` population** — not the
+C164 `31/31` dataset finding 47 had to use. It is a million records, the same
+scale that benchmark ran at, so the two are directly comparable.
+
+Note this capture is at bound 143. If the tightened bound is adopted, the
+cofactor population moves by less than 0.04% down to the floor (129,711 →
+129,664 over the whole band), so this file remains valid
+input either way.
+
+A note on scope: this tunes *our* post-sieve input. It is not a criticism of
+las's default — `lambda1 = 3.5` is a safe general-purpose value, and CADO pays
+much less than we do for a loose bound because its funnel differs. The finding
+is that a GPU-resident design gets to choose, and choosing well is worth ~2x on
+the two stages that were binding.
+
+#### The mix, measured (2026-08-04), and what it does to finding 47's number
+
+The capture was histogrammed rather than assumed. 548 special-q headers,
+1,062,811 records, **1,939 records/q** (the 544/1,957 above are off by the four
+q whose headers carry no candidates — corrected here):
+
+| bits | side 0 (rational, `lpb 31`) | side 1 (algebraic, `lpb 32`) |
+|---:|---:|---:|
+| 1–31 | 517,824 — 48.72% | 7,590 — 0.71% |
+| 32–62 | **544,987 — 51.28%** | 17,949 — 1.69% |
+| 63–64 | 0 | 11,357 — 1.07% |
+| 65–96 | 0 (max = 60 bits) | **1,025,915 — 96.53%** |
+
+**This workload is heavier than the C164 `31/31` set finding 47 measured on.**
+Applying finding 47's per-class rates to this mix projects **≈2.99 s for the
+1,062,811 records — 355K candidates/s, ≈5.5 ms/q**, about **12% slower** than
+the 4.92 ms/q sizing datum, and still roughly **11.7×** the rate the sieve chain
+needs to be fed at. The headroom conclusion survives; the number moves.
+
+**But treat even that projection as fragile, for a specific reason.** 96.53% of
+the algebraic side lands in the 65–96 bit class, and at `mfba 92` with
+`lpba 32` that class is **three large primes**. Finding 47's per-class rate for
+it was measured on a 2LP splitting problem. The entire projection therefore
+rests on transporting one rate across a change in the *kind* of factorization,
+not just its size — and 3LP splitting is where ECM curve counts and the MPQS
+fallback behave least like their 2LP counterparts. This is a stage-mix
+projection and nothing more; the real `lpba 32` curve behaviour and the actual
+yield still require the controlled run.
+
+**Harness gap found while preparing that run:** the captured files are not in a
+format the existing YAFU test parser accepts (`a b cofac0 cofac1`, with
+`# q = (q, rho, side)` header lines between q blocks). The controlled rerun
+needs a small input adapter or a parser mode, on top of the harness fixes
+already listed under finding 47.
+
+## GPU resieve — CORRECTED (2026-08-04): not settled, and the A/B has to be run
+
+**I got CADO's shorthint backwards, and it invalidates the conclusion below.**
+The claim in the original version of this section — that a 4 B record "loses the
+prime by construction, which is why CADO resieves rather than re-reading its own
+buckets" — is wrong on both halves. Read the source:
+
+```cpp
+/* sieve/bucket.hpp:87 */
+class shorthint_t {
+  public:
+    slice_offset_t hint = 0;          // offset of the prime WITHIN its slice
+    shorthint_t(fbprime_t, slice_offset_t slice_offset, slice_index_t)
+        : hint(slice_offset) { }
+};
+
+/* sieve/bucket.cpp:326 — recovery, in the purge path */
+slice_index_t const slice_index = BA.get_slice_index(i_slice);
+for (auto const & it : BA.slice_range(i, i_slice))
+    if (UNLIKELY(S[it.x] != 255))
+        fbprime_t const p = fb[slice_index].get_prime(it.hint);
+```
+
+Two facts follow, and both cut against what this section concluded:
+
+1. **CADO's 16 bits are a within-slice offset, not a slice index.** Slice
+   identity comes from the enclosing bucket *segment* — `slice_range(i, i_slice)`
+   — so `(segment, hint)` names the factor-base entry exactly and
+   `get_prime(hint)` returns `p` with no search. Our 16 bits are the slice index
+   itself (`bench_kernels.cu:99`, `sl << 16`), which recovers `log p` and
+   nothing more. **Ours is not "CADO's shorthint exactly"; it is strictly less
+   information in the same 4 bytes.** The comment at `bench_kernels.cu:88–90`
+   asserting that this field is "what resieve would use to recover the prime
+   itself, exactly as CADO's shorthint does" is false and should be corrected in
+   the source.
+2. **CADO does not resieve to recover large primes.** `bucket_array_complete::purge`
+   (`bucket.cpp:370`) walks the *retained* bucket array, keeps updates whose
+   `S[it.x] != 255`, and rewrites each survivor as a 6 B `longhint_t`
+   (`slice_index` + `hint`). Resieving is reserved for the small tier below
+   `bkthresh` — the primes that were never bucketed. So the option this section
+   killed as "insufficient, not merely slow" is the one CADO actually ships; it
+   is insufficient *for our record layout*, which is an argument for changing the
+   layout, not for abandoning the approach.
+
+Corrected option table:
+
+| option | what it costs | verdict |
+|---|---|---|
+| widen records to 8 B carrying the FB index | fill is the largest stage at 24.5 ms; ~1.2 GB/q extra write traffic | still **dead** — a permanent sieve cost to save a one-off post-sieve cost |
+| **A — re-walk the FB against a hierarchical survivor filter** | measured occupancy below; est. 8–14 ms/side-pair | **candidate**, not the answer |
+| **B — slice-segmented 4 B records (16-bit offset + 16-bit within-slice offset) + CADO-style purge** | 2.43 GB second streaming read; segmentation overhead in fill | **candidate — must be benchmarked against A** |
+| 14-bit offset + 18-bit hint, unsegmented | 2.43 GB stream, ~26 candidate primes per record | **fallback only** — see below |
+
+The 14/18 split is worth keeping on record because it is the version that needs
+no segmentation: region is 2^14, so 14 bits suffice for the offset, and 18 bits
+give 262,144 slices of ~26 entries. A re-read then pins the prime to ~26
+candidates and brute-forcing 26 modular tests on only the ~880K survivor hits is
+free. Its cost lands in *apply*: the `log p` lookup table goes from 2 KB in
+shared memory to 512 KB in L2 (`bench_kernels.cu:323` masks a shared-mem LUT),
+adding a dependent L2 load per record to a kernel finding 8 already shows
+DRAM-bound. Layout B gets the same exact-prime recovery *without* that penalty,
+because the segment already names the slice and the LUT stays 2 KB. **B strictly
+dominates the 14/18 split.** Keep 14/18 only if segmentation turns out to cost
+more than the L2 LUT does.
+
+### Layout B: segmentation without a counting pass
+
+The obvious objection to B is that per-`(bucket, slice)` allocation needs a
+counting pass, and a counting pass costs about what the re-walk it replaces
+costs. It does not, and the reason is worth writing down:
+
+- Fill **one slice per launch**, in slice order, with a single `cursor[b]` per
+  bucket exactly as now. Records from a given slice therefore land contiguously
+  within each bucket, because nothing else is writing at the same time.
+- After each slice's launch, snapshot `cursor[]` into row `s` of a boundary
+  table. That table *is* CADO's per-slice pointer array, obtained for free.
+- Size: `nbuckets × nslices × 4 B`. **Measured**, not estimated — `bench --side 1
+  --q 120000053 --rho 112625526` prints it at startup:
+
+  ```
+    bucketed  32768 <= p < 120000053 : 6840490 entries
+    sieve area I=2^15 x J=16384; region 2^14; 32768 regions
+    factor base cut into 39 slices (padded to 64), log p in [15,27] bits
+    single-level: 32768 buckets x cap 11202 x 4 B = 1.37 GB
+    records landed : 312211826
+  ```
+
+  So **39 slices on side 1** and 32,768 buckets, giving a boundary table of
+  `32768 × 39 × 4 B = 5.1 MB` (8.4 MB if it is padded to 64 like the `logp`
+  LUT). Negligible either way.
+
+**Do not assume ~120 segments.** That figure has been quoted in review; the real
+count is 39, and it follows mechanically from `build_slices`
+(`bench_kernels.cu:591`), which cuts on a `logp` change *or* every 262,144
+entries. Note this run truncates the factor base at `q` (the GGNFS convention —
+`--fbbound` defaults to `q`); at CADO's full-`alim` convention side 1 carries
+all 7,605,406 pairs and the count rises by a few slices.
+
+Total fill *work* is unchanged — every prime is walked exactly once either way.
+What changes is the launch structure, and that is where B's real risk lives:
+
+- ~39 launches on side 1 against 1 today. At ~5 µs of launch overhead that is
+  ~0.2 ms/q of pure overhead — small against 24.5 ms, but not nothing, and it is
+  the kind of thing CUDA graphs or a cooperative-groups grid-wide sync exists to
+  remove. Cost it before dismissing it.
+- Load imbalance within a launch: the small-`p` slices generate far more hits
+  per entry than the large-`p` ones, so per-launch occupancy will vary. The
+  262,144-entry cap bounds entries per slice but *not* hits per slice. With 39
+  slices over `log p ∈ [15,27]`, the first few slices carry most of the 312M
+  records — those launches are fine, and it is the *last* slices, with few hits
+  spread over 32,768 buckets, that will underutilise the device.
+- `cursor[b]` contention is per-bucket and unchanged; only the number of
+  kernel boundaries changes.
+
+### Layout A: re-walk against a hierarchical survivor filter
+
+**The re-walk is cheap because the intersected survivor set is sparse, and it is
+only cheap because of that.** This is the structural reason step 1 must precede
+step 2, independent of the correctness argument:
+
+- Two-sided survivors: ~800K positions out of A = 536,870,912, i.e. 1 in 671.
+- Group positions into 64-position words: 8.39M words, of which **783,415
+  actually contain a survivor — 9.34% occupancy, in a 1.05 MB summary bitmap.**
+- That table is permanently L2-resident. Each of the 607M bucket-prime hits
+  tests one bit in it; **90.7% are rejected there**, and only ~57M proceed to a
+  read of the full 67 MB bitmap.
+
+**This table is measured, not assumed.** The `surv.side{0,1}.bits` bitmaps from
+the finding-40 session were ANDed and gcd-filtered directly; the intermediate
+counts reproduce finding 41 exactly (1,386,939 pre-gcd, 841,418 primitive),
+which is what says the measurement is of the right thing.
+
+| granularity | summary table | measured occupancy | 2nd-level DRAM reads |
+|---:|---:|---:|---:|
+| 32 | 2.10 MB | 4.84% | 29 M |
+| **64** | **1.05 MB** | **9.34%** | **57 M** |
+| 128 | 0.52 MB | 17.45% | 106 M |
+| 256 | 0.26 MB | 30.81% | 187 M |
+
+Survivors turn out to be very nearly Poisson at this scale — 841,418 survivors
+in 783,415 occupied words is 1.073 per occupied word against ~1.05 for a random
+spread — so the clustering one might hope for near root lines buys almost
+nothing at granularity 64, and the assumed 9.5% was right for the wrong reason.
+Coarser granularities do show clustering (30.8% at 256 against 38.0% random),
+but 64 is the operating point.
+
+Cost estimate, both sides: the walk itself is fill minus the scatter (fill is
+12.6/11.9 ms *including* 280M L2 write sectors, so the bare walk is the smaller
+part); 607M L2-resident summary probes; ~58M scattered DRAM sector reads ≈
+1.85 GB ≈ 3 ms; output ~880K `(survivor, prime)` pairs, which is nothing.
+**Estimate ~8–14 ms/q for both sides, with no extra bucket storage and no
+change to the record format.** Label this an estimate — it is derived, not
+measured.
+
+Now run the same arithmetic against a *one-sided* survivor set (14.9M / 18.9M):
+occupancy exceeds 100% at 64-position granularity, the summary rejects nothing,
+and every one of the 607M hits goes to DRAM. Resieving before intersecting is
+roughly an order of magnitude worse. **Intersect, then resieve** — and the
+sequence is forced by cost, not just by taste.
+
+**Order the two sides, cheap one first.** las trial-divides side 0 first and the
+funnel shows why: 797,028 → 33,355 after side-0 TD. Restricting the side-1
+re-walk to those 33K survivors drops its summary occupancy from 9.5% to 0.4%,
+so nearly every side-1 hit is rejected in L2 and the second-level traffic
+almost vanishes. It costs a serial dependency between the two sides; take it.
+
+### What the A/B must measure
+
+Recovery cost alone is the wrong metric, because A and B move cost between
+stages in opposite directions: A adds a post-sieve pass and touches fill not at
+all; B adds launch structure to fill and makes recovery a streaming read.
+**Measure `fill + apply + recovery` end to end, per q, for both.** First-order
+expectation, to be falsified rather than trusted:
+
+| | A (re-walk) | B (segment + purge) |
+|---|---|---|
+| fill | unchanged | +launch overhead, +2 MB boundary writes |
+| apply | unchanged | unchanged (2 KB LUT survives) |
+| recovery | bare FB walk + 607M L2 filter probes + ~58M DRAM sectors | 2.43 GB streamed once ≈ 1.4–1.6 ms at 1.5–1.8 TB/s, + compaction of survivors |
+| bucket memory | can be freed after apply | must stay resident through recovery — **1.37 GB for side 1 alone** at the measured `32768 × 11202 × 4 B`, and both sides are needed |
+| prime recovery | exact, by construction | exact, `get_prime(hint)` |
+
+The memory row looked like the one most likely to decide it, and **it does not**:
+the same bench startup reports **10.76 GB free of 11.94 GB**, against 1.37 GB of
+side-1 buckets and a comparable side-0 allocation — ~2.7 GB for both, on top of
+two 67 MB bitmaps and the factor base. B's "extra" residency is only extra if
+the design was going to reuse the bucket allocation for the cofactor queue, and
+there is room not to. **So B is not memory-blocked and the A/B is worth running
+on its merits.**
+
+And a third possibility that neither option covers, already flagged in the
+post-sieve section and easy to forget once the A/B framing takes hold: **recover
+no large primes at all.** CADO's `-batch` mode factors the surviving cofactor
+against a product tree of the factor base. That deletes the recovery stage
+outright and replaces it with a batch remainder-tree cost, which is a different
+shape of expense and is the one that scales with *survivors*, not with *hits*.
+It should be on the same chart as A and B.
+
+## Trial division — the arithmetic is free, the small primes are the cost
+
+**Norm recomputation is not a concern and should not be treated as one.** The
+log scales pin the sizes: 255/1.275 ≈ 200 bits algebraic, 255/1.925 ≈ 132 bits
+rational, so 256-bit and 160-bit integers. A degree-6 Horner in 256-bit
+arithmetic is ~150–200 IMADs; at 800K survivors that is ~0.16 Gops/side per q
+against a card doing on the order of 15 T lane-ops/s. **Under 0.05 ms.** Exact
+division by a recovered 32-bit prime is a multiply-by-inverse chain, similarly
+negligible. Nothing in the big-integer path is a throughput risk — the entire
+question is memory access patterns, which is a statement worth making
+explicitly because "GPU big-int TD" sounds hard and is not.
+
+Note the norms here must be **exact integers recomputed from `(a,b)`**, not the
+sieve's hybrid fp32/fp64 approximation. Finding 28 established that the sieve
+norm is wrong in both directions near root lines; it is a log approximation and
+was only ever meant to be one.
+
+**Small primes (`p < bkthresh = 2^15`) must NOT be resieved.** The small sieve
+carries 6.84e9 updates per q. Even at one L2-resident summary probe each, that
+is ~40 ms — worse than everything else in the post-sieve budget combined. Test
+them directly instead: for a survivor at `(i,j)`, `p` divides the norm iff
+`i ≡ rt·j (mod p)` with the transformed root already sitting in the small-sieve
+tables. At ~3,600 entries per side and ~4 ops per test, that is **~11.5 Gops
+per side per q, ≈1 ms at peak and plausibly 3–5 ms achieved.** Perfectly
+regular, fully coalesced over the prime list, no divergence.
+
+So the split inverts relative to the sieve's own reasoning:
+
+- `p ≥ 2^15` (bucketed): **resieve**, because hits are rare and survivors sparse.
+- `p < 2^15` (small): **direct test per survivor**, because hits are dense.
+
+The crossover is not at `bkthresh` and there is no reason it should be. Per
+prime, direct testing costs `n_survivors × 4` ops while resieving costs `A/p`
+probes; they cross near `p ≈ A/(4·n_survivors) ≈ 168`. Between 168 and 2^15
+it is close to a wash (≈490M hits to resieve versus ≈11 Gops to test directly),
+so this is a tuning knob, not a decision. Take the direct test for the whole
+small tier because it needs no second kernel and no second data structure.
+
+## Where the budget stands, with finding 47 folded in
+
+Finding 47 landed while this section was being written and it moves the ranking,
+so the ordering below is *not* what I would have written from the cost model
+alone. My independent op-count estimate for the hard-cofactor stage was ~7 ms/q
+at peak and ~25 ms/q at a realistic fraction of it, on an assumption of B1 in the
+low thousands and ~20 curves. Finding 47's provisional recurring-work figure is
+**4.92 ms/q**, better than my optimistic end — because the measured harness runs
+`b1=300` with a ten-curve no-success stopping rule, which is a much cheaper
+strategy than I assumed. The measurement supersedes the model; I record the
+model only because it was the basis for a recommendation that the measurement
+then changed.
+
+| stage | ms/q | basis |
+|---|---:|---|
+| intersect two 67 MB bitmaps + compact + gcd filter | ~0.5 | estimate: 134 MB streamed, 1.4M candidates compacted |
+| resieve, both sides, re-walk + hierarchical filter | **~8–14** | estimate, above |
+| TD: exact norms + small-prime direct tests | **~4–8** | estimate, above |
+| hard cofactors, ~1,851/q | **4.92** | finding 47, provisional, non-target C164 `31/31` |
+| **total post-sieve** | **~18–27** | |
+
+Against finding 46: energy parity (≤106–114 ms) is comfortably met. **A 2×
+energy win (≤21–25 ms) is now genuinely on the boundary**, and the thing sitting
+on that boundary is resieve + TD at ~12–22 ms of a ~16–20 ms remaining
+allowance. Finding 47 reached the same conclusion from the other side —
+*"if the target rerun holds near 4.9 ms/q, GPU resieve/factor recovery/TD
+becomes the largest unknown inside the 2× budget"* — and the estimate above is
+the first sizing of that unknown. It says the 2× target is reachable but has no
+slack, which makes two things load-bearing that would otherwise be tuning:
+
+- **The survivor-bound sweep.** Resieve and TD are both linear in the survivor
+  count. If the bound can drop with no relation loss, this is the difference
+  between clearing 2× and missing it.
+- **The `p < 2^15` direct-test kernel.** It is the larger half of my TD
+  estimate and it is a completely regular, coalesced kernel. If it lands at the
+  1 ms peak rather than the 5 ms pessimistic figure, the budget stops being
+  tight.
+
+Both should be settled before anyone concludes where in the zone this lands.
+
+**One architectural point survives the reranking unchanged.** 1,851 cofactors
+per q fills 2.5% of this device's 73,728 resident threads, so the cofactor stage
+cannot run in per-q lockstep — it needs a device-resident queue spanning many q.
+Finding 47 reaches this from its own direction (one million records ≈ 526 q ≈
+34 seconds of arrivals, and its rerun must sweep smaller batches). Two ways to
+fill the device: run curves in parallel within a cofactor, which forfeits the
+early exit that finding 47's `-s 10` stopping rule depends on; or batch across
+q, which keeps it. **Batch across q** — latency is irrelevant for a throughput
+job. Assume the decoupled producer/consumer shape from the start; retrofitting
+it is expensive, and it is the only hard-to-reverse decision in the post-sieve
+path.
+
+## Recommended order
+
+0. **Done in this review.** The CADO patch exists and the oracle is captured;
+   `oracle/` holds the `after_sieve` `(a,b)` sets (with and without `powlim`
+   pinning), las's 37 relations, and the cofactor-candidate file. CADO itself
+   is restored to its pre-review state.
+1. **Done in this review.** Relation containment ran over the full 67-lattice
+   band: 3,026/3,026 in-region relations contained, zero misses. It also
+   exposed that PARITY.md's q-lattice basis claim holds at only 47 of 67
+   lattices; restate it and add a basis-agreement check to any per-q parity
+   comparison.
+2. **Bill and fix the per-q host work** (`bench_kernels.cu:677`). Index-permutation
+   sort, not `qsort` (four parallel arrays); bill transform, sort and transfer
+   separately. The timing report is the part that matters. Goal-1 evidence.
+3. **Device intersect + compact + primitive filter, emitting `(a,b)`**, gated
+   by item 1. One deliverable, not two.
+4. **Survivor-bound sweep downward** on las over the band (CPU-side, concurrent
+   with 3). It sizes resieve and TD, which are the binding stages.
+4b. **Capture the target cofactor population** with `-batch-print-survivors`
+   over ~50–500 q. No patch needed; feeds item 6.
+5. **Resieve + TD** — **REVISED 2026-08-04, see the correction above.** Not a
+   single design to implement but an **A/B to run**: layout A (re-walk +
+   hierarchical survivor filter) against layout B (slice-segmented records with
+   an exact within-slice offset + CADO-style purge), measured as
+   `fill + apply + recovery` end to end, with batch/product-tree recovery on the
+   same chart as a third point. The largest unknown in the 2× budget, and now
+   also the largest *open design question*.
+5b. **Sweep the small/large split rather than assuming it.** "Direct testing for
+   `p < 2^15`" was asserted, not measured; `2^15` is simply the default
+   `bkthresh`. CADO's own policy is a mixed direct/resieve split and is the right
+   starting point, but the boundary is a free parameter and both A and B are
+   sensitive to it in opposite directions. Sweep it inside the A/B.
+6. **Finding 47's controlled rerun** on the target `31/32` population, using
+   4b's capture. Concurrent with 3–5 whenever the box is free. **Note the
+   harness gap:** the captured CADO files are not in a format the existing YAFU
+   test parser accepts, so this item needs a small input adapter or a parser
+   mode *in addition* to the harness fixes already listed under finding 47.
+7. Wire the device-resident cofactor queue and measure the assembled pipeline.
+
+Items 1, 4, 4b and 6 use the CPU; items 2, 3, 5 and 5b use the GPU. They do not
+contend.
+
+**Two ordering notes added after the 2026-08-04 cross-review:**
+
+- Item 3 should **retain the compact `x` indices**, not just derive `(a,b)` and
+  discard them. Recovery — under either layout — is indexed by `x`; a design
+  that throws `x` away at compaction has to reconstruct it, and `(a,b) → x`
+  requires inverting the lattice basis per survivor. Emit both.
+- Item 4 is **closed, at bound 128.** The six missing probes were run and the
+  true zero-loss floor is 128, not 131. The containment gate was then rerun on
+  our own bitmaps at that bound and passes 3,026/3,026 — so the tightening is
+  validated on our norms, not just CADO's. Hard-code **128**: 2.46× fewer
+  survivors on CADO's count, 2.35× on ours, zero relations lost. Do not go
+  below it; 127 costs a relation in CADO's own sweep.
+
+**One loose end I did not close:** side 1's 722 missing survivors and side 0's
+residual 266 have no confirmed cause. Not truncation (disproved), not `powlim`
+(side 1 unchanged under it). Finding 28's two-directional norm error is the
+leading candidate. Since relation containment passes, this is a diagnostic to
+run — a handful of `las_tracek` probes at missing positions — not a blocker.
+
+## Two things I would not do yet
+
+- **Do not widen the bucket record to 8 B.** It is the obvious way to make
+  resieve trivial and it is a permanent tax on the largest stage in the chain to
+  avoid a stage that the sparsity argument already makes cheap. Revisit only if
+  the measured re-walk badly misses the ~8–14 ms estimate — and note that if it
+  does miss, the 2× budget is gone either way, so the decision will be made on
+  evidence rather than on this trade. **Layout B is the thing to try before 8 B
+  records**: it buys exact prime recovery inside the existing 4 B, which is
+  precisely what the 8 B record was going to be spent on.
+- **Do not chase the remaining +5.6% survivor excess.** It is las's
+  approximation, not our error (PARITY.md), and its whole cost is a 5.6% larger
+  input to the post-sieve stages — which the bound sweep in item 2 may make
+  moot in either direction. Get the containment zero first; the excess is a
+  cost question, not a correctness one.
+
+## Caveat on everything numeric above
+
+Measured during this review, on a busy box (so the only timing quoted from it
+is the host-sort band, explicitly given as an upper band): the
+`-batch-print-survivors` population (1,851, not 797,028); the survivor filter
+occupancy table (9.34% at granularity 64); the full containment gate
+(2,162 → 1,005 missing under `powlim` pinning, with side attribution);
+relation containment (37/37); bit-exact bitmap reproducibility; the one-sided
+popcounts contradicting finding 40's table; and the host insertion-sort cost.
+
+Added 2026-08-04, also measured on a busy box (load 17–24, so again no timings):
+the full-band relation containment (3,026/3,026 over 67 lattices, and the 47/67
+basis agreement); the cofactor bit-size histogram over all 1,062,811 captured
+records; and the side-1 slice count, bucket geometry and device memory
+(39 slices, 32,768 buckets, 1.37 GB, 10.76 GB free) read off `bench`'s startup
+output. All of these are **counts and sizes, which are load-independent** —
+that is the only reason they were run while the box was busy. Everything in the
+resieve A/B remains **derived, not measured**; that is precisely why it is
+written as a benchmark to run rather than a decision.
+
+Except for those, the record layout, the CADO source behaviour, the counts
+already in RESULTS.md, and finding 47's measured cofactor figure, every number
+in this section is **derived from measured inputs, not measured**. The op-count models
+are order-of-magnitude tools chosen to rank stages against each other and
+against the finding-46 budget. They are good enough to decide what to build next
+and in what order — and finding 47 is the demonstration of their limits: a
+measurement came in at 0.7× my optimistic end and inverted a recommendation.
+The first measurement of any stage should replace its row in the table above
+rather than be compared against it.

@@ -9,8 +9,13 @@ CC        ?= gcc
 NVCC_ARCH ?= -gencode arch=compute_120,code=sm_120 \
              -gencode arch=compute_89,code=compute_89
 
-NVCC_FLAGS = $(NVCC_ARCH) -O3 -std=c++17 -lineinfo -Xcompiler "-O3 -Wall"
-CFLAGS     = -O3 -march=native -Wall -Wextra -std=c11
+# Extra -D's for pricing experiments, e.g. make DEFS=-DNORM_CANCEL_TOL=0.0f.
+# Nothing in the default build sets this; it exists so a variant can be timed
+# without editing a header and forgetting to put it back.
+DEFS      ?=
+
+NVCC_FLAGS = $(NVCC_ARCH) -O3 -std=c++17 -lineinfo -Xcompiler "-O3 -Wall" $(DEFS)
+CFLAGS     = -O3 -march=native -Wall -Wextra -std=c11 $(DEFS)
 
 CU_SRCS = bench_main.cu bench_kernels.cu
 C_SRCS  = fb_load.c verify_cpu.c poly.c rfb.c fb_cado.c

@@ -21,6 +21,8 @@ static void usage(void)
 "  --threads N      threads per block          [256]\n"
 "  --blocks N       0 = auto (6 per SM)        [0]\n"
 "  --reps N         timing repetitions         [3]\n"
+"  --survbits FILE  write a survivor bitmap (1 bit/position, x order)\n"
+"  --not-both-even  apply las's filter: i,j both even can never survive\n"
 "  --verify         run the CPU cross-check (slow)\n"
 "  --poly PATH      algebraic polynomial       [../oracle/c183.poly]\n"
 "  --stage S        fill | both | apply        [both]\n"
@@ -63,6 +65,7 @@ int main(int argc, char **argv)
     cfg.small_sieve = 1; cfg.side = 1;
     cfg.scale = 1.0; cfg.dump = NULL; cfg.cadofb = NULL;
     cfg.probe_i = 0; cfg.probe_j = 0xFFFFFFFFu;
+    cfg.survbits = NULL; cfg.not_both_even = 0;
     int maxbits = 15;
     int allowance_set = 0;
 
@@ -105,6 +108,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--scale") && i + 1 < argc) cfg.scale = atof(argv[++i]);
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc) cfg.dump = argv[++i];
         else if (!strcmp(argv[i], "--cadofb") && i + 1 < argc) cfg.cadofb = argv[++i];
+        else if (!strcmp(argv[i], "--survbits") && i + 1 < argc) cfg.survbits = argv[++i];
+        else if (!strcmp(argv[i], "--not-both-even")) cfg.not_both_even = 1;
         else if (!strcmp(argv[i], "--maxbits") && i + 1 < argc) maxbits = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--probe") && i + 1 < argc) {
             int pi; unsigned pj;

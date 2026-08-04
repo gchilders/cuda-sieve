@@ -3,6 +3,12 @@
 Everything below came from one `las` run on `c183.poly`. This is the reference
 Path 3 gate 2 diffs against.
 
+Architecture note: CADO and `-batch-print-survivors` are used here to define
+correct sets and relations. The primary runtime target keeps survivor
+intersection, resieve/factor recovery, and cofactorization GPU-resident; dumping
+candidates to a CPU cofactor process is an optional hybrid mode, not what this
+oracle commits the implementation to.
+
 ## Reproduce
 
 ```
@@ -54,7 +60,31 @@ catches it.
 
 `bench/qlat_build` with `--q 120000053 --rho 112625526` produces
 `(-7374527, 1, 120000053, 0)`, which is las's basis with the first vector
-negated: **the same reduced basis. Gate passed.**
+negated: **the same reduced basis, at this special-q.**
+
+> **This does not generalise — corrected 2026-08-04.** The "first vector
+> negated" relation was verified at exactly one `(q, rho)` and was previously
+> written here as a passed gate. Measured over the whole frozen band
+> (`-q0 120000000 -q1 120001000`, **67 lattices**, not 67 primes — a prime with
+> several roots of `f` gives several lattices), it holds at **47 of 67**. On the
+> other **20**, `bench`'s second basis vector is las's `v2 - v1`: the same
+> lattice under a unimodular transform, but a **different `(i, j)` rectangle**,
+> so the two cover different `(a, b)` regions.
+>
+> Neither basis is wrong. Under the *skewed* norm ours is the shorter vector
+> (11,484 against 12,881 at q=120000169), i.e. **our reduction is the
+> better-reduced one and las's is not Gauss-reduced there.**
+>
+> Consequences, both of which bite:
+>
+> - **Any per-q parity or yield comparison against las must test basis
+>   agreement first.** Without that test a legitimate region difference reads as
+>   a correctness failure — 4.3% of las's relations in this band fall outside our
+>   region for exactly this reason.
+> - **Final relation yield cannot be taken from las.** It has to be measured by
+>   cofactoring *our* region. Containment (see
+>   `../prototype.md`, "The gate at scale") establishes in-region correctness —
+>   3,026 of 3,026 — but not yield equivalence.
 
 ## Log scales — the parity-critical constants
 
@@ -214,6 +244,26 @@ to compute, not an error on either side, and it is why a byte-for-byte region
 diff could never have reached zero even with a working dumpfile.
 
 ## ⚠ The `-dumpfile` oracle is still not usable (superseded by gate 5)
+
+**Do not use any number derived from the two `.dump` files.** Kept only as
+evidence of the CADO bug. RESULTS.md finding 17 has the analysis: the dump
+carries roughly the small-sieve contribution and **not** the bucket-sieved one
+(mean sieved log 41.1 against our 54.2 and an analytic 54.65), and it does not
+correlate positionally in either i orientation (+0.033 direct, +0.016 mirrored,
+against a +0.636 control).
+
+Re-confirmed 2026-08-03 at full resolution: `dumpcmp diff` against our pinned
+side-1 dump over all 536,870,912 positions gives a **flat** delta histogram,
+~4.5M positions at each delta in [-8,+8] and 86% outside that window. Our dump
+is verified correct at the four gate-5 positions (reads exactly `init - sieved
+sum` = 219, 153, 195, 195 at `x = j*I + i + I/2`); las's file matches none of
+them either way round.
+
+The table below is therefore a description of a **corrupt** file. In
+particular its `S <= bound` row is *not* las's survivor count — fewer logs were
+subtracted, so it is biased low by construction. Finding 38 was retracted for
+quoting it. **las never prints a one-sided survivor count**; the only survivor
+figure the oracle supports is the two-sided `after_sieve: 797028`.
 
 ## What the dump contains
 

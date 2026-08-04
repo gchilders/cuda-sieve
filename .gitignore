@@ -1,6 +1,17 @@
+# Large frozen oracles: NOT in git, but pinned by oracle/MANIFEST.sha256.
+# Regenerate with the commands in oracle/README.md, then verify against the
+# manifest — that is what makes them oracles rather than just files.
 *.dump
 *.afb.0
 *.fb1
+
+# Captured survivor / cofactor populations. Same rule: manifest-pinned, not
+# committed. gzip and tar do not delta-compress, so committing these would add
+# their full size to every clone, permanently, for data that is reproducible.
+*.txt.gz
+*.tar.gz
+
+# Build products
 *.o
 bench/bench
 bench/fbtest

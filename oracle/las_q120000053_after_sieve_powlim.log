@@ -1,0 +1,129 @@
+# (0574bc39d) ./las_survdump -poly /home/kylea/code/cuda-sieve/oracle/c183.poly -fb1 /home/kylea/code/cuda-sieve/oracle/c183.fb1 -lim0 67100000 -lim1 134200000 -lpb0 31 -lpb1 32 -mfb0 60 -mfb1 92 -lambda0 2.35 -lambda1 3.5 -powlim0 32767 -powlim1 32767 -A 29 -sqside 1 -q0 120000011 -nq 1 -adjust-strategy 0 -B 14 -t 1 -v
+# List of modified files in working directory and their SHA1 sum:
+# M sieve/las-process-bucket-region.cpp d9a05930b3dafda14ad9ff67164faecc92314a08
+# M sieve/las-threads-work-data.cpp c3534f10547378e274d07abf80806a08841cfd0b
+# Compiled with gcc 13.3.0
+# Compilation flags (C) -Werror=all -Werror=extra -std=c99 -Wall -Wextra -O3 -march=native -funroll-loops -DNDEBUG -DSIZEOF_P_R_VALUES=8
+# Compilation flags (C++) -Werror=extra -Werror=all -export-dynamic -std=c++20 -Wno-c++11-compat -Wall -Wextra -O3 -march=native -funroll-loops -DNDEBUG -DSIZEOF_P_R_VALUES=8 -Wno-stringop-overflow -Wno-literal-suffix
+# las flags: BUCKET_SIEVE_POWERS LOGNORM_GUARD_BITS=1.00
+# Getting rid of sieve_shared_data structure [rss=7424.00 k]
+# Applying binding machine,1,1 with hwloc disabled
+# 1 jobs in parallel
+# 1 threads per job
+# Expected memory usage per binding zone for the factor base: 177.97 MB
+# Expected memory usage per subjob for logI=15: 1.81 GB
+# Expected memory use per subjob (max reached for logI=15): 1.81 GB
+# Expected memory use for 1 binding zone(s) and 1 1-threaded jobs per zone, counting 12 MB of base footprint: 2.00 GB
+# Creating side-0 rational factor base for polynomial f0(x) = -302373103001840496072794392623995033+58958421689715064693511*x
+# including primes up to 67100000 and prime powers up to 32767 using threadpool of 1 threads.
+# Creating side-0 rational factor base took 0.9 (6.8 real)
+# Reading side-1 factor base from disk for polynomial f1(x) = -230628868106431738173949771021343942925597240-7196585837893771008938965563233970542*x+836630598661015441244544068131*x^2-2465553130084580317098*x^3-223080491136*x^4+110880*x^5
+# Reading side-1 factor base from /home/kylea/code/cuda-sieve/oracle/c183.fb1
+# Factor base successfully read, 4817858 primes, largest was 134199997
+# Note: 1 primes above limits (lim=134200000, powlim=32767) were discarded
+# Reading side-1 factor base took 0.8 (3.2 real)
+# polynomial has no roots for 2 of the 3 primes that were tried
+#
+# Now sieving side-1 q=120000053; rho=112625526
+# Side 0: log2(maxnorm)=131.86 scale=1.93, logbase=1.433439 bound=141
+# Creating new slicing on side 0 for scale=1.93, thresholds={32768, 67100000, 67100000, 67100000}
+# side-0 part 0: 3589 primes, 3589 ideals, weight 3.3755
+# side-0 part 1: 3953784 primes, 3953784 ideals, weight 0.54966 [86 slices]
+# Side 1: log2(maxnorm)=196.61 scale=1.28, logbase=1.722273 bound=143
+# Creating new slicing on side 1 for scale=1.28, thresholds={32768, 134200000, 134200000, 134200000}
+# side-1 part 0: 2362 primes, 3839 ideals, weight 9.359
+# side-1 part 1: 4815496 primes, 7601776 ideals, weight 0.58699 [138 slices]
+# Using default strategy for the cofactorization: ncurves0=100 ncurves1=21
+# Building/reading strategies took 0.8s
+# Sieving side-1 q=120000053; rho=112625526; a0=7374527; b0=-1; a1=120000053; b1=0; I=32768; J=16384;
+# Reserving buckets with a multiplier of 1,
+# Error: 1s buckets are full, worst is bucket 15301 on side 0: 4766* /4704
+# redoing side-1 q=120000053; rho=112625526 because 1s buckets are full
+# Fullest level-1s bucket #15301, wrote 4766/4704
+# Updating 1s bucket multiplier to 1.000*4766/4704*1.05, =1.064
+# Expected memory usage per binding zone for the factor base: 177.97 MB
+# Expected memory usage per subjob for logI=15: 1.93 GB
+# Expected memory use per subjob (max reached for logI=15): 1.93 GB
+# Expected memory use for 1 binding zone(s) and 1 1-threaded jobs per zone, counting 12 MB of base footprint: 2.11 GB
+#
+# Now sieving side-1 q=120000053; rho=112625526
+# Side 0: log2(maxnorm)=131.86 scale=1.93, logbase=1.433439 bound=141
+# Side 1: log2(maxnorm)=196.61 scale=1.28, logbase=1.722273 bound=143
+# Sieving side-1 q=120000053; rho=112625526; a0=7374527; b0=-1; a1=120000053; b1=0; I=32768; J=16384;
+# Reserving buckets with a multiplier of 1,1s:1.064
+-1944779377970,3897:191,8ef,2d4d,d6f27f,eba3ab,14c173d,1651c75:2,2,2,2,2,2,2,2,2,2,2,2,2,2,3,3,5,7,b,b,d,11,1f,35,6b,3ad,fc59,3f9eb,486d7,ca5c7,7270e35,1b33915b,1e4df915
+-1756624045237,16232:3,3,c1,c487,4c3297,1397db5,1edb6eef,3f076339:2,2,2,2,2,5,5,7,11,13,17,1cd,481,7cd,67f37,7d093,1a3a91,13b829d,7270e35,8d88b73,81f74f33
+-1690558520172,8087:d,11c5,fe63,149c4b,1925a8b,232577f,1cd56187:2,2,2,2,3,3,3,3,5,7,baf83,278209,2161d2d,3dfcf79,550f8ef,7270e35,b0a42c7,4f9e33cb
+-1531231347095,2266:3,3,3,d,9d,df,ef,5cb,6c5,903f7,8be492d,3e6f4cfd:2,2,2,2,5,5,7,b,1f,29,347,40f,10fd,421f,11ce3,2d13e5,7270e35,92895b9,ce949e5,17ebe3b1
+-1371812439495,2974:13,4f,1169,1319,1c45,2e6eab5,a782949,1a7b3abb:2,2,2,2,2,2,3,3,5,7,d,1d,2f,10b1,3d21,5bf3,6dcd,2e1fdd,69c7ae1,7270e35,1b46e19d,5aa7cb3d
+-1414240220197,9248:3,4b1,2136b,4075d,2681d6d,14cc0dd3,5b6acd29:2,2,2,2,2,5,7,2b,2b,277,11731,211c7,40469,480893,7270e35,fc4e185,3fcb3255,95ad31a7
+-1441291615147,14218:1f,274d,16987,202ae9,115b86f,303e2bd,492dd71:2,2,2,2,3,5,7,17,35,3b,25f7,13afbd,1bcb83,4457d35,7270e35,17f900c3,246f8639,3e0bec9d
+1197188788006,6581:22ed,5e883,e31b5,56773f,4784f7d,56a9e45b:2,2,2,2,2,3,5,7,d,d,13,1d,d3,139,94d,1394f,32d0d,86b25,677dcc1,7270e35,d0c82f9,12e13bb1
+1073719268531,7442:3,5,6d,1b7,329,363faf,20ef01f,5785f6f,147fcc2f:2,2,2,2,2,7,b,d,d,11,13,1d,19c39,97511,6be1c5,70e481,8ddeeb,906065,7270e35,96707d7d
+-1148823280163,4939:2,2,2,3,5,13,29,241,259,8885,77b559,15b908c7,1b7b3a67:b,d,17,59,e9,aab,2d2a7,95f27,1690cd,7270e35,2da55b85,2f75a235,796c5563
+1032500890300,10623:d,25,25,53,9f7,2d74f,b05139,dc5cc4d,66338221:2,2,2,2,2,2,3,3,5,7,b,17,2f,2e3,36b8eb,556af5,14c7f9b,619c739,7270e35,b5c426d,fb2e2891
+934727641885,10717:2,3,3,1f,83,649,9126af,1a1bf53,5b5d8e5,41d1ae49:5,5,7,b,d,17,2b,35,449,1327,139d,1cf01,7c659d,2dec641,7270e35,4a0024f9,978ee565
+-1043586612596,14117:35,13c3,1433,6f9b,2b3c3,601a5,ae6341,80fdfb9:2,2,2,2,3,5,7,7,b,115f,12175,137cf,10a86f9,10aefb1,7270e35,9493d47,a3cd489,383b9189
+-943048513134,4259:9006d,14f8cd,1d19d1,5b0ebb,706bc5,1210ac3:2,2,2,2,3,5,7,d,13,17,3b,2c0f,17281,42cce9,6884dd,1141bb3,7270e35,74d0e0f,a6c9b599
+-884917640836,10761:59,2fdfe5,565175,99b8f7,12d4c951,26934cfb:2,2,2,2,3,3,5,7,86c5,1374b,14c5f,3944b,78679f,7270e35,199b7703,879fd36f,e9eb74e1
+-845143795233,9875:2,a99,2b2b3,203165,11c4ab7,cb9348b,161ba3c3:3,5,7,b,a757,12491,dc8c7,239117,16e231b,428f95d,7270e35,d8a1b01,76702327
+709463510495,7238:3,3,3,3,3,3,3,3,3,134f5f,202f7f,4dd51d,9f5299,2e9dd703:2,2,2,2,5,7,7,7,b,3d,139,1dd7bb,619b4f,54646c1,7270e35,e065363,fced26f,8ed2130b
+736752082973,2903:2,2,3,17,67,6b,653,f494f,b20015,13a33f9,2c258495:5,5,7,7,7,1f,71,b3,2a1,305,32b,3a319,3bf86f9,428f5eb,528cce5,7270e35,3f7bd2d3
+491900114828,10021:5,7,13,1f,209,1aaffa7,1e2b187,10ab272d,43ecf103:2,2,2,2,3,b,25,35,3d,b8d,139d,6a93,17c5bb,279fd3,3da7307,491a523,7270e35,728f8bfd
+-570656465239,5589:2,11,9c125,102e317,20e3711,ebb5ae9,200c2145:3,3,5,7,1d,61,67,bf,577,4787,2904bb,11988c7,5ce1c93,7270e35,9b3eae1,51bc241b
+365415785267,8134:5,4fd,71f1d,1d1179,6b11b7,224f9a1,664a3d6b:2,2,2,2,3,7,d,11,1d,61,1d405,6e6e9,30805d,465455,76b1e7,38ba88d,7270e35,d66b59b7
+369124714977,634:5,5,b3,3841,13b8cb,6b0e25,a3bd81f,71de8b11:2,2,2,2,3,3,3,3,7,7,61,407,4613,4c0ff,cd6f1,207be7,21843d,7270e35,9a5b63f,102be28f
+254675832515,11223:2,b,17,9fd,86c75,9185b,a5887,1c3a2f1,17ac75dd:3,3,5,5,7,d,11,13,13,54185,1a56a87,2f20217,7270e35,1383880d,1527a7b1,6fce1833
+298478455567,2517:2,2,13,875b,4ebd1,8c699,9fca3,23bc73,3c9582d9:3,3,3,5,7,761,65039,b87fb,19a77f,3b7433,2aeecbd,6c20453,7270e35,1889163b
+-372574502414,14251:3,679,679,ae5,5d55,1a0075f,138cda23,34533feb:2,2,2,2,5,d,11,13,2f,2dd,35b,1c7d1,86af7,68e7239,7270e35,9834659,ac898c5,52282327
+-340574004683,11067:2,2,2,2,47,12b9,fc9799,3d2cfbb,183386a7,54f6b107:3,3,3,5,7,b,59,b3,35b,33f1,ae71,2119d,4e0f1,7270e35,c594625,24b2fa3b,965e3ccd
+-257003479391,1069:2,3,7b35,10873,17437,1376fb,e25bfd1,342028b7:5,d,d,d,2b,3d,e9,2ab5f,9c3a3,212dfd,5817085,7270e35,91af36f,aae67e51
+-221780949361,312:115,6a3,94f,14b1,ab78d,1824d9,2afce3,4d6861:2,2,2,2,2,3,3,5,13,45f7,6c2b,19237,2b9bd,4ff4b,4c5acf,7270e35,1d3cf2ed,8a185e49
+-208003464347,2105:2,b,1d,49,49,15d,469,2e97,384b,e653,1b03b,194122d9:3,5,7,7,15c817,7730d1,a5b4a9,b16d0d,2b556e9,7270e35,7b05e01,21b70abb
+-183494333134,783:11,49,2ed3b,53909,116b091,10b04ae7,21df7a1d:2,2,2,2,2,3,3,5,5,7,d,4eb,2395d,413db,1c8869,1a2316b,7270e35,7413e39,41f593f7
+-138913230134,433:3,b,35,4459,122ad,15593,218bc9,ced5f3,150af7b:2,2,2,5,5,7,61,bf,d3,161,16bd,2a01,3c079,bd973,14a851,8bb9bb,5891c9f,7270e35
+20702663152,13709:5,5,97,92b9,5b07d7,2c37bb1,c55374b,1e721e8f:2,2,2,3,3,7,11,13,e8f,8945,1bc73,3c49d,a99ff,7270e35,2326c2c5,62b7c071,8dbfc921
+-114302564793,6794:5,5,7,13,23b,42d,1349,2267,4bc80b,69592d,28779b93:2,2,2,2,2,3,1d,35,38b,38b,708d1,226c63,181bda9,51d3be5,7270e35,94d4fa3,175b941f
+36480970276,1741:3,3,7,11,83,11b,e5e55,15aedd3,13c61e8d,6f433b9d:2,2,2,2,2,5,13,13,1f,231af,6ca12d,500edc5,7270e35,8719ed7,132f5309,292df389
+34135333983,1457:2,2,2,2,97,aa15,e80f,20171,1167e5,1d3ed9,e9f337b:3,5,b,d,13,3b,b3f,22ff3f,4691fdb,7270e35,141ea12b,7028fa43,7eb851a5
+-136664197821,13097:2,2,59,c25,114b9,64531,4bd597,243fe0f,26c816e7:3,5,7,17,47,16f,14e7,29965,39a1f,1e2317f,7270e35,b803fcf,3eccc44f,87a93615
+-36057898952,1033:3,3,b,2f,3d,fb3,50ed,a5f7,1a9c9,777a6f,15b9a587:2,2,2,5,1021,2cad,3bc89,be517,26f657,38974d9,4c3d857,7270e35,9852f40d
+# survivors before_sieve: 536870912
+# survivors after_sieve: 795845 (ratio 1.48e-03)
+# survivors not_both_even: 795845
+# survivors not_both_multiples_of_p: 795844
+# survivors trial_divided_on_side[0]: 33354
+# survivors check_leftover_norm_on_side[0]: 33354 (4.2%)
+# survivors trial_divided_on_side[1]: 1851
+# survivors check_leftover_norm_on_side[1]: 1851 (5.5%)
+# survivors enter_cofactoring: 1851
+# survivors cofactored: 1404 (75.9%)
+# survivors smooth: 37
+# Checksums over sieve region: after all sieving: 0 0
+# 37 relation(s)
+# Time for side-1 q=120000053; rho=112625526: (41.9 elapsed) 24.05s [norm 0.02+0.0, sieving 10.1 (4.5+5.4 + 0.3), factor 1.4 (0.3+0.3 + 0.7), rest 10.5]
+# subjob 0 done (1 special-q's), now waiting for other jobs
+# Average J=16384 for 1 special-q's, max bucket fill -bkmult 1,1s:1.064
+# Discarded 0 special-q's out of 1 pushed
+# survivors before_sieve: 536870912
+# survivors after_sieve: 795845 (ratio 1.48e-03)
+# survivors not_both_even: 795845
+# survivors not_both_multiples_of_p: 795844
+# survivors trial_divided_on_side[0]: 33354
+# survivors check_leftover_norm_on_side[0]: 33354 (4.2%)
+# survivors trial_divided_on_side[1]: 1851
+# survivors check_leftover_norm_on_side[1]: 1851 (5.5%)
+# survivors enter_cofactoring: 1851
+# survivors cofactored: 1404 (75.9%)
+# survivors smooth: 37
+# Wasted cpu time due to 1 bkmult adjustments: 0.89
+# Cumulated wait time over all threads 0.14
+# Total cpu time 19.35s, useful 24.05s [norm 0.02+0.0, sieving 10.1 (4.5+5.4 + 0.3), factor 1.4 (0.3+0.3 + 0.7), rest 10.5], wasted+waited 1.03s, rest -5.73s
+# Total elapsed time 75.68s, per special-q 75.6821, per relation 2.04546
+# Expected memory usage per binding zone for the factor base: 177.97 MB
+# Expected memory usage per subjob for logI=15: 1.93 GB
+# Expected memory use per subjob (max reached for logI=15): 1.93 GB
+# Expected memory use for 1 binding zone(s) and 1 1-threaded jobs per zone, counting 12 MB of base footprint: 2.11 GB
+# PeakMemusage (MB) = 3352
+# Total 37 reports [0.523s/r, 37.0r/sq] in 75.7 elapsed s [25.6% CPU]
+# Getting rid of sieve_shared_data structure [rss=326.93 MB]

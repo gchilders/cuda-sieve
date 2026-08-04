@@ -218,7 +218,8 @@ __global__ void k_apply(const uint32_t *__restrict buckets,
                         const uint32_t *__restrict sp, const uint32_t *__restrict srt,
                         const uint32_t *__restrict sg, const uint16_t *__restrict slp,
                         uint32_t nsmall, uint32_t nblk, uint32_t nwrp,
-                        uint32_t probe_x, uint32_t *__restrict probe_out)
+                        uint32_t probe_x, uint32_t *__restrict probe_out,
+                        uint32_t *__restrict survbits, int not_both_even)
 {
     extern __shared__ uint32_t sm[];
     const uint32_t ncell  = 1u << log_region;
@@ -342,16 +343,24 @@ __global__ void k_apply(const uint32_t *__restrict buckets,
                  * produced is v - (CINIT - probe_out[0]). */
                 probe_out[1] = v;
             }
-            if (v >= THRESH) {
+            const uint32_t x = xbase + w * CPW + c;
+            /* las's `not_both_even` filter. x = j*I + (i + I/2) and I/2 is a
+             * power of two >= 2, so parity(i) == parity(x) and parity(j) ==
+             * parity(x >> logI). Both even means (a,b) are both even and the
+             * relation is a duplicate of (a/2, b/2); las marks these 255 so
+             * they can never survive. Off by default so that every survivor
+             * count recorded before 2026-08-03 still reproduces. */
+            const int botheven = ((x & 1u) == 0u) && (((x >> logI) & 1u) == 0u);
+            if (v >= THRESH && !(not_both_even && botheven)) {
                 uint32_t at = atomicAdd(nsurv, 1u);
-                if (at < maxsurv) surv[at] = xbase + w * CPW + c;
+                if (at < maxsurv) surv[at] = x;
+                if (survbits) atomicOr(&survbits[x >> 5], 1u << (x & 31u));
             }
             if (dump) {
                 /* las's byte: S = max(T - sum(logp), 0), and our cell holds
                  * CINIT - T + sum, so S = CINIT - cell. */
                 int32_t sv = (int32_t)CINIT - (int32_t)v;
-                dump[xbase + w * CPW + c] =
-                    (uint8_t)(sv < 0 ? 0 : (sv > 255 ? 255 : sv));
+                dump[x] = (uint8_t)(sv < 0 ? 0 : (sv > 255 ? 255 : sv));
             }
         }
     }
@@ -573,6 +582,7 @@ struct dev_bufs {
     uint32_t *sp, *srt, *sg;
     uint16_t *slp;
     uint8_t  *dumpbuf;
+    uint32_t *survbits;
 };
 
 static float time_kernel(cudaEvent_t a, cudaEvent_t b)
@@ -608,6 +618,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     const uint32_t xmax = I * cfg->J;
     const int log_region = cfg->log_region;
     const uint32_t nregion = xmax >> log_region;
+    const uint32_t nbitword = xmax >> 5;   /* survivor bitmap, 1 bit/position */
     const int log_super = log_region + 7;             /* 128 regions/super */
     const uint32_t nsuper = xmax >> log_super;
 
@@ -916,6 +927,15 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
             CK(cudaMalloc(&D.probe, 8));
             CK(cudaMemset(D.probe, 0, 8));
             CK(cudaMalloc(&D.nsurv, 4));
+            if (cfg->survbits) {
+                CK(cudaMalloc(&D.survbits, (size_t)nbitword * 4));
+                printf("  writing a survivor bitmap (1 bit per position, x"
+                       " order) to %s (%.0f MB)\n",
+                       cfg->survbits, nbitword * 4 / 1048576.0);
+            }
+            if (cfg->not_both_even)
+                printf("  las `not_both_even` filter ON: positions with i and j"
+                       " both even cannot survive\n");
             if (cfg->dump) {
                 CK(cudaMalloc(&D.dumpbuf, (size_t)xmax));
                 printf("  dumping the region in las byte convention to %s"
@@ -940,13 +960,16 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                 cudaEventRecord(e3);                                           \
                 for (int rep = 0; rep < cfg->reps; rep++) {                    \
                     CK(cudaMemset(D.nsurv, 0, 4));                             \
+                    if (D.survbits)                                            \
+                        CK(cudaMemset(D.survbits, 0, (size_t)nbitword * 4));   \
                     k_apply<CBV, AT, NM><<<nregion, athr, smem>>>(             \
                         (const uint32_t *)D.out, D.cursor, cap,                \
                         cfg->logI, log_region, D.slice_logp, nslice_pow2,      \
                         N, CINIT, CINIT - BOUND, tconst, D.dumpbuf,            \
                         D.surv, D.nsurv, maxsurv,                              \
                         D.dbg, dbgreg, D.sp, D.srt, D.sg, D.slp,             \
-                        nsmall, nblk, nwrp, probe_x, D.probe);                 \
+                        nsmall, nblk, nwrp, probe_x, D.probe,                  \
+                        D.survbits, cfg->not_both_even);                       \
                 }                                                              \
                 cudaEventRecord(e4);                                           \
                 CK(cudaEventSynchronize(e4));                                  \
@@ -973,6 +996,15 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
             }
 #undef LAUNCH_APPLY
 
+            if (cfg->survbits) {
+                uint32_t *h = (uint32_t *)malloc((size_t)nbitword * 4);
+                FILE *fo = fopen(cfg->survbits, "wb");
+                CK(cudaMemcpy(h, D.survbits, (size_t)nbitword * 4,
+                              cudaMemcpyDeviceToHost));
+                if (!fo) { perror(cfg->survbits); }
+                else { fwrite(h, 4, (size_t)nbitword, fo); fclose(fo); }
+                free(h);
+            }
             if (cfg->dump) {
                 uint8_t *h = (uint8_t *)malloc((size_t)xmax);
                 FILE *fo = fopen(cfg->dump, "wb");
@@ -1047,7 +1079,13 @@ after_apply:
     }
     if (t_apply > 0)
         printf("  %-26s %8.3f ms\n", "apply (init+add+scan)", t_apply);
-    printf("  %-26s %8.3f ms  <-- vs 182 ms (tie CPU) / 56 ms (TD floor)\n",
+    /* Guideposts, not floors. Both descend from the GGNFS breakdown at the
+     * MEASURED N_eff = 10.24 (was 182/56 under the assumed 13). ~225 ms is the
+     * replaceable sieve work; ~71 ms is what a HYBRID would retain on the CPU
+     * for TD and cofactoring. The primary target is GPU-resident, where no CPU
+     * stage is a floor at all -- see RESULTS.md findings 43 and 45. Printing
+     * the old numbers made the sieve look done when it is one stage of five. */
+    printf("  %-26s %8.3f ms  <-- vs ~225 ms replaceable / ~71 ms hybrid-retained\n",
            "SIEVE CHAIN ms/special-q", t_trans + t_fill + t_apply);
     if (landed) {
         printf("  %-26s %8.2f\n", "ns per record (fill)", t_fill * 1e6 / landed);
@@ -1060,6 +1098,6 @@ after_apply:
     cudaFree(D.out); cudaFree(D.overflow); cudaFree(D.nproj); cudaFree(D.nlost);
     cudaFree(D.l1); cudaFree(D.l1cnt); cudaFree(D.slice); cudaFree(D.slice_logp);
     cudaFree(D.surv); cudaFree(D.nsurv); cudaFree(D.dbg); cudaFree(D.probe);
-    cudaFree(D.sp); cudaFree(D.srt); cudaFree(D.sg); cudaFree(D.slp); cudaFree(D.dumpbuf);
+    cudaFree(D.sp); cudaFree(D.srt); cudaFree(D.sg); cudaFree(D.slp); cudaFree(D.dumpbuf); cudaFree(D.survbits);
     return 0;
 }

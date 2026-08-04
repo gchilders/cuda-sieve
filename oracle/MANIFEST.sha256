@@ -1,3 +1,9 @@
+# oracle/MANIFEST.sha256 — checksums for the frozen oracle set.
+# Verify with:  cd oracle && sha256sum -c MANIFEST.sha256
+# Covers the git-ignored large binaries (*.dump, *.afb.0, *.fb1) as well as the
+# tracked files, since pinning the former is the whole reason this file exists.
+
+# --- the target job, frozen 2026-08-01 ---
 8d817cc61ece6fef018eddf0a5cce3894c376d97f5a2d709f85d8d0faa4e6407  c183.poly
 b4534cb6a0bbfc218cd8d9e3fd9d9f8f9f8d11227788161fb90563192a3a4cf4  c183.fb1
 b26209ad2ebc6fa78835c211a11b4eeb2808d16abc36418652166752a3a83182  c183.q120000053.side0.dump
@@ -5,4 +11,29 @@ f30a0ba72878fa17ba25d37b03ba4e8dfdebded186349e204a938d4e10c83273  c183.q12000005
 02469a2657222960f31840d528e1503714f5ab180b43929855639dabe9eacfe0  input.job
 27f5ed1d3bfba2c2ba58f68749916cbb8a4bcb2ca265d48592ed7802576c90ca  input.job.afb.0
 5f4f144bf8c1645b8a978922c013db08cf3c310b1fb48bad8ddb6e1a9e7a9754  las_q120000053.log
-56d5e50a3e119fe31b5675488068e0f95fb346e52a2ca9f55dd8f6cb0a35ffe1  PARITY.md
+12860cfcc2acbe283ab5549c2bb0a4fccbc7da1fd2941ebd43d7aa903e47e062  PARITY.md
+
+# --- survivor-containment gate, 2026-08-03 (prototype.md, "The gate was built and run") ---
+9b19d612f4a1b7a0bf74d61b13591955ed3b53ea10dc3b242dfcefaae65d17b6  cado-after-sieve-survdump.patch
+755306e7768b8f8c6fe7f2a7824db3382c2abd4478191a5790af1483c567178f  c183.q120000053.after_sieve_ab.powlim.txt.gz
+04fe89e391589e2915eb942a7db1871af2d63f8f4985cf206682e6190bab8a88  c183.q120000053.after_sieve_ab.nopowlim.txt.gz
+c4d744f9716cb57db04b913e2fdbcede60c83d6449fc9c87e43cfcd19fd9b1f5  c183.q120000053.relations_ab.txt
+a2d9c2dd1d802f4ee6da9e2d2168210f8bab56f714ceefa06500f15e428438af  c183.q120000053.cofac_candidates.txt
+45a79de17d56a0a721c81f075e1d8e00241379317c0144f1dfbb3b73aa7e6286  las_q120000053_after_sieve_powlim.log
+4b181ecb4da48b58ac9df1adad66b3d186db0857f76fc1702f25eb5a31bb0f17  las_q120000053_batchsurv.log
+
+# --- relation containment over the frozen band, 2026-08-03 ("The gate at scale") ---
+74e2d2efa88d5b02b3a76736338c79d5c6e6b963eef12744fc6b52cf7e937666  relcontain_band.c
+c7cbab653043048510bc8d5fb05f6da35b1efd907d451b473663273c0d14f2d4  relation_containment_band.txt
+043c1a56e6157462c16967419b5d32959c3e860247b72f3964c2ae636c4cddff  c183.q120000000-120001000.relations.default.txt
+
+# --- containment gate at the tightened bound, 2026-08-04 ---
+59ae8be1827ebe86f7133b197a554373d84adc157ab3c4664f2d5f7a639e227a  relation_containment_bound128.txt
+
+# --- survivor-bound sweep (coarse 2026-08-03, refined to 1-unit 2026-08-04; floor = 128) ---
+4317ace67ed5de624aedd056ad72b9dc7d5e11d2827b399ebc64271a18c5b879  bound_sweep.sh
+267b2f36bf69290279f99d055a27c2e7e683d280a4410c7a571a0cdc37de299f  bound_sweep_fine.sh
+9db65e347161a113c0848f5fe5c870b8ab38b683287839a9236a8009ee08246d  bound_sweep_results.txt
+
+# --- target cofactor population, 2026-08-03 (1,062,811 records over 548 special-q) ---
+a129d9d8d8ded25316c4d0019dd2cddf27e91cfd0fd351e7d279026376384afe  c183.q120000000-120010000.cofac_candidates.tar.gz

@@ -1,0 +1,84 @@
+# survivor-bound sweep, 68 special-q in [120000000,120001000]
+# las -powlim0/1 32767 -adjust-strategy 0 -A 29 -sqside 1, lambda0=2.35 fixed
+#
+# bound1 = (unsigned char)(scale1 * lambda1 * lpb1) + 1
+#        = floor(40.7998 * lambda1) + 1     [scale1 = 1/log2(1.722273) = 1.274995]
+# A lambda1 step of 0.1 is 4.08 units of bound, which is why the first pass
+# (2026-08-03, -t 16) had to be refined at 1-unit resolution (2026-08-04, -t 8
+# at nice 19 on a loaded box; counts are thread- and load-independent).
+#
+# Totals are over all 68 q. Per-q columns are totals/68.
+#
+# lambda1 bound  survivors    surv/q   enter_cofac  cof/q  relations  lost
+  3.5     143    53162592     781803   129711       1907.5  3162       0
+  3.4     139    42156618     619950   129711       1907.5  3162       0
+  3.3     135    33233120     488722   129707       1907.5  3162       0
+  3.28    134    31288639     460127   129705       1907.4  3162       0
+  3.25    133    29447141     433046   129704       1907.4  3162       0
+  3.22    132    27704042     407412   129704       1907.4  3162       0
+  3.2     131    26055425     383168   129699       1907.3  3162       0
+  3.17    130    24496641     360245   129693       1907.3  3162       0
+  3.15    129    23024022     338589   129681       1907.1  3162       0
+  3.12    128    21633604     318141   129664       1906.8  3162       0   <-- FLOOR
+  3.1     127    20320557     298832   129633       1906.4  3161       1
+  3.0     123    15764576     231832   129464       1903.9  3159       3
+  2.9     119    12172418     179006   129152       1899.3  3158       4
+  2.8     115     9354205     137562    99211       1459.0  2949     213   <-- cliff
+#
+# RESULT
+# ------
+# The zero-loss floor is exactly bound 128. Relations are identical (3,162) from
+# the default 143 all the way down to 128; 127 is the first bound that costs
+# anything, and it costs one relation in 3,162 (0.032%).
+#
+#   bound 143 -> 128 : survivors 781,803/q -> 318,141/q = 2.458x fewer, 0 relations lost
+#   bound 143 -> 131 : 2.041x fewer (the figure quoted before this refinement)
+#
+# Relation sets were compared element by element, not by count, at 131 and 135
+# (see b131.rels / b135.rels in the working directory); the symmetric difference
+# is empty.
+#
+# CORRECTION to the 2026-08-03 reading of this data
+# -------------------------------------------------
+# "enter_cofactoring is pinned at exactly 1,907 from 143 to 131" was an artifact
+# of rounding the per-q figure. The raw totals drift continuously from bound 135
+# downward: 129711, 129711, 129707, 129705, 129704, 129704, 129699, 129693,
+# 129681, 129664, 129633. There is no plateau in this column.
+#
+# It remains a useful leading indicator, but for a different reason than stated:
+# it starts moving at bound 135, eight units before the relation count moves at
+# 127. Losing cofactor candidates is not the same as losing relations -- the
+# marginal candidates are overwhelmingly unproductive -- so a drift here is an
+# early warning, not a loss. Only the collapse at 115 (-23%) tracks a real
+# relation cliff (-6.7%).
+#
+# OPERATING POINT: bound 128, gate-validated
+# ------------------------------------------
+# The sweep above proves CADO's relation set survives at 128 under CADO's norms.
+# That is not automatically true of ours -- RESULTS.md findings 28/40/41 record a
+# one-unit norm difference, two-directional -- so the containment gate was rerun
+# on our own bitmaps at bound 128 (bench --scale 1.275 --allowance 100, 67
+# side-1 lattices; side 0 is unchanged at bound 141 since lambda0 was fixed):
+#
+#   lattices: 67  (basis matches las: 47, differs: 20)
+#   relations: 3162   unattributed: 0
+#     CONTAINED (in our region, is a survivor): 3026
+#     outside our sieve region (basis differs): 136
+#     in region but NOT a survivor  <-- real : 0
+#
+# Identical to the bound-143 result, and the bitmaps genuinely tightened
+# (q=120000053, raw popcounts):
+#
+#                side0        side1     two-sided (pre-gcd)
+#   bound 143  24301359     22499522     1386939
+#   bound 128  24301359      9521087      590665
+#
+# The 1,386,939 reproduces finding 41 exactly. Our own two-sided survivor set
+# falls 2.35x for zero relations lost.
+#
+#   bound 128  - ADOPT. 2.46x on CADO's survivors, 2.35x on ours.
+#   bound 130  - the conservative point; no longer needed.
+#   bound 127+ - below the floor; costs relations. 119 is the practical limit
+#                (0.13%), 115 is the cliff (6.7%). The gate cannot license these:
+#                it shows our norms keep what CADO keeps, never that a bound
+#                below the floor is safe.

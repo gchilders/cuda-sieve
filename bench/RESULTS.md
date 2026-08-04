@@ -7,6 +7,20 @@
 **Config unless stated:** I15e (`logI=15`, `J=16384`, A=5.369e8), region 2^15, q=120000011,
 FB truncated at q (GGNFS convention) → 6,843,511 entries, **312,265,384 records/special-q**
 
+## Architecture scope
+
+The project's **primary goal is GPU-resident relation collection**, not a
+permanent GPU-sieve + CPU-cofactor split. These results first isolate the sieve
+because it is the largest regular stage. A completed primary path must also put
+survivor intersection/compaction, primitive filtering, resieve/factor recovery,
+trial division, and cofactorization on the GPU wherever practical, so sustained
+host compute does not scale roughly one-for-one with GPU count.
+
+A hybrid that leaves GGNFS/CADO factor recovery and cofactoring on the CPU is a
+useful secondary deployment option, especially for the measured 9800X3D + RTX
+5070. Any hybrid throughput or energy number below is labelled as a projection
+and does not set the primary roadmap.
+
 ## Correctness
 
 The Franke-Kleinjung reduction and walk are ported from CADO
@@ -28,8 +42,11 @@ The Franke-Kleinjung reduction and walk are ported from CADO
 | **total, algebraic side** | **13.87** |
 | *(both sides ≈ 2×, extrapolated)* | *≈ 28* |
 
-Against the CPU lines derived from the GGNFS breakdown at `N_eff ≈ 13`:
-**182 ms** to tie the box on sieve work, **56 ms** to reach the trial-division floor.
+Against the CPU lines from the GGNFS breakdown. **Superseded 2026-08-03**: at
+the *measured* `N_eff = 10.24` (finding 43) these become **~225 ms** to tie the
+box on sieve work and **~70 ms** for the optional hybrid's retained CPU TD
+stage. The 182/56
+figures below assumed `N_eff ≈ 13` and are too generous to the CPU.
 Apply, small-prime sieve, norm init and the threshold scan are **not yet measured**.
 
 ## Finding 1 — two-level fan-out loses, and the reason invalidates its premise
@@ -160,6 +177,8 @@ Best configuration: **region 2^14, 4 B records, 16-bit cells, 256 fill threads,
 | *(both sides ≈ 2×, extrapolated)* | *≈ 35* |
 
 Against **182 ms** to tie the box and **56 ms** to reach the trial-division
+*(both superseded — measured N_eff gives ~225 / ~71 ms, finding 43, and the
+~71 ms is a hybrid's retained stage, not a floor for the GPU-resident target)*
 floor. Still missing: the small-prime sieve (p < 2^15) and the rational side.
 
 ## Finding 5 — occupancy is the whole ballgame, and the ceiling table was right
@@ -280,8 +299,8 @@ taken from las, not the synthetic one used above. Region 2^14, 4 B records,
 | apply — norm init + small sieve + bucket apply + scan | 11.95 | 7.91 | 19.86 |
 | **total ms / special-q** | **26.30** | **20.81** | **47.11** |
 
-**47.1 ms for the complete sieve, both sides**, against **182 ms** to tie the
-CPU box and **56 ms** to reach its trial-division floor.
+**47.1 ms for the complete sieve, both sides**, against the then-used **182 ms**
+CPU sieve-work line and **56 ms** optional-hybrid retained-TD line.
 
 Correctness at full I15e, both sides: records landed equal the CPU reference
 exactly (312,211,826 and 295,181,761), and a full region replayed independently
@@ -421,7 +440,8 @@ the ideal set and the log units are las's rather than approximations of them.
 Up from 47.1 ms, entirely because prime powers add small-sieve work: side 1
 goes 2.96e9 → **5.03e9** updates, side 0 1.40e9 → **1.81e9**. **6.84e9
 small-sieve updates per special-q**, now half the chain. That puts the complete
-two-sided sieve at **55.5 ms against the 56 ms trial-division floor**.
+two-sided sieve at **55.5 ms against the then-used 56 ms hybrid retained-TD
+stage**.
 
 Correctness holds: full I15e, both sides, a region replayed independently on
 the CPU gives **0 cells differing**.
@@ -1031,54 +1051,651 @@ than rediscovering it 7.6M times.
   cell `(-16384,1)` and would have certified a position nobody asked about —
   the worst possible failure mode for a parity instrument.
 
+## Finding 36 — the GPU half of Gate 1 now has joules; the CPU half cannot be measured on this box
+
+**Superseded by finding 44 for the Gate-1 comparison.** WSL2 still cannot read
+CPU energy directly, but a later same-session HWiNFO64 log measured CPU PPT,
+GPU board power and both DIMM PMICs from Windows while the real CPU and GPU
+workloads ran. The GPU-only measurements below remain valid historical data.
+
+Gate 1's metric is updates/sec/**joule** and no joules existed. Board power
+sampled at 10 Hz (`nvidia-smi --query-gpu=power.draw,utilization.gpu
+--loop-ms=100`) across a 400-rep run of the chain, 2026-08-03:
+
+| | chain ms/q | busy board power | J/q |
+|---|---:|---:|---:|
+| side 1 | 37.97 | 202.0 W (peak 222.7) | 7.67 |
+| side 0 | 26.11 | 188.9 W (peak 220.3) | 4.93 |
+| **both sides** | **64.08** | | **12.60** |
+
+Idle is 27.65 W (108 samples, nothing on the card). 147 of 160 side-1 samples
+sat at 100% utilisation, so this is a clean plateau, not an average over gaps.
+The card's cap is 250 W and the chain draws 76–81% of it: this is a
+power-limited, fully-occupied kernel with no headroom story to tell.
+
+Three caveats, all of which push the same way:
+
+- `power.draw` is **board** power, not wall. A 90%-efficient PSU puts this
+  nearer **14 J/q** at the plug, and that is the number a relations/watt claim
+  has to use.
+- The box was running 14 `gnfs-lasieve4I1` workers throughout, so the
+  milliseconds are contended and J/q is *over*-stated. The wattage itself is a
+  device property and is unaffected.
+- A GPU-sieving box still pays for its CPU and its idle draw. Per-device joules
+  is the wrong comparison; whole-box wall watts in each configuration is the
+  right one.
+
+**The CPU side cannot be measured from inside WSL2.** There is no
+`/sys/class/powercap` (no RAPL) and no `/dev/cpu/*/msr`, so package energy for
+the 9800X3D is not readable here at all. It needs either a Windows-side tool
+(HWiNFO64, LibreHardwareMonitor) or a wall meter. **A wall meter is the better
+instrument** — Gate 1's real question is relations/sec/watt for the whole box in
+each configuration, and a plug measures exactly that with no attribution
+argument. Two readings settle it: the box sieving on CPU at 14 workers, and the
+box sieving on GPU. Until one of those exists, Gate 1 has a numerator and no
+denominator, and no relations/watt claim should be made.
+
+## Finding 37 — the hybrid norm costs 1.4%; fp64-everywhere would have cost 2.7x
+
+Finding 28 called the fp64 fallback "noise" on reasoning alone, and the
+not-addressed list flagged that as reasoning rather than measurement. Measured
+now. `NORM_CANCEL_TOL` became a compile-time override (`make
+DEFS=-DNORM_CANCEL_TOL=...`) purely for this; the default is unchanged and
+neither override is a correct setting. Norm-init cost is
+apply(`--norm horner`) − apply(`--norm const`), side 1, 300 reps:
+
+| build | apply ms | norm init | chain ms |
+|---|---:|---:|---:|
+| `--norm const` (no init at all) | 16.94 | — | 30.91 |
+| tol = 0 — fp32 only, fallback dead | 23.32 | 6.34 | 37.21 |
+| **tol = 4.9e-4 — default hybrid** | **23.82** | **6.89** | **37.87** |
+| tol = 1 — every cell through fp64 | 86.87 | 69.94 | 100.82 |
+
+The guard plus the fallback cost **0.55 ms on a 37.9 ms chain — 1.4%**. That is
+an upper bound on the fallback alone, since nvcc may fold the now-dead `|·|`
+error-bound chain out of the tol=0 build.
+
+The interesting number is the last row. Fixing finding 28 the obvious way —
+evaluate every norm in fp64 — costs **63 ms more per q** and takes the chain
+from 37.9 ms to 100.8 ms. Against the then-used 182 ms tie-point (now ~225 ms,
+finding 43) that is 1.8x instead of
+4.8x. Consumer Blackwell runs fp64 at 1/64 rate so the cliff is expected; what
+is worth recording is that the accuracy repair the probe needed turned out to
+be nearly free, while the naive version of the same repair would have eaten
+most of the margin the probe exists to establish.
+
+## Finding 38 — RETRACTED: there is no measured survivor-count discrepancy
+
+**Originally claimed** that our one-sided survivor counts (33.7M side 1, 32.8M
+side 0) ran ~1.5x above "las's" 21,650,256 and 23,952,829. Those two numbers
+came from `dumpcmp stat` on the `-dumpfile` capture — the same capture
+**finding 17 in this document already ruled unusable**, because the dump
+carries the small-sieve contribution and *not* the bucket-sieved one. Missing
+bucket logs means less is subtracted, S is too high, and the survivor count
+from that file is too low by construction. It was never las's survivor count.
+The claim is withdrawn; no comparison was actually made.
+
+Two things worth keeping from the attempt:
+
+**The dump was re-confirmed dead, this time positionally.** Running side 1
+pinned (`--scale 1.275 --allowance 112 --fbbound 134200000`) and dumping all
+536,870,912 positions gives a `dumpcmp diff` delta histogram that is *flat* —
+about 4.5M positions at every delta from -8 to +8, 86% of positions outside
+that window entirely. Two arrays that share no position-level structure. Our
+side of it is sound: at the four gate-5 positions our dump reads exactly
+`init - sieved sum` = 219, 153, 195, 195 at `x = j*I + i + I/2`. las's file
+reads none of those under either i orientation.
+
+**Exact scale pins the bound with no fitting.** At the documented `scale =
+1.275` (not the printed 1.28) the rule `(unsigned char)(scale * lambda * lpb) +
+LOGNORM_GUARD_BITS` gives `(uchar)(142.8) + 1 = 143` — **las's bound exactly**.
+At 1.28 it gives 144. Finding 25's exact scales and finding 31's bound rule
+agree only at the exact value, which is a second independent check on both.
+
+The real lesson is procedural: this document contained the refutation (finding
+17) about 600 lines above the claim, and I quoted the discredited numbers
+anyway. Numbers from a source marked unusable have to be deleted, not left
+lying in a table where they read as data.
+
+## Finding 39 — the only las survivor number that exists is two-sided
+
+Chasing finding 38 turned up what the oracle can and cannot support. las's `-v`
+log reports:
+
+```
+# survivors before_sieve: 536870912
+# survivors after_sieve: 797028 (ratio 1.48e-03)
+# survivors trial_divided_on_side[0]: 33355
+# survivors enter_cofactoring: 1851
+# survivors smooth: 37          -> 37 relations
+```
+
+`after_sieve: 797028` is **after intersecting both sides**. las never prints a
+one-sided count, and the byte dump that would have given us one is broken. So
+**there is no way to gate our one-sided survivor rate against las at all** —
+not with a better comparison, but at all. The gate that does exist is the
+two-sided one, and it requires the intersection we have not built.
+
+That collapses three open items into one deliverable. The two-sided
+intersection is simultaneously the missing pipeline stage, the only available
+survivor parity gate (target: **797,028**), and the input to every
+cofactor-cost projection. It should be built next.
+
+Note also the funnel las reports: 797,028 survivors -> 1,851 entering
+cofactoring -> 37 relations. Two orders of magnitude are removed by trial
+division and leftover-norm checks *before* cofactoring, which is the part of
+the CPU cost this probe keeps assuming is unchanged.
+
+## Finding 40 — the two-sided survivor gate PASSES to within 0.25%
+
+`bench --survbits FILE` writes a 1-bit-per-position survivor bitmap (64 MB);
+`dumpcmp and A B logI` intersects two of them and applies the primitive-point
+filter. Both sides pinned to las:
+
+| | ours | las | |
+|---|---:|---:|---|
+| side-1 bound | **143** | 143 | exact |
+| side-0 bound | **141** | 141 | exact |
+| side-1 one-sided | 14,888,741 | 14,139,941 | +5.3% |
+| side-0 one-sided | 18,936,923 | 18,663,976 | +1.5% |
+| **two-sided** | **841,418** | **797,028** | **+5.6%** |
+
+Both bounds land on las with no fitting, from `(unsigned char)(scale * lambda *
+lpb) + LOGNORM_GUARD_BITS` at the **exact** scales 1.275/1.925 — 1.28 would
+give 144. A second independent confirmation of findings 25 and 31.
+
+Tightening only the side-1 bound by the already-understood one-unit norm
+difference (`--allowance 111` -> bound 142) gives **795,037 against 797,028,
+-0.25%**, and side 1 one-sided 14,062,732 against 14,139,941, -0.55%. That
+one unit is diagnostic only — it must **not** be hardcoded, it is las's
+approximation and ours is the more accurate side (PARITY.md).
+
+las never prints a one-sided count; those two las numbers came from opening the
+opposite side's bound to 253, which excludes only the 0.4% of positions whose
+byte saturates. The two-sided figure is las's own `survivors after_sieve`
+straight from its log, so this gate does not touch the broken `-dumpfile`.
+
+**Bonus result, and it matters more than the parity.** las returns **37
+relations at bound, bound+6 and bound+12** (`after_sieve` 797,028 -> 1,408,504
+-> 2,438,956). Tripling the survivor count yields zero extra relations, so
+every survivor past the tuned bound is pure cofactorisation waste. Survivor
+*rate* is therefore a first-order cost input, not a detail.
+
+## Finding 41 — CORRECTED: the "1.74x failure" was comparing two different populations
+
+This finding first reported 1,386,939 against 797,028 and called the gate
+failed. It was wrong, and the error was mine in a way worth recording.
+
+**CADO's `after_sieve` counts PRIMITIVE points**: it has already dropped every
+`(i,j)` with `gcd(i,j) > 1`, not merely the both-even ones. Our filter
+(`--not-both-even`, `bench_kernels.cu`) removed only both-even. Applying the
+right filter moves our two-sided count 1,386,939 -> **841,418** and closes
+essentially the whole gap.
+
+This convention is written down in `prototype.md`, in a list headed *"Known
+parity gotchas, collected so nobody rediscovers them"*: "skip positions with
+`gcd(i,j) > 1` conventions (`unsievethresh`)". I rediscovered it, from the
+wrong end, after a day of measurement.
+
+Two chains of reasoning built on the bad comparison, both now void:
+
+- **The "clean six-unit shift on both sides".** Real, reproducible, and an
+  artifact — two populations differing by ~35% of positions produce a smooth
+  CDF offset that looks exactly like a calibration error. It reconciled with
+  las at three bound settings across a 3x range of counts, which is precisely
+  why it was convincing. *A consistent-looking offset between aggregates is not
+  evidence of a constant; it is evidence the aggregates are comparable, which
+  was the untested assumption.*
+- **The p=2 ladder suspicion.** The "wrong sign" on both-even
+  over-representation (33.7% of our survivors against a 25% baseline) is not
+  anomalous at all. Removing the common power of two from a nonprimitive point
+  leaves the cofactor of a *smaller* primitive point, so nonprimitive points
+  are unusually likely to pass until they are explicitly filtered. Expected
+  behaviour, not a bug.
+
+The fifteen `las_tracek` traces were right all along: las is **+1**, and only
++1, everywhere. Per-position parity was never in question — the aggregate was
+counting a different set. When per-position evidence and aggregate counts
+disagree, the population definition is the thing to check first, before any
+hypothesis about the arithmetic.
+
+**Implementation note.** The right shape is the one now in `dumpcmp`: intersect
+the two device bitmaps first, then compact and gcd-filter the ~1.4M
+intersections — **not** 537M gcds over the whole area. `--not-both-even` stays
+as the device-side pre-filter because parity is nearly free in the kernel
+(`x`'s low bit and `x >> logI`'s low bit) while a gcd is not; the full
+primitive-point test belongs on the compacted host-side set.
+
+Still open: the exact survivor-*set* comparison. Matching counts to 0.25% is
+not the same as matching membership, and nothing here has compared the sets
+element by element.
+
+## Finding 42 — a clean single-thread las number, on the parity profile only
+
+With the CPU actually free (the GGNFS job finished), 31 special-q from
+q=120000053, same flags as the parity capture minus `-dumpfile`:
+
+```
+# Total elapsed time 321.53s, per special-q 10.372, per relation 0.218581
+# Total 1471 reports [0.182s/r, 47.5r/sq] in 322 elapsed s [83.1% CPU]
+```
+
+**10.37 s per special-q, 47.5 relations per special-q, single-threaded.**
+Against our 66.9 ms for the two-sided sieve chain (39.0 + 27.9).
+
+**This is not a baseline and must not be quoted as one.** `-B 14` forces las
+into 2^14 bucket regions to match our region size, and `-adjust-strategy 0`
+pins I and J — both are parity settings chosen to make the *comparison* valid,
+and both cost las performance. `-t 1` is one thread of sixteen. The honest
+CADO Gate 0 number needs production flags and the full box. At the time of
+this parity run GGNFS `N_eff` was still unmeasured; finding 43 immediately
+below measures it and supersedes the old 182 ms tie-point.
+
+What it does establish: 47.5 relations per special-q, and the funnel
+797,028 survivors -> 1,851 into cofactoring -> 37 smooth at the parity q.
+
+## Finding 43 — N_eff measured at last: 10.24, not the assumed 13
+
+Measured by codex on the quiet box, GGNFS `gnfs-lasieve4I15e` scaling sweep:
+
+| workers | steady q/s | N_eff |
+|---|---:|---:|
+| 1 | 0.331 | 1.00 |
+| 8 (physical cores) | 2.120 | 6.40 |
+| 14 | 2.974 | 8.98 |
+| **16** | **3.392** | **10.24** |
+
+Sixteen workers win — SMT is worth 1.6x over the eight physical cores, which is
+why 14 was leaving throughput on the table. `N_eff` is the divisor in every
+target number in this document and it had never been measured; the assumed 13
+was optimistic.
+
+**Every guidepost moves, and against us.** Production-equivalent CPU time is
+**~295 ms/q, not the assumed 238 ms**. The two lines this document has quoted
+since the first page become approximately:
+
+| | old (assumed N_eff 13) | **measured (N_eff 10.24)** |
+|---|---:|---:|
+| tie the box on sieve work | 182 ms | **~225 ms** |
+| hybrid retained TD stage (if kept on CPU) | 56 ms | **~70 ms** |
+
+Quiet-machine GPU timing, same session: side 1 38.056 ms, side 0 26.166 ms,
+**64.2 ms/q** on the equal-work profile (65.0 ms on full-alim parity).
+
+So the GPU sieve sits just below the **hybrid's retained CPU TD stage** — 64.2
+ms against ~70 ms. That makes the 9800X3D + RTX 5070 a promising balanced
+hybrid pair, but it does not create an irreducible project floor. Everything
+that remains unbuilt—device intersection/compaction, resieve, factor recovery,
+GPU cofactorization, and relation output—now determines the primary
+GPU-resident result. Pause sieve-kernel optimization until those stages reveal
+the actual critical path; do not infer that sieve milliseconds have no value
+in an all-GPU or multi-GPU design.
+
+## Finding 44 — Windows-side power closes the component-energy proxy
+
+HWiNFO64 logged the Windows sensors every two seconds while codex drove the
+actual workloads from WSL2. The saved run has 466 usable samples over 931 s.
+The raw local capture is
+`C:\Users\Kyle\OneDrive\Documents\loads.CSV` (not committed to this repo).
+The comparison uses
+
+```
+P_proxy = CPU PPT + NVIDIA GPU Power + DIMM0 Total Power + DIMM1 Total Power
+```
+
+so both configurations pay for the CPU socket, the discrete GPU board and the
+two DDR5 modules. It is a substantially better comparison than finding 36's
+GPU-only joules, but it is still a **component proxy, not wall power**: it omits
+the motherboard/chipset, storage, fans, VRM losses and PSU conversion losses.
+
+Same-session idle and the full 16-worker CPU plateau:
+
+| configuration | CPU PPT | GPU board | two DIMMs | **component proxy** |
+|---|---:|---:|---:|---:|
+| idle (45 samples) | 37.637 W | 28.669 W | 2.006 W | **68.311 W** |
+| 16-worker GGNFS (27 samples, before the first worker exited) | 125.073 W | 28.436 W | 5.222 W | **158.731 W** |
+
+The power batch covered 448 special-q and 20,445 relations. Summing each
+persistent worker's steady rate gives **3.55825 q/s** (45.64 relations/q), or
+281.0 ms of whole-box time per q. That makes the CPU configuration
+**44.609 J/q** on the component proxy, or **25.411 J/q above idle**. This
+short power batch does not replace finding 43's broader `N_eff` sweep; it is
+the simultaneous throughput denominator for this power capture.
+
+The benchmark times transform, fill and apply in separate repetition blocks,
+and the HWiNFO trace resolves the resulting plateaus. Weighting each power
+plateau by that stage's measured time is required; a single sample or a simple
+mean over the invocation is wrong:
+
+| stage | algebraic proxy | rational proxy |
+|---|---:|---:|
+| transform + plattice | 221.213 W | 228.283 W |
+| fill | 237.330 W | 236.125 W |
+| apply + norm + small sieve + scan | 281.775 W | 282.384 W |
+
+| side | chain ms/q | stage-weighted proxy | proxy J/q | J/q above idle |
+|---|---:|---:|---:|---:|
+| algebraic | 38.177 | 264.183 W | 10.086 | 7.478 |
+| rational | 26.194 | 259.172 W | 6.789 | 4.999 |
+| **both sides** | **64.371** | **262.144 W** | **16.874** | **12.477** |
+
+Of the two-sided 16.874 J/q, 13.306 J is GPU-board energy, 3.440 J is CPU
+package energy and about 0.129 J is DIMM energy. Independent `nvidia-smi`
+spot checks agreed with the HWiNFO watt trace: 227.16 W during algebraic apply
+and 179.41 W during rational fill. Several unrelated HWiNFO utilisation and
+temperature columns were frozen and were not used. The earlier standalone
+`idle.CSV` reported about 14 W for the GPU while NVML read about 29 W, so it was
+excluded; all baselines and deltas here come from the self-consistent load log,
+whose idle GPU value (~28.7 W) agrees with NVML.
+
+For the **measured portions only**, the GPU sieve requires 37.8% as much total
+proxy energy per q as the complete CPU GGNFS q (a 2.64x advantage), or 49.1%
+as much energy above idle (a 2.04x advantage). That is encouraging, but it is
+deliberately **not an end-to-end perf/watt claim**: the CPU number includes its
+complete q, while the GPU number stops after the two sieve sides. Device
+intersection, primitive filtering, transfer, resieve/factor recovery, the
+TD/cofactor feed and unique-relation accounting must be measured before Gate 2
+can close. A wall meter is still the final instrument for economics, but CPU
+power is no longer the binding unknown in Gate 1.
+
+## Finding 45 — secondary hybrid whole-box projection
+
+Finding 44 compares the GPU *sieve* against a complete CPU *q*, and says so.
+This section asks a useful but secondary deployment question: what would the
+measured 9800X3D + RTX 5070 do if the GPU sieved while GGNFS's factor recovery,
+trial division, and cofactoring remained on the CPU? It is still a projection—the
+glue is unbuilt—but its arithmetic inputs come from measurements rather than
+the earlier planning assumptions. It is **not** the primary GPU-resident result.
+
+**Cross-check first.** The GGNFS breakdown extrapolated to the measured
+`N_eff = 10.24` predicts 302.1 ms/q. Directly measured: 294.8 ms/q (finding 43
+sweep) and 281.0 ms/q (finding 44 power batch). Within 5–7%, by two independent
+routes. For this hybrid split, **231.1 ms/q moves to the GPU and 71.1 ms/q is
+retained on the CPU** for trial division and cofactoring.
+
+A hybrid box pipelines: the GPU sieves q+1 while the CPU cofactors q, so
+per-q time is the **max**, not the sum.
+
+| | CPU-only | hybrid (projected) |
+|---|---:|---:|
+| ms per q | 281–295 | **71.1** (max of GPU 64.4, CPU floor 71.1) |
+| component-proxy watts | 158.7 | **337.0** (125.1 CPU + 206.7 GPU board + 5.2 DIMM) |
+| **J per q** | **44.6–46.8** | **23.96** |
+| throughput | 1.00x | **3.95–4.15x** |
+| **energy** | 1.00x | **1.86–1.95x** |
+
+**Three things follow for this deployment mode.**
+
+1. **The projected hybrid energy win is half its throughput win.** ~4x faster,
+   ~1.9x more efficient, because the GPU adds 207 W while the CPU remains busy.
+   For this hybrid, **1.9x is the relevant projection**, not finding 44's 2.64x
+   stage comparison and not the 4x throughput number. The GPU-resident
+   relations/watt result remains unmeasured.
+
+2. **One RTX 5070 approximately fills one 9800X3D-class CPU in this split.**
+   The ideal max() is pinned by 71.1 ms of retained CPU work versus a 64.4 ms
+   sieve. Under perfect overlap and zero glue, further sieve optimization does
+   not improve this particular hybrid. That statement does not apply to the
+   GPU-resident path, to another CPU/GPU ratio, or if missing glue puts the GPU
+   stage back on the critical path.
+
+3. **The hybrid's next lever is its retained side.** Tightening the survivor
+   bound did not reduce the 37-relation yield at bound, bound+6, or bound+12,
+   but it also did not remove the retained work. Moving resieve/TD and
+   cofactorization to the GPU is the primary roadmap; retaining them on the
+   CPU remains the optional shortcut.
+
+**Assumptions, stated so they can be attacked.** Perfect pipelining with no
+stall; the CPU cofactor path unchanged and fully parallel at `N_eff = 10.24`;
+GPU and CPU plateau powers additive; approximately one strong CPU available per
+GPU. CPU cofactor-only scaling and power have not been isolated directly.
+
+**For hybrid accounting, resieve is already charged to retained CPU TD.**
+`oracle/ggnfs_timing_breakdown.txt` accounts for wall time in four categories
+that close to within 0.01% at every q: Sieve (1683 ms), medsched (309) and
+Sieve-Change (373) — all replaced — against **TD including MPQS (734 ms),
+retained**. There is no separate resieve line because lasieve4 recovers a
+survivor's prime factorisation *inside* trial division, which is the retained
+phase. The 71.1 ms hybrid stage therefore already pays for it, and the hybrid
+GPU need only deliver survivor `(i,j)` pairs. For the primary GPU-resident
+design, resieve/factor recovery remains an unimplemented and unmeasured GPU
+stage; CPU bookkeeping does not resolve that engineering work.
+
+One caveat for the hybrid: this holds for the **GGNFS** path, which the 182/56 split
+descends from. CADO's las does have an explicit resieve inside its sieve time,
+so a CADO Gate 0 comparison must re-derive the split rather than reuse this
+one. The residual risk is instead our **+5.6% survivor excess** (finding 40),
+which raises the retained TD load by the same 5.6%.
+
+The hybrid's survivor transfer is not a bandwidth risk: ~800K survivors/q at
+4–8 B is 3–6 MB, and at 14 q/s that is 45–90 MB/s over an x16 link. The primary
+path should keep those candidates resident and transfer final relations, so
+this bandwidth observation is not an argument for choosing the hybrid.
+
+## Finding 46 — the GPU-resident budget: what Path 4 has to hit
+
+The primary target is GPU-resident, so the hybrid max() model does not apply —
+a standalone box pays **sieve + every post-sieve stage, summed**. That makes
+the verdict a budget question, and every input is now measured, so the budget
+is derivable rather than notional.
+
+Box power in GPU-resident operation is finding 44's stage-weighted proxy,
+**262.1 W** (206.7 W GPU board + ~53 W host + ~2 W DIMM) — measured while the
+GPU sieves and the CPU only orchestrates, which is exactly the target mode.
+Against the CPU-only box at 44.6–46.8 J/q:
+
+| goal | total ms/q allowed | **post-sieve budget** (after the 64.4 ms sieve) |
+|---|---:|---:|
+| throughput parity | 281–295 | ~220 ms — not the binding constraint |
+| **energy parity** | **170–179** | **~106–114 ms** |
+| **2x energy win** | **85–89** | **~21–25 ms** |
+
+Read that carefully, because it is the whole project in three rows.
+**Throughput parity is nearly free** — the sieve alone is 4.5x faster than the
+CPU box, so almost any post-sieve path beats the CPU on relations/sec.
+**Energy parity is comfortable**: ~106–114 ms for intersection, compaction,
+primitive filtering, resieve/factor recovery, TD and cofactorisation, against
+a CPU that needs 71 ms of *whole-box* time for the last three. **A 2x energy
+win is tight**: ~21–25 ms for all of it.
+
+So the honest statement of the remaining question is not "can it work" but
+**"where in the 21–114 ms band does the post-sieve path land"** — and the
+answer decides between a marginal result and a strong one. That is a far
+better-posed question than this project had yesterday.
+
+Two required rates follow, at the measured 15.5 q/s sieve pace:
+
+| stage | volume | **required rate** |
+|---|---:|---:|
+| primitive candidates out of intersection | ~0.80M/q | **12.4M/s** |
+| hard cofactors after TD funnel | ~1,900/q | **29,500/s** |
+
+For reference the CPU produces 1.015–1.065 **relations/joule** at 47.5
+relations/q. That is the number to beat and it is the first time it has been
+written down.
+
+**Caveat on the power figure.** 262.1 W was measured with the GPU running the
+*sieve*. Post-sieve stages have different occupancy and instruction mixes —
+ECM in particular is integer-heavy and branchy — so their board power may
+differ. The budget should be re-derived once any post-sieve stage is measured;
+until then treat 262 W as the sieve-plateau estimate, not a pipeline average.
+
+## Finding 47 — preliminary YAFU 3LP cofactor benchmark clears the rate gate; a target run is still required
+
+The owner supplied a 2026-02-05 log from Ben Buhrow's standalone
+`nfs_3lp_batch_factor` suite. This was **not rerun in this results session**
+because the CPU and GPU were occupied, and the raw log is not yet a frozen
+artifact in this repository. It is nevertheless useful as a fail-fast result:
+the RTX 5070's recurring 64/96-bit cofactor work is comfortably faster than
+Path 4's estimated feed rate.
+
+The source dataset is one million records from a **C164 GNFS job with
+`lpbr=lpba=31`**. The project target is C183 with `lpbr=31, lpba=32`, so this is
+not a target-equivalent benchmark. The CPU and GPU paths also use different
+algorithms—batch GCD on the CPU versus staged ECM on the GPU—so the ratio is a
+comparison of complete cofactor strategies, not the speedup of one identical
+kernel.
+
+The logged commands were `./cuda_3lp -m 1` on the CPU and
+`./cuda_3lp -m 0 -b1 300 -b2 50 -c 100 -s 10` on the GPU. The latter printed
+an effective 96-bit ECM run at `b1=300`, `b2=15000`, 100 requested curves and
+a ten-curve no-success stopping rule. The CPU's 22.7166 s timer excludes both
+its one-time 54,321,530-prime product build and the 0.55 s input parse; the GPU
+outer timer excludes its 0.98 s parse but includes CUDA startup and teardown.
+
+| path | reported time / 1M inputs | input rate | vs. 29,500/s Path-4 feed | equivalent time/q at 1,900 inputs/q |
+|---|---:|---:|---:|---:|
+| Ryzen 7 9800X3D batch solve (`-m 1`) | 22.7166 s | 44,021/s | 1.49x | 43.16 ms/q |
+| RTX 5070 outer cold invocation (`-m 0`) | 11.9524 s | 83,665/s | 2.84x | 22.71 ms/q |
+| RTX 5070 sum of printed recurring stages | **2.5901 s** | **386,084/s** | **13.09x** | **4.92 ms/q** |
+
+The 2.5901 s estimate is the sum of the timers printed around the three work
+stages: 140.4765 ms for 367,684 64-bit inputs, 2,431.7275 ms for 903,301
+96-bit inputs, and 17.9066 ms for the final 19,352 64-bit inputs. The 96-bit
+stage is 94% of that sum. Ben's correction that the useful GPU work was about
+2.4 s is therefore directionally right. The more conservative **2.5901 s is
+the provisional steady-work estimate**; it is not yet a clean persistent-mode
+wall-clock measurement.
+
+Source inspection explains much of the 11.9524 s cold time: the outer timer
+includes GPU discovery, context creation, PTX load/JIT, kernel setup,
+allocation/packing, and teardown. A production queue can retain the context,
+module, and buffers. It is not valid, however, to label the entire
+`11.9524 - 2.5901` s difference one-time until a persistent driver times the
+full recurring path, including preparation, compaction, and validation.
+
+The GPU run produced 10,246 complete relations versus 10,257 on the CPU:
+**99.893% of the CPU count, 11 fewer**. That is encouraging but not a
+correctness proof. The GPU run stopped after 95 of 100 requested curves after
+ten curves without a valid factor, and the two strategies need not choose the
+same successful subset. The controlled rerun must compare validated relation
+sets and report yield as well as speed.
+
+If the C164 stage mix and difficulty transfer to the target workload, the
+hard-cofactor stage would consume about **4.9 ms/q**, leaving roughly
+**16–20 ms/q** of finding 46's 21–25 ms post-sieve allowance for a 2x energy
+win. Even the cold outer timing clears the raw 29,500/s rate by 2.84x, but at
+22.7 ms/q it consumes essentially that entire aggressive allowance. The
+correct conclusion is therefore:
+
+> **The preliminary cofactor-rate fail-fast gate passes.** It does not yet
+> close target coverage, steady-state latency, energy, correctness, or
+> host-independence. If the target rerun holds near 4.9 ms/q, GPU
+> resieve/factor recovery/TD becomes the largest unknown inside the 2x budget.
+
+One million records represent about 526 target q at 1,900 records/q—roughly
+34 seconds of arrivals at the 15.5 q/s sieve rate. The rerun must sweep smaller
+batches and overlapping queues; a result that only saturates after buffering
+half a minute is not sufficient evidence for the production pipeline.
+
+### Harness audit before the controlled rerun
+
+The freshly downloaded suite has changed since the February log (including
+P-1 support and CPU TinySIQS/MPQS tails), and a source audit found several
+prototype hazards to fix or explicitly control before trusting new numbers:
+
+- The stack `relation_batch_t` is not zero-initialized. The CPU batch path
+  resets its success count, but diagnostic counters are not initialized; this
+  explains the nonsensical ~3.49-billion ECM/abort counters in the old CPU
+  log. The current GPU path also needs an explicit success-count reset before
+  it increments the field.
+- The Makefile defines uppercase `TOOLKIT_VERSION`, while the source tests
+  lowercase `toolkit_version`; the CUDA-version branch can therefore be the
+  wrong one. Its CUDA-13 branch also passes an uninitialized
+  `CUctxCreateParams *` to context creation.
+- All devices with compute major >= 9 currently select `cuda_ecm90.ptx`; the
+  RTX 5070 log consequently loaded sm_90 PTX on an sm_120 card. Add a native
+  sm_120 artifact and loader selection before treating the rerun as a fair
+  Blackwell result.
+- The GPU path is not host-independent as written: the CPU parses and packs
+  records, prepares Montgomery constants with GMP, validates and
+  primality-checks results, compacts between curves, and in the newer tree may
+  run CPU TinySIQS/MPQS tails. Record CPU utilization and component power, and
+  distinguish required recurring host work from removable prototype setup.
+
+The target rerun should therefore use a C183 `31/32` survivor/cofactor set,
+zeroed accounting, native sm_120 PTX, a persistent context and reusable
+buffers, a batch-size/queue-depth sweep, exact output validation, and
+simultaneous CPU/GPU power sampling. Until that run exists, use 4.92 ms/q as a
+promising sizing datum—not as a Path-5 result.
+
 ## Not addressed in this round
 
-- **The survivor-set gate.** Gate 5 is *sampled* pipeline parity: four
-  positions, and on profiles that differ (finding 31). The decisive test is a
-  profile-pinned survivor-set comparison, or failing that per-region **offset
-  hashes** rather than counts — counts cannot see a permutation within a region.
-  This is the next correctness step and it is not done.
-- **The hybrid norm kernel has not been timed on a quiet GPU.** The extra
-  absolute-value FMA chain runs on every cell and the fp64 branch diverges;
-  calling that "noise" (finding 28) is reasoning, not measurement.
-- **Timings in this session are not comparable.** The GPU was shared with an
-  ECM job throughout; every millisecond figure printed on 2026-08-02 is inflated
-  and none should be quoted. Correctness results are unaffected.
+- ~~**The survivor-set gate passes on counts**~~ **DONE — 2026-08-03/04.** This
+  item is superseded; see `../prototype.md`, "The gate was built and run" and
+  "The gate at scale". Corrections to what is written above:
+  - `las -batch-print-survivors` **does not** dump the `after_sieve` set. It
+    emitted 1,851 records, not 797,028, because `needs_resieving()`
+    (`las-siever-config.hpp:116`) returns false when any side has `lim == 0`,
+    and the flag's output is the post-TD cofactor list. The set comparison
+    required a 3-line CADO patch instead (`../oracle/cado-after-sieve-survdump.patch`).
+  - **Strict set containment fails and that is expected**, not a defect:
+    2,162 of las's survivors are absent from ours, attributed to `powlim`
+    pinning, a boundary column at `b = I/2` where the two conventions sieve
+    different half-open intervals, and an unexplained residue (side 1: 722,
+    side 0: 266) that remains open as a diagnostic.
+  - **Relation containment is the operative gate and it passes:** over the whole
+    frozen band, **3,026 of 3,026** in-region las relations are survivors of
+    ours, zero misses. The remaining 136 fall outside our sieve region because
+    20 of the band's 67 lattices use a different (equally valid, in fact
+    better-reduced) basis — see `../oracle/PARITY.md`.
+  - What this establishes is **in-region sieve correctness, not yield
+    equivalence.** Final relation yield must come from cofactoring our own
+    region.
+- **The primitive-point filter is host-side only.** `dumpcmp` applies
+  `gcd(i,j) == 1` at intersection time; the device still emits both-even
+  survivors and nothing on the GPU compacts or gcd-filters them. That is the
+  next pipeline stage, not a finished one.
+- **The primary post-sieve GPU path is unbuilt.** No GPU resieve/factor
+  recovery, regular TD, or hard-cofactor stage consumes the compacted
+  candidates. The local YAFU tree has an NFS-facing CUDA/OpenCL cofactor path
+  with 64/96-bit ECM kernels and known coverage limitations. Finding 47 gives
+  it a promising preliminary C164 `31/31` rate, but there is still no measured
+  result for this C183 `31/32` job and no integrated device-resident stage.
+- **Per-region offset hashes** are still not done — counts cannot see a
+  permutation within a region, and the verify gate compares counts.
 - **`--maxbits > 15` is now safe but untested**: the transform handles bucketed
   odd prime powers, and `g > 1` losses are reported, but no run has exercised
   it. The reported-loss counter is the thing to watch when someone does.
 - The `g > 1` bucketed case emits nothing rather than routing to the small
   tier. Correct-and-reported, not correct-and-complete. Zero at the default
   `bkthresh`.
-- Everything under "What is not yet measured" below, unchanged.
+- The remaining items under "What is not yet measured" below.
 
 ## What is not yet measured
 
 **This is a sieve measurement, not a relation-collection measurement, and the
 distinction is load-bearing.** What runs end-to-end is: transform → fill →
 apply → threshold → survivor list, per side. What does not exist at all is the
-two-sided survivor intersection, resieve, factor recovery, host transfer, the
-cofactor feed, and unique-relation accounting. The survivor *list* is also
+two-sided survivor intersection/compaction, GPU resieve/factor recovery/TD,
+GPU cofactorization, final relation output, and unique-relation accounting.
+The survivor *list* is also
 capped at 2^22 entries against one-sided sets of 18–30M — the count is exact
 and truncation is reported, but nothing consumes the list yet.
 
-So: **kernel feasibility is demonstrated; relation-collection feasibility is
-not.** Any "3–4× whole-box speedup" is a projection from sieve-q throughput
-with the cofactor path assumed unchanged, not a measured relation rate. It
-should be stated that way everywhere it appears.
+So: **kernel feasibility is demonstrated; GPU-resident relation-collection
+feasibility is not.** Any "3–4× whole-box speedup" is specifically the optional
+hybrid projection with a strong CPU cofactor path assumed unchanged, not a
+measured relation rate and not an all-GPU estimate.
 
-The comparison constants are also still assumptions, and every graded claim
-inherits their error bars:
+The remaining comparison constants and scope limits are:
 
 | constant | status |
 |---|---|
-| GGNFS `N_eff` at 14–16 workers | **unmeasured** — needs the quiet box. It is the divisor in every target number. |
-| GPU watts during the chain | **never captured.** The Gate-1 metric is updates/sec/**joule** and no joules exist. ~5 s of looping plus `nvidia-smi power.draw` sampling. |
-| CADO `f ≈ 0.23` (Gate 0) | assumed to generalise from GGNFS |
+| GGNFS `N_eff` at 14–16 workers | **measured 2026-08-03: 10.24 at 16 workers** (finding 43). Was assumed 13. |
+| GPU watts during the chain | **measured cleanly** in finding 44: 206.7 W stage-weighted board average, 13.306 board J/q for both sides. |
+| CPU and DRAM watts under 16-worker GGNFS | **measured from Windows** in finding 44: 125.073 W CPU PPT + 5.222 W DIMMs; 158.731 W full component proxy including the idle GPU. |
+| component energy comparison | **measured** in finding 44: CPU full q 44.609 J/q; GPU two-side sieve 16.874 J/q. Scope differs, so this is not yet end-to-end. |
+| resieve/factor recovery | **accounted for only in the hybrid projection** inside GGNFS's retained TD phase; unimplemented and unmeasured on GPU for the primary path. |
+| GPU hard cofactor stage | **preliminary only**: finding 47's external C164 `31/31` printed stages imply 386,084 inputs/s and 4.92 ms/q at the projected feed. C183 `31/32`, persistent latency, power, yield and host demand remain unmeasured. |
+| whole-box wall watts | **unmeasured** — motherboard, drives, fans, VRM and PSU losses remain outside the HWiNFO component proxy. Required for the final economics verdict. |
+| CADO post-sieve share (Gate 0) | unmeasured; useful for oracle workload and a CADO hybrid projection, not a prerequisite for the GPU-resident architecture. |
 | the "200× root-transform speedup" (finding 4) | GGNFS's Sieve-Change timer also covers small-sieve setup, transformed-polynomial work and report-bound setup, so this is an **upper bound**, not a like-for-like stage comparison. |
 
-Also unmeasured: `bkthresh` sweep, I16e slabbing, throughput mode, production
-scales 2/4/8 (finding 23), and the per-q host-side small-FB transform and sort
+Also unmeasured: target-equivalent persistent YAFU-derived GPU cofactor
+throughput, coverage, power and recurring host demand; weak-host and multi-GPU
+scaling; `bkthresh` sweep; I16e slabbing; throughput mode; production scales
+2/4/8 (finding 23); and the per-q host-side small-FB transform and sort
 (`bench_kernels.cu`), which runs outside every timed number.
 
 Byte-exact parity is blocked on a trustworthy oracle, not on our side of the
@@ -1094,16 +1711,24 @@ sides, which is not implemented.
 
 ## Reproduce
 
-**The 55.5 ms configuration of record** — this is the command every number
-downstream quotes, and the one the CLI defaults now reproduce:
+**Current clean equal-work profile** — exact las scales, algebraic factor base
+truncated at the special-q (GGNFS convention), and the cheap device parity
+filter enabled. This is the profile used by findings 43–44:
 
 ```
 cd bench && make
-./bench --cadofb ../oracle/c183.fb1 --side 1 --scale 1.28 \
-        --q 120000053 --rho 112625526 --allowance 112     # 32.8 ms
-./bench --side 0 --scale 1.93 \
-        --q 120000053 --rho 112625526 --allowance 72.85   # 22.7 ms
+./bench --cadofb ../oracle/c183.fb1 --side 1 --scale 1.275 \
+        --fbbound 120000053 --q 120000053 --rho 112625526 \
+        --allowance 112 --not-both-even                    # 38.177 ms
+./bench --side 0 --scale 1.925 \
+        --q 120000053 --rho 112625526 --allowance 72.85 \
+        --not-both-even                                    # 26.194 ms
 ```
+
+For finding 44's power plateaus, add `--reps 2500` to side 1 and `--reps
+3600` to side 0 while HWiNFO logs at two-second intervals. The benchmark times
+transform, fill and apply as separate repetition blocks, so compute joules by
+weighting each plateau by its printed stage time.
 
 Defaults are `--mode atomic --record-bytes 4 --region 14 --apply-threads 512`
 as of 2026-08-02; before that they were `twolevel` and `--region 15`, so

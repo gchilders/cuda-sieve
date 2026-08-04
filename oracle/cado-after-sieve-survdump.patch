@@ -1,0 +1,34 @@
+--- a/sieve/las-process-bucket-region.cpp	2026-08-04 06:50:40.080537469 -0400
++++ b/sieve/las-process-bucket-region.cpp	2026-08-04 06:50:40.100992737 -0400
+@@ -16,6 +16,10 @@
+ #include <sys/types.h>
+ #include <array>
+ #include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cinttypes>
++#include <mutex>
+ #include <iterator>
+ #include <memory>
+ #include <ranges>
+@@ -566,6 +570,20 @@
+         /* start building a new object. This is a swap operation */
+         cofac_standalone cur { nsides, N, x, ws.conf.logI, Q };
+ 
++        /* cuda-sieve: dump (a,b) of every after_sieve survivor, pre-TD. */
++        {
++            static std::mutex cs_mm;
++            static FILE * cs_fp = NULL;
++            static bool cs_tried = false;
++            const std::lock_guard<std::mutex> cs_lk(cs_mm);
++            if (!cs_tried) {
++                cs_tried = true;
++                const char * fn = getenv("CUDASIEVE_SURVDUMP");
++                if (fn) cs_fp = fopen(fn, "w");
++            }
++            if (cs_fp) fprintf(cs_fp, "%" PRId64 " %" PRIu64 "\n", cur.a, cur.b);
++        }
++
+         for(int side = 0 ; side < nsides ; side++) {
+             if (ws.sides[side].no_fb()) continue;
+             cur.S[side] = S[side][x];

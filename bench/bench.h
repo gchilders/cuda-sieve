@@ -101,8 +101,15 @@ typedef struct {
 /* Recompute a cell in fp64 when the fp32 Horner cancels below this fraction of
  * the sum of |terms|. 2^-11 leaves ~13 good fp32 bits, i.e. a relative error
  * around 1e-4 -- far tighter than the ~0.3 needed to round the sieve log
- * correctly, and it fires on well under 1 cell in 1000. */
+ * correctly, and it fires on well under 1 cell in 1000.
+ *
+ * Overridable at compile time (-DNORM_CANCEL_TOL=0.0f / =1.0f) only to PRICE
+ * the hybrid: 0 disables the fp64 path, 1 forces every cell through it, and the
+ * two together bracket what the guard costs. Neither is a correct setting --
+ * 0 reinstates the fp32 error documented above. */
+#ifndef NORM_CANCEL_TOL
 #define NORM_CANCEL_TOL 4.9e-4f
+#endif
 
 double norm_acc_fp64(const norm_t *N, int32_t i, uint32_t j);
 
@@ -145,10 +152,12 @@ typedef struct {
     int      side;          /* 1 = algebraic (special-q side), 0 = rational     */
     double   allowance;     /* bits of cofactor tolerated (lambda*lpb)         */
     double   scale;         /* las byte scale for this side; 1.0 = raw bits    */
-    const char *dump;
+    const char *dump;       /* write the region in las byte convention here     */
     int32_t  probe_i;            /* gate 5: read back this cell after apply  */
-    uint32_t probe_j;            /* 0xFFFFFFFF = no probe                    */       /* write the region in las byte convention here    */
+    uint32_t probe_j;            /* 0xFFFFFFFF = no probe                    */
     const char *cadofb;     /* CADO makefb text factor base (has powers)       */
+    const char *survbits;   /* write a 1-bit-per-position survivor bitmap here  */
+    int      not_both_even; /* apply las's not_both_even filter (see k_apply)   */
 } bench_cfg_t;
 
 #define FILL_ATOMIC   0     /* (a) direct global atomicAdd per record   */
