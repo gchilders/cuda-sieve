@@ -166,6 +166,17 @@ typedef struct {
     const char *emit;       /* write the compacted survivor list here           */
     int      td;            /* run exact norms + trial division on survivors    */
     int      ab_resieve;    /* re-run the settled layout A/B resieve experiment  */
+    int      resieve_sweep; /* sweep resieve unroll depth and summary granularity */
+    /* ---- both-sides pipeline: side 1 uses scale/allowance/lpb/mfb/lim ---- */
+    int      pipeline;      /* run both sides in one process                    */
+    int      verbose_q;     /* print a line per special-q rather than a summary */
+    const char *qlist;      /* file of `q rho` pairs; one special-q per line     */
+    uint32_t nq_max;        /* stop after this many q (0 = all)                 */
+    int      td_verify;     /* run the factors x cofactor == norm reconstruction */
+    double   scale0, allowance0;
+    uint32_t lim0, lpb0, mfb0;
+    const char *relations;  /* complete relations, needing no cofactorisation   */
+    const char *candidates; /* the cofactorisation batch                        */
     uint32_t lim;           /* factor-base bound for this side (rlim / alim)    */
     uint32_t lpb;           /* large-prime bound, in bits                       */
     uint32_t mfb;           /* max cofactor bits carried into cofactorisation   */
@@ -185,6 +196,19 @@ typedef struct {
 
 /* Runs transform -> plattice -> fill -> apply and prints a timing breakdown.
  * Returns 0 on success. */
+/* One special-q of the band: the prime and a root of f mod it. las prints the
+ * pair; the oracle captures carry it in their `# q = (q, rho, side)` headers. */
+typedef struct { uint64_t q, rho; } qsel_t;
+
+/* Both sides in one process, over a band of special-q: sieve, intersect,
+ * trial-divide and classify each side against the shared two-sided bitmap,
+ * then join. This is the path that becomes the siever; run_bench stays the
+ * measurement harness. */
+int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
+                 const fb_t *fb0, const fb_t *fbs0,
+                 const qsel_t *qlist, uint32_t nq,
+                 const poly_t *P, const bench_cfg_t *cfg);
+
 int run_bench(const fb_t *fb, const fb_t *small, const qlat_t *L,
               const poly_t *P, const bench_cfg_t *cfg);
 

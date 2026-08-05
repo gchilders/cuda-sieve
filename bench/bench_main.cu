@@ -26,6 +26,17 @@ static void usage(void)
 "  --emit FILE      write the compacted survivor list (x, a, b) here\n"
 "  --td             exact norms + trial division on the survivors\n"
 "  --ab-resieve     re-run the settled layout A/B resieve experiment (slow)\n"
+"  --resieve-sweep  sweep the resieve unroll depth and summary granularity\n"
+"  --pipeline       BOTH SIDES in one process: sieve, intersect, TD, classify,\n"
+"                   join, and emit relations + cofactorisation candidates\n"
+"  --alim N         side-1 factor base bound   [134200000]\n"
+"  --scale0 S       side-0 byte scale          [1.925]\n"
+"  --allowance0 B   side-0 survivor bits       [68.1 -> bound 132]\n"
+"  --relations F    write complete relations here\n"
+"  --qlist FILE     band of special-q: `q rho` per line (# comments ok)\n"
+"  --nq N           stop after N special-q from the list\n"
+"  --verbose-q      print a line per special-q instead of a band summary\n"
+"  --candidates F   write the cofactorisation batch here\n"
 "  --lpb N          large-prime bound in bits  [32 side 1, 31 side 0]\n"
 "  --mfb N          max cofactor bits          [92 side 1, 60 side 0]\n"
 "  --cofgate FILE   gate --td against CADO's own cofactors (a b cof0 cof1)\n"
@@ -56,8 +67,10 @@ int main(int argc, char **argv)
     bench_cfg_t cfg;
     uint64_t q = 120000011ull;          /* prime, mid-range of [50M,190M] */
     uint32_t bkthresh = 0, fbbound = 0;
+    int fbbound_set = 0, scale_set = 0;
     uint64_t rho = 0;   /* 0 = synthetic; pass the real root of f mod q to match las */
     uint32_t rlim = 67100000;   /* side-0 factor base bound (input.job rlim) */
+    uint32_t alim = 134200000;  /* side-1 factor base bound (input.job alim) */
     fb_t fb, fbs; qlat_t L; poly_t POLY;
 
     /* Defaults are the CONFIGURATION OF RECORD -- single-level atomic fill,
@@ -77,7 +90,16 @@ int main(int argc, char **argv)
     cfg.other_bits = NULL; cfg.emit = NULL;
     cfg.td = 0; cfg.cofgate = NULL; cfg.emit_cof = NULL;
     cfg.lim = 0; cfg.lpb = 0; cfg.mfb = 0;   /* 0 == take the side's default */
-    cfg.ab_resieve = 0;
+    cfg.ab_resieve = 0; cfg.resieve_sweep = 0;
+    /* Pipeline defaults are the WORKING configuration established 2026-08-04:
+     * survivor bound 128 on side 1 and 132 on side 0 (128 on both loses one of
+     * las's 37 relations at the parity q), and the full algebraic factor base
+     * to alim, since truncating at the special-q costs relations outright. */
+    cfg.pipeline = 0;
+    cfg.scale0 = 1.925; cfg.allowance0 = 68.1;
+    cfg.lim0 = 0; cfg.lpb0 = 31; cfg.mfb0 = 60;
+    cfg.relations = NULL; cfg.candidates = NULL;
+    cfg.qlist = NULL; cfg.nq_max = 0; cfg.verbose_q = 0; cfg.td_verify = 1;
     int maxbits = 15;
     int allowance_set = 0;
 
@@ -87,7 +109,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--J") && i + 1 < argc) cfg.J = (uint32_t)strtoul(argv[++i], 0, 10);
         else if (!strcmp(argv[i], "--region") && i + 1 < argc) cfg.log_region = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--bkthresh") && i + 1 < argc) bkthresh = (uint32_t)strtoul(argv[++i], 0, 10);
-        else if (!strcmp(argv[i], "--fbbound") && i + 1 < argc) fbbound = (uint32_t)strtoul(argv[++i], 0, 10);
+        else if (!strcmp(argv[i], "--fbbound") && i + 1 < argc) { fbbound = (uint32_t)strtoul(argv[++i], 0, 10); fbbound_set = 1; }
         else if (!strcmp(argv[i], "--q") && i + 1 < argc) q = strtoull(argv[++i], 0, 10);
         else if (!strcmp(argv[i], "--rho") && i + 1 < argc) rho = strtoull(argv[++i], 0, 10);
         else if (!strcmp(argv[i], "--record-bytes") && i + 1 < argc) cfg.record_bytes = atoi(argv[++i]);
@@ -117,7 +139,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--no-smallsieve")) cfg.small_sieve = 0;
         else if (!strcmp(argv[i], "--side") && i + 1 < argc) cfg.side = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--rlim") && i + 1 < argc) rlim = (uint32_t)strtoul(argv[++i], 0, 10);
-        else if (!strcmp(argv[i], "--scale") && i + 1 < argc) cfg.scale = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--scale") && i + 1 < argc) { cfg.scale = atof(argv[++i]); scale_set = 1; }
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc) cfg.dump = argv[++i];
         else if (!strcmp(argv[i], "--cadofb") && i + 1 < argc) cfg.cadofb = argv[++i];
         else if (!strcmp(argv[i], "--survbits") && i + 1 < argc) cfg.survbits = argv[++i];
@@ -125,6 +147,16 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--emit") && i + 1 < argc) cfg.emit = argv[++i];
         else if (!strcmp(argv[i], "--td")) cfg.td = 1;
         else if (!strcmp(argv[i], "--ab-resieve")) cfg.ab_resieve = 1;
+        else if (!strcmp(argv[i], "--resieve-sweep")) cfg.resieve_sweep = 1;
+        else if (!strcmp(argv[i], "--pipeline")) cfg.pipeline = 1;
+        else if (!strcmp(argv[i], "--qlist") && i + 1 < argc) cfg.qlist = argv[++i];
+        else if (!strcmp(argv[i], "--nq") && i + 1 < argc) cfg.nq_max = (uint32_t)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--verbose-q")) cfg.verbose_q = 1;
+        else if (!strcmp(argv[i], "--alim") && i + 1 < argc) alim = (uint32_t)strtoul(argv[++i], 0, 10);
+        else if (!strcmp(argv[i], "--scale0") && i + 1 < argc) cfg.scale0 = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--allowance0") && i + 1 < argc) cfg.allowance0 = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--relations") && i + 1 < argc) cfg.relations = argv[++i];
+        else if (!strcmp(argv[i], "--candidates") && i + 1 < argc) cfg.candidates = argv[++i];
         else if (!strcmp(argv[i], "--lpb") && i + 1 < argc) cfg.lpb = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--mfb") && i + 1 < argc) cfg.mfb = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--cofgate") && i + 1 < argc) cfg.cofgate = argv[++i];
@@ -148,7 +180,7 @@ int main(int argc, char **argv)
      * quantity in unscaled bits (16-bit cells need no scale). */
     if (!allowance_set && cfg.side == 0) cfg.allowance = 2.35 * 31.0;
     if (!bkthresh) bkthresh = 1u << cfg.logI;
-    if (!fbbound && cfg.side == 1)
+    if (!fbbound && cfg.side == 1 && !cfg.pipeline)
         fbbound = (q > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (uint32_t)q;
 
     /* Bound log_region before ANY 1u << log_region: the shift is undefined for
@@ -245,6 +277,86 @@ int main(int argc, char **argv)
     if (poly_load(polypath, &POLY) != 0) return 1;
     printf("polynomial %s: algebraic degree %d, skew %.4g\n",
            polypath, POLY.deg, POLY.skew);
+
+    /* ---- both sides in one process ---- */
+    if (cfg.pipeline) {
+        fb_t fb1, fbs1, fb0, fbs0;
+        int prc;
+        /* The pipeline defaults to the full algebraic factor base. Truncating
+         * it at the special-q is a legitimate configuration (GGNFS does it)
+         * but it costs relations outright -- 30 of 1,851 cofactors at the
+         * parity q differ by exactly one prime in (q, alim]. */
+        /* The pipeline's documented configuration is bound 128 on side 1 and
+         * 132 on side 0. Side 1's scale and allowance were being left at the
+         * single-side benchmark defaults (1.0 and 112), which gives bound 113
+         * and a materially larger trial-division input. */
+        if (!scale_set) cfg.scale = 1.275;
+        if (!allowance_set) cfg.allowance = 100.0;
+        if (!cfg.qlist && !rho) {
+            fprintf(stderr, "bench --pipeline: needs a real root of f mod q."
+                    " Pass --rho, or --qlist for a band.\n"
+                    "  A synthetic root is fine for a sieve microbenchmark but"
+                    " not for a path that emits relations.\n");
+            return 2;
+        }
+        if (!fbbound_set) fbbound = alim;
+        if (!cfg.lim)  cfg.lim  = fbbound;
+        if (!cfg.lim0) cfg.lim0 = rlim;
+        if (!cfg.lpb)  cfg.lpb  = 32;
+        if (!cfg.mfb)  cfg.mfb  = 92;
+
+        if (cfg.cadofb) {
+            if (fb_load_cado(cfg.cadofb, cfg.scale, &fb1) != 0) return 1;
+        } else if (fb_load(fbpath, &fb1) != 0) return 1;
+        fb_fill_logp(&fb1, cfg.scale);
+        if (fb_split_small(&fb1, bkthresh, &fbs1) != 0) return 1;
+        fb_restrict(&fb1, bkthresh, fbbound);
+
+        if (rfb_build(&POLY, rlim, maxbits, cfg.scale0, &fb0) != 0) return 1;
+        fb_fill_logp(&fb0, cfg.scale0);
+        if (fb_split_small(&fb0, bkthresh, &fbs0) != 0) return 1;
+        fb_restrict(&fb0, bkthresh, rlim);
+
+        printf("\nside 1 (algebraic): bucketed %u <= p < %u : %u entries,"
+               " line-sieved %u\n", bkthresh, fbbound, fb1.n, fbs1.n);
+        printf("side 0 (rational) : bucketed %u <= p < %u : %u entries,"
+               " line-sieved %u\n", bkthresh, rlim, fb0.n, fbs0.n);
+
+        {
+            qsel_t *ql = NULL;
+            uint32_t nq = 0, capq = 0;
+            if (cfg.qlist) {
+                FILE *f = fopen(cfg.qlist, "r");
+                char line[256];
+                if (!f) { perror(cfg.qlist); return 1; }
+                while (fgets(line, sizeof line, f)) {
+                    unsigned long long qq, rr;
+                    if (line[0] == '#') continue;
+                    if (sscanf(line, "%llu %llu", &qq, &rr) != 2) continue;
+                    if (nq == capq) {
+                        capq = capq ? capq * 2 : 256;
+                        ql = (qsel_t *)realloc(ql, (size_t)capq * sizeof(qsel_t));
+                        if (!ql) { fclose(f); return 1; }
+                    }
+                    ql[nq].q = qq; ql[nq].rho = rr; nq++;
+                    if (cfg.nq_max && nq >= cfg.nq_max) break;
+                }
+                fclose(f);
+                if (!nq) { fprintf(stderr, "%s: no `q rho` pairs\n", cfg.qlist); return 1; }
+                printf("band: %u special-q from %s\n", nq, cfg.qlist);
+            } else {
+                ql = (qsel_t *)malloc(sizeof(qsel_t));
+                ql[0].q = q;
+                ql[0].rho = rho ? rho : (uint64_t)(0x9E3779B97F4A7C15ull % q);
+                nq = 1;
+            }
+            prc = run_pipeline(&fb1, &fbs1, &fb0, &fbs0, ql, nq, &POLY, &cfg);
+            free(ql);
+        }
+        fb_free(&fb1); fb_free(&fbs1); fb_free(&fb0); fb_free(&fbs0);
+        return prc;
+    }
+
 
     /* The special-q lives on side 1, so only side 1's factor base is truncated
      * at q (the GGNFS convention). Side 0 runs to rlim regardless. */

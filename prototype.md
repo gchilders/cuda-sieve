@@ -3088,6 +3088,64 @@ the small-prime table in shared memory changed nothing (the reads are
 warp-uniform and already broadcast), and buffering hits to remove warp
 divergence changed nothing. The cost was arithmetic, in the divisions.
 
+## Resieve optimised: 12.68 -> 9.85 ms, and the 2x budget is now met
+
+The resieve walk was 58% of the post-sieve chain and the obvious lever. Three
+hypotheses, measured in this order:
+
+| hypothesis | change | result |
+|---|---|---|
+| L2 **bandwidth** on the summary probe | add a coarse L1-resident pre-filter | **worse at every granularity** |
+| the summary table not being **cache-resident** | replace it, 1 MB -> 64 KB | **flat: 5.21 -> 5.35 ms** |
+| **latency**: one probe in flight per warp | unroll the walk, probe ahead | **6.92 -> 5.21 ms** |
+
+**The failed experiments are what identified the bottleneck**, so they are
+worth more than the successful one. The coarse pre-filter at 1 bit per 256
+positions rejected **96.5% of walk steps** before they reached the summary, and
+the kernel got *slower* (6.69 -> 7.82 ms). If the probes were a throughput
+cost, removing 96.5% of them could not possibly lose. And sweeping the summary
+from 1 MB down to 64 KB — a 16x change in table size, straddling any plausible
+L1/L2 boundary — moved the time by 2.7%. Neither the number of probes nor where
+they land is what this kernel spends its time on.
+
+What it spends its time on is **one dependent scattered load per step, with
+nothing else in flight**. It already runs at full occupancy (40 registers, 48
+warps/SM, no spills), so the fix is not more warps but more loads per warp:
+walk `UNROLL` positions ahead — pure register arithmetic, no speculation
+needed — and issue all `UNROLL` summary probes before branching on any of them.
+
+| unroll | 1 | 2 | **4** | 8 |
+|---|---:|---:|---:|---:|
+| resieve + scatter (side 1) | 6.92 | 5.76 | **5.21** | 5.98 |
+
+4 is the optimum; 8 regresses. Recovered prime counts are bit-identical at
+every unroll depth and every granularity — the sweep checks that at each
+setting and fails the run if it changes.
+
+### The post-sieve chain as it now stands
+
+| stage | side 1 | side 0 | total |
+|---|---:|---:|---:|
+| intersect + gcd + compact | 0.42 | shared | 0.42 |
+| rank scan + emit + filter | 0.46 | shared | 0.46 |
+| resieve + scatter | **5.20** | **4.65** | **9.85** |
+| norms + trial division | 2.78 | 2.50 | 5.29 |
+| classify | 1.02 | 0.70 | 1.71 |
+| host per-q | 0.65 | 0.75 | 1.40 |
+| | | | **19.13** |
+
+**19.1 ms against finding 46's 21–25 ms allowance for a 2x energy win.** With
+finding 47's ~4.9 ms/q of GPU cofactor kernel the total is ~24.0 ms, which is
+**inside the band** rather than 10% over it as the pre-optimisation chain was.
+That is a change of verdict, and it rests on one 25% improvement to one kernel,
+so it should be treated as *marginally* inside until cofactorisation is
+measured rather than projected — the harness work already showed 33x of host
+overhead sitting around those kernels, and none of that is in the 4.9 ms.
+
+All gates still pass at these settings: 1,850 of 1,850 cofactors identical to
+CADO on both sides, factors x cofactor == norm on 32,982 and 14,141 candidates,
+1,851 joint candidates, and **37 of 37 of las's relations recovered.**
+
 ## Cofactor classification: 1,852 candidates against CADO's 1,851
 
 `k_classify` implements CADO's `check_leftover_norm`
@@ -3179,6 +3237,238 @@ and independently in Python over the 1,852 joint candidates, both sides at
 once: **1,852 of 1,852**. The CADO gate validates the residual; this validates
 the list that produced it. Both were needed — a wrong factor list with a
 compensating residual would pass the first and fail the second.
+
+## Cofactorisation: the adapter works, the harness does not yet
+
+`bench/mkcofbatch` joins the two per-side `--emit-cof` files into
+`nfs_3lp_batch_factor` input (`res1,res2:a,b:rfac_hex:afac_hex`, negative
+meaning "still needs splitting"). **The classification blocker is cleared** —
+this is the piece the 2026-08-04 harness work said was not "a small input
+adapter", and it is now a 100-line join because `k_classify` does the real
+work on the GPU. At q=120000053 it emits 1,844 batch records and 7 already
+complete relations, which is the full 1,851 candidate set.
+
+The harness then runs and produces **23 relations from 526,140 records over 548
+special-q** = 0.042 relations/q. The batch was filtered to the `r=2,a=3` class
+(see below), which at the parity q holds 8 of the 30 batch-visible relations,
+so the matched expectation is ~8/q and the shortfall is **191x**. Quoting it
+against las's 37/q would give 882x and against all batch-visible relations
+715x, but neither is the population that was fed. **No cofactorisation cost
+from this run should be quoted**, in either direction. An untimed pipeline that does not produce relations tells us
+nothing about the cost of one that does. What the run did establish:
+
+### The predicted aliasing bug is confirmed, and it is worse than recorded
+
+The standing item above says `gpu_cofactorization.c:1454` "fills the 96-bit
+array indexed by *relation* index while `residues_a_in` is populated on the 2LP
+path". Confirmed, and there are **two** index errors, not one:
+
+```c
+t->modulus96_in[3*j + 0] = t->residues_a_in[3*i + 0];   /* line 1454 */
+```
+`i` runs over `t->rb->num_relations`, but `residues_a_in` is packed at
+`residues_a_in[ka++]` (line 1757) **densely and with a variable stride** — the
+inner loop runs `c->lp_a_num_words` times, which is 1, 2 or 3. So the read is
+wrong in its index space *and* in its stride. Both are invisible on the bundled
+reference workload, where every relation has a 3-word a-side residue and takes
+the 2LP path, making the dense index equal the relation index and the stride
+always 3.
+
+**The classification gap was not the cause**, which settles the open question:
+the bad-modulus rate is **33.59%** with correct classification against 34.4%
+before, essentially unchanged.
+
+### Second upstream bug: an 80-byte path buffer
+
+`main.c:422` is `char outfile[80]` followed by
+`sprintf(outfile, "%s.cu.out", infile)`. Any input path over 72 characters
+overflows it and glibc aborts the process. The same unguarded copy of a
+user-supplied path into an 80-byte buffer is at `main.c:695`
+(`strcpy(fname, options->file)`). The buffer at `main.c:699` is a different,
+shadowed one used for the fixed `bgcd_lpb%d` name and is NOT affected. Worth
+sending upstream with the PTX fix.
+
+### The finding that actually matters for how this gets fed
+
+Restricting the batch to the shape the harness handles (r-side 2 words, a-side
+3 words) makes the aliasing bug harmless — but it throws away most of the
+relations. Where las's 30 batch-visible relations at q=120000053 actually live:
+
+| class (r words, a words) | batch records | las relations | density |
+|---|---:|---:|---:|
+| r=2 a=3 (the shape the harness handles) | 948 | 8 | 0.8% |
+| r=0 a=3 | 856 | 6 | 0.7% |
+| **r=2 a=2** | **21** | **9** | **43%** |
+| **r=0 a=2** | **16** | **4** | **25%** |
+| **r=2 a=0** | **3** | **3** | **100%** |
+
+**16 of 30 relations come from 40 records.** The classes where one side is
+already finished or small are enormously relation-dense, and they are exactly
+the classes the harness cannot process. Feeding it only the `r=2,a=3` class
+processes **51.4% of records (948/1,844) to keep 26.7% of the yield (8/30)**.
+Taking both `a=3` classes processes **97.8% of records for 46.7% of the yield**
+— so the a=3 population is 98% of the records and less than half the relations,
+while 40 records carry the other half.
+
+**So the design consequence is not "fix the adapter".** It is that a cofactor
+stage for this workload has to be organised by residue class, cheapest and
+densest first, and the **2-word-by-3-word** case — the expensive one — is the
+least productive per record. (It cannot be 3-word by 3-word: `mfbr = 60`, so a
+rational residual never exceeds two words on this job.) That is a scheduling statement about our own queue
+(item 7), and it holds regardless of whose ECM eventually runs underneath.
+
+### The rho iteration cap was my error, and it matters
+
+An earlier draft of the plan for our own cofactor stage said that a record not
+split within ~2^17 Brent-rho iterations is "provably dead" and can be dropped.
+**That is wrong.** Pollard rho and Brent rho are Monte Carlo: expected work is
+O(sqrt p) for a factor p, and no unsuccessful finite run establishes that no
+admissible factor exists. Implemented as stated it would have silently
+discarded relations, with nothing in any gate able to see it — the CADO
+cofactor gate and the reconstruction gate both run *upstream* of splitting.
+
+The bounded-work property worth having is real, but it is a **scheduling**
+statement, not a rejection proof: 2^17 iterations is one service slice, and on
+exhaustion the task must reseed with a different polynomial, requeue with an
+attempt count, or escalate to a bounded ECM tier. ECM is bounded the same way,
+by finite B1/B2 and a curve count — which is exactly what the external harness
+does at `gpu_cofactorization.c:1804`. Neither algorithm turns an exhausted
+budget into a proof.
+
+### Where that leaves the budget
+
+Finding 47's ~4.92 ms/q remains **a projection**, now with a third caveat: the
+harness that produced its sizing datum cannot process 73% of this job's
+candidates without the index fix, and the yield it currently achieves is 191x
+short of the class it was fed. The post-sieve chain at **19.1 ms/q is measured**; the cofactor term
+added to it is not.
+
+## Both sides in one process
+
+`bench --pipeline` sieves side 1 and side 0, keeps both survivor bitmaps
+device-resident, intersects once, trial-divides and classifies each side
+against the shared two-sided bitmap, joins in memory, and writes complete
+relations and the cofactorisation batch directly.
+
+**Its output is byte-identical to the two-process path.** Same 9,521,087 and
+16,969,340 one-sided survivors, same 239,446 two-sided primitive survivors,
+same 1,844 candidates and 7 complete relations, and `diff` on both output files
+against `mkcofbatch`'s is empty. That is the gate for the merge: it is the same
+computation, not a reimplementation that happens to agree on counts.
+
+| | |
+|---|---:|
+| complete relations, products == norms | **7/7** |
+| complete relations present in las's 37 | **7/7** |
+| candidates + relations | **1,851** (CADO's count at this q) |
+| **las's 37 covered** | **37/37** |
+
+Three things had to be got right and are worth recording, because each was a
+silent failure rather than a crash:
+
+- **Side 0's norms are a degree-1 form.** `run_bench` obtains that by mutating
+  `POLY` in its caller, which the pipeline must not do — `run_td_stage` still
+  needs the degree-5 coefficients for side 1's exact norms. The pipeline makes
+  a local degree-1 copy for `norm_setup` and leaves `POLY` alone.
+- **The factor order was not reproducible.** Large primes reach a survivor's
+  slot through an `atomicAdd`, so their order in the emitted factorisation
+  varied run to run. The two paths agreed on every multiset and differed on two
+  lines by a transposition. Factor lists are now sorted at emission, which is
+  what makes a `diff` between two paths meaningful at all.
+- **The bucket array is shared between sides.** At 1.38 GB it is the largest
+  allocation in the process and nothing needs it after apply, so side 0 reuses
+  side 1's rather than doubling the footprint.
+
+### The band: `--qlist`, and the first relations produced at scale
+
+`bench --pipeline --qlist FILE` runs a band of special-q in one process, with
+everything q-independent hoisted out of the loop (factor base upload, slice
+tables, pinned staging, all device buffers for the sieve). Over the first 8 q
+of the captured band:
+
+| | |
+|---|---:|
+| two-sided primitive survivors / q | 238,820 |
+| cofactorisation candidates / q | 1,923 |
+| **complete relations / q** | **8.0** |
+| relations emitted over 8 q | **64** |
+| **factors x cofactor == norm, all primes within lpb** | **64 / 64** |
+| also found by las | 63 / 64 |
+
+These are relations produced end to end by the GPU pipeline with no
+cofactorisation stage at all -- the 8 per q that fall out of trial division
+alone. Every one was re-derived independently from `(a,b)` and the polynomial.
+
+**One of the 64 is a relation las did not find:**
+
+```
+(a, b) = (-2282211070036, 15437)
+rational : 3 . 7 . 7589 . 40487 . 91529 . 159079 . 591959 . 4099723 . 20472997
+algebraic: 2^4 . 5 . 89 . 163 . 383 . 457 . 1987 . 78691 . 175859 . 420557
+           . 1395181 . 4123793 . 29617799 . 120000107 . 349460389
+```
+
+It is valid: both products equal the norms exactly and every prime is inside
+its side's bound. This is the +5.6% survivor excess appearing as a *bonus* for
+the second time -- our norms are exact where las's are approximate, so
+positions las discards can still carry relations. It is one in 64 here, which
+is a yield effect worth quantifying over a longer band rather than a curiosity.
+
+### Where the per-q wall time actually goes -- and it is not compute
+
+| stage | ms/q |
+|---|---:|
+| sieve, both sides | 66.1 |
+| intersect + gcd + compact | 0.44 |
+| host per-q (tables, staging) | 1.18 |
+| **TD + classify, wall** | **241.2** |
+| join and emit | 4.81 |
+| unaccounted | 2.41 |
+| **wall clock per q** | **316.2** |
+
+The TD stage's *device kernels* measure ~19 ms/q across both sides (resieve
+9.9, trial division 5.3, classify 1.7, rank and emit 0.9). It costs **241 ms**
+of wall clock.
+
+**An earlier draft of this section attributed that whole gap to
+`cudaMalloc`/`cudaFree` and readback. That was asserted, not measured, and it
+is wrong.** The pipeline calls `run_td_stage`, which is the *benchmark* entry
+point, and it runs every stage best-of-three plus two diagnostic variants:
+rank x3, emit x3, resieve x3 plus a restoring pass, trial division x3 with no
+small primes, x3 with no division, x3 ordinary, one recording pass, and
+classify x3 -- per side. That is on the order of 90 ms/q of redundant kernel
+time before any allocator cost. The rank scan, the emission and the summary
+build are also done twice, once per side, despite being functions of the shared
+two-sided bitmap alone.
+
+So the 222 ms decomposes into at least three parts -- redundant benchmark
+passes, per-q allocation and readback of arrays sized for all 239K survivors
+when ~1,900 are candidates, and the first-q reconstruction gate -- **and this
+document does not yet say how much each contributes.** That is the measurement
+to take, not a conclusion to quote. **No band timing belongs against finding 46
+until the production path stops running the harness**: 316 ms/q is not the
+siever.
+
+**The lesson is the recurring one.** This is the second gap in this log that I
+explained before instrumenting it -- the first was the small-prime direct test,
+where a contended GPU produced a 10 ms figure I called a model failure and a
+quiet GPU put it inside the predicted range. Both times the honest move was a
+timer, and both times the explanation arrived first.
+
+### What this does and does not measure
+
+**The pipeline's per-stage times are single-shot and include first-launch
+costs**, so they are not comparable to `run_bench`'s best-of-N and should not be
+quoted against finding 46. Two consecutive runs reported 66.6 ms and 97.2 ms for
+the same two sieves. **run_bench remains the timing reference** until the
+pipeline loops over a band of special-q, at which point the one-time costs
+amortise and its numbers become the honest ones — which is exactly the
+measurement the cofactor queue needs anyway.
+
+What the merge delivers is not speed. It is that a single process can now
+produce a *stream* of classified candidates across many special-q, which is the
+input the cross-q cofactor queue requires and which two single-side processes
+exchanging files cannot supply.
 
 ## Lazy module loading bit again
 

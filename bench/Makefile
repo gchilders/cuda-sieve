@@ -28,7 +28,7 @@ CU_OBJS = $(CU_SRCS:.cu=.o)
 C_OBJS  = $(C_SRCS:.c=.o)
 OBJS    = $(CU_OBJS) $(C_OBJS)
 
-all: bench fbtest dumpcmp
+all: bench fbtest dumpcmp mkcofbatch
 
 bench: $(OBJS)
 	$(NVCC) $(NVCC_ARCH) -o $@ $^ -lcudart -lm
@@ -41,6 +41,10 @@ fbtest: fbtest.c $(C_OBJS)
 dumpcmp: dumpcmp.c
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
+# joins the two per-side --emit-cof files into cofactorisation batch input
+mkcofbatch: mkcofbatch.c
+	$(CC) $(CFLAGS) -o $@ $< -lm
+
 %.o: %.cu
 	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
 
@@ -50,7 +54,7 @@ dumpcmp: dumpcmp.c
 -include $(OBJS:.o=.d)
 
 clean:
-	rm -f bench fbtest dumpcmp *.o *.d
+	rm -f bench fbtest dumpcmp mkcofbatch *.o *.d
 
 .PHONY: all clean check
 

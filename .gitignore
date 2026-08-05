@@ -16,4 +16,5 @@
 bench/bench
 bench/fbtest
 bench/dumpcmp
+bench/mkcofbatch
 *.d

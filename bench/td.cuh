@@ -260,14 +260,39 @@ __global__ void k_emit_ranked(const uint32_t *__restrict bits,
     }
 }
 
-/* ---- resieve that scatters into per-survivor lists --------------------- */
-
-/* k_resieve_rewalk with the output changed from an unordered (x,p) array to a
+/* ---- resieve that scatters into per-survivor lists --------------------- *
+ *
+ * k_resieve_rewalk with the output changed from an unordered (x,p) array to a
  * per-survivor list. PROPER PRIME POWERS ARE SKIPPED: if p^2 hits a position
  * then p hits it too and p is in the same factor base, so the base prime is
  * always recorded and multiplicity is recovered by repeated division. A p^2
  * entry recorded as if it were prime would be divided out as p^2, which is
- * wrong whenever the true multiplicity is odd. */
+ * wrong whenever the true multiplicity is odd.
+ *
+ * UNROLL is the whole performance story of this kernel, so it is worth stating
+ * what it is fixing.
+ *
+ * The walk is neither arithmetic-bound nor bandwidth-bound. It runs 315.5M
+ * steps in 6.69 ms, which is 325 lane-cycles for a step of about eight
+ * instructions, at full occupancy (40 registers, 48 warps/SM, no spills). What
+ * costs is the summary probe: one scattered dependent load per step, and with
+ * one load in flight per warp, 48 warps cannot cover L2 latency.
+ *
+ * A COARSE PRE-FILTER ABOVE THE SUMMARY WAS TRIED AND LOST at every
+ * granularity from 256 to 4096 positions per bit -- 6.69 ms became 6.75 to
+ * 7.82 -- even though at 256 it rejected 96.5% of steps before they reached
+ * the summary. That is the measurement that identifies the bottleneck:
+ * removing 96.5% of the probes did not help, so the probes were never the
+ * throughput cost. Rejecting a step still costs one dependent load, and the
+ * steps that pass now pay two in series.
+ *
+ * The fix for latency is more loads in flight, not fewer loads. Walking UNROLL
+ * positions ahead and issuing all UNROLL summary probes before branching on
+ * any of them multiplies memory-level parallelism per warp by UNROLL. The walk
+ * itself is pure register arithmetic, so running ahead costs nothing and needs
+ * no speculation.
+ */
+template <int UNROLL>
 __global__ void k_resieve_scatter(const plat_t *__restrict plat,
                                   const uint32_t *__restrict primes,
                                   const uint8_t *__restrict ispow,
@@ -278,9 +303,11 @@ __global__ void k_resieve_scatter(const plat_t *__restrict plat,
                                   uint32_t *__restrict plist,
                                   uint32_t *__restrict pcnt,
                                   uint32_t K,
-                                  unsigned long long *__restrict noverflow)
+                                  unsigned long long *__restrict noverflow,
+                                  int log_gran)
 {
     const uint32_t Imask = (1u << logI) - 1;
+    const uint32_t NONE = 0xFFFFFFFFu;      /* x < 2^29, so this cannot collide */
     uint32_t stride = gridDim.x * blockDim.x;
     unsigned long long ovf = 0;
 
@@ -289,14 +316,33 @@ __global__ void k_resieve_scatter(const plat_t *__restrict plat,
         if (P.inc_warp == 0xFFFFFFFFu) continue;
         if (ispow && ispow[k]) continue;
         uint32_t p = primes[k];
-        for (uint32_t x = pl_first(&P, logI); x < xmax; x = pl_next(x, &P, Imask)) {
-            uint32_t sb = x >> 6;
-            if (!((summary[sb >> 5] >> (sb & 31u)) & 1u)) continue;
-            if (!((bits[x >> 5] >> (x & 31u)) & 1u)) continue;
-            uint32_t idx = td_rank(bits, gbase, x);
-            uint32_t slot = atomicAdd(&pcnt[idx], 1u);
-            if (slot < K) plist[(size_t)idx * K + slot] = p;
-            else ovf++;
+        uint32_t x = pl_first(&P, logI);
+
+        while (x < xmax) {
+            uint32_t xs[UNROLL], hit[UNROLL];
+
+            #pragma unroll
+            for (int u = 0; u < UNROLL; u++) {
+                if (x < xmax) { xs[u] = x; x = pl_next(x, &P, Imask); }
+                else xs[u] = NONE;
+            }
+            /* every one of these is independent, so they issue together */
+            #pragma unroll
+            for (int u = 0; u < UNROLL; u++) {
+                uint32_t sb = xs[u] >> log_gran;
+                hit[u] = (xs[u] == NONE) ? 0u
+                                         : ((summary[sb >> 5] >> (sb & 31u)) & 1u);
+            }
+            #pragma unroll
+            for (int u = 0; u < UNROLL; u++) {
+                if (!hit[u]) continue;
+                uint32_t xv = xs[u];
+                if (!((bits[xv >> 5] >> (xv & 31u)) & 1u)) continue;
+                uint32_t idx = td_rank(bits, gbase, xv);
+                uint32_t slot = atomicAdd(&pcnt[idx], 1u);
+                if (slot < K) plist[(size_t)idx * K + slot] = p;
+                else ovf++;
+            }
         }
     }
     if (ovf) atomicAdd(noverflow, ovf);
@@ -323,7 +369,12 @@ __global__ void k_resieve_scatter(const plat_t *__restrict plat,
  * thread reaches each __syncthreads. */
 #define TD_TILE 512
 #define TD_MAXHIT 16      /* buffered small-prime hits; ~7 per survivor typical */
-#define TD_FMAX  32       /* recorded factors per survivor, multiplicity included */
+/* Recorded factors per survivor, multiplicity included. 32 was not enough: a
+ * 224-bit algebraic norm carrying a high power of a small prime records one
+ * entry per division, and a candidate at q=120000007 exceeded it. Exceeding
+ * the cap fails the run rather than emitting a truncated factorisation, so the
+ * observed maximum is reported to keep the margin visible. */
+#define TD_FMAX  64
 
 /* DIVIDE == 0 runs the identical hit test but skips the big-integer division
  * it triggers, and counts the hits instead. That is the only way to tell

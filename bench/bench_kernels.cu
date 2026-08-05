@@ -647,6 +647,27 @@ __device__ __forceinline__ uint32_t bgcd(uint32_t u, uint32_t v)
  *    is exactly the traffic layout B would have, because the record is 4 B
  *    either way and every record is read exactly once.
  */
+/* One summary bit per `wper` words of the full bitmap. wper == 2 reproduces
+ * k_build_summary's 1-bit-per-64-positions table. Whole output words are built
+ * by one thread, so unlike k_build_summary this needs no atomics. */
+__global__ void k_build_summary_g(const uint32_t *__restrict bits,
+                                  uint32_t nword, uint32_t wper,
+                                  uint32_t *__restrict summary)
+{
+    const uint32_t nsw = nword / (wper * 32);
+    const uint32_t stride = gridDim.x * blockDim.x;
+    for (uint32_t w = blockIdx.x * blockDim.x + threadIdx.x; w < nsw; w += stride) {
+        uint32_t out = 0;
+        for (uint32_t b = 0; b < 32; b++) {
+            uint32_t o = 0;
+            const uint32_t base = (w * 32 + b) * wper;
+            for (uint32_t k = 0; k < wper; k++) o |= bits[base + k];
+            if (o) out |= 1u << b;
+        }
+        summary[w] = out;
+    }
+}
+
 __global__ void k_build_summary(const uint32_t *__restrict bits,
                                 uint32_t nword, uint32_t *__restrict summary)
 {
@@ -1069,11 +1090,30 @@ static int td_gate_cofactors(const char *path, uint32_t n,
 
 /* ---- the stage ---------------------------------------------------------- */
 
+/* Per-side trial-division results, for callers that join both sides in
+ * process. All arrays are malloc'd here and owned by the caller. */
+typedef struct {
+    uint32_t  n;
+    int64_t  *a, *b;
+    bn_t     *cof;
+    uint8_t  *bits, *status;
+    uint32_t *fac, *faccnt;
+} td_out_t;
+
+static void td_out_free(td_out_t *o)
+{
+    if (!o) return;
+    free(o->a); free(o->b); free(o->cof); free(o->bits); free(o->status);
+    free(o->fac); free(o->faccnt);
+    memset(o, 0, sizeof(*o));
+}
+
 static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                         const poly_t *POLY, const bench_cfg_t *cfg,
                         const plat_t *d_plat, const uint32_t *d_primes,
                         const uint32_t *d_two, uint32_t nbitword,
-                        uint32_t xmax, int blocks, int threads)
+                        uint32_t xmax, int blocks, int threads,
+                        td_out_t *out)
 {
     const uint32_t K = 16;          /* large primes kept per survivor */
     const uint32_t ngroup = nbitword / TD_GROUP_W;
@@ -1179,18 +1219,112 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     CK(cudaEventSynchronize(t1)); CK(cudaGetLastError());
     ms_sum = time_kernel(t0, t1);
 
-    for (int rep = 0; rep < 3; rep++) {
+    /* Sweep BOTH knobs, because they attack the same bottleneck from opposite
+     * directions and only measurement separates them.
+     *
+     *   unroll     -- more probes in flight per warp, hiding the latency
+     *   granularity-- a coarser summary is a smaller table, so the probe may
+     *                 land in L1 instead of L2, lowering the latency itself.
+     *                 Coarser also means more steps reach the 67 MB bitmap.
+     *
+     * The recovered prime counts must be identical at every setting. */
+    {
+        uint32_t *h_ref = NULL;
+        /* Production setting first, so a normal run times exactly one thing.
+         * The rest is the sweep that chose it and only runs on request:
+         * unroll 4 at the original granularity, measured 5.21 ms against 6.92
+         * at unroll 1. Granularity turned out not to matter at all -- 5.21 to
+         * 5.35 ms across a 16x change in table size -- which is itself the
+         * evidence that this kernel is latency-bound rather than
+         * cache-resident-bound. */
+        struct { int lg, u; } trial[] = {
+            {6,4},
+            {6,1},{6,2},{6,8},{7,4},{8,4},{9,4},{10,4},{9,8},{10,8}
+        };
+        const unsigned ntrial = cfg->resieve_sweep
+                              ? (unsigned)(sizeof trial / sizeof *trial) : 1u;
+        for (unsigned ti = 0; ti < ntrial; ti++) {
+            const int log_gran = trial[ti].lg, U = trial[ti].u;
+            const uint32_t wper = 1u << (log_gran - 5);
+            const uint32_t nsw = nbitword / (wper * 32);
+            float best = 1e30f;
+            uint32_t mism = 0;
+            if (!nsw) continue;
+            k_build_summary_g<<<blocks, threads>>>(d_two, nbitword, wper, d_sum);
+            CK(cudaDeviceSynchronize()); CK(cudaGetLastError());
+            for (int rep = 0; rep < 3; rep++) {
+                CK(cudaMemset(d_pcnt, 0, (size_t)n * 4));
+                CK(cudaMemset(d_ovf, 0, 8));
+                cudaEventRecord(t0);
+                switch (U) {
+                case 1: k_resieve_scatter<1><<<blocks, threads>>>(
+                            d_plat, d_primes, NULL, fb->n, xmax, cfg->logI,
+                            d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, log_gran); break;
+                case 2: k_resieve_scatter<2><<<blocks, threads>>>(
+                            d_plat, d_primes, NULL, fb->n, xmax, cfg->logI,
+                            d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, log_gran); break;
+                case 4: k_resieve_scatter<4><<<blocks, threads>>>(
+                            d_plat, d_primes, NULL, fb->n, xmax, cfg->logI,
+                            d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, log_gran); break;
+                default: k_resieve_scatter<8><<<blocks, threads>>>(
+                            d_plat, d_primes, NULL, fb->n, xmax, cfg->logI,
+                            d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, log_gran); break;
+                }
+                cudaEventRecord(t1);
+                CK(cudaEventSynchronize(t1)); CK(cudaGetLastError());
+                { float t = time_kernel(t0, t1); if (t < best) best = t; }
+            }
+            /* Compare the recovered PRIMES, not merely how many there are:
+             * two configurations could scatter different primes into a
+             * survivor's slot and still agree on the count. The scatter order
+             * within a slot is atomic-dependent, so sort each slot first. */
+            {
+                const size_t sz = (size_t)n * (K + 1) * 4;
+                uint32_t *h = (uint32_t *)malloc(sz);
+                CK(cudaMemcpy(h, d_pcnt, (size_t)n * 4, cudaMemcpyDeviceToHost));
+                CK(cudaMemcpy(h + n, d_plist, (size_t)n * K * 4,
+                              cudaMemcpyDeviceToHost));
+                for (uint32_t z = 0; z < n; z++) {
+                    uint32_t c = h[z] > K ? K : h[z];
+                    std::sort(h + n + (size_t)z * K, h + n + (size_t)z * K + c);
+                }
+                if (!h_ref) h_ref = h;
+                else {
+                    for (uint32_t z = 0; z < n; z++) {
+                        uint32_t c = h[z] > K ? K : h[z];
+                        if (h[z] != h_ref[z]) { mism++; continue; }
+                        for (uint32_t y = 0; y < c; y++)
+                            if (h[n + (size_t)z * K + y] !=
+                                h_ref[n + (size_t)z * K + y]) { mism++; break; }
+                    }
+                    free(h);
+                }
+            }
+            if (cfg->resieve_sweep)
+                printf("  %-30s %8.3f ms   (1 bit/%4d positions, %6.1f KB,"
+                       " unroll %d)%s\n", "resieve + scatter", best,
+                       1 << log_gran, nsw * 4 / 1024.0, U,
+                       mism ? "  ** RECOVERY CHANGED" : "");
+            else
+                printf("  %-30s %8.3f ms   (unroll %d)\n",
+                       "resieve + scatter", best, U);
+            if (mism) rc = -1;
+            /* ti == 0 IS the production configuration (unroll 4, 1 bit/64).
+             * Taking the fastest trial instead would report a chain total for
+             * a setting the pipeline does not run. */
+            if (ti == 0) ms_scatter = best;
+        }
+        free(h_ref);
+        /* restore the reference summary and leave a correct scatter behind */
+        k_build_summary_g<<<blocks, threads>>>(d_two, nbitword, 2u, d_sum);
         CK(cudaMemset(d_pcnt, 0, (size_t)n * 4));
         CK(cudaMemset(d_ovf, 0, 8));
-        cudaEventRecord(t0);
-        k_resieve_scatter<<<blocks, threads>>>(
+        k_resieve_scatter<4><<<blocks, threads>>>(
             d_plat, d_primes, NULL, fb->n, xmax, cfg->logI,
-            d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf);
-        cudaEventRecord(t1);
-        CK(cudaEventSynchronize(t1)); CK(cudaGetLastError());
-        { float t = time_kernel(t0, t1); if (t < ms_scatter) ms_scatter = t; }
+            d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, 6);
+        CK(cudaDeviceSynchronize()); CK(cudaGetLastError());
+        CK(cudaMemcpy(&hovf, d_ovf, 8, cudaMemcpyDeviceToHost));
     }
-    CK(cudaMemcpy(&hovf, d_ovf, 8, cudaMemcpyDeviceToHost));
 
     /* ---- the trial division itself ---- */
     CK(cudaMalloc(&d_poly, sizeof(tdpoly_t)));
@@ -1255,8 +1389,7 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     printf("  %-30s %8.3f ms\n", "rank scan", ms_rank);
     printf("  %-30s %8.3f ms\n", "emit (x,a,b) in rank order", ms_emit);
     printf("  %-30s %8.3f ms\n", "build survivor filter", ms_sum);
-    printf("  %-30s %8.3f ms%s\n", "resieve + scatter", ms_scatter,
-           hovf ? "   ** list overflow" : "");
+    if (hovf) printf("  ** resieve list overflow\n");
     printf("  %-30s %8.3f ms   (norm + special-q + %u recovered large primes)\n",
            "  ...without small primes", ms_td_nosm, K);
     printf("  %-30s %8.3f ms   (%llu hits, %.2f per survivor)\n",
@@ -1283,7 +1416,7 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
      * A separate untimed pass with RECORD=1 rather than stores in the measured
      * kernel: the factors are only wanted when a run is emitting, and the hot
      * path should not carry writes it does not need. */
-    if (cfg->emit_cof) {
+    if (cfg->emit_cof || out) {
         CK(cudaMalloc(&d_fac, (size_t)n * TD_FMAX * 4));
         CK(cudaMalloc(&d_faccnt, (size_t)n * 4));
         k_td<1, 1><<<blocks, threads>>>(d_a, d_b, d_x, n, cfg->logI, d_poly,
@@ -1355,26 +1488,42 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
             td_gate_cofactors(cfg->cofgate, n, ha, hb, hcof, cfg->side) != 0)
             rc = -1;
 
-        if (cfg->emit_cof) {
-            FILE *fo = fopen(cfg->emit_cof, "w");
+        if (cfg->emit_cof || out) {
+            FILE *fo = cfg->emit_cof ? fopen(cfg->emit_cof, "w") : NULL;
             uint32_t *hfac = (uint32_t *)malloc((size_t)n * TD_FMAX * 4);
             uint32_t *hfn = (uint32_t *)malloc((size_t)n * 4);
-            uint32_t checked = 0, bad = 0, overflowed = 0;
+            uint32_t checked = 0, bad = 0, overflowed = 0, maxfac = 0;
             CK(cudaMemcpy(hfac, d_fac, (size_t)n * TD_FMAX * 4, cudaMemcpyDeviceToHost));
             CK(cudaMemcpy(hfn, d_faccnt, (size_t)n * 4, cudaMemcpyDeviceToHost));
+            /* Canonical order. The large primes arrive via an atomicAdd on the
+             * survivor's slot counter, so their order in the list varies run to
+             * run; sorting makes the emitted factorisation byte-reproducible,
+             * which is what lets two paths be diffed against each other. */
+            /* Unconditional: a candidate whose factor list overflowed TD_FMAX
+             * has a TRUNCATED list, and every consumer reads faccnt entries.
+             * Detecting that only on the verified q left later q emitting an
+             * out-of-bounds read of the factor matrix. */
+            for (uint32_t k = 0; k < n; k++) {
+                uint32_t c = hfn[k] > TD_FMAX ? TD_FMAX : hfn[k];
+                if (hstat[k] != COF_ACCEPT && hstat[k] != COF_SPLIT) continue;
+                if (hfn[k] > maxfac) maxfac = hfn[k];
+                if (hfn[k] > TD_FMAX) overflowed++;
+                std::sort(hfac + (size_t)k * TD_FMAX,
+                          hfac + (size_t)k * TD_FMAX + c);
+            }
 
             /* Reconstruction gate: the recorded factors times the residual
              * cofactor must rebuild the exact norm. The CADO gate above checks
              * only the residual, so it would pass even if the factor list were
              * wrong; this checks the list. Run over the candidates, which are
              * the records that will actually be emitted. */
-            for (uint32_t k = 0; k < n; k++) {
+            for (uint32_t k = 0; cfg->td_verify && k < n; k++) {
                 bns_t acc; bn_t t;
                 int64_t a, b;
                 uint64_t ua, ub;
                 int sa, sb;
                 if (hstat[k] != COF_ACCEPT && hstat[k] != COF_SPLIT) continue;
-                if (hfn[k] > TD_FMAX) { overflowed++; continue; }
+                if (hfn[k] > TD_FMAX) continue;
                 checked++;
                 a = ha[k]; b = hb[k];
                 ua = (uint64_t)(a < 0 ? -a : a); ub = (uint64_t)(b < 0 ? -b : b);
@@ -1394,18 +1543,22 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                     bn_mul_u64(&t, (uint64_t)hfac[(size_t)k * TD_FMAX + z]);
                 if (bn_cmp(&t, &acc.m) != 0) bad++;
             }
-            printf("  %-30s %8u of %u   %s\n",
-                   "factors x cofactor == norm", checked - bad, checked,
-                   bad ? "FAIL" : "PASS");
+            if (cfg->td_verify)
+                printf("  %-30s %8u of %u   %s\n",
+                       "factors x cofactor == norm", checked - bad, checked,
+                       bad ? "FAIL" : "PASS");
             if (bad) rc = -1;
+            if (cfg->td_verify)
+                printf("  %-30s %8u of %d\n", "most factors on a candidate",
+                       maxfac, TD_FMAX);
             if (overflowed) {
-                fprintf(stderr, "  ** %u candidates had more than %d factors\n",
-                        overflowed, TD_FMAX);
+                fprintf(stderr, "  ** %u candidates had more than %d factors;"
+                        " raise TD_FMAX\n", overflowed, TD_FMAX);
                 rc = -1;
             }
 
-            if (!fo) perror(cfg->emit_cof);
-            else {
+            if (cfg->emit_cof && !fo) { perror(cfg->emit_cof); rc = -1; }
+            else if (fo) {
                 char buf[80];
                 for (uint32_t k = 0; k < n; k++) {
                     int64_t a = ha[k], b = hb[k];
@@ -1416,11 +1569,21 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                         fprintf(fo, " %u", hfac[(size_t)k * TD_FMAX + z]);
                     fputc('\n', fo);
                 }
-                fclose(fo);
-                printf("  wrote %u (a, b, cofactor, bits, status, factors) to %s\n",
-                       n, cfg->emit_cof);
+                /* a short write shows up at fclose, and this file is now an
+                 * input to the next process in the pipeline */
+                if (ferror(fo)) rc = -1;
+                if (fclose(fo)) { perror(cfg->emit_cof); rc = -1; }
+                else if (rc == 0)
+                    printf("  wrote %u (a, b, cofactor, bits, status, factors)"
+                           " to %s\n", n, cfg->emit_cof);
             }
-            free(hfac); free(hfn);
+            if (out && rc == 0) { out->fac = hfac; out->faccnt = hfn; }
+            else { free(hfac); free(hfn); }
+        }
+        if (out && rc == 0) {
+            out->n = n; out->a = ha; out->b = hb;
+            out->cof = hcof; out->bits = hbits; out->status = hstat;
+            ha = hb = NULL; hcof = NULL; hbits = hstat = NULL;
         }
         free(hcof); free(hbits); free(hstat); free(ha); free(hb);
     }
@@ -1891,15 +2054,16 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                 FILE *fi = fopen(cfg->other_bits, "rb");
                 float t_isect = 0;
 
-                if (!fi) { perror(cfg->other_bits); }
+                if (!fi) { perror(cfg->other_bits); td_failed = 1; }
                 else {
                     CK(cudaHostAlloc((void **)&hother, (size_t)nbitword * 4,
                                      cudaHostAllocDefault));
                     size_t got = fread(hother, 4, (size_t)nbitword, fi);
                     fclose(fi);
                     if (got != (size_t)nbitword) {
-                        fprintf(stderr, "  --other-bits: short read (%zu of %u words)\n",
-                                got, nbitword);
+                        fprintf(stderr, "  --other-bits: short read (%zu of %u"
+                                " words)\n", got, nbitword);
+                        td_failed = 1;
                     } else {
                         CK(cudaMalloc(&dother, (size_t)nbitword * 4));
                         CK(cudaMemcpy(dother, hother, (size_t)nbitword * 4,
@@ -2253,7 +2417,8 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                     /* ---- exact norms + trial division --------------------- */
                     if (cfg->td && d_two &&
                         run_td_stage(fb, fbs, L, POLY, cfg, D.plat, D.primes,
-                                     d_two, nbitword, xmax, blocks, cfg->threads))
+                                     d_two, nbitword, xmax, blocks, cfg->threads,
+                                     NULL))
                         td_failed = 1;
 
                     if (hother) cudaFreeHost(hother);
@@ -2367,3 +2532,5 @@ after_apply:
     cudaFree(D.sp); cudaFree(D.srt); cudaFree(D.sg); cudaFree(D.slp); cudaFree(D.dumpbuf); cudaFree(D.survbits);
     return td_failed ? -1 : 0;
 }
+
+#include "pipeline.cuh"
