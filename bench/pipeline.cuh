@@ -253,6 +253,486 @@ static int pipe_side_perq(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     return 0;
 }
 
+/* ======================= the production TD path ========================== *
+ *
+ * run_td_stage is the MEASUREMENT harness. Calling it per special-q, per side,
+ * is what made the pipeline's post-sieve cost 222 ms/q: it runs the rank scan,
+ * the emission, the resieve and the classification three times each for a
+ * best-of-three, plus two diagnostic variants of k_td that exist only to
+ * separate the congruence test from the divisions it triggers, plus a dense
+ * recording pass over every survivor -- and it rebuilds the rank scan and the
+ * emission for the SECOND side even though both are functions of the shared
+ * two-sided bitmap alone.
+ *
+ * This is the same arithmetic with the harness taken out. Four things change:
+ *
+ *   1. Rank scan, emission and the resieve summary run ONCE per q, not once
+ *      per side. They read the two-sided bitmap; neither side owns them.
+ *   2. Every buffer is allocated once for the whole band, not once per q.
+ *      Only a survivor count larger than anything seen so far reallocates.
+ *   3. The two sides' acceptances are intersected ON DEVICE, and the recording
+ *      pass runs over that compacted list. Recording is the only pass that
+ *      writes 64 words per thread; over ~240,000 survivors that is a 61 MB
+ *      matrix per side, and over the ~1,900 joint candidates it is 486 KB.
+ *   4. The reconstruction gate is an explicitly separate phase on the first q,
+ *      excluded from the band timing rather than hidden inside it.
+ *
+ * What does NOT change is the arithmetic: same kernels, same production
+ * settings (resieve unroll 4, 1 summary bit per 64 positions). The output of
+ * this path is diffed byte-for-byte against the harness path, which is the
+ * only reason a restructure this large is safe to make.
+ */
+
+#define PIPE_K 16          /* large primes kept per survivor, as run_td_stage */
+
+typedef struct {
+    double rank, emit, summary, resieve, td, classify, compact, record;
+    double readback, join, hostq, cofac;
+} pipe_tm_t;
+
+typedef struct {
+    uint32_t nbitword, ngroup, nb, nsumword;
+    uint32_t scap, ccap;          /* survivors, joint candidates */
+    /* shared by both sides: functions of the two-sided bitmap alone */
+    uint32_t *d_cnt, *d_gbase, *d_bsum, *d_sum;
+    uint32_t *d_x;  int64_t *d_a, *d_b;
+    uint32_t *d_flags;  unsigned long long *d_ovf;
+    /* joint acceptance */
+    uint32_t *d_aflag, *d_aoff, *d_absum, *d_sel, *d_nacc;
+    /* per side */
+    uint32_t  *d_plist[2], *d_pcnt[2];
+    bn_t      *d_cof[2];
+    uint8_t   *d_cofbits[2], *d_status[2];
+    tdpoly_t  *d_poly[2];
+    tdsmall_t *d_sm[2], *h_sm[2];
+    uint32_t   nsm[2], nsmcap[2];
+    tdpoly_t   hpoly[2];
+    /* compacted candidate records, device then pinned host */
+    int64_t  *d_ca, *d_cb, *h_ca, *h_cb;
+    bn_t     *d_ccof[2], *h_ccof[2];
+    uint8_t  *d_cbits[2], *h_cbits[2];
+    uint32_t *d_cfac[2], *h_cfac[2], *d_cfn[2], *h_cfn[2];
+    cudaEvent_t ev[16];
+} pipe_td_t;
+
+static void pipe_td_free(pipe_td_t *C)
+{
+    cudaFree(C->d_cnt); cudaFree(C->d_gbase); cudaFree(C->d_bsum);
+    cudaFree(C->d_sum); cudaFree(C->d_x); cudaFree(C->d_a); cudaFree(C->d_b);
+    cudaFree(C->d_flags); cudaFree(C->d_ovf);
+    cudaFree(C->d_aflag); cudaFree(C->d_aoff); cudaFree(C->d_absum);
+    cudaFree(C->d_sel); cudaFree(C->d_nacc);
+    cudaFree(C->d_ca); cudaFree(C->d_cb);
+    if (C->h_ca) cudaFreeHost(C->h_ca);
+    if (C->h_cb) cudaFreeHost(C->h_cb);
+    for (int s = 0; s < 2; s++) {
+        cudaFree(C->d_plist[s]); cudaFree(C->d_pcnt[s]);
+        cudaFree(C->d_cof[s]); cudaFree(C->d_cofbits[s]); cudaFree(C->d_status[s]);
+        cudaFree(C->d_poly[s]); cudaFree(C->d_sm[s]);
+        cudaFree(C->d_ccof[s]); cudaFree(C->d_cbits[s]);
+        cudaFree(C->d_cfac[s]); cudaFree(C->d_cfn[s]);
+        if (C->h_sm[s])   cudaFreeHost(C->h_sm[s]);
+        if (C->h_ccof[s]) cudaFreeHost(C->h_ccof[s]);
+        if (C->h_cbits[s]) cudaFreeHost(C->h_cbits[s]);
+        if (C->h_cfac[s]) cudaFreeHost(C->h_cfac[s]);
+        if (C->h_cfn[s])  cudaFreeHost(C->h_cfn[s]);
+    }
+    for (int k = 0; k < 16; k++) if (C->ev[k]) cudaEventDestroy(C->ev[k]);
+    memset(C, 0, sizeof(*C));
+}
+
+/* Survivor-sized buffers. Grown, never shrunk: a band's first q pays for its
+ * own count plus half, and in practice nothing after it reallocates. */
+static int pipe_td_grow(pipe_td_t *C, uint32_t n)
+{
+    uint32_t cap, nab;
+    if (n <= C->scap) return 0;
+    cap = n + n / 2 + 1024;
+    nab = (cap + TD_SCAN_BLK - 1) / TD_SCAN_BLK;
+    cudaFree(C->d_x); cudaFree(C->d_a); cudaFree(C->d_b);
+    cudaFree(C->d_aflag); cudaFree(C->d_aoff); cudaFree(C->d_absum);
+    C->d_x = NULL; C->d_a = NULL; C->d_b = NULL;
+    C->d_aflag = C->d_aoff = C->d_absum = NULL;
+    CK(cudaMalloc(&C->d_x, (size_t)cap * 4));
+    CK(cudaMalloc(&C->d_a, (size_t)cap * 8));
+    CK(cudaMalloc(&C->d_b, (size_t)cap * 8));
+    CK(cudaMalloc(&C->d_aflag, (size_t)cap * 4));
+    CK(cudaMalloc(&C->d_aoff, (size_t)cap * 4));
+    CK(cudaMalloc(&C->d_absum, (size_t)nab * 4));
+    for (int s = 0; s < 2; s++) {
+        cudaFree(C->d_plist[s]); cudaFree(C->d_pcnt[s]); cudaFree(C->d_cof[s]);
+        cudaFree(C->d_cofbits[s]); cudaFree(C->d_status[s]);
+        C->d_plist[s] = C->d_pcnt[s] = NULL; C->d_cof[s] = NULL;
+        C->d_cofbits[s] = C->d_status[s] = NULL;
+        CK(cudaMalloc(&C->d_plist[s], (size_t)cap * PIPE_K * 4));
+        CK(cudaMalloc(&C->d_pcnt[s], (size_t)cap * 4));
+        CK(cudaMalloc(&C->d_cof[s], (size_t)cap * sizeof(bn_t)));
+        CK(cudaMalloc(&C->d_cofbits[s], (size_t)cap));
+        CK(cudaMalloc(&C->d_status[s], (size_t)cap));
+    }
+    C->scap = cap;
+    return 0;
+}
+
+/* Candidate-sized buffers, device and pinned host. */
+static int pipe_td_grow_cand(pipe_td_t *C, uint32_t n)
+{
+    uint32_t cap;
+    if (n <= C->ccap) return 0;
+    cap = n + n / 2 + 1024;
+    cudaFree(C->d_sel); cudaFree(C->d_ca); cudaFree(C->d_cb);
+    C->d_sel = NULL; C->d_ca = C->d_cb = NULL;
+    if (C->h_ca) cudaFreeHost(C->h_ca);
+    if (C->h_cb) cudaFreeHost(C->h_cb);
+    C->h_ca = C->h_cb = NULL;
+    CK(cudaMalloc(&C->d_sel, (size_t)cap * 4));
+    CK(cudaMalloc(&C->d_ca, (size_t)cap * 8));
+    CK(cudaMalloc(&C->d_cb, (size_t)cap * 8));
+    CK(cudaHostAlloc((void **)&C->h_ca, (size_t)cap * 8, cudaHostAllocDefault));
+    CK(cudaHostAlloc((void **)&C->h_cb, (size_t)cap * 8, cudaHostAllocDefault));
+    for (int s = 0; s < 2; s++) {
+        cudaFree(C->d_ccof[s]); cudaFree(C->d_cbits[s]);
+        cudaFree(C->d_cfac[s]); cudaFree(C->d_cfn[s]);
+        C->d_ccof[s] = NULL; C->d_cbits[s] = NULL;
+        C->d_cfac[s] = C->d_cfn[s] = NULL;
+        if (C->h_ccof[s])  cudaFreeHost(C->h_ccof[s]);
+        if (C->h_cbits[s]) cudaFreeHost(C->h_cbits[s]);
+        if (C->h_cfac[s])  cudaFreeHost(C->h_cfac[s]);
+        if (C->h_cfn[s])   cudaFreeHost(C->h_cfn[s]);
+        C->h_ccof[s] = NULL; C->h_cbits[s] = NULL;
+        C->h_cfac[s] = C->h_cfn[s] = NULL;
+        CK(cudaMalloc(&C->d_ccof[s], (size_t)cap * sizeof(bn_t)));
+        CK(cudaMalloc(&C->d_cbits[s], (size_t)cap));
+        CK(cudaMalloc(&C->d_cfac[s], (size_t)cap * TD_FMAX * 4));
+        CK(cudaMalloc(&C->d_cfn[s], (size_t)cap * 4));
+        CK(cudaHostAlloc((void **)&C->h_ccof[s], (size_t)cap * sizeof(bn_t),
+                         cudaHostAllocDefault));
+        CK(cudaHostAlloc((void **)&C->h_cbits[s], (size_t)cap, cudaHostAllocDefault));
+        CK(cudaHostAlloc((void **)&C->h_cfac[s], (size_t)cap * TD_FMAX * 4,
+                         cudaHostAllocDefault));
+        CK(cudaHostAlloc((void **)&C->h_cfn[s], (size_t)cap * 4, cudaHostAllocDefault));
+    }
+    C->ccap = cap;
+    return 0;
+}
+
+/* q-independent setup: the exact polynomials, the rank tables sized by the
+ * bitmap, and the pinned staging for the per-q small-prime table. */
+static int pipe_td_init(pipe_td_t *C, const fb_t *fbs1, const fb_t *fbs0,
+                        const poly_t *POLY, uint32_t nbitword)
+{
+    const fb_t *fbs[2];
+    memset(C, 0, sizeof(*C));
+    fbs[0] = fbs0; fbs[1] = fbs1;
+    if (nbitword % TD_GROUP_W) {
+        fprintf(stderr, "  pipeline: %u bitmap words is not a multiple of %d\n",
+                nbitword, TD_GROUP_W);
+        return -1;
+    }
+    C->nbitword = nbitword;
+    C->ngroup = nbitword / TD_GROUP_W;
+    C->nb = (C->ngroup + TD_SCAN_BLK - 1) / TD_SCAN_BLK;
+    C->nsumword = ((nbitword / 2) + 31) / 32;
+    for (int k = 0; k < 16; k++) CK(cudaEventCreate(&C->ev[k]));
+    CK(cudaMalloc(&C->d_cnt, (size_t)C->ngroup * 4));
+    CK(cudaMalloc(&C->d_gbase, (size_t)C->ngroup * 4));
+    CK(cudaMalloc(&C->d_bsum, (size_t)C->nb * 4));
+    CK(cudaMalloc(&C->d_sum, (size_t)C->nsumword * 4));
+    CK(cudaMalloc(&C->d_flags, 4));
+    CK(cudaMalloc(&C->d_ovf, 8));
+    CK(cudaMalloc(&C->d_nacc, 4));
+    for (int s = 0; s < 2; s++) {
+        if (td_build_poly(&C->hpoly[s], POLY, s)) {
+            fprintf(stderr, "  pipeline: could not parse side %d coefficients\n", s);
+            return -1;
+        }
+        CK(cudaMalloc(&C->d_poly[s], sizeof(tdpoly_t)));
+        CK(cudaMemcpy(C->d_poly[s], &C->hpoly[s], sizeof(tdpoly_t),
+                      cudaMemcpyHostToDevice));
+        C->nsmcap[s] = (fbs[s] && fbs[s]->n) ? fbs[s]->n : 0;
+        if (C->nsmcap[s]) {
+            CK(cudaHostAlloc((void **)&C->h_sm[s],
+                             (size_t)C->nsmcap[s] * sizeof(tdsmall_t),
+                             cudaHostAllocDefault));
+            CK(cudaMalloc(&C->d_sm[s], (size_t)C->nsmcap[s] * sizeof(tdsmall_t)));
+        }
+    }
+    return pipe_td_grow_cand(C, 8192);
+}
+
+/* Per-q, per-side host work: retransform the small-prime direct-test table
+ * into the pinned buffer and upload it. Everything else about the side is
+ * already resident. */
+static int pipe_td_small(pipe_td_t *C, int side, const fb_t *fbs,
+                         const qlat_t *L, int logI)
+{
+    if (!C->nsmcap[side]) { C->nsm[side] = 0; return 0; }
+    C->nsm[side] = td_fill_small(fbs, L, logI, C->h_sm[side]);
+    if (!C->nsm[side]) return -1;
+    CK(cudaMemcpy(C->d_sm[side], C->h_sm[side],
+                  (size_t)C->nsm[side] * sizeof(tdsmall_t), cudaMemcpyHostToDevice));
+    return 0;
+}
+
+/* ---- the first-q validation phase -------------------------------------- *
+ *
+ * Reconstruction: the recorded factors times the residual cofactor must
+ * rebuild the exact norm. This runs the DENSE recording pass and checks every
+ * candidate on the side, which is what run_td_stage did -- deliberately, so
+ * the check keeps its old strength rather than narrowing to the joint set the
+ * production path records. It reads back 61 MB per side and rebuilds a 224-bit
+ * norm per candidate on the host, so it is a separate phase whose cost is
+ * reported on its own and excluded from the band average. */
+static int pipe_td_verify(pipe_td_t *C, int side, uint32_t n, int logI,
+                          uint32_t sq, const bench_cfg_t *cfg,
+                          int blocks, int threads)
+{
+    uint32_t *d_fac = NULL, *d_faccnt = NULL;
+    uint32_t *hfac = NULL, *hfn = NULL;
+    uint8_t *hstat = NULL;
+    bn_t *hcof = NULL;
+    int64_t *ha = NULL, *hb = NULL;
+    uint32_t checked = 0, bad = 0, overflowed = 0, maxfac = 0;
+    const tdpoly_t *P = &C->hpoly[side];
+    int rc = 0;
+
+    CK(cudaMalloc(&d_fac, (size_t)n * TD_FMAX * 4));
+    CK(cudaMalloc(&d_faccnt, (size_t)n * 4));
+    k_td<1, 1, 0><<<blocks, threads>>>(C->d_a, C->d_b, C->d_x, NULL, n, logI,
+                                       C->d_poly[side], sq,
+                                       C->d_plist[side], C->d_pcnt[side], PIPE_K,
+                                       C->d_sm[side], C->nsm[side],
+                                       C->d_cof[side], C->d_cofbits[side],
+                                       C->d_flags, NULL, d_fac, d_faccnt, TD_FMAX);
+    if (cudaDeviceSynchronize() != cudaSuccess || cudaGetLastError() != cudaSuccess) {
+        fprintf(stderr, "  verify: recording pass failed\n");
+        cudaFree(d_fac); cudaFree(d_faccnt); return -1;
+    }
+    hfac = (uint32_t *)malloc((size_t)n * TD_FMAX * 4);
+    hfn = (uint32_t *)malloc((size_t)n * 4);
+    hstat = (uint8_t *)malloc((size_t)n);
+    hcof = (bn_t *)malloc((size_t)n * sizeof(bn_t));
+    ha = (int64_t *)malloc((size_t)n * 8);
+    hb = (int64_t *)malloc((size_t)n * 8);
+    if (!hfac || !hfn || !hstat || !hcof || !ha || !hb) { rc = -1; goto out; }
+    if (cudaMemcpy(hfac, d_fac, (size_t)n * TD_FMAX * 4, cudaMemcpyDeviceToHost) ||
+        cudaMemcpy(hfn, d_faccnt, (size_t)n * 4, cudaMemcpyDeviceToHost) ||
+        cudaMemcpy(hstat, C->d_status[side], (size_t)n, cudaMemcpyDeviceToHost) ||
+        cudaMemcpy(hcof, C->d_cof[side], (size_t)n * sizeof(bn_t), cudaMemcpyDeviceToHost) ||
+        cudaMemcpy(ha, C->d_a, (size_t)n * 8, cudaMemcpyDeviceToHost) ||
+        cudaMemcpy(hb, C->d_b, (size_t)n * 8, cudaMemcpyDeviceToHost)) {
+        fprintf(stderr, "  verify: readback failed\n"); rc = -1; goto out;
+    }
+
+    for (uint32_t k = 0; k < n; k++) {
+        bns_t acc; bn_t t;
+        int64_t a, b; uint64_t ua, ub; int sa, sb;
+        if (hstat[k] != COF_ACCEPT && hstat[k] != COF_SPLIT) continue;
+        if (hfn[k] > maxfac) maxfac = hfn[k];
+        if (hfn[k] > TD_FMAX) { overflowed++; continue; }
+        checked++;
+        a = ha[k]; b = hb[k];
+        ua = (uint64_t)(a < 0 ? -a : a); ub = (uint64_t)(b < 0 ? -b : b);
+        sa = (a < 0) ? -1 : 1; sb = (b < 0) ? -1 : 1;
+        bns_zero(&acc);
+        for (int d = 0; d <= P->deg; d++) {
+            int sgn = P->sign[d];
+            t = P->c[d];
+            if (bn_is_zero(&t)) continue;
+            for (int e = 0; e < d; e++) { bn_mul_u64(&t, ua); sgn *= sa; }
+            for (int e = 0; e < P->deg - d; e++) { bn_mul_u64(&t, ub); sgn *= sb; }
+            bns_addmag(&acc, &t, sgn);
+        }
+        t = hcof[k];
+        for (uint32_t z = 0; z < hfn[k]; z++)
+            bn_mul_u64(&t, (uint64_t)hfac[(size_t)k * TD_FMAX + z]);
+        if (bn_cmp(&t, &acc.m) != 0) bad++;
+    }
+    printf("    side %d: factors x cofactor == norm  %u of %u  %s"
+           "   (most factors %u of %d)\n",
+           side, checked - bad, checked, bad ? "FAIL" : "PASS", maxfac, TD_FMAX);
+    if (bad) rc = -1;
+    if (overflowed) {
+        fprintf(stderr, "    side %d: %u candidates had more than %d factors;"
+                " raise TD_FMAX\n", side, overflowed, TD_FMAX);
+        rc = -1;
+    }
+    if (cfg->cofgate &&
+        td_gate_cofactors(cfg->cofgate, n, ha, hb, hcof, side) != 0) rc = -1;
+
+out:
+    free(hfac); free(hfn); free(hstat); free(hcof); free(ha); free(hb);
+    cudaFree(d_fac); cudaFree(d_faccnt);
+    return rc;
+}
+
+/* ---- one special-q of trial division, both sides ----------------------- */
+
+static int pipe_td_perq(pipe_td_t *C, const fb_t *fb1, const fb_t *fbs1,
+                        const fb_t *fb0, const fb_t *fbs0,
+                        const qlat_t *L, const bench_cfg_t *cfg,
+                        const pside_t *S1, const pside_t *S0,
+                        const uint32_t *d_two, uint32_t xmax,
+                        int blocks, int threads, int verify,
+                        uint32_t *n_out, uint32_t *nacc_out, pipe_tm_t *tm,
+                        double *t_verify)
+{
+    const fb_t *fb[2];
+    const pside_t *S[2];
+    const uint32_t lpb[2] = {cfg->lpb0, cfg->lpb};
+    const uint32_t mfb[2] = {cfg->mfb0, cfg->mfb};
+    const uint32_t lim[2] = {cfg->lim0, cfg->lim};
+    cudaEvent_t *E = C->ev;
+    uint32_t n = 0, nacc = 0, nab, hflags = 0;
+    unsigned long long hovf = 0;
+    double h0;
+
+    fb[0] = fb0; fb[1] = fb1;
+    S[0] = S0; S[1] = S1;
+
+    /* ---- phase 1: rank over the two-sided bitmap (shared) ---- */
+    cudaEventRecord(E[0]);
+    k_group_counts<<<blocks, threads>>>(d_two, C->ngroup, C->d_cnt);
+    k_scan_pass1<<<C->nb, TD_SCAN_BLK>>>(C->d_cnt, C->ngroup, C->d_gbase, C->d_bsum);
+    k_scan_pass2<<<1, 1024>>>(C->d_bsum, C->nb);
+    k_scan_pass3<<<C->nb, TD_SCAN_BLK>>>(C->d_gbase, C->ngroup, C->d_bsum);
+    cudaEventRecord(E[1]);
+    CK(cudaEventSynchronize(E[1])); CK(cudaGetLastError());
+    {
+        uint32_t base = 0, cnt = 0;
+        CK(cudaMemcpy(&base, C->d_gbase + C->ngroup - 1, 4, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(&cnt, C->d_cnt + C->ngroup - 1, 4, cudaMemcpyDeviceToHost));
+        n = base + cnt;
+    }
+    *n_out = n; *nacc_out = 0;
+    if (!n) { fprintf(stderr, "  pipeline: no survivors at this q\n"); return -1; }
+    if (pipe_td_grow(C, n)) return -1;
+
+    /* the per-q, per-side host tables; the only host work left in the TD path */
+    h0 = host_ms();
+    if (pipe_td_small(C, 1, fbs1, L, cfg->logI) ||
+        pipe_td_small(C, 0, fbs0, L, cfg->logI)) return -1;
+    tm->hostq += host_ms() - h0;
+
+    /* ---- phase 2: emit, summary, then both sides ---- */
+    CK(cudaMemset(C->d_flags, 0, 4));
+    CK(cudaMemset(C->d_ovf, 0, 8));
+    cudaEventRecord(E[2]);
+    k_emit_ranked<<<blocks, threads>>>(d_two, C->d_gbase, C->nbitword, cfg->logI,
+                                       L->a0, L->a1, L->b0, L->b1,
+                                       C->d_x, C->d_a, C->d_b, n);
+    cudaEventRecord(E[3]);
+    /* 1 summary bit per 2 bitmap words == per 64 positions, the setting the
+     * resieve sweep selected. */
+    k_build_summary_g<<<blocks, threads>>>(d_two, C->nbitword, 2u, C->d_sum);
+    cudaEventRecord(E[4]);
+
+    for (int si = 0; si < 2; si++) {
+        const int side = si ? 0 : 1;          /* side 1 first, as before */
+        const int e = si ? 7 : 4;
+        CK(cudaMemsetAsync(C->d_pcnt[side], 0, (size_t)n * 4));
+        k_resieve_scatter<4><<<blocks, threads>>>(
+            S[side]->plat, S[side]->primes, NULL, fb[side]->n, xmax, cfg->logI,
+            C->d_sum, d_two, C->d_gbase, C->d_plist[side], C->d_pcnt[side],
+            PIPE_K, C->d_ovf, 6);
+        cudaEventRecord(E[e + 1]);
+        k_td<1, 0, 0><<<blocks, threads>>>(
+            C->d_a, C->d_b, C->d_x, NULL, n, cfg->logI, C->d_poly[side],
+            side == 1 ? (uint32_t)L->q : 0u,
+            C->d_plist[side], C->d_pcnt[side], PIPE_K,
+            C->d_sm[side], C->nsm[side],
+            C->d_cof[side], C->d_cofbits[side], C->d_flags, NULL, NULL, NULL, 0);
+        cudaEventRecord(E[e + 2]);
+        k_classify<<<blocks, threads>>>(C->d_cof[side], C->d_cofbits[side],
+                                        C->d_b, n, lpb[side], mfb[side],
+                                        (double)lim[side], C->d_status[side]);
+        cudaEventRecord(E[e + 3]);
+    }
+
+    /* ---- joint acceptance, compacted on device ---- */
+    nab = (n + TD_SCAN_BLK - 1) / TD_SCAN_BLK;
+    k_accept_flags<<<blocks, threads>>>(C->d_status[0], C->d_status[1], n, C->d_aflag);
+    k_scan_pass1<<<nab, TD_SCAN_BLK>>>(C->d_aflag, n, C->d_aoff, C->d_absum);
+    k_scan_pass2<<<1, 1024>>>(C->d_absum, nab);
+    k_scan_pass3<<<nab, TD_SCAN_BLK>>>(C->d_aoff, n, C->d_absum);
+    k_scatter_sel<<<blocks, threads>>>(C->d_aflag, C->d_aoff, n, C->d_sel,
+                                       C->ccap, C->d_nacc);
+    cudaEventRecord(E[11]);
+    CK(cudaEventSynchronize(E[11])); CK(cudaGetLastError());
+    tm->emit     += time_kernel(E[2], E[3]);
+    tm->summary  += time_kernel(E[3], E[4]);
+    tm->resieve  += time_kernel(E[4], E[5]) + time_kernel(E[7], E[8]);
+    tm->td       += time_kernel(E[5], E[6]) + time_kernel(E[8], E[9]);
+    tm->classify += time_kernel(E[6], E[7]) + time_kernel(E[9], E[10]);
+    tm->compact  += time_kernel(E[10], E[11]);
+    tm->rank     += time_kernel(E[0], E[1]);
+
+    CK(cudaMemcpy(&hflags, C->d_flags, 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(&hovf, C->d_ovf, 8, cudaMemcpyDeviceToHost));
+    if (hflags & TDF_NORM_OVERFLOW) {
+        fprintf(stderr, "  ** NORM OVERFLOW: a norm exceeded %d bits\n", BN_LIMBS * 32);
+        return -1;
+    }
+    if (hflags & TDF_LIST_TRUNCATED) {
+        fprintf(stderr, "  ** %llu large-prime records past the %u/survivor cap\n",
+                hovf, PIPE_K);
+        return -1;
+    }
+    CK(cudaMemcpy(&nacc, C->d_nacc, 4, cudaMemcpyDeviceToHost));
+    if (nacc > C->ccap) {           /* the scatter clamped; redo it once, larger */
+        if (pipe_td_grow_cand(C, nacc)) return -1;
+        k_scatter_sel<<<blocks, threads>>>(C->d_aflag, C->d_aoff, n, C->d_sel,
+                                           C->ccap, C->d_nacc);
+        CK(cudaDeviceSynchronize()); CK(cudaGetLastError());
+    }
+    *nacc_out = nacc;
+
+    /* ---- the first q's reconstruction gate, on its own clock ---- */
+    if (verify) {
+        double v0 = host_ms();
+        printf("\n  --- first-q validation (excluded from the band timing) ---\n");
+        if (pipe_td_verify(C, 1, n, cfg->logI, (uint32_t)L->q, cfg, blocks, threads) ||
+            pipe_td_verify(C, 0, n, cfg->logI, 0u, cfg, blocks, threads)) return -1;
+        *t_verify = host_ms() - v0;
+        printf("  --- validation took %.1f ms ---\n\n", *t_verify);
+    }
+
+    /* ---- phase 3: record the joint candidates only ---- */
+    if (!nacc) return 0;
+    cudaEventRecord(E[12]);
+    k_gather_ab<<<blocks, threads>>>(C->d_a, C->d_b, C->d_sel, nacc,
+                                     C->d_ca, C->d_cb);
+    for (int si = 0; si < 2; si++) {
+        const int side = si ? 0 : 1;
+        k_td<1, 1, 1><<<blocks, threads>>>(
+            C->d_a, C->d_b, C->d_x, C->d_sel, nacc, cfg->logI, C->d_poly[side],
+            side == 1 ? (uint32_t)L->q : 0u,
+            C->d_plist[side], C->d_pcnt[side], PIPE_K,
+            C->d_sm[side], C->nsm[side],
+            C->d_ccof[side], C->d_cbits[side], C->d_flags, NULL,
+            C->d_cfac[side], C->d_cfn[side], TD_FMAX);
+    }
+    cudaEventRecord(E[13]);
+    CK(cudaEventSynchronize(E[13])); CK(cudaGetLastError());
+    tm->record += time_kernel(E[12], E[13]);
+
+    h0 = host_ms();
+    CK(cudaMemcpy(C->h_ca, C->d_ca, (size_t)nacc * 8, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(C->h_cb, C->d_cb, (size_t)nacc * 8, cudaMemcpyDeviceToHost));
+    for (int s = 0; s < 2; s++) {
+        CK(cudaMemcpy(C->h_ccof[s], C->d_ccof[s], (size_t)nacc * sizeof(bn_t),
+                      cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(C->h_cbits[s], C->d_cbits[s], (size_t)nacc,
+                      cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(C->h_cfn[s], C->d_cfn[s], (size_t)nacc * 4,
+                      cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(C->h_cfac[s], C->d_cfac[s], (size_t)nacc * TD_FMAX * 4,
+                      cudaMemcpyDeviceToHost));
+    }
+    tm->readback += host_ms() - h0;
+    return 0;
+}
+
 /* ---- the whole per-q pipeline ------------------------------------------ */
 
 extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
@@ -264,19 +744,19 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     const uint32_t nregion = xmax >> cfg->log_region;
     const uint32_t nbitword = xmax >> 5;
     const int blocks = cfg->blocks ? cfg->blocks : 48 * 6;
-    const uint32_t icap = 1u << 22;
 
     pside_t S1, S0;
-    td_out_t o1, o0;
+    pipe_td_t C;
+    pipe_tm_t tm;
+    cofq_t Q; cofq_out_t QO;
     uint8_t *d_bucket = NULL;
     uint32_t *d_cursor = NULL, *d_overflow = NULL, *d_two = NULL;
-    uint32_t *d_x = NULL, *d_n = NULL;
-    int64_t *d_a = NULL, *d_b = NULL;
+    uint32_t *d_n = NULL;
     unsigned long long *d_pre = NULL;
     uint64_t est1, est0, est;
     uint32_t cap, nqdone = 0;
     double acc_sieve = 0, acc_isect = 0, acc_host = 0, acc_wall = 0;
-    double acc_td = 0, acc_join = 0, td0 = 0, jn0 = 0;
+    double acc_td = 0, t_verify = 0, td0 = 0, jn0 = 0, cf0 = 0, cofac_tail = 0;
     unsigned long long acc_surv = 0, acc_cand = 0, acc_rel = 0;
     FILE *fr = NULL, *fc = NULL;
     char rtmp[2048] = "", ctmp[2048] = "";
@@ -284,7 +764,8 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     cudaEvent_t ea, eb;
 
     memset(&S1, 0, sizeof S1); memset(&S0, 0, sizeof S0);
-    memset(&o1, 0, sizeof o1); memset(&o0, 0, sizeof o0);
+    memset(&C, 0, sizeof C); memset(&tm, 0, sizeof tm);
+    memset(&Q, 0, sizeof Q); memset(&QO, 0, sizeof QO);
     cudaEventCreate(&ea); cudaEventCreate(&eb);
 
     printf("\n=== pipeline: both sides in one process, %u special-q ===\n", nq);
@@ -312,10 +793,15 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     if (pipe_side_init(fb1, fbs1, cfg, &S1) ||
         pipe_side_init(fb0, fbs0, cfg, &S0)) { rc = -1; goto done; }
     CK(cudaMalloc(&d_two, (size_t)nbitword * 4));
-    CK(cudaMalloc(&d_x, (size_t)icap * 4));
-    CK(cudaMalloc(&d_a, (size_t)icap * 8));
-    CK(cudaMalloc(&d_b, (size_t)icap * 8));
     CK(cudaMalloc(&d_n, 4)); CK(cudaMalloc(&d_pre, 8));
+    if (pipe_td_init(&C, fbs1, fbs0, POLY, nbitword)) { rc = -1; goto done; }
+    /* The cross-q cofactor queue. Per-q the candidate count is ~1,956, which
+     * would run the rho kernel at 3% occupancy; the queue accumulates across
+     * special-q and flushes ~67 q worth at a time. With it resident, only the
+     * ~2% of records that become relations are read back, and the 295 MB
+     * candidate file and its ~3 ms/q of host emission are gone. */
+    if (cfg->cofactor && cofq_init(&Q, &QO, CQ_FLUSH, cfg->cof_ecm,
+                                   cfg->ecm_b1, cfg->ecm_curves)) { rc = -1; goto done; }
 
     if (cfg->relations && cfg->candidates &&
         !strcmp(cfg->relations, cfg->candidates)) {
@@ -337,8 +823,8 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     for (uint32_t qi = 0; qi < nq; qi++) {
         qlat_t Lq;
         float ts1 = 0, ts0 = 0, tis = 0;
-        double th1 = 0, th0 = 0, qwall = host_ms();
-        uint32_t hn = 0, ncand = 0, nrel = 0;
+        double th1 = 0, th0 = 0, qwall = host_ms(), tv = 0;
+        uint32_t hn = 0, nacc = 0, ncand = 0, nrel = 0;
 
         if (!pipe_check_root(POLY, qlist[qi].q, qlist[qi].rho)) {
             fprintf(stderr, "  q=%llu: rho=%llu is not a root of f mod q\n",
@@ -362,99 +848,140 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         CK(cudaMemset(d_n, 0, 4)); CK(cudaMemset(d_pre, 0, 8));
         CK(cudaMemset(d_two, 0, (size_t)nbitword * 4));
         cudaEventRecord(ea);
+        /* The compacted (x,a,b) output is not used: k_emit_ranked rebuilds it
+         * in RANK order, which the resieve scatter needs and this kernel's
+         * atomic order cannot give. Passing cap 0 keeps the survivor count --
+         * an independent second count of the same bitmap, cross-checked below
+         * against the rank scan -- without the writes. */
         k_intersect_compact<1><<<blocks, cfg->threads>>>(
             S1.survbits, S0.survbits, nbitword, cfg->logI,
-            Lq.a0, Lq.a1, Lq.b0, Lq.b1, d_x, d_a, d_b, icap, d_n, d_pre, d_two);
+            Lq.a0, Lq.a1, Lq.b0, Lq.b1, NULL, NULL, NULL, 0u, d_n, d_pre, d_two);
         cudaEventRecord(eb);
         CK(cudaEventSynchronize(eb)); CK(cudaGetLastError());
         tis = time_kernel(ea, eb);
         CK(cudaMemcpy(&hn, d_n, 4, cudaMemcpyDeviceToHost));
-        if (hn > icap) {
-            fprintf(stderr, "  q=%llu: survivor list overflowed %u\n",
-                    (unsigned long long)qlist[qi].q, icap);
-            rc = -1; break;
-        }
 
         td0 = host_ms();
         {
-            bench_cfg_t c = *cfg;
-            c.resieve_sweep = 0;          /* the sweep is a one-off experiment */
-            /* The reconstruction gate rebuilds a 224-bit norm per candidate on
-             * the host. It is worth running -- it caught a real bug -- but at
-             * ~47K norms per q it would dominate a band measurement, so run it
-             * on the first special-q and trust it thereafter. */
-            c.td_verify = (qi == 0);
-            c.side = 1; c.emit_cof = NULL;
-            c.lpb = cfg->lpb; c.mfb = cfg->mfb; c.lim = cfg->lim;
-            if (run_td_stage(fb1, fbs1, &Lq, POLY, &c, S1.plat, S1.primes, d_two,
-                             nbitword, xmax, blocks, cfg->threads, &o1)) { rc = -1; break; }
-            c.side = 0; c.scale = cfg->scale0; c.allowance = cfg->allowance0;
-            c.lpb = cfg->lpb0; c.mfb = cfg->mfb0; c.lim = cfg->lim0;
-            if (run_td_stage(fb0, fbs0, &Lq, POLY, &c, S0.plat, S0.primes, d_two,
-                             nbitword, xmax, blocks, cfg->threads, &o0)) { rc = -1; break; }
-        }
-        acc_td += host_ms() - td0;
-        jn0 = host_ms();
-        if (o1.n != o0.n || !o1.cof || !o0.cof) {
-            fprintf(stderr, "  q=%llu: sides produced %u and %u survivors\n",
-                    (unsigned long long)qlist[qi].q, o1.n, o0.n);
-            rc = -1; break;
+            uint32_t n = 0;
+            if (pipe_td_perq(&C, fb1, fbs1, fb0, fbs0, &Lq, cfg, &S1, &S0,
+                             d_two, xmax, blocks, cfg->threads, qi == 0,
+                             &n, &nacc, &tm, &tv)) { rc = -1; break; }
+            if (n != hn) {
+                fprintf(stderr, "  q=%llu: intersect counted %u survivors,"
+                        " rank scan %u\n", (unsigned long long)qlist[qi].q, hn, n);
+                rc = -1; break;
+            }
+            t_verify += tv;
+            acc_td += host_ms() - td0 - tv;   /* the gate is not the siever */
         }
 
-        for (uint32_t k = 0; k < o1.n; k++) {
-            int st1 = o1.status[k], st0 = o0.status[k];
-            int64_t a, b;
+        cf0 = host_ms();
+        /* Inline cofactorisation: the joint candidates stay on device and are
+         * appended to the queue instead of being formatted into a file. The
+         * relations trial division already completed are still emitted here --
+         * they need no splitting and would only take a queue slot. */
+        if (cfg->cofactor && nacc) {
+            /* Flush BEFORE a q that will not fit rather than splitting it.
+             * Splitting means enqueuing part of a q, flushing, and enqueuing
+             * the rest -- and the obvious way to write that re-enqueues the
+             * whole q after the flush, which counts its first rows twice. A
+             * special-q is ~1,956 records against a 131,072 slot queue, so
+             * never splitting one costs at most 1.5% of a flush's occupancy. */
+            if (Q.n + nacc > Q.cap &&
+                cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
+                           cfg->cof_rounds, cfg->cof_budget, blocks,
+                           cfg->threads, fr)) { rc = -1; break; }
+            if (nacc > Q.cap) {
+                fprintf(stderr, "  q=%llu: %u candidates exceeds the %u-slot"
+                        " cofactor queue\n", (unsigned long long)qlist[qi].q,
+                        nacc, Q.cap);
+                rc = -1; break;
+            }
+            k_cof_enqueue<<<blocks, cfg->threads>>>(
+                C.d_ccof[0], C.d_cbits[0], C.d_ccof[1], C.d_cbits[1],
+                C.d_ca, C.d_cb, C.d_cfac[0], C.d_cfn[0], C.d_cfac[1], C.d_cfn[1],
+                nacc, Q.n, cfg->lpb0, cfg->lpb, Q);
+            if (cudaDeviceSynchronize() != cudaSuccess ||
+                cudaGetLastError() != cudaSuccess) { rc = -1; break; }
+            Q.n += nacc;
+        }
+        tm.cofac += host_ms() - cf0;
+        jn0 = host_ms();
+        for (uint32_t k = 0; k < nacc; k++) {
+            int64_t a = C.h_ca[k], b = C.h_cb[k];
+            const uint32_t c0 = C.h_cfn[0][k], c1 = C.h_cfn[1][k];
+            const uint32_t *f0 = C.h_cfac[0] + (size_t)k * TD_FMAX;
+            const uint32_t *f1 = C.h_cfac[1] + (size_t)k * TD_FMAX;
+            const int b0 = C.h_cbits[0][k], b1 = C.h_cbits[1][k];
             char buf[80];
-            if ((st1 != COF_ACCEPT && st1 != COF_SPLIT) ||
-                (st0 != COF_ACCEPT && st0 != COF_SPLIT)) continue;
-            a = o1.a[k]; b = o1.b[k];
+            /* A truncated factor list leaves factors undivided and every
+             * consumer reads faccnt entries, so it fails the run rather than
+             * being emitted. Checked on every q, over exactly the records that
+             * get written. */
+            if (c0 > TD_FMAX || c1 > TD_FMAX) {
+                fprintf(stderr, "  q=%llu: a candidate has %u/%u factors,"
+                        " more than the %d recorded; raise TD_FMAX\n",
+                        (unsigned long long)qlist[qi].q, c0, c1, TD_FMAX);
+                rc = -1; break;
+            }
+            /* Canonical order: the resieve scatters through an atomicAdd on
+             * the survivor's slot counter, so the list order varies run to run
+             * and sorting is what makes the emitted batch reproducible. */
+            std::sort((uint32_t *)f0, (uint32_t *)f0 + c0);
+            std::sort((uint32_t *)f1, (uint32_t *)f1 + c1);
             if (b < 0) { a = -a; b = -b; }
-            if (o0.bits[k] <= (int)cfg->lpb0 && o1.bits[k] <= (int)cfg->lpb) {
+            if (b0 <= (int)cfg->lpb0 && b1 <= (int)cfg->lpb) {
                 nrel++;
-                if (fr) {
+                /* Under --cofactor the queue holds EVERY joint candidate,
+                 * including the ones trial division already completed -- they
+                 * come back from it with both sides CF_OK and no split primes.
+                 * Emitting them here as well would duplicate them, so the
+                 * queue is the single emitter. */
+                if (fr && !cfg->cofactor) {
                     fprintf(fr, "%lld,%lld:", (long long)a, (long long)b);
-                    for (uint32_t z = 0; o0.faccnt && z < o0.faccnt[k] && z < TD_FMAX; z++)
-                        fprintf(fr, "%s%x", z ? "," : "", o0.fac[(size_t)k * TD_FMAX + z]);
-                    if (o0.bits[k] > 1)
-                        fprintf(fr, "%s%llx", (o0.faccnt && o0.faccnt[k]) ? "," : "",
-                                (unsigned long long)strtoull(bn_to_dec(&o0.cof[k], buf), NULL, 10));
+                    for (uint32_t z = 0; z < c0; z++)
+                        fprintf(fr, "%s%x", z ? "," : "", f0[z]);
+                    if (b0 > 1)
+                        fprintf(fr, "%s%llx", c0 ? "," : "",
+                                (unsigned long long)strtoull(
+                                    bn_to_dec(&C.h_ccof[0][k], buf), NULL, 10));
                     fputc(':', fr);
-                    for (uint32_t z = 0; o1.faccnt && z < o1.faccnt[k] && z < TD_FMAX; z++)
-                        fprintf(fr, "%s%x", z ? "," : "", o1.fac[(size_t)k * TD_FMAX + z]);
-                    if (o1.bits[k] > 1)
-                        fprintf(fr, "%s%llx", (o1.faccnt && o1.faccnt[k]) ? "," : "",
-                                (unsigned long long)strtoull(bn_to_dec(&o1.cof[k], buf), NULL, 10));
+                    for (uint32_t z = 0; z < c1; z++)
+                        fprintf(fr, "%s%x", z ? "," : "", f1[z]);
+                    if (b1 > 1)
+                        fprintf(fr, "%s%llx", c1 ? "," : "",
+                                (unsigned long long)strtoull(
+                                    bn_to_dec(&C.h_ccof[1][k], buf), NULL, 10));
                     fputc('\n', fr);
                 }
                 continue;
             }
             ncand++;
+            if (cfg->cofactor) continue;   /* the queue has it */
             if (fc) {
-                fprintf(fc, "%s%s,", o0.bits[k] > (int)cfg->lpb0 ? "-" : "",
-                        bn_to_dec(&o0.cof[k], buf));
-                fprintf(fc, "%s%s:%lld,%lld:", o1.bits[k] > (int)cfg->lpb ? "-" : "",
-                        bn_to_dec(&o1.cof[k], buf), (long long)a, (long long)b);
-                for (uint32_t z = 0; o0.faccnt && z < o0.faccnt[k] && z < TD_FMAX; z++)
-                    fprintf(fc, "%s%x", z ? "," : "", o0.fac[(size_t)k * TD_FMAX + z]);
+                fprintf(fc, "%s%s,", b0 > (int)cfg->lpb0 ? "-" : "",
+                        bn_to_dec(&C.h_ccof[0][k], buf));
+                fprintf(fc, "%s%s:%lld,%lld:", b1 > (int)cfg->lpb ? "-" : "",
+                        bn_to_dec(&C.h_ccof[1][k], buf), (long long)a, (long long)b);
+                for (uint32_t z = 0; z < c0; z++)
+                    fprintf(fc, "%s%x", z ? "," : "", f0[z]);
                 fputc(':', fc);
-                for (uint32_t z = 0; o1.faccnt && z < o1.faccnt[k] && z < TD_FMAX; z++)
-                    fprintf(fc, "%s%x", z ? "," : "", o1.fac[(size_t)k * TD_FMAX + z]);
+                for (uint32_t z = 0; z < c1; z++)
+                    fprintf(fc, "%s%x", z ? "," : "", f1[z]);
                 fputc('\n', fc);
             }
         }
+        if (rc) break;
 
-        acc_join += host_ms() - jn0;
+        tm.join += host_ms() - jn0;
         acc_sieve += ts1 + ts0; acc_isect += tis; acc_host += th1 + th0;
-        acc_wall += host_ms() - qwall;
-        {   /* read the count BEFORE freeing the arrays it lives in */
-            uint32_t nsurv_q = o1.n;
-            acc_surv += nsurv_q; acc_cand += ncand; acc_rel += nrel;
-            nqdone++;
-            td_out_free(&o1); td_out_free(&o0);
-            if (cfg->verbose_q)
-                printf("  q=%llu: %u survivors, %u candidates, %u relations\n",
-                       (unsigned long long)qlist[qi].q, nsurv_q, ncand, nrel);
-        }
+        acc_wall += host_ms() - qwall - tv;
+        acc_surv += hn; acc_cand += ncand; acc_rel += nrel;
+        nqdone++;
+        if (cfg->verbose_q)
+            printf("  q=%llu: %u survivors, %u joint candidates, %u relations\n",
+                   (unsigned long long)qlist[qi].q, hn, ncand, nrel);
         if (!cfg->verbose_q && ((qi % 10) == 9 || qi + 1 == nq))
             printf("    %u/%u q done, %llu relations, %llu candidates\r",
                    qi + 1, nq, (unsigned long long)acc_rel,
@@ -462,6 +989,17 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         fflush(stdout);
     }
 
+    /* The last partial flush happens AFTER the band loop, so its cost is not
+     * in acc_wall. On a band shorter than one flush that is the ENTIRE
+     * cofactorisation, which is why it is carried separately and added back
+     * rather than folded into the per-q average. */
+    if (rc == 0 && cfg->cofactor && Q.n) {
+        cf0 = host_ms();
+        if (cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
+                       cfg->cof_rounds, cfg->cof_budget, blocks, cfg->threads, fr))
+            rc = -1;
+        cofac_tail = host_ms() - cf0;
+    }
     if (fr) { if (ferror(fr)) rc = -1; if (fclose(fr)) rc = -1; fr = NULL; }
     if (fc) { if (ferror(fc)) rc = -1; if (fclose(fc)) rc = -1; fc = NULL; }
     if (rc == 0) {
@@ -478,34 +1016,97 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     }
 
     if (nqdone) {
+        const double N = nqdone;
+        const double dev = (tm.rank + tm.emit + tm.summary + tm.resieve + tm.td
+                            + tm.classify + tm.compact + tm.record) / N;
         printf("\n\n  --- band of %u special-q ---\n", nqdone);
-        printf("  %-34s %8.2f ms\n", "wall clock per q", acc_wall / nqdone);
-        printf("  %-34s %8.2f ms\n", "  sieve, both sides", acc_sieve / nqdone);
-        printf("  %-34s %8.3f ms\n", "  intersect + gcd + compact", acc_isect / nqdone);
-        printf("  %-34s %8.3f ms\n", "  host per-q (tables, staging)", acc_host / nqdone);
-        printf("  %-34s %8.2f ms   <- device kernels + per-q allocation and\n"
-               "%-36s               readback, both sides\n",
-               "  TD + classify, wall", acc_td / nqdone, "");
-        printf("  %-34s %8.2f ms\n", "  join and emit", acc_join / nqdone);
+        if (t_verify > 0)
+            printf("  (first-q reconstruction gate: %.1f ms, excluded below)\n",
+                   t_verify);
+        printf("  %-34s %8.2f ms\n", "wall clock per q", acc_wall / N);
+        printf("  %-34s %8.2f ms\n", "  sieve, both sides", acc_sieve / N);
+        printf("  %-34s %8.3f ms\n", "  intersect + gcd", acc_isect / N);
+        printf("  %-34s %8.3f ms\n", "  host per-q (sieve tables, staging)",
+               acc_host / N);
+        printf("  %-34s %8.2f ms   <- of which, on the device:\n",
+               "  TD + classify, wall", acc_td / N);
+        printf("      %-30s %8.3f ms\n", "rank scan (shared)", tm.rank / N);
+        printf("      %-30s %8.3f ms\n", "emit (x,a,b), rank order (shared)",
+               tm.emit / N);
+        printf("      %-30s %8.3f ms\n", "survivor filter (shared)", tm.summary / N);
+        printf("      %-30s %8.3f ms\n", "resieve + scatter, both sides",
+               tm.resieve / N);
+        printf("      %-30s %8.3f ms\n", "norms + trial division, both sides",
+               tm.td / N);
+        printf("      %-30s %8.3f ms\n", "classify, both sides", tm.classify / N);
+        printf("      %-30s %8.3f ms\n", "joint accept + compact", tm.compact / N);
+        printf("      %-30s %8.3f ms\n", "record candidate factorisations",
+               tm.record / N);
+        printf("      %-30s %8.3f ms\n", "= device total", dev);
+        printf("      %-30s %8.3f ms\n", "host: small-prime tables", tm.hostq / N);
+        printf("      %-30s %8.3f ms\n", "host: readback of candidates",
+               tm.readback / N);
+        printf("      %-30s %8.3f ms\n", "host: unaccounted",
+               acc_td / N - dev - tm.hostq / N - tm.readback / N);
+        printf("  %-34s %8.2f ms\n", "  join and emit", tm.join / N);
+        if (cfg->cofactor)
+            printf("  %-34s %8.2f ms\n", "  cofactorisation, in-loop flushes",
+                   tm.cofac / N);
         printf("  %-34s %8.2f ms\n", "  unaccounted",
-               (acc_wall - acc_sieve - acc_isect - acc_host - acc_td - acc_join) / nqdone);
+               (acc_wall - acc_sieve - acc_isect - acc_host - acc_td - tm.join
+                - tm.cofac) / N);
         printf("  %-34s %8.1f\n", "two-sided primitive survivors/q",
-               (double)acc_surv / nqdone);
+               (double)acc_surv / N);
         printf("  %-34s %8.2f\n", "cofactorisation candidates/q",
-               (double)acc_cand / nqdone);
-        printf("  %-34s %8.3f\n", "COMPLETE RELATIONS/q", (double)acc_rel / nqdone);
+               (double)acc_cand / N);
+        printf("  %-34s %8.3f\n", "COMPLETE RELATIONS/q", (double)acc_rel / N);
         printf("  %-34s %8llu\n", "total relations", (unsigned long long)acc_rel);
         printf("  %-34s %8llu\n", "total candidates", (unsigned long long)acc_cand);
+        if (cfg->cofactor) {
+            printf("\n  --- cofactorisation, cross-q queue ---\n");
+            printf("  %-34s %8.2f ms\n", "rational queue (2 limbs)", Q.ms_rat / N);
+            printf("  %-34s %8.2f ms\n", "algebraic queue (3 limbs)", Q.ms_alg / N);
+            printf("  %-34s %8.3f ms\n", "readback + emit of relations", Q.ms_host / N);
+            printf("  %-34s %8.2f ms\n", "  = device time per q",
+                   (Q.ms_rat + Q.ms_alg + Q.ms_host) / N);
+            printf("  %-34s %8.2f ms\n", "wall: in-loop flushes", tm.cofac / N);
+            printf("  %-34s %8.2f ms\n", "wall: final flush after the band",
+                   cofac_tail / N);
+            /* Everything joint-accepted is enqueued, INCLUDING the records
+             * trial division already completed -- the queue is the single
+             * emitter, so they have to travel with the rest. They cost nothing
+             * to split (their status is already CF_OK, and compaction drops
+             * them before the first round), but they are counted here, so this
+             * is a record count and not a splitting-work count. Labelling it
+             * "cofactorised" made it look like a 7-record discrepancy against
+             * the candidate total at the parity q. */
+            printf("  %-34s %8llu  (of which %llu needed no splitting)\n",
+                   "records enqueued", (unsigned long long)Q.nseen,
+                   (unsigned long long)acc_rel);
+            /* Q.nrel is EVERY relation: the queue is the single emitter, so
+             * it already holds the ones trial division completed. */
+            printf("  %-34s %8.2f\n", "ALL RELATIONS/q", (double)Q.nrel / N);
+            printf("  %-34s %8.2f\n", "  of which, from cofactorisation",
+                   (double)(Q.nrel - acc_rel) / N);
+            printf("  %-34s %8llu\n", "total relations",
+                   (unsigned long long)Q.nrel);
+            /* acc_wall ALREADY contains the queue: the flush happens inside
+             * the q loop. Adding the device times to it would double count,
+             * which the first version of this line did -- it reported 132.31
+             * ms/q against a 112 ms/q process wall clock. */
+            printf("  %-34s %8.2f ms\n", "wall clock per q, COMPLETE",
+                   (acc_wall + cofac_tail) / N);
+        }
     }
 
 done:
     if (fr) fclose(fr);
     if (fc) fclose(fc);
-    td_out_free(&o1); td_out_free(&o0);
+    pipe_td_free(&C);
+    cofq_free(&Q, &QO);
     pside_free(&S1); pside_free(&S0);
     cudaFree(d_bucket); cudaFree(d_cursor); cudaFree(d_overflow);
-    cudaFree(d_two); cudaFree(d_x); cudaFree(d_a); cudaFree(d_b);
-    cudaFree(d_n); cudaFree(d_pre);
+    cudaFree(d_two); cudaFree(d_n); cudaFree(d_pre);
     cudaEventDestroy(ea); cudaEventDestroy(eb);
     return rc;
 }

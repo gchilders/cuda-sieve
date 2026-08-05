@@ -381,9 +381,17 @@ __global__ void k_resieve_scatter(const plat_t *__restrict plat,
  * whether this kernel is spending its time on 3e9 congruence tests or on the
  * few million 256-bit divisions those tests find -- the two have completely
  * different fixes and the fused number cannot distinguish them. */
-template <int DIVIDE, int RECORD>
+/* SELECT == 1 runs over a LIST of survivor indices rather than all of them.
+ * Inputs stay indexed by the survivor index s = sel[t]; outputs are written at
+ * the compacted index t. That is what lets the recording pass -- the only pass
+ * that writes a 64-word factor list per thread -- run over the ~1,900 joint
+ * candidates instead of the ~240,000 survivors, which is the difference between
+ * a 61 MB device array read back per side and a 600 KB one. The dense form is
+ * still what the measured passes use; recording is not on the hot path. */
+template <int DIVIDE, int RECORD, int SELECT>
 __global__ void k_td(const int64_t *__restrict A, const int64_t *__restrict B,
-                     const uint32_t *__restrict X, uint32_t n, int logI,
+                     const uint32_t *__restrict X,
+                     const uint32_t *__restrict sel, uint32_t n, int logI,
                      const tdpoly_t *__restrict P,
                      uint32_t sq,
                      const uint32_t *__restrict plist,
@@ -407,8 +415,9 @@ __global__ void k_td(const int64_t *__restrict A, const int64_t *__restrict B,
     for (uint32_t it = 0; it < iters; it++) {
         const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x + it * nthread;
         const bool active = (t < n);
-        const int64_t a = active ? A[t] : 0;
-        const int64_t b = active ? B[t] : 0;
+        const uint32_t s = (SELECT && active) ? sel[t] : t;
+        const int64_t a = active ? A[s] : 0;
+        const int64_t b = active ? B[s] : 0;
         const uint64_t ua = (uint64_t)(a < 0 ? -a : a);
         const uint64_t ub = (uint64_t)(b < 0 ? -b : b);
         const int sa = (a < 0) ? -1 : 1, sb = (b < 0) ? -1 : 1;
@@ -443,10 +452,10 @@ __global__ void k_td(const int64_t *__restrict A, const int64_t *__restrict B,
 
         /* ---- large primes recovered by the resieve ---- */
         if (active) {
-            uint32_t c = pcnt[t];
+            uint32_t c = pcnt[s];
             if (c > K) { c = K; myflags |= TDF_LIST_TRUNCATED; }
             for (uint32_t k = 0; k < c; k++) {
-                uint32_t p = plist[(size_t)t * K + k];
+                uint32_t p = plist[(size_t)s * K + k];
                 td_divide_out<RECORD>(&N, p, bn_recip_u32(p), myfac, &nf, fmax);
             }
         }
@@ -460,7 +469,7 @@ __global__ void k_td(const int64_t *__restrict A, const int64_t *__restrict B,
          * into one dense division loop per survivor where every lane has work,
          * and the entry loop keeps its uniform control flow. */
         {
-            const uint32_t x = active ? X[t] : 0u;
+            const uint32_t x = active ? X[s] : 0u;
             const int32_t  i = (int32_t)(x & Imask) - Ihalf;
             const uint32_t j = x >> logI;
             const uint32_t hi = (uint32_t)(Ihalf - i);      /* in (0, 2^logI] */
@@ -543,6 +552,53 @@ __global__ void k_classify(const bn_t *__restrict cof,
          * after_sieve too and drops it later. */
         if (B[t] == 0) { status[t] = COF_DEGENERATE; continue; }
         status[t] = (uint8_t)cof_classify(&c, cofbits[t], lpb, mfb, lim);
+    }
+}
+
+/* ---- joint acceptance, compacted on device ----------------------------- *
+ *
+ * A record is only worth recording if BOTH sides classified it as a
+ * cofactorisation candidate; one side accepting is not a candidate at all. The
+ * join used to happen on the host over every survivor, which meant reading back
+ * both sides' whole factor matrices to reach ~1,900 rows. Doing the intersection
+ * here reduces the readback to those rows.
+ *
+ * Ordered, not atomic: a prefix scan over the accept flags gives each candidate
+ * a deterministic slot, so the emitted batch is byte-reproducible run to run.
+ * That property is what makes diffing this path against the two-process one a
+ * real regression test, so it is not worth trading for one atomicAdd. */
+__global__ void k_accept_flags(const uint8_t *__restrict st0,
+                               const uint8_t *__restrict st1,
+                               uint32_t n, uint32_t *__restrict flag)
+{
+    const uint32_t stride = gridDim.x * blockDim.x;
+    for (uint32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < n; t += stride) {
+        uint32_t a = (st0[t] == COF_ACCEPT || st0[t] == COF_SPLIT);
+        uint32_t b = (st1[t] == COF_ACCEPT || st1[t] == COF_SPLIT);
+        flag[t] = a & b;
+    }
+}
+
+__global__ void k_scatter_sel(const uint32_t *__restrict flag,
+                              const uint32_t *__restrict off,
+                              uint32_t n, uint32_t *__restrict sel,
+                              uint32_t cap, uint32_t *__restrict nacc)
+{
+    const uint32_t stride = gridDim.x * blockDim.x;
+    for (uint32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < n; t += stride) {
+        if (flag[t] && off[t] < cap) sel[off[t]] = t;
+        if (t == n - 1) *nacc = off[t] + flag[t];
+    }
+}
+
+__global__ void k_gather_ab(const int64_t *__restrict A,
+                            const int64_t *__restrict B,
+                            const uint32_t *__restrict sel, uint32_t n,
+                            int64_t *__restrict oa, int64_t *__restrict ob)
+{
+    const uint32_t stride = gridDim.x * blockDim.x;
+    for (uint32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < n; t += stride) {
+        oa[t] = A[sel[t]]; ob[t] = B[sel[t]];
     }
 }
 

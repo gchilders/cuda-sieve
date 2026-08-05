@@ -3040,22 +3040,32 @@ survivors, best-of-3 per kernel:
 | classify | 1.01 | 0.70 | |
 | host per-q | 0.54 | 0.55 | |
 
-**Post-sieve total: 21.7 ms/q**, everything except cofactorisation.
+**Post-sieve total: 21.7 ms/q** of device kernels and per-q host tables,
+everything except cofactorisation. (Measured post-sieve *wall clock* over a
+348-q band is 27.9 ms/q; see the note under "Against finding 46".)
 
 ### Against finding 46
 
 | goal | post-sieve budget | where we are |
 |---|---:|---|
 | throughput parity | ~220 ms | not binding |
-| energy parity | ~106–114 ms | **comfortable, 5x of headroom** |
-| **2x energy win** | **~21–25 ms** | **21.7 ms before cofactorisation** |
+| energy parity | ~106–114 ms | **comfortable, 4x of headroom** |
+| **2x energy win** | **~21–25 ms** | **27.9 ms before cofactorisation** |
+
+*(Superseded below: with cofactorisation measured, post-sieve is 41.4 ms/q.)*
+
+*(The 27.9 ms is the 348-q band's measured post-sieve wall clock. This section
+originally read 21.7 ms, which was the sum of device kernels and per-q host
+table building only, and did not include the intersect, the launch and readback
+overhead around the TD kernels, or the host join and file emission. See "Where
+the per-q wall time went" below.)*
 
 So the answer to finding 46's question — "where in the 21–114 ms band does the
-post-sieve path land" — is **21.7 ms plus cofactorisation**. Energy parity is
-not in doubt. The 2x win is *just* out of reach: finding 47's ~4.9 ms/q of GPU
-cofactor kernel time puts the total near 26.6 ms against a 21–25 ms allowance,
-about 10% over, and that ignores the 33x host overhead the harness work
-measured around those kernels.
+post-sieve path land" — is **27.9 ms plus cofactorisation**. Energy parity is
+not in doubt. The 2x win is out of reach as things stand: finding 47's ~4.9 ms/q
+of GPU cofactor kernel time puts the total near 33 ms against a 21–25 ms
+allowance, and that ignores the 33x host overhead the harness work measured
+around those kernels.
 
 **The lever is resieve + scatter at 12.7 ms, 58% of the post-sieve chain.** It
 is now the largest post-sieve stage by a factor of two, and unlike trial
@@ -3141,6 +3151,20 @@ That is a change of verdict, and it rests on one 25% improvement to one kernel,
 so it should be treated as *marginally* inside until cofactorisation is
 measured rather than projected — the harness work already showed 33x of host
 overhead sitting around those kernels, and none of that is in the 4.9 ms.
+
+**Update, after the band ran: this table is device kernels plus per-q host
+table building, and that is not the whole post-sieve chain.** The 348-q band
+measures the same kernels at **18.53 ms/q**, confirming the 19.13 above, but
+post-sieve *wall clock* is **27.93 ms/q** once the intersect (0.41), the
+readback and launch overhead around the TD kernels (2.17), and the host join
+and file emission (3.00) are counted. Energy is wall clock times power, so
+27.93 is the number finding 46's allowance has to be read against, and it is
+**above** the 21-25 ms band for a 2x energy win, not marginally inside it.
+Adding finding 47's projected ~4.9 ms puts it near 33 ms. Energy parity
+(~106-114 ms) remains comfortable. Roughly 3 ms/q of that is writing 1,956
+candidate records to a file per q, which the device-resident cofactor queue is
+supposed to remove rather than optimise; that is a reason to expect the number
+to come down, not a reason to quote a lower one now.
 
 All gates still pass at these settings: 1,850 of 1,850 cofactors identical to
 CADO on both sides, factors x cofactor == norm on 32,982 and 14,141 candidates,
@@ -3340,8 +3364,9 @@ budget into a proof.
 Finding 47's ~4.92 ms/q remains **a projection**, now with a third caveat: the
 harness that produced its sizing datum cannot process 73% of this job's
 candidates without the index fix, and the yield it currently achieves is 191x
-short of the class it was fed. The post-sieve chain at **19.1 ms/q is measured**; the cofactor term
-added to it is not.
+short of the class it was fed. The post-sieve chain is measured -- **18.5 ms/q
+of device kernels, 27.9 ms/q of wall clock** over a 348-q band; the cofactor
+term added to it is not.
 
 ## Both sides in one process
 
@@ -3414,61 +3439,382 @@ the second time -- our norms are exact where las's are approximate, so
 positions las discards can still carry relations. It is one in 64 here, which
 is a yield effect worth quantifying over a longer band rather than a curiosity.
 
-### Where the per-q wall time actually goes -- and it is not compute
+### Where the per-q wall time went -- measured, after the harness was removed
+
+The first version of this section reported **316.2 ms/q**, of which **241.2 ms**
+was "TD + classify, wall" against ~19 ms of device kernels, and attributed the
+gap to `cudaMalloc`/`cudaFree` and readback. **That was asserted, not measured,
+and it was wrong.** The pipeline was calling `run_td_stage`, which is the
+*benchmark* entry point: it runs every stage best-of-three plus two diagnostic
+variants -- rank x3, emit x3, resieve x3 plus a restoring pass, trial division
+x3 with no small primes, x3 with no division, x3 ordinary, one dense recording
+pass, classify x3 -- **per side**, and it rebuilt the rank scan, the emission
+and the resieve summary for the second side even though all three are functions
+of the shared two-sided bitmap alone.
+
+`pipe_td_perq` is the same arithmetic with the harness taken out. Four changes:
+the three shared stages run once per q rather than once per side; every buffer
+is allocated once for the whole band; the two sides' acceptances are intersected
+**on device** and the recording pass runs over that compacted list rather than
+over every survivor; and the reconstruction gate is a separate phase whose cost
+is reported on its own.
+
+The third of those is the one with real mass. Recording is the only pass that
+writes a 64-word factor list per thread. Over 239,446 survivors that is a
+**61 MB** matrix per side to allocate, fill and read back; over the 1,844 joint
+candidates it is **486 KB**. The joint acceptance is computed by a prefix scan
+over the accept flags rather than an atomic, so the compacted order is
+deterministic and the emitted batch stays byte-reproducible -- which is the
+property that makes diffing two paths a test at all.
+
+**Band of 348 special-q, one process, 35.2 s wall:**
 
 | stage | ms/q |
 |---|---:|
-| sieve, both sides | 66.1 |
-| intersect + gcd + compact | 0.44 |
-| host per-q (tables, staging) | 1.18 |
-| **TD + classify, wall** | **241.2** |
-| join and emit | 4.81 |
-| unaccounted | 2.41 |
-| **wall clock per q** | **316.2** |
+| sieve, both sides | 68.77 |
+| intersect + gcd | 0.41 |
+| host per-q (sieve tables, staging) | 1.14 |
+| **TD + classify, wall** | **20.70** |
+| join and emit | 3.00 |
+| unaccounted | 2.67 |
+| **wall clock per q** | **96.70** |
 
-The TD stage's *device kernels* measure ~19 ms/q across both sides (resieve
-9.9, trial division 5.3, classify 1.7, rank and emit 0.9). It costs **241 ms**
-of wall clock.
+and inside that 20.70 ms, on the device:
 
-**An earlier draft of this section attributed that whole gap to
-`cudaMalloc`/`cudaFree` and readback. That was asserted, not measured, and it
-is wrong.** The pipeline calls `run_td_stage`, which is the *benchmark* entry
-point, and it runs every stage best-of-three plus two diagnostic variants:
-rank x3, emit x3, resieve x3 plus a restoring pass, trial division x3 with no
-small primes, x3 with no division, x3 ordinary, one recording pass, and
-classify x3 -- per side. That is on the order of 90 ms/q of redundant kernel
-time before any allocator cost. The rank scan, the emission and the summary
-build are also done twice, once per side, despite being functions of the shared
-two-sided bitmap alone.
+| TD stage | ms/q |
+|---|---:|
+| rank scan (shared) | 0.212 |
+| emit (x,a,b) in rank order (shared) | 0.184 |
+| survivor filter (shared) | 0.279 |
+| resieve + scatter, both sides | 9.902 |
+| norms + trial division, both sides | 5.464 |
+| classify, both sides | 1.737 |
+| joint accept + compact | 0.023 |
+| record candidate factorisations | 0.731 |
+| **= device total** | **18.53** |
+| host: small-prime tables | 0.819 |
+| host: readback of candidates | 0.404 |
+| host: unaccounted | 0.949 |
 
-So the 222 ms decomposes into at least three parts -- redundant benchmark
-passes, per-q allocation and readback of arrays sized for all 239K survivors
-when ~1,900 are candidates, and the first-q reconstruction gate -- **and this
-document does not yet say how much each contributes.** That is the measurement
-to take, not a conclusion to quote. **No band timing belongs against finding 46
-until the production path stops running the harness**: 316 ms/q is not the
-siever.
+**241.2 ms/q becomes 20.70 ms/q, and 18.53 of it is device kernels.** The
+prediction that section made from the individual kernel measurements -- "~19
+ms/q across both sides" -- was right; what was wrong was the account of the
+other 222 ms. It was the harness, and it is gone.
 
-**The lesson is the recurring one.** This is the second gap in this log that I
+The output is **byte-identical** to the previous path at every scale checked:
+the parity q's 1,844 candidates and 7 relations, and the whole 8-q band's
+15,382 candidates and 64 relations, `diff`-clean against the files the
+`run_td_stage` pipeline wrote.
+
+**Post-sieve is now 27.93 ms/q** (96.70 minus the sieve), against finding 46's
+~106-114 ms for energy parity and ~21-25 ms for a 2x energy win -- with no
+cofactorisation stage in it yet. The sieve, at 68.77 ms/q, is now 71% of wall
+clock, which is where it should be and was not before.
+
+**The lesson is the recurring one.** This was the second gap in this log that I
 explained before instrumenting it -- the first was the small-prime direct test,
 where a contended GPU produced a 10 ms figure I called a model failure and a
 quiet GPU put it inside the predicted range. Both times the honest move was a
-timer, and both times the explanation arrived first.
+timer, and both times the explanation arrived first. The timer has now been
+taken, and it agreed with none of the three contributors the earlier draft
+guessed at in the proportions it guessed.
+
+### The band at 348 special-q
+
+| | |
+|---|---:|
+| two-sided primitive survivors / q | 238,786 |
+| cofactorisation candidates / q | 1,956 |
+| **complete relations / q** | **8.43** |
+| relations emitted over 348 q | **2,933** |
+| cofactorisation candidates emitted | **680,695** |
+| wall clock, whole band | **35.2 s** |
+
+Every one of the 2,933 relations and all 680,695 candidates were re-derived
+independently from `(a,b)` and the polynomial: the recorded factors times the
+residual cofactor rebuild both exact norms, and every prime in a relation is
+inside its side's large-prime bound. **2,933/2,933 and 680,695/680,695.** The
+CADO cofactor gate still passes at the parity q on both sides (1,850 of the
+1,850 reference records that are in our survivor list).
+
+### A thousand special-q, and where the q-list comes from
+
+**No root-finding is needed, and none was written.** A special-q below `alim`
+*is* an algebraic factor-base prime, and CADO's `makefb` output already lists
+every root of f mod it -- so the band is a window of the factor base the run
+uploads anyway. `--qrange MIN:MAX` reads it there, skipping proper prime powers
+and projective roots. It reproduces the hand-extracted `band.qlist` exactly, and
+it is worth noting that the captured list held only the **first** root of each
+q: the factor base has 543 (q, rho) pairs in the 120000000-120010000 window
+where the file had 348. Every root is a separate special-q and all of them are
+now enumerated.
+
+**1,000 special-q, one process, 96.5 s wall (95.64 ms/q):**
+
+| | |
+|---|---:|
+| special-q processed | 1,000 |
+| two-sided primitive survivors / q | 238,813 |
+| cofactorisation candidates / q | 1,958 |
+| **complete relations / q** | **8.28** |
+| relations emitted | **8,283**, all distinct `(a,b)` |
+| candidates emitted | **1,958,036** (295 MB) |
+| **verified from (a,b) and the polynomial** | **8,283 / 8,283** |
+
+Nothing had to be added to make this run. The band loop, the growth policy on
+the survivor buffers, the per-q overflow checks on the bucket array and the
+factor-list cap all held for 1,000 consecutive special-q without firing.
+
+### Against las, over the same band
+
+`oracle/c183.q120000000-120001000.relations.default.txt` is las's own output over
+q in [120000000, 120001000] -- **67 special-q** once every root is counted. Run
+against exactly that band:
+
+| | |
+|---|---:|
+| las's relations | **3,162** |
+| ours, trial division only | **556** |
+| of ours, also found by las | **527** |
+| **of ours, NOT found by las** | **29** |
+| las's still locked in our candidates | **2,635** |
+
+Two things follow, and they point in opposite directions.
+
+**The 29 are real and they are ours.** Same effect as the single case recorded
+in the 8-q band: our norms are exact where las's are approximate, so positions
+las discards can still carry relations. At 29 in 556 that is **+5.2%**, which
+lines up with the +5.6% survivor excess PARITY.md attributes to las's
+approximation. It is a yield *bonus*, measured now at band scale rather than
+inferred from one relation.
+
+**And 83% of the yield is not there yet.** 556 of 3,162 is **17.6%**. The other
+2,635 relations are sitting inside the 129,993 cofactorisation candidates this
+band emitted and never processed. That is the whole remaining gap, it is a
+single missing stage, and it is the last thing between this and a siever whose
+relations/sec can be quoted at all. Every timing in this document is a
+*post-sieve* timing with no cofactorisation term measured in it.
+
+### What cofactorisation actually has to do, from the 1.96M-record corpus
+
+Sizing it from the real output rather than from the mfb settings, over the
+1,000-q band's 1,958,036 candidates:
+
+| | records | share |
+|---|---:|---:|
+| both sides need splitting | 998,719 | 51.0% |
+| algebraic only | 950,406 | 48.5% |
+| rational only | 8,911 | 0.5% |
+
+**Rational (lpb 31, mfb 60): 1,007,630 splits, every one of them 53-60 bits and
+2LP.** Trial division stripped everything below `rlim` = 67.1M, so both factors
+lie in (2^26, 2^31]. There is no 3LP case on this side at all.
+
+**Algebraic (lpb 32, mfb 92): 1,949,125 splits, and they are bimodal.** 51,163
+(2.6%) at 55-64 bits are 2LP; 1,897,962 (97.4%) at 81-92 bits are 3LP, three
+factors each in (2^27, 2^32]. **Nothing lands in 65-80 bits** -- that band is
+exactly `COF_REJECT_GAP`, since a cofactor between L^2 = 2^64 and B^3 = 2^81.05
+cannot split at all, and the classifier already threw it away. Seeing the gap
+appear in the emitted data is a check on the classifier that no count could give.
+
+Two design consequences follow directly:
+
+- **The rational side is the cheap gate and it must run first.** It is one
+  60-bit semiprime split, and 51% of records need it. A record whose rational
+  side does not split admissibly is dead regardless of the algebraic side, so
+  the 3LP work on it never has to be started. That is the class-aware dispatch,
+  and the corpus says it can suppress up to half the expensive work.
+- **97.4% of the algebraic work is one shape**: a 81-92 bit number into three
+  primes of about 30 bits. That is narrow enough to specialise for, rather than
+  building a general cofactorizer.
+
+## Cofactorisation, and the first complete relation rate
+
+`bench --cofac FILE` splits an emitted candidate batch on the GPU and writes the
+relations. Built as a separate entry point on purpose: the corpus is 1,958,036
+real candidates from the 1,000-q band, which is a far better test of a splitter
+than one special-q would be, and it keeps the algorithm measurable before it is
+wired into the band loop.
+
+**Pollard-Brent rho, not ECM, and bounded rather than capped.** ECM's appeal on
+a GPU is that its cost is data-independent; rho's iteration count is geometric
+and a warp runs at its slowest lane. The answer taken here is to bound the
+budget per launch and requeue whatever has not split with a different rho
+constant, so divergence inside a launch is bounded by the budget rather than by
+the tail of a distribution. That is the "reseed, requeue, escalate" structure,
+and it is why nothing is ever *dropped*: a cofactor that resists one constant is
+not one that cannot be split.
+
+**Primality is nearly free here.** Trial division removed every factor below
+`lim`, so any part below lim^2 is prime BY SIZE with no test at all. On the
+algebraic side lim^2 is 2^54, so the only parts needing a real sprp2 are those
+of 55 bits or more -- the middle of a 3LP split. A general cofactorizer would
+test everything.
+
+**Class-aware dispatch, and it is worth 15.6%.** The rational side runs first
+and alone: one 60-bit semiprime split, against the algebraic side's 92-bit 3LP
+one. A record whose rational side has a prime above 2^31 is dead whatever the
+algebraic side does, so its algebraic job is never enqueued. Measured over the
+full corpus, that suppresses **303,201 of 1,949,125** algebraic jobs.
+
+### Where the budget knee is
+
+Over las's own 67-q band, sweeping the requeue rounds at budget 65536:
+
+| rounds | relations | las's still missed | GPU ms/q |
+|---:|---:|---:|---:|
+| 2 | 3,147 | 143 | **14.9** |
+| 3 | 3,155 | 136 | 28.2 |
+| 4 | 3,155 | 136 | 54.1 |
+| 5 | 3,155 | 136 | 103.5 |
+
+**Yield saturates at 3 rounds and each further round costs 2x for nothing.** The
+136 that remain are therefore *not* a rho-budget problem -- more rho does not
+find them -- which points at the sieve's survivor bound, the one item this
+document already has open (bound 128 loses a relation at the parity q). Rounds =
+2 is the production setting: it buys 99.7% of the achievable yield at 53% of the
+cost of the setting that saturates.
+
+### Against las, end to end
+
+Same 67 special-q, trial division plus cofactorisation:
+
+| | |
+|---|---:|
+| las's relations | 3,162 |
+| **ours** | **3,147 (99.5%)** |
+| of ours, las found too | 3,019 |
+| **of ours, las did NOT find** | **128** |
+| las's we still miss | 143 |
+
+**Every relation was verified independently** from `(a,b)` and the polynomial --
+recorded factors times residual cofactor rebuild both exact norms, every prime
+inside its side's bound: **2,591/2,591** on this band and **38,440/38,440** over
+the full corpus.
+
+### The 1,000-q band, complete
+
+| | |
+|---|---:|
+| relations from trial division | 8,283 |
+| relations from cofactorisation | 38,440 |
+| **total** | **46,723** (46,722 distinct `(a,b)`) |
+| **relations / q** | **46.7** |
+| las, same job | 47.2 / q |
+| cofactorisation, GPU | **13.44 ms/q** |
+| sieve + TD | 96.70 ms/q |
+| **wall clock / q** | **110.1 ms** |
+
+**This is the first end-to-end relation rate in this document, and it is 99% of
+las's yield.**
+
+### Against finding 46, with a cofactor term that is measured
+
+| goal | post-sieve budget | where we are |
+|---|---:|---|
+| throughput parity | ~220 ms | not binding |
+| energy parity | ~106-114 ms | **41.4 ms: 2.6x of headroom** |
+| **2x energy win** | **~21-25 ms** | **44.1 ms: not met** |
+
+Post-sieve is 44.06 ms/q in the wired pipeline -- 20.71 of TD and
+classification, 18.89 of cofactorisation, and the rest join, intersect and
+per-q host work. (The batch cofactorizer measures 13.44 ms/q on the same corpus
+because its job arrays are compacted; see the queue section.) Finding 47 projected ~4.92 ms/q for the cofactor term; the
+measured figure is **2.7x that**, and the projection is now retired -- it was
+always a projection, and it was optimistic.
+
+**The lever, if the 2x win is wanted, is ECM.** The evidence is in the round
+sweep above: rho's cost doubles per round while its yield is flat after round 3,
+which is the signature of a method spending nearly all of its time on cofactors
+it will never split. 966,305 of the 1,645,924 algebraic jobs finish "stuck" --
+almost all of them are *dead* rather than unsplit, and rho has no cheap way to
+prove it. ECM finds a 30-bit factor in far fewer modmuls than rho and its
+failure is informative at a fixed price. That is a build, not a tune, and it
+should be costed against the 2x win rather than started on principle.
+
+### Wired in: the cross-q device queue
+
+`bench --pipeline --cofactor` now runs sieve to relations in one process with
+nothing on disk in between. A special-q produces ~1,956 joint candidates, which
+at the pipeline's launch geometry is 3% occupancy -- so cofactorising per q
+would run the rho kernel on an almost empty grid and pay every requeue round
+for it. Candidates accumulate in a device-resident queue and flush at 131,072,
+about 67 q worth. Only the ~2% of records that become relations are ever read
+back.
+
+**Band of 1,000 special-q, one process, sieve to relations:**
+
+| stage | ms/q |
+|---|---:|
+| sieve, both sides | 69.18 |
+| intersect + gcd | 0.42 |
+| host per-q (sieve tables) | 1.10 |
+| TD + classify | 20.71 |
+| join and emit | 0.24 |
+| **cofactorisation (queue + flush)** | **18.89** |
+| unaccounted | 2.36 |
+| final flush after the band | 0.34 |
+| **wall clock per q, COMPLETE** | **113.24** |
+| **relations / q** | **46.72** |
+
+**46,723 relations, 46,722 distinct `(a,b)`, all 46,723 verified** from `(a,b)`
+and the polynomial. Over las's own 67-q band the inline path's output is
+**byte-for-byte identical** to the two-pass `--candidates` + `--cofac` path.
+
+Two things the wiring bought beyond the file going away: `join and emit` fell
+from 3.00 to **0.24 ms/q**, and the 295 MB candidate file for this band is
+simply not written.
+
+**It also cost 27% on the cofactor stage, and the reason is worth stating.**
+The batch path compacted its job arrays -- 109,446 contiguous algebraic jobs
+after the rational gate -- and measured 14.9 ms/q. The inline queue runs all
+130,549 slots with the gated-out records falling through, so its live lanes are
+scattered: nearly every warp holds a mix and runs at the live lanes' cost.
+4,080 warps against 3,420 is 1.19x, and 14.9 x 1.19 is 17.7 against the 18.9
+measured. **Compacting the queue before each flush is worth about 20% of this
+stage**, which is ~3.7 ms/q of a 113 ms/q wall. It is a real lever, it is
+quantified, and it is not built.
+
+### Two accounting errors I made wiring this up, both caught by arithmetic
+
+**The queue received the records trial division had already completed**, and
+the host loop emitted them too -- 556 relations written twice over the 67-q
+band. The queue is now the single emitter. Caught because "candidates
+cofactorised" read 130,549 against 129,993 candidates, a difference of exactly
+556.
+
+**Then the summary double-counted the cofactor time**, reporting 132.31 ms/q
+against a process that finished in 112 ms/q: the flush happens inside the band
+loop, so `acc_wall` already contained it and the summary added the device times
+on top. Only the *final* partial flush, after the loop, is outside `acc_wall`,
+and it is now the only thing added back. **A per-q figure that exceeds the
+process wall clock divided by q is always wrong**, and that check is cheaper
+than any of the reasoning that produced the number.
+
+### One bug worth recording
+
+The emitter dropped every record whose **algebraic cofactor was already 1** --
+trial division had fully split that side, so there was no algebraic job to come
+back from, and the join looked for the record in the queue's output. It cost
+**17% of the yield** on the first sample and it was found by the count of
+relations disagreeing with the number of lines written by one. The lesson is the
+cheap one: emit a count from each path and compare it against the file, because
+a stage that silently produces less is invisible in every other check -- all 391
+relations it did write verified perfectly.
 
 ### What this does and does not measure
 
-**The pipeline's per-stage times are single-shot and include first-launch
-costs**, so they are not comparable to `run_bench`'s best-of-N and should not be
-quoted against finding 46. Two consecutive runs reported 66.6 ms and 97.2 ms for
-the same two sieves. **run_bench remains the timing reference** until the
-pipeline loops over a band of special-q, at which point the one-time costs
-amortise and its numbers become the honest ones — which is exactly the
-measurement the cofactor queue needs anyway.
+These are band averages over 348 special-q in one process, so the first-launch
+and one-time costs that made the single-q numbers unusable have amortised.
+**They are the honest ones**, with two caveats worth keeping attached:
 
-What the merge delivers is not speed. It is that a single process can now
-produce a *stream* of classified candidates across many special-q, which is the
-input the cross-q cofactor queue requires and which two single-side processes
-exchanging files cannot supply.
+- the first q's reconstruction gate is excluded and reported separately (137.8
+  ms), because it reads back both 61 MB factor matrices and rebuilds a 224-bit
+  norm per candidate on the host. It is a validation phase, not the siever.
+- there is still **no cofactorisation stage**. The 8.43 relations/q are the ones
+  that fall out of trial division alone; the 1,956 candidates/q are what a
+  cofactorizer would have to process, and finding 47's term for that is still a
+  projection.
 
 ## Lazy module loading bit again
 
@@ -3497,6 +3843,427 @@ notices the number is implausible.**
   input to the post-sieve stages — which the bound sweep in item 2 may make
   moot in either direction. Get the containment zero first; the excess is a
   cost question, not a correctness one.
+
+## Costing ECM against rho, and what the rho profile actually says
+
+Task 11 asked for a cost, not a build. The measurement needed first was: where do
+rho's iterations *go*? `k_cofac` now accumulates iterations per job and bins them
+by final status. Over the 67-q band, 129,993 candidates, rounds = 2, budget =
+65536:
+
+| algebraic (3-limb) outcome | jobs | share of iterations | mean iterations |
+|---|---:|---:|---:|
+| split ok | 2,199 | **0.68%** | 71,617 |
+| proven dead | 43,130 | 17.15% | 91,578 |
+| **stuck (never resolved)** | **64,117** | **82.17%** | 295,182 |
+
+The rational side by contrast has **zero** stuck jobs and costs 101.8 ms against
+the algebraic side's 958.5 ms. The whole problem is the 3LP side.
+
+**82% of the work resolves nothing, and 0.68% of it produces the relations.**
+
+### The stuck records are dead, and that is not a rho failure
+
+Sampling 400 of the 125,919 3LP-sized algebraic cofactors and factoring them on
+the CPU:
+
+| | |
+|---|---:|
+| admissible (every prime ≤ 2^32) | 3 (0.8%) |
+| **dead (some prime > 2^32)** | **397 (99.2%)** |
+
+The dead ones' smallest over-`lpb` factor runs 33–65 bits, massed at 33–43. The
+admissible ones' smallest factor is 28 bits — trivial for rho. So the
+cofactoriser's actual job on this job is **rejection**, and rejection is the one
+thing no factoring algorithm can do cheaply: you cannot prove a number has no
+factor below 2^32 without searching for one.
+
+### Tuning rho is not the lever — measured, not argued
+
+The earlier sweep varied *rounds* at fixed budget. It never varied the budget.
+Sweeping it at rounds = 2, and costing against the whole pipeline rather than
+the stage:
+
+| budget | cofac ms/q | relations/q | pipeline ms/q | rel/ms |
+|---:|---:|---:|---:|---:|
+| 16384 | 5.8 | 29.2 | ~103 | 0.284 |
+| 32768 | 10.7 | 43.0 | ~108 | 0.398 |
+| **65536** | **15.8** | **47.0** | **~113** | **0.416** |
+
+Yield does not saturate in budget; it tracks cost. Going down loses more yield
+than cost, and the rounds sweep already showed going up costs 13.3 ms/q for 8
+relations. **Rho is already at its optimum, so any gain must come from a
+different algorithm rather than a different parameter.** That is a negative
+result and it is the useful half of this task.
+
+### What ECM is and is not worth here
+
+The intuition that ECM beats rho is right in general and needs care here.
+*Every* factor this job hunts is 8–10 decimal digits — the rational side splits
+53–60 bit semiprimes into two factors in (2^26, 2^31], and 97.4% of the
+algebraic work is three factors in (2^27, 2^32]. That is the regime where rho is
+competitive; ECM's subexponential advantage opens up well above it.
+
+And ECM cannot buy **yield**: rho at 2 rounds is 65536 + 131072 = 196,608
+iterations, against ~1.25·√p ≈ 82,000 expected for a factor at the very top of
+the admissible range. Rho's reach already exceeds `lpb`, which is why the rounds
+sweep saturates. The 136 relations still missed are the survivor bound, not the
+splitter.
+
+So the entire ECM case is **cost of rejection**, and it rests on one asymmetry:
+rho's cost to reject is set by √p for a factor it will never find, while ECM's
+is set by B1, which can be sized to exactly "no factor ≤ 2^32" and stopped.
+
+An order-of-magnitude cost, in 3-limb modular multiplications per dead record:
+
+| | modmuls | basis |
+|---|---:|---|
+| rho, as built | ~590,000 | 295,182 mean iterations × ~2 modmuls |
+| ECM, B1 = 2000, 3 curves | ~144,000 | ~1.44·B1 ≈ 2,885 ladder bits × ~11 modmuls, +50% for stage 2 |
+
+**~4×, and it applies to the 82% of the stage that is currently pure waste.**
+Folding that in: the algebraic stage would go from 14.3 ms/q to roughly
+14.3 × (0.18 + 0.82/4) ≈ 5.5 ms/q, saving ~8.8 ms/q.
+
+### Why that still does not close the 2× win, and the arithmetic that says so
+
+| | ms/q |
+|---|---:|
+| post-sieve today | 44.06 |
+| cofactorisation (queue + tail) | 19.23 |
+| **post-sieve if cofactorisation were free** | **24.83** |
+
+The 2× energy window is 21–25 ms. **A perfect cofactoriser lands at the worst
+edge of it.** With ECM at the estimated 4× (~8.8 ms/q) and the queue compaction
+already quantified (~3.7 ms/q), post-sieve reaches ~31.6 ms/q — a real
+improvement, comfortably past energy parity, and still short of the 2× win.
+**TD at 20.71 ms/q is now the co-equal problem and no amount of ECM touches
+it.** Any plan that spends its next effort only on the cofactoriser is planning
+to miss.
+
+The ECM figure above is a **model, not a measurement** — the 11-modmuls-per-bit
+ladder constant assumes Montgomery curves with PRAC chains, and ECM's register
+pressure and stage-2 tables may cost occupancy that rho does not pay. It is good
+enough to rank the lever, which is what the task asked for.
+
+## The `--cadofb` trap, which cost 2/3 of the relations and looked like a regression
+
+Found while gathering the profile above, and worth recording as a method
+failure rather than a bug. Running the band without `--cadofb` gave 13 relations
+at q = 120000053 where las gets 37, and 15.52 relations/q where the band summary
+says 46.72. It looked exactly like a regression in the task-10 wiring.
+
+It was not. **The GGNFS `.afb.0` default factor base carries neither p = 2 nor
+any prime power.** The chain from there:
+
+1. The algebraic norm keeps its full power of 2 — measured at 2,174 of 2,707
+   records, true 2-adic valuation 3–9, recorded 2s **zero**. (`c2` is the only
+   odd coefficient of this polynomial, so F(a,b) ≡ a²b³ (mod 2) and 2 has both
+   an affine and a projective root.)
+2. `cof_classify` *accepts* even cofactors on purpose (`prp.cuh:211`), so they
+   inflate the candidate count rather than being rejected — 2,707 against
+   CADO's 1,852.
+3. `mz_rho` builds `mz_n0inv(n->v[0])`, which requires an **odd** modulus.
+   Montgomery arithmetic on an even n is undefined, so those records can never
+   split. They burn the entire budget and report `CF_INCOMPLETE`.
+
+**Nothing in the codebase could see this.** The norms still reconstruct exactly,
+so every verification passed — factors × cofactor rebuilt both exact norms on
+100% of records, because the leftover 2^k is *in* the recorded cofactor. `make
+check` passed; it gates the factor-base transform, not end-to-end yield. The
+only visible symptom was a relation count, and the only reason it was caught is
+that it disagreed with a number already in this document.
+
+Three lessons, in order of how much they would have saved:
+
+- **A yield number is the only gate on a yield bug.** Every structural gate here
+  passed. Reproducing a documented relation count is the cheap check and it was
+  not run first.
+- **"It reconstructs exactly" is not "it is complete."** Verification confirmed
+  self-consistency of what we recorded, never that we had recorded everything
+  divisible out. Those are different claims and only one was being checked.
+- **A 3× discrepancy is a configuration difference until proven otherwise.** I
+  spent the first stretch hunting a regression in uncommitted code, when the
+  measurement that localised it — dump the small-prime table and look for p = 2 —
+  took two minutes.
+
+`bench` now **warns loudly** when the algebraic small factor base has no entry
+for p = 2, and `TD_DUMP_SMALL=1` dumps both sides' trial-division tables. The
+guard is three lines and would have turned a day into a minute.
+
+## The queue compaction, built and measured
+
+Task 12. `k_cofac` gained a `SELECT` template parameter and the flush now packs
+the still-unresolved jobs before every round. The reason it matters is not that
+a resolved lane costs anything itself — it costs nothing — but that **its warp
+runs for as long as its slowest live lane**, so a warp holding one live lane and
+31 dead ones pays a full rho budget to do one job. Packing turns that back into
+32 jobs per budget.
+
+The compaction is the ordered prefix scan already used for the survivor rank,
+not an atomic append, so the job order is a function of the status array alone.
+Clean A/B on the 67-q band, same binary, one template argument apart:
+
+| | rational | algebraic | device/q | wall/q |
+|---|---:|---:|---:|---:|
+| uncompacted | 2.25 ms | 16.37 ms | 18.69 ms | 111.61 ms |
+| **compacted** | **1.38 ms** | **12.75 ms** | **14.20 ms** | **106.70 ms** |
+
+**1.32× on the stage, 4.91 ms/q off the wall** — better than the 1.19× the warp
+count predicted, because compacting before *every* round also shrinks the
+requeue rounds, which the prediction ignored. Output is byte-for-byte identical
+to both the uncompacted queue and the two-pass `--candidates` + `--cofac` path,
+3,147 relations all three ways. The device-side count means the grid is never
+sized from a host-visible value, so no synchronisation was added.
+
+## Side 0's survivor bound was never swept, and it was worth more than the kernel
+
+Task 13 set out to attack TD's 20.31 ms/q, of which resieve is 9.93 — 54% of
+device time. The lever turned out not to be in the kernel.
+
+Side 1's bound has a documented zero-loss floor at 128. **Side 0's was never
+swept at all.** It was barely filtering: side 1 alone gives 318,141 survivors and
+the two-sided intersection is 238,929, so side 0 was removing 25% of what side 1
+had already passed. Sweeping `--allowance0` on the 67-q band:
+
+| `--allowance0` | survivors/q | relations | ms/q | rel/ms |
+|---:|---:|---:|---:|---:|
+| 68.1 (default) | 238,929 | 3,147 | 106.96 | 0.4391 |
+| 62 | 143,998 | 3,139 | 100.22 | 0.4675 |
+| **60** | **121,149** | **3,138** | **99.61** | **0.4702** |
+| 59 | 111,106 | 3,034 | 98.61 | 0.4592 |
+| 58 | 101,910 | 2,861 | 97.31 | 0.4388 |
+| 56 | 85,871 | 2,325 | 93.57 | 0.3708 |
+
+**The floor is sharp and it is at 60**: 59 already costs 3.3% of the relations
+and 58 costs 9%. At 60 the survivor count halves for **9 relations out of 3,147
+(0.29%)**. Confirmed on a wider 300-q band: 13,967 → 13,940 relations (−0.19%),
+107.25 → 99.85 ms/q, rate +7.2%.
+
+This is **not** offered as a zero-loss point — it is not one, and side 1's
+documented floor is held to a stricter standard on purpose. It is offered as the
+best point on relations/sec, which is the metric that decides the project. It
+is one flag; the default is unchanged pending that call.
+
+### Resieve is walk-dominated, which bounds what task 13 can ever win
+
+Halving the survivors cut resieve by only 14% (9.93 → 8.52 ms). Fitting the two
+points: **~7.1 ms/q is the factor-base walk and is survivor-independent**, and
+only ~1.4 ms is the scatter that survivor count touches. So further survivor
+reduction cannot move resieve, and resieve is now 65% of TD's device time. Two
+points is a line, not a model — but the direction is not in doubt, and the
+consequence is: **cutting resieve means cutting the walk, which means the 8 B
+bucket record this document has twice refused.** That trade should be re-costed
+against the new numbers rather than re-refused from the old ones.
+
+## Where the whole pipeline now stands
+
+67-q band, one process, sieve to relations, `--cadofb --allowance0 60`:
+
+| stage | ms/q |
+|---|---:|
+| sieve, both sides | 65.74 |
+| intersect + gcd | 0.41 |
+| host per-q (sieve tables) | 1.03 |
+| TD + classify (13.17 device + 1.66 host) | 14.83 |
+| join and emit | 0.22 |
+| cofactorisation | 14.37 |
+| unaccounted | 1.67 |
+| **wall clock per q, COMPLETE** | **98.26** |
+| **relations / q** | **46.84** |
+
+On absolute wall figures: the same binary and band re-measured later in the
+session gave 100.1 ms/q for this configuration and 108.3 for the default -- a
+~2% drift with the machine's clock state. Every comparison in this document's
+recent sections was run back to back for that reason, and the *deltas* are
+stable: compaction 4.91 ms/q, the side-0 bound 8.17 ms/q (repeated). Treat the
+absolute numbers as +/-2% and the deltas as real.
+
+Chaining the two back-to-back deltas against the session's starting point on
+this band: **113.2 -> 100.1 ms/q at 46.97 -> 46.84 relations/q, a 12.8% gain in
+relations per millisecond** for 0.29% of the relations.
+
+**Post-sieve is now ~33 ms/q, against 44.06 at the start.** TD (14.83) and
+cofactorisation (14.37) are now equal, which is the first time neither one
+dominates.
+
+## ECM stage 1: built, measured, and it loses to rho
+
+Task 11 costed ECM from a model and projected ~4x, which would have put
+post-sieve inside the 2x window. **That projection was wrong and the build says
+so.** It assumed stage 2; stage 1 alone is a different proposition, because
+stage 1 succeeds only when the whole group order is B1-smooth, and stage 2 is
+where most of ECM's probability per unit cost lives.
+
+Montgomery curves in XZ coordinates, Suyama parameterisation, binary ladder,
+and the curve constant kept PROJECTIVE as A24 = (an : ad) so that no modular
+inversion is needed per curve -- one extra multiply per doubling against a
+binary extended GCD per curve per record, which at tens of curves is clearly the
+right way round. `--cof-ecm --ecm-b1 N --ecm-curves N`. Same corpus, same 67-q
+band, 129,993 candidates:
+
+| config | relations | rational ms | algebraic ms | rel/ms |
+|---|---:|---:|---:|---:|
+| B1=250, 8 curves | 630 | 58.6 | 137.1 | 3.219 |
+| B1=250, 32 curves | 1,902 | 126.2 | 593.0 | 2.645 |
+| B1=1000, 8 curves | 1,878 | 134.3 | 703.1 | 2.243 |
+| B1=1000, 32 curves | 2,589 | 305.3 | 2,071.7 | 1.089 |
+| B1=2000, 32 curves | 2,599 | 427.2 | 4,215.5 | 0.560 |
+| **rho, rounds=2, budget=65536** | **2,591** | **101.8** | **958.5** | **2.444** |
+
+**At matched yield ECM is 2.3x slower**: B1=1000 with 32 curves takes 2,377 ms
+against rho's 1,060 for the same ~2,590 relations. The configurations that beat
+rho on rel/ms do so only by doing less work -- B1=250 with 8 curves is 3.219
+rel/ms but finds 24% of the relations, and dropping 76% of the cofactor yield
+costs far more pipeline throughput than it saves. Recomputing the whole-pipeline
+rate, rho is 0.4711 and the best ECM point is 0.393, **17% worse**.
+
+ECM is correct, not broken: it finds 2,589 relations of which **8 are ones rho
+does not find**, while missing 10 that rho does. The two methods agree on the
+substance and differ only in their stochastic tails.
+
+### The one thing ECM is genuinely better at, and why it still does not pay
+
+The hypothesis behind task 11 was that ECM would reject dead records faster.
+**That is confirmed.** On the same corpus:
+
+| | rho | ECM (B1=1000, 32 curves) |
+|---|---:|---:|
+| algebraic records **proven dead** | 43,130 | **71,846** |
+| algebraic records left stuck | 64,117 | 35,391 |
+
+ECM resolves **66% more dead records** and leaves 45% fewer unresolved, exactly
+the mechanism predicted: ECM's cost is set by B1 rather than by sqrt(p), so a
+dead cofactor whose smallest factor is 40 bits is within reach instead of being
+hopeless. It simply does not pay -- the extra rejections cost more than the rho
+budget they replace.
+
+### Headroom not built, and the honest projection
+
+Two real optimisations are missing, both deliberately:
+
+- **PRAC addition chains** instead of the binary ladder: ~30% off stage 1.
+- **Stage 2**, worth roughly 1.6x in probability per unit cost.
+
+Applying both to the matched-yield point: 2,377 x 0.7 / 1.6 ~= **1,040 ms
+against rho's 1,060**. A fully optimised ECM projects to **break-even**, not a
+win -- and that is generous to ECM, since it assumes the two optimisations
+compose perfectly and ignores stage 2's register pressure and table traffic.
+
+**So the cofactoriser is not the road to the 2x energy win, and the ECM lever is
+closed.** Post-sieve stands at ~33 ms/q against a 21-25 ms window, and the ~14.4
+of it that cofactorisation costs is not going to fall by a factor that matters.
+The remaining levers are TD's resieve -- walk-dominated with a ~7.1 ms/q floor,
+so it means revisiting the 8 B bucket record this document has twice refused --
+and the sieve itself at 65.7 ms/q, which no work in this session has touched.
+
+The rho path is **byte-for-byte identical** after the refactor that added the
+method switch, and `make check` passes.
+
+## Review, 2026-08-05, and what it caught
+
+An external review of everything above. Findings, and what was done.
+
+### The ECM result was measured on a path the production run never takes
+
+**The inline queue never received the ECM configuration.** `cofq_init` memset the
+struct and nothing populated `Q.ecm`, `Q.ecm_curves`, `Q.d_s` or `Q.ns`, so the
+branch in `cofq_flush` always chose rho no matter what `--cof-ecm` asked for.
+Confirmed the way it should be: `--cof-ecm --ecm-b1 2 --ecm-curves 0` still
+produced all 37 relations at the parity q, when zero curves can split nothing
+and the answer had to be 7.
+
+The rho-vs-ECM *comparison* survives -- both arms ran on the standalone path, so
+it was apples to apples -- but the claim that the lever is closed **under the
+production compacted scheduler** was never measured. It has been now:
+
+| | ms/q | relations |
+|---|---:|---:|
+| **rho, rounds=2, budget=65536** | **14.40** | **3,147** |
+| ECM B1=1000, 16 curves, 2 rounds | 31.29 | 3,146 |
+| ECM B1=1000, 32 curves, 1 round | 36.17 | 3,145 |
+| ECM B1=2000, 24 curves, 2 rounds | 65.41 | 3,155 |
+
+**2.2-2.5x slower at matched yield**, slightly worse for ECM than the standalone
+measurement suggested. Worth noting: ECM does reach 3,155, the same ceiling rho
+reaches at rounds=3 -- but for 65.4 ms/q against rho's 28.2. The conclusion
+stands and is now measured where it matters.
+
+### Bounds that truncated silently
+
+`--lpb`/`--mfb` were unrestricted while the representation is deliberately
+narrow: split factors are emitted as one uint32 limb, the rational cofactor is
+`mz<2>`, the algebraic `mz<3>`. `--lpb 33` therefore emitted relations whose
+factors no longer reconstruct the norm, and a negative value through `atoi`
+became an enormous unsigned bound. All of it now refuses: lpb <= 32, rational
+mfb <= 64, algebraic mfb <= 96, plus `lim^2 > 2^lpb` (without which the
+prime-by-size shortcut in `mz_split` is unsound), rounds in 1..24, and
+`budget << (rounds-1)` checked against uint32 rather than left to shift past the
+width.
+
+### The even-cofactor invariant was a warning, and a warning was not enough
+
+The guard added earlier diagnosed the missing p = 2 correctly and then **exited
+0 anyway**, having lost two thirds of the yield -- which is precisely how this
+was mistaken for a regression once already. Sieve-only runs still warn, since
+they never reach the cofactoriser and their survivor counts are meaningful.
+Anything producing relations, candidates, or inline cofactorisation now **fails
+fast**: `mz_n0inv` requires an odd modulus and there is no honest way to
+continue past a violation of it.
+
+### Gates that could not see the thing they were gating
+
+- **`make check` depended on `fbtest` alone**, so the whole CUDA path could fail
+  to compile while the gates reported "all gates passed". It now depends on
+  `all`.
+- **The reconstruction gate ran before splitting**, so it said nothing about the
+  primes the cofactoriser emits. `--check-relations FILE` now rebuilds both
+  norms from `(a,b)` and the polynomial over an emitted relation file, requiring
+  every recorded factor to divide exactly, both norms to reduce to 1, and every
+  prime to sit within its side's lpb. Both emitters write the same format, so
+  one implementation gates both paths. 3,147/3,147 on the rho band and
+  2,589/2,589 on the ECM one, with a corrupted-factor negative control that
+  fails as it must.
+- **A new GPU golden test**, `cofcheck.sh`, wired into `make check`: rho and ECM
+  at the parity q, the method switch actually taking effect, every bounds
+  refusal, the even-cofactor refusal, a candidate file with no trailing newline,
+  and inline-equals-two-pass byte equality. Twelve cases, each pinning an
+  **exact** relation count -- the bugs in this section all presented as a
+  plausible smaller number, never as a crash, so only an exact expectation
+  catches them.
+
+### The parser dropped its last record
+
+`run_cofac` counted records by counting newlines and terminated the parse on the
+first line without one, so a candidate file with no trailing newline silently
+lost its final record. Fixed; a truncated copy of the 129,993-record corpus now
+parses identically and yields the same 2,591 relations.
+
+### Accounting
+
+"candidates cofactorised 1,851" against 1,844 needing splitting was a labelling
+error, not a double count: every joint-accepted record is enqueued including the
+7 trial division had already completed, because the queue is the single emitter
+and they have to travel with the rest. They cost nothing -- their status is
+already `CF_OK` and compaction drops them before the first round. Now reported
+as "records enqueued ... (of which N needed no splitting)". A device readback to
+count them exactly was written and then reverted: a synchronisation in the flush
+loop is too high a price for a cosmetic number.
+
+### Left undone, deliberately
+
+- **The inline path is not fully device-resident.** Every candidate's
+  coordinates, cofactors and two 64-entry factor arrays are still copied to the
+  host with a host loop over all of them. Measured cost is ~0.5-0.9 ms/q of a
+  ~100 ms/q wall, and the emit path is what every byte-identical guarantee in
+  this document rests on, so it is a task and not a same-session change.
+- **The two schedulers should become one batch executor.** They diverged in
+  exactly the dangerous way -- standalone had ECM but no compaction, inline had
+  compaction but never received the ECM configuration. Unifying them is the
+  structural fix for the class of bug this review found.
+
+The band output is **byte-for-byte identical to before the review** at 3,147
+relations, and the whole gate suite passes.
 
 ## Caveat on everything numeric above
 

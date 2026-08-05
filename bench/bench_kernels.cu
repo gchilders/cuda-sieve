@@ -994,15 +994,15 @@ static int td_build_poly(tdpoly_t *T, const poly_t *P, int side)
  * For a PRIME modulus the transform's row divisor g can only be 1 or p (it is
  * gcd(D, p)), so p == m*g always holds and the prime never has to be carried
  * separately. */
-static uint32_t td_build_small(const fb_t *fbs, const qlat_t *L, int logI,
-                               tdsmall_t **out)
+/* Fills a caller-provided table of at least fbs->n entries. Split out from
+ * td_build_small so the pipeline can refill ONE pinned buffer per special-q
+ * instead of malloc/free-ing 85 KB on every q of a band. Returns the entry
+ * count, or 0 with a message if the m*g invariant fails. */
+static uint32_t td_fill_small(const fb_t *fbs, const qlat_t *L, int logI,
+                              tdsmall_t *t)
 {
     const uint32_t Ihalf = 1u << (logI - 1);
     uint32_t n = 0;
-    tdsmall_t *t;
-    if (!fbs || !fbs->n) { *out = NULL; return 0; }
-    t = (tdsmall_t *)malloc((size_t)fbs->n * sizeof(tdsmall_t));
-    if (!t) { *out = NULL; return 0; }
     for (uint32_t i = 0; i < fbs->n; i++) {
         uint32_t rt, g, m;
         if (FB_ISPOW(fbs, i)) continue;
@@ -1011,7 +1011,7 @@ static uint32_t td_build_small(const fb_t *fbs, const qlat_t *L, int logI,
         if (m * g != fbs->primes[i]) {          /* the invariant above */
             fprintf(stderr, "td_build_small: m*g != p at entry %u"
                             " (p=%u m=%u g=%u)\n", i, fbs->primes[i], m, g);
-            free(t); *out = NULL; return 0;
+            return 0;
         }
         t[n].m = m; t[n].rt = rt; t[n].g = g;
         t[n].cst = Ihalf % m;
@@ -1019,6 +1019,28 @@ static uint32_t td_build_small(const fb_t *fbs, const qlat_t *L, int logI,
         td_magic_build(m, &t[n].magic, &t[n].sh);
         n++;
     }
+    if (getenv("TD_DUMP_SMALL")) {
+        uint32_t c2 = 0;
+        fprintf(stderr, "td_fill_small: %u entries from %u fb rows; first 6:", n, fbs->n);
+        for (uint32_t i = 0; i < n && i < 6; i++)
+            fprintf(stderr, " p=%u(m=%u,g=%u,rt=%u,magic=%u)",
+                    t[i].m * t[i].g, t[i].m, t[i].g, t[i].rt, t[i].magic);
+        for (uint32_t i = 0; i < n; i++) if (t[i].m * t[i].g == 2) c2++;
+        fprintf(stderr, "  | entries with p==2: %u\n", c2);
+    }
+    return n;
+}
+
+static uint32_t td_build_small(const fb_t *fbs, const qlat_t *L, int logI,
+                               tdsmall_t **out)
+{
+    uint32_t n;
+    tdsmall_t *t;
+    if (!fbs || !fbs->n) { *out = NULL; return 0; }
+    t = (tdsmall_t *)malloc((size_t)fbs->n * sizeof(tdsmall_t));
+    if (!t) { *out = NULL; return 0; }
+    n = td_fill_small(fbs, L, logI, t);
+    if (!n) { free(t); *out = NULL; return 0; }
     *out = t;
     return n;
 }
@@ -1090,30 +1112,17 @@ static int td_gate_cofactors(const char *path, uint32_t n,
 
 /* ---- the stage ---------------------------------------------------------- */
 
-/* Per-side trial-division results, for callers that join both sides in
- * process. All arrays are malloc'd here and owned by the caller. */
-typedef struct {
-    uint32_t  n;
-    int64_t  *a, *b;
-    bn_t     *cof;
-    uint8_t  *bits, *status;
-    uint32_t *fac, *faccnt;
-} td_out_t;
-
-static void td_out_free(td_out_t *o)
-{
-    if (!o) return;
-    free(o->a); free(o->b); free(o->cof); free(o->bits); free(o->status);
-    free(o->fac); free(o->faccnt);
-    memset(o, 0, sizeof(*o));
-}
-
+/* The MEASUREMENT harness for the trial-division chain: best-of-three on every
+ * kernel, plus the two diagnostic variants of k_td that separate the small
+ * prime congruence test from the divisions it triggers, plus the reconstruction
+ * gate. The pipeline used to call this per q and per side, which is what made
+ * its post-sieve cost 222 ms/q; it now runs pipe_td_perq, and this stays what
+ * `bench --td` reports and what every command in RESULTS.md reproduces. */
 static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                         const poly_t *POLY, const bench_cfg_t *cfg,
                         const plat_t *d_plat, const uint32_t *d_primes,
                         const uint32_t *d_two, uint32_t nbitword,
-                        uint32_t xmax, int blocks, int threads,
-                        td_out_t *out)
+                        uint32_t xmax, int blocks, int threads)
 {
     const uint32_t K = 16;          /* large primes kept per survivor */
     const uint32_t ngroup = nbitword / TD_GROUP_W;
@@ -1345,11 +1354,11 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
      * full pass overwrites its output. */
     for (int rep = 0; rep < 3; rep++) {
         cudaEventRecord(t0);
-        k_td<1, 0><<<blocks, threads>>>(d_a, d_b, d_x, n, cfg->logI, d_poly,
-                                        cfg->side == 1 ? (uint32_t)L->q : 0u,
-                                        d_plist, d_pcnt, K, d_sm, 0u,
-                                        d_cof, d_cofbits, d_flags, NULL,
-                                        NULL, NULL, 0);
+        k_td<1, 0, 0><<<blocks, threads>>>(d_a, d_b, d_x, NULL, n, cfg->logI, d_poly,
+                                           cfg->side == 1 ? (uint32_t)L->q : 0u,
+                                           d_plist, d_pcnt, K, d_sm, 0u,
+                                           d_cof, d_cofbits, d_flags, NULL,
+                                           NULL, NULL, 0);
         cudaEventRecord(t1);
         CK(cudaEventSynchronize(t1)); CK(cudaGetLastError());
         { float t = time_kernel(t0, t1); if (t < ms_td_nosm) ms_td_nosm = t; }
@@ -1360,11 +1369,11 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     CK(cudaMemset(d_ovf, 0, 8));
     for (int rep = 0; rep < 3; rep++) {
         cudaEventRecord(t0);
-        k_td<0, 0><<<blocks, threads>>>(d_a, d_b, d_x, n, cfg->logI, d_poly,
-                                        cfg->side == 1 ? (uint32_t)L->q : 0u,
-                                        d_plist, d_pcnt, K, d_sm, nsm,
-                                        d_cof, d_cofbits, d_flags, d_ovf,
-                                        NULL, NULL, 0);
+        k_td<0, 0, 0><<<blocks, threads>>>(d_a, d_b, d_x, NULL, n, cfg->logI, d_poly,
+                                           cfg->side == 1 ? (uint32_t)L->q : 0u,
+                                           d_plist, d_pcnt, K, d_sm, nsm,
+                                           d_cof, d_cofbits, d_flags, d_ovf,
+                                           NULL, NULL, 0);
         cudaEventRecord(t1);
         CK(cudaEventSynchronize(t1)); CK(cudaGetLastError());
         { float t = time_kernel(t0, t1); if (t < ms_td_nodiv) ms_td_nodiv = t; }
@@ -1375,11 +1384,11 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     for (int rep = 0; rep < 3; rep++) {
         CK(cudaMemset(d_flags, 0, 4));
         cudaEventRecord(t0);
-        k_td<1, 0><<<blocks, threads>>>(d_a, d_b, d_x, n, cfg->logI, d_poly,
-                                        cfg->side == 1 ? (uint32_t)L->q : 0u,
-                                        d_plist, d_pcnt, K, d_sm, nsm,
-                                        d_cof, d_cofbits, d_flags, NULL,
-                                        NULL, NULL, 0);
+        k_td<1, 0, 0><<<blocks, threads>>>(d_a, d_b, d_x, NULL, n, cfg->logI, d_poly,
+                                           cfg->side == 1 ? (uint32_t)L->q : 0u,
+                                           d_plist, d_pcnt, K, d_sm, nsm,
+                                           d_cof, d_cofbits, d_flags, NULL,
+                                           NULL, NULL, 0);
         cudaEventRecord(t1);
         CK(cudaEventSynchronize(t1)); CK(cudaGetLastError());
         { float t = time_kernel(t0, t1); if (t < ms_td) ms_td = t; }
@@ -1416,14 +1425,14 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
      * A separate untimed pass with RECORD=1 rather than stores in the measured
      * kernel: the factors are only wanted when a run is emitting, and the hot
      * path should not carry writes it does not need. */
-    if (cfg->emit_cof || out) {
+    if (cfg->emit_cof) {
         CK(cudaMalloc(&d_fac, (size_t)n * TD_FMAX * 4));
         CK(cudaMalloc(&d_faccnt, (size_t)n * 4));
-        k_td<1, 1><<<blocks, threads>>>(d_a, d_b, d_x, n, cfg->logI, d_poly,
-                                        cfg->side == 1 ? (uint32_t)L->q : 0u,
-                                        d_plist, d_pcnt, K, d_sm, nsm,
-                                        d_cof, d_cofbits, d_flags, NULL,
-                                        d_fac, d_faccnt, TD_FMAX);
+        k_td<1, 1, 0><<<blocks, threads>>>(d_a, d_b, d_x, NULL, n, cfg->logI, d_poly,
+                                           cfg->side == 1 ? (uint32_t)L->q : 0u,
+                                           d_plist, d_pcnt, K, d_sm, nsm,
+                                           d_cof, d_cofbits, d_flags, NULL,
+                                           d_fac, d_faccnt, TD_FMAX);
         CK(cudaDeviceSynchronize()); CK(cudaGetLastError());
     }
 
@@ -1488,7 +1497,7 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
             td_gate_cofactors(cfg->cofgate, n, ha, hb, hcof, cfg->side) != 0)
             rc = -1;
 
-        if (cfg->emit_cof || out) {
+        if (cfg->emit_cof) {
             FILE *fo = cfg->emit_cof ? fopen(cfg->emit_cof, "w") : NULL;
             uint32_t *hfac = (uint32_t *)malloc((size_t)n * TD_FMAX * 4);
             uint32_t *hfn = (uint32_t *)malloc((size_t)n * 4);
@@ -1577,13 +1586,7 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                     printf("  wrote %u (a, b, cofactor, bits, status, factors)"
                            " to %s\n", n, cfg->emit_cof);
             }
-            if (out && rc == 0) { out->fac = hfac; out->faccnt = hfn; }
-            else { free(hfac); free(hfn); }
-        }
-        if (out && rc == 0) {
-            out->n = n; out->a = ha; out->b = hb;
-            out->cof = hcof; out->bits = hbits; out->status = hstat;
-            ha = hb = NULL; hcof = NULL; hbits = hstat = NULL;
+            free(hfac); free(hfn);
         }
         free(hcof); free(hbits); free(hstat); free(ha); free(hb);
     }
@@ -2417,8 +2420,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                     /* ---- exact norms + trial division --------------------- */
                     if (cfg->td && d_two &&
                         run_td_stage(fb, fbs, L, POLY, cfg, D.plat, D.primes,
-                                     d_two, nbitword, xmax, blocks, cfg->threads,
-                                     NULL))
+                                     d_two, nbitword, xmax, blocks, cfg->threads))
                         td_failed = 1;
 
                     if (hother) cudaFreeHost(hother);
@@ -2533,4 +2535,5 @@ after_apply:
     return td_failed ? -1 : 0;
 }
 
+#include "cofac.cuh"
 #include "pipeline.cuh"

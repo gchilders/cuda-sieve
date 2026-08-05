@@ -56,7 +56,17 @@ mkcofbatch: mkcofbatch.c
 clean:
 	rm -f bench fbtest dumpcmp mkcofbatch *.o *.d
 
-.PHONY: all clean check
+.PHONY: all clean check cofcheck
 
-check: fbtest
+# `check` depended on fbtest alone, so the whole CUDA path -- kernels, the
+# cofactoriser, the pipeline -- could fail to compile while the gates reported
+# "all gates passed". Depend on `all`.
+check: all cofcheck
 	./fbtest --cadofb ../oracle/c183.fb1
+
+# A GPU golden test over the cofactoriser: rho and ECM on the parity special-q,
+# the even-cofactor invariant, the bounds refusals, and a candidate file with no
+# trailing newline. Each case asserts an exact relation count, so a silent
+# change of method or a truncated parse fails here rather than in a band run.
+cofcheck: bench
+	@./cofcheck.sh

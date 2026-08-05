@@ -178,6 +178,17 @@ int fb_split_small(const fb_t *fb, uint32_t bkthresh, fb_t *small)
 {
     uint32_t i, k = 0, cap = 0;
     memset(small, 0, sizeof(*small));
+    if (getenv("TD_DUMP_SMALL")) {
+        uint32_t n2 = 0, np = 0;
+        for (i = 0; i < fb->n; i++) {
+            if (fb->primes[i] == 2) n2++;
+            if (FB_ISPOW(fb, i)) np++;
+        }
+        fprintf(stderr, "fb_split_small: input fb n=%u, p==2 rows=%u, ispow rows=%u,"
+                        " first p=%u (root %u), bkthresh=%u\n",
+                fb->n, n2, np, fb->n ? fb->primes[0] : 0,
+                fb->n ? fb->roots[0] : 0, bkthresh);
+    }
     for (i = 0; i < fb->n; i++)
         if (fb->primes[i] < bkthresh || FB_ISPOW(fb, i)) cap++;
     small->primes = (uint32_t *)malloc((size_t)(cap ? cap : 1) * 4);

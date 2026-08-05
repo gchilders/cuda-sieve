@@ -171,6 +171,13 @@ typedef struct {
     int      pipeline;      /* run both sides in one process                    */
     int      verbose_q;     /* print a line per special-q rather than a summary */
     const char *qlist;      /* file of `q rho` pairs; one special-q per line     */
+    uint64_t qmin, qmax;    /* --qrange: take the band from the algebraic FB     */
+    int      cofactor;      /* split the cofactors inline, cross-q queue        */
+    int      cof_rounds;    /* rho requeue rounds                               */
+    uint32_t cof_budget;    /* rho iterations in the first round                */
+    int      cof_ecm;       /* use ECM stage 1 instead of rho                   */
+    uint32_t ecm_b1;        /* ECM stage-1 bound                                */
+    uint32_t ecm_curves;    /* ECM curves attempted per round                   */
     uint32_t nq_max;        /* stop after this many q (0 = all)                 */
     int      td_verify;     /* run the factors x cofactor == norm reconstruction */
     double   scale0, allowance0;
@@ -208,6 +215,20 @@ int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                  const fb_t *fb0, const fb_t *fbs0,
                  const qsel_t *qlist, uint32_t nq,
                  const poly_t *P, const bench_cfg_t *cfg);
+
+/* Cofactorise a batch written by --candidates and emit the relations it
+ * yields. A separate entry point on purpose: the emitted corpus is a far
+ * better test of the splitter than one special-q would be. */
+/* Verify an emitted relation file against the polynomial: every recorded factor
+ * divides its norm exactly, both norms rebuild to 1, every prime within its lpb.
+ * Gates what the cofactoriser EMITTED, which the pre-split gate cannot see. */
+int check_relations(const char *path, const poly_t *poly, uint32_t lpb0,
+                    uint32_t lpb1);
+
+int run_cofac(const char *path, const char *out, uint32_t lim0, uint32_t lpb0,
+              uint32_t lim1, uint32_t lpb1, int rounds, uint32_t budget,
+              int blocks, int threads, int ecm, uint32_t ecm_b1,
+              uint32_t ecm_curves);
 
 int run_bench(const fb_t *fb, const fb_t *small, const qlat_t *L,
               const poly_t *P, const bench_cfg_t *cfg);
