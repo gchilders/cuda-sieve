@@ -5,9 +5,14 @@
 NVCC      ?= nvcc
 CC        ?= gcc
 
-# sm_120 native (RTX 5070, Blackwell consumer). PTX fallback for other cards.
+# sm_120 native (RTX 5070, Blackwell consumer), sm_86 native (RTX 3090/A10).
+# PTX fallback is compute_80, NOT compute_89: the driver only JITs PTX to a
+# target >= the virtual arch, so a compute_89 fallback cannot load on any
+# Ampere card at all -- the previous default was unrunnable on a 3090.
+# The only sub-sm_80 intrinsic used is __shfl_*_sync (sm_70+).
 NVCC_ARCH ?= -gencode arch=compute_120,code=sm_120 \
-             -gencode arch=compute_89,code=compute_89
+             -gencode arch=compute_86,code=sm_86 \
+             -gencode arch=compute_80,code=compute_80
 
 # Extra -D's for pricing experiments, e.g. make DEFS=-DNORM_CANCEL_TOL=0.0f.
 # Nothing in the default build sets this; it exists so a variant can be timed

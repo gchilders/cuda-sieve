@@ -19,7 +19,17 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 fail=0
 
-run() { ./bench --pipeline --cadofb $FB --poly $POLY --qrange 120000053:120000053 "$@" 2>&1; }
+# The relation-count cases pin the survivor bound EXPLICITLY, to the values the
+# derivation produced before it stopped importing lambda conventions. They are
+# here to test the cofactoriser -- a method that silently falls back, a factor
+# base missing p = 2, a truncated parse -- and that job is only done if the
+# count is held still by everything else. Letting the allowance policy move
+# these numbers would mean re-baselining 37 every time the policy is tuned, and
+# a re-baselined golden number stops catching the bugs it was written for.
+#
+# The policy itself is pinned separately, in its own case below.
+PIN="--allowance 101.6 --allowance0 68.1"
+run() { ./bench --pipeline --cadofb $FB --poly $POLY --qrange 120000053:120000053 $PIN "$@" 2>&1; }
 
 expect_rel() {   # name expected <bench args...>
     name=$1; want=$2; shift 2
@@ -65,24 +75,38 @@ expect_refused "zero ECM curves"               --cofactor --cof-ecm --ecm-curves
 # pinning a number here would also pin the derived allowance, which is a
 # separate thing with its own case above.
 JOB=../oracle/input.job
+# `|| true` on every grep -c: it exits 1 when the count is 0, and `set -e` at
+# the top of this script turns that into an abort partway through the suite
+# rather than a FAIL line. That cost a confusing debugging round once.
 got=$(./bench --pipeline --cadofb $FB --poly $JOB $Q --relations $TMP/j.txt 2>&1 \
-      | grep -c 'job file: rlim 67100000, alim 134200000, lpbr 31, lpba 32, mfbr 60, mfba 92')
+      | grep -c 'job file: rlim 67100000, alim 134200000, lpbr 31, lpba 32, mfbr 60, mfba 92' || true)
 if [ "$got" = "1" ]; then
     printf 'PASS   %-34s all six keys\n' "job file parsed"
 else
     printf 'FAIL   %-34s banner line not found\n' "job file parsed"; fail=1
 fi
 
-# GGNFS units: alambda 3.5 * log2(alim 134200000) = 94.5 bits. If this is ever
-# read as CADO units (3.5 * lpba 32 = 112) the bound LOOSENS by 17 bits and the
-# error is invisible in the relation count -- it just costs time. Pin the
-# conversion itself.
-got=$(./bench --pipeline --cadofb $FB --poly $JOB $Q --relations $TMP/j.txt 2>&1 \
-      | grep -c 'alambda 3.5 x log2(alim 134200000) = 94.5[0-9]* bits')
+# The job file's lambda is REPORTED and NOT APPLIED. Two things to pin: that
+# the GGNFS-unit conversion is still right (3.5 * log2(134200000) = 94.5 bits,
+# not the 112 a CADO reading would give), and that the number does not reach
+# the survivor bound -- it is calibrated to GGNFS's gate, which is measurably
+# tighter than ours at the same nominal bits.
+# `|| true` for the same reason as the greps: a bare command substitution under
+# `set -e` takes bench's exit status, so a failing case would abort the suite
+# instead of printing FAIL and continuing.
+out=$(./bench --pipeline --cadofb $FB --poly $JOB $Q --relations $TMP/j.txt 2>&1 || true)
+got=$(printf '%s' "$out" | grep -c 'alambda 3.5 -> 94.5[0-9]* bits (side 1), reported only' || true)
 if [ "$got" = "1" ]; then
-    printf 'PASS   %-34s 3.5 -> 94.5 bits, not 112\n' "GGNFS lambda conversion"
+    printf 'PASS   %-34s 3.5 -> 94.5 bits, reported not applied\n' "GGNFS lambda conversion"
 else
     printf 'FAIL   %-34s wrong or missing conversion\n' "GGNFS lambda conversion"; fail=1
+fi
+# ...and the allowance actually in force is the DERIVED one, not 94.50.
+got=$(printf '%s' "$out" | grep -c 'side 1 log2(maxnorm)=.* allowance=94.50' || true)
+if [ "$got" = "0" ]; then
+    printf 'PASS   %-34s job lambda did not reach the bound\n' "lambda not applied"
+else
+    printf 'FAIL   %-34s job lambda leaked into the allowance\n' "lambda not applied"; fail=1
 fi
 
 # Explicit flags outrank the job file. With both allowances stated, the job
@@ -95,6 +119,50 @@ if [ -n "$a" ] && [ "$a" = "$b" ] && cmp -s $TMP/p1.txt $TMP/p2.txt; then
     printf 'PASS   %-34s %s each, byte-identical\n' "explicit flags outrank job file" "$a"
 else
     printf 'FAIL   %-34s poly %s vs job %s\n' "explicit flags outrank job file" "$a" "$b"; fail=1
+fi
+
+# ---- cofactor width -------------------------------------------------------
+# Side 0 is 3 limbs like side 1, so an SNFS job with mfbr 88 on the rational
+# side is representable. 97 is not, and 96 against lpb0 31 asks for 4 parts,
+# which mz_split's stack cannot hold -- it would present as CF_OVERFLOW on the
+# records needing it, i.e. a silent partial yield loss, so it is refused.
+expect_refused "side-0 mfb above 3 limbs"     --cofactor --mfb0 97
+expect_refused "side-0 4LP refused"           --cofactor --mfb0 96 --lpb0 31
+expect_refused "side-1 4LP refused"           --cofactor --mfb 96 --lpb 24
+# $PIN so this measures the cofactor WIDTH and not the allowance policy: with
+# --mfb0 88 and no pin, the derived allowance0 follows mfb to 89.5 bits and the
+# case would be exercising the survivor bound instead of the thing it is named
+# for.
+if ./bench --pipeline --cadofb $FB --poly $POLY $Q $PIN --cofactor --mfb0 88 --lpb0 31 \
+           --relations $TMP/w.txt >$TMP/o 2>&1; then
+    printf 'PASS   %-34s accepted\n' "side-0 3LP width (mfb0 88)"
+else
+    printf 'FAIL   %-34s refused, should be legal\n' "side-0 3LP width (mfb0 88)"; fail=1
+fi
+
+expect_refused "sq-side out of range"         --cofactor --sq-side 2
+
+# ---- survivor allowance policy -------------------------------------------
+# The DERIVED default (mfb + ~1.5 bits, from our own quantisation) is tighter
+# than the old CADO-rule value, and on this single q that costs one relation:
+# 36 rather than the 37 the pinned cases above get. That is a deliberate trade,
+# measured over a real band rather than this one q -- c183, 120 special-q:
+#
+#     allowance0 61.5 (mfb+1.5)   82,969 survivors/q   46.48 rel/q
+#     allowance0 68.1 (mfb+8.1)  143,760 survivors/q   46.57 rel/q
+#
+# 42% of the trial-division input for 0.19% of the relations. The single-q
+# figure of 1-in-37 is an unlucky sample, not the rate.
+#
+# Pinned so that a change to the allowance policy has to be deliberate: if this
+# moves, the derivation moved, and the band measurement above needs redoing.
+got=$(./bench --pipeline --cadofb $FB --poly $POLY $Q --cofactor --cof-rounds 2 \
+      --cof-budget 65536 --relations $TMP/pol.txt 2>&1 \
+      | grep 'total relations' | tail -1 | awk '{print $NF}')
+if [ "$got" = "36" ]; then
+    printf 'PASS   %-34s 36 relations\n' "derived allowance policy"
+else
+    printf 'FAIL   %-34s expected 36, got %s\n' "derived allowance policy" "$got"; fail=1
 fi
 
 expect_refused "lpb above the 32-bit limb"    --cofactor --lpb 33

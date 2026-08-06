@@ -64,6 +64,36 @@ int poly_load(const char *path, poly_t *P)
     return 0;
 }
 
+/* Does f have a root mod 2 -- affine (x = 0 or 1) or projective (2 | c_deg)?
+ *
+ * If it does not, 2 NEVER divides the algebraic norm, and a factor base with
+ * no p = 2 entry is correct rather than truncated. That is not a corner case:
+ * the SNFS polynomial x^5 + x^4 - 4x^3 - 3x^2 + 3x + 1 has f(0) = 1, f(1) = -1
+ * and an odd leading coefficient, so makefb emits no p = 2 and the norms are
+ * always odd.
+ *
+ * Parity is read off the EXACT decimal strings, not the doubles: c0 runs to
+ * 147 bits on some jobs and the double is good to 53. The last digit is all
+ * that is needed, and a leading '-' does not change it. */
+int poly_has_root_mod2(const poly_t *P)
+{
+    /* Initialised, though the loop always assigns both: k runs 0..deg, so the
+     * k == 0 and k == P->deg arms each fire once. The compiler cannot see it. */
+    int sum = 0, c0_even = 0, lead_even = 0;
+    for (int k = 0; k <= P->deg; k++) {
+        const char *s = P->cs[k];
+        size_t n = strlen(s);
+        int odd = n && (s[n - 1] - '0') % 2;   /* empty string = absent = 0 */
+        sum ^= odd;
+        if (k == 0)       c0_even  = !odd;
+        if (k == P->deg)  lead_even = !odd;
+    }
+    if (c0_even)   return 1;        /* x = 0 is a root      */
+    if (!sum)      return 1;        /* x = 1 is a root      */
+    if (lead_even) return 1;        /* projective root at 2 */
+    return 0;
+}
+
 double job_allowance_bits(double lambda, uint32_t lim)
 {
     if (lambda <= 0.0 || lim < 2) return 0.0;
@@ -95,6 +125,50 @@ double las_allowance(double maxlog2, double scale, double lambda,
     if (lambda <= 0.0) lambda = 0.3 + (double)mfb / (double)lpb;
     r = maxlog2 - 1.0 / scale;            /* LOGNORM_GUARD_BITS / scale */
     if (r > lambda * (double)lpb) r = lambda * (double)lpb;
+    return r;
+}
+
+/* The survivor allowance we actually want, in bits, derived from THIS tool's
+ * behaviour rather than from an imported lambda.
+ *
+ * A survivor is a position whose approximated remaining log looks small enough
+ * to be worth trial dividing. The hard gate downstream is mfb: a cofactor
+ * above it is rejected outright, so admitting positions far above mfb buys
+ * nothing but work. The only reason to exceed mfb at all is that the survivor
+ * test is approximate -- a byte-quantised log against an fp32 norm estimate --
+ * so a position whose true cofactor is under mfb can read over it.
+ *
+ * One byte unit is 1/scale bits, which is the natural granularity of that
+ * error, and the floor of 1.5 bits keeps a fine scale from producing a slack
+ * so tight that ordinary rounding starts costing relations.
+ *
+ * Measured, SNFS job side 0 (mfb 88, scale 1.60), 200 special-q:
+ *     mfb + 3.8 (91.80, the .job file's rlambda 3.4): 120,317 surv  10,313 rel
+ *     mfb + 1.5 (89.50, what this returns)          : 104,615 surv  10,312 rel
+ *     mfb + 1.0 (89.00)                             :  99,808 surv  10,312 rel
+ *     mfb + 0.0 (88.00)                             :  90,782 surv  10,306 rel
+ *     mfb - 3.0 (85.00)                             :  74,849 surv   9,668 rel
+ * so 13% of the trial-division input goes away for one relation in ten
+ * thousand. Below mfb the cliff is real and fast -- hence a floor, not a cap
+ * at mfb exactly.
+ *
+ * WHY NOT THE .job FILE'S LAMBDA. It is calibrated to a different survivor
+ * gate. On the same job and q range, gnfs-lasieve4I14e loses 17.3% of its
+ * yield going from 91.8 to 87.5 bits where we lose 0.07% going to 88.0 -- so
+ * the number does not transfer, and importing it just inherits another tool's
+ * calibration. CADO's automatic (0.3 + mfb/lpb) x lpb is no better a source:
+ * on this job it gives 97.3 bits, looser still.
+ *
+ * Capped by the norm itself: a cofactor cannot exceed the norm it came from,
+ * less one guard unit. */
+double sieve_allowance(double maxlog2, double scale, unsigned mfb)
+{
+    double slack, r;
+    if (scale <= 0.0) return 0.0;
+    slack = 2.0 / scale;
+    if (slack < 1.5) slack = 1.5;
+    r = (double)mfb + slack;
+    if (r > maxlog2 - 1.0 / scale) r = maxlog2 - 1.0 / scale;
     return r;
 }
 
@@ -149,10 +223,16 @@ void norm_setup(norm_t *N, const poly_t *P, const qlat_t *L,
 
     /* The unbalanced-terms warning means the q-lattice was reduced without the
      * skew, which is a real defect -- it is reported on every q regardless. */
+    /* Named by DEGREE, not by is_sqside. This printed is_sqside in a field
+     * labelled "side", which was only ever right while is_sqside == (side==1);
+     * --sq-side 0 broke that and the warning then pointed at the wrong
+     * polynomial. norm_setup does not know the side index, but it knows the
+     * degree, and that identifies the form unambiguously. */
     if (nclamp)
-        printf("  ** q=%llu side %d: %d normalised term(s) flushed to zero"
+        printf("  ** q=%llu %s (deg %d): %d normalised term(s) flushed to zero"
                " -- terms are unbalanced **\n",
-               (unsigned long long)L->q, is_sqside, nclamp);
+               (unsigned long long)L->q,
+               P->deg == 1 ? "rational" : "algebraic", P->deg, nclamp);
     if (!norm_verbose) return;
     printf("  norm setup: deg %d, A=%.4e B=%.4e, log2(maxnorm)=%.2f, scale=%.3f%s\n",
            P->deg, A, B, N->log2M - N->bias, N->scale,

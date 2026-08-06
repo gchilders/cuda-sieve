@@ -15,9 +15,23 @@
  *                               97.4% at 81-92 bits (3LP, ~30-bit factors).
  *                               Nothing at 65-80 bits: that is COF_REJECT_GAP.
  *
- * So this is not a general-purpose cofactorizer. It is two narrow shapes, and
- * the arithmetic is sized to them: 2 limbs for the rational side, 3 for the
- * algebraic.
+ * So this is not a general-purpose cofactorizer. It is a few narrow shapes,
+ * and the arithmetic is sized to them: 3 limbs (96 bits) on both sides, which
+ * covers 2LP and 3LP on either.
+ *
+ * The rational side was 2 limbs while the special-q always sat on the
+ * algebraic side. An SNFS job whose hard side is the rational one (mfbr 88)
+ * needs the width there instead. Measured cost of widening it, c183 band of 66
+ * special-q, identical parameters, output byte-identical (same md5):
+ *
+ *     rational queue    2.15 -> 3.94 ms/q   (+83%)
+ *     wall clock        172.65 -> 173.75    (+0.64%)
+ *
+ * So the stage itself nearly doubles and it still does not matter, because the
+ * rational queue is ~1% of a special-q. That is the trade being made -- not
+ * "the cost is nil", but "the cost is 0.6% of wall to stop assuming which side
+ * is hard". A per-side dispatch would buy that 0.6% back at the price of a
+ * second instantiation to keep in step, which is what task #15 removed.
  *
  * WHY POLLARD-BRENT RHO AND NOT ECM. ECM's appeal on a GPU is that its cost is
  * data-independent, which rho's emphatically is not -- rho's iteration count is
@@ -48,10 +62,15 @@
 #define CF_INCOMPLETE 2   /* out of rho budget: requeue, do not drop */
 #define CF_OVERFLOW   3   /* more parts than the caller made room for */
 
-#define CF_MAXFAC 4       /* mfb/lpb is 2 on the rational side, 3 on the
-                           * algebraic; 4 leaves one slot of headroom so an
-                           * unexpected shape is reported rather than silently
-                           * truncated */
+#define CF_MAXFAC 4       /* ceil(mfb/lpb) is at most 3 on EITHER side -- 3LP
+                           * is 88/31 on the rational side of an SNFS job and
+                           * 92/32 on the algebraic side of a GNFS one -- so 4
+                           * leaves one slot of headroom and an unexpected
+                           * shape is reported (CF_OVERFLOW) rather than
+                           * silently truncated. mz_split's stack peaks at 3
+                           * for a 3-way split, which its `sp + 2 > CF_MAXFAC`
+                           * guard admits exactly. Raising this to allow 4LP
+                           * means revisiting that guard, not just this line. */
 
 #if defined(__CUDACC__)
 #define CF_FN __device__ __forceinline__
@@ -804,7 +823,16 @@ static void cf_run_rounds(const mz<L> *d_n, mz<L> lim2, uint32_t lpb, uint32_t n
 
 typedef struct {
     uint32_t cap, n, rcap;
-    mz<2>    *d_c0;   mz<3>   *d_c1;      /* the two cofactors, narrowed */
+    /* Both sides are 3 limbs. Side 0 used to be mz<2>, which assumed the
+     * rational side's cofactor always fit in 64 bits -- true while the
+     * special-q sat on the algebraic side and the rational mfb was ~60, false
+     * for an SNFS job whose hard side is the rational one (mfbr 88). It also
+     * silently truncated lim0^2 for any rlim above 2^32.
+     *
+     * Kept uniform rather than dispatched per side: the rational queue was
+     * 0.04 ms of a 24.49 ms special-q on the c151, so the 2-limb path was
+     * buying nothing worth a second instantiation to keep in step. */
+    mz<3>    *d_c0;   mz<3>   *d_c1;      /* the two cofactors, narrowed */
     uint8_t  *d_st0,  *d_st1;             /* CF_* per side                */
     uint32_t *d_sm0,  *d_sm1;             /* residual when no split needed */
     int64_t  *d_a,    *d_b;
@@ -854,6 +882,7 @@ __global__ void k_cof_enqueue(const bn_t *__restrict cof0, const uint8_t *__rest
             bn_t v = cof0[t];
             if ((uint32_t)bits0[t] > lpb0) {
                 Q.d_c0[d].v[0] = v.v[0]; Q.d_c0[d].v[1] = v.v[1];
+                Q.d_c0[d].v[2] = v.v[2];
                 Q.d_sm0[d] = 0; Q.d_st0[d] = CF_INCOMPLETE;
             } else {
                 Q.d_sm0[d] = (bits0[t] > 1) ? v.v[0] : 0u;
@@ -1007,7 +1036,7 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
      * against a 12 GB card, and removes the failure mode instead of retuning
      * the threshold for one more job. */
     Q->rcap = cap;
-    CK(cudaMalloc(&Q->d_c0, (size_t)cap * sizeof(mz<2>)));
+    CK(cudaMalloc(&Q->d_c0, (size_t)cap * sizeof(mz<3>)));
     CK(cudaMalloc(&Q->d_c1, (size_t)cap * sizeof(mz<3>)));
     CK(cudaMalloc(&Q->d_st0, cap)); CK(cudaMalloc(&Q->d_st1, cap));
     CK(cudaMalloc(&Q->d_sm0, (size_t)cap * 4)); CK(cudaMalloc(&Q->d_sm1, (size_t)cap * 4));
@@ -1063,14 +1092,20 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
 {
     const uint32_t n = Q->n;
     const uint32_t nb = (n + TD_SCAN_BLK - 1) / TD_SCAN_BLK;
-    mz<2> l0; mz<3> l1;
+    mz<3> l0, l1;
     uint32_t nr = 0;
     cudaEvent_t e0, e1, e2;
     float t0 = 0, t1 = 0;
     double h0;
     if (!n) return 0;
+    /* 3 limbs, not 2. lim0^2 needs more than 64 bits once rlim exceeds 2^32.
+     * No job here is close -- the largest rlim so far is 134200000, about
+     * 2^27, giving lim0^2 ~ 2^54 -- so this is headroom, not a live fix. It is
+     * worth having anyway because the old truncation was silent and lim2 is
+     * the "prime by size" threshold: a wrong one accepts composites as prime,
+     * which surfaces only as relations that fail to reconstruct. */
     { unsigned __int128 v = (unsigned __int128)lim0 * lim0;
-      for (int i = 0; i < 2; i++) { l0.v[i] = (uint32_t)v; v >>= 32; } }
+      for (int i = 0; i < 3; i++) { l0.v[i] = (uint32_t)v; v >>= 32; } }
     { unsigned __int128 v = (unsigned __int128)lim1 * lim1;
       for (int i = 0; i < 3; i++) { l1.v[i] = (uint32_t)v; v >>= 32; } }
 
@@ -1088,7 +1123,7 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
 
     cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventCreate(&e2);
     cudaEventRecord(e0);
-    cf_run_rounds<2>(Q->d_c0, l0, lpb0, n, Q->d_st0, Q->d_sp0, Q->d_nsp0,
+    cf_run_rounds<3>(Q->d_c0, l0, lpb0, n, Q->d_st0, Q->d_sp0, Q->d_nsp0,
                      &S, &W, NULL, blocks, threads);
     /* The class-aware gate: a record whose rational side did not split is dead
      * whatever the algebraic side does, so its 3-limb job is never started. */
@@ -1201,7 +1236,7 @@ template <int L>
 static int cf_run_side(mz<L> *h_n, uint32_t nj, uint64_t lim, uint32_t lpb,
                        uint8_t *h_status, uint32_t *h_fac, uint8_t *h_nfac,
                        int blocks, int threads, int verbose, double *ms_out,
-                       const cf_sched_t *S)
+                       const cf_sched_t *S, const char *side_name)
 {
     mz<L> *d_n = NULL; uint8_t *d_status = NULL, *d_nfac = NULL;
     uint32_t *d_fac = NULL;
@@ -1241,8 +1276,8 @@ static int cf_run_side(mz<L> *h_n, uint32_t nj, uint64_t lim, uint32_t lpb,
     cudaEventRecord(e0);
     cf_run_rounds<L>(d_n, lim2, lpb, nj, d_status, d_fac, d_nfac,
                      S, &W, d_iters, blocks, threads);
-    /* Release before returning. run_cofac calls this twice -- mz<2> for the
-     * rational side, then mz<3> for the algebraic -- on the same device, so a
+    /* Release before returning. run_cofac calls this twice -- once per side,
+     * both mz<3> -- on the same device, so a
      * bare `return -1` here left the second call short by everything the first
      * had allocated: on the 1.96M-record corpus, hundreds of MB, and the
      * second side then fails for a reason that has nothing to do with itself. */
@@ -1259,8 +1294,11 @@ static int cf_run_side(mz<L> *h_n, uint32_t nj, uint64_t lim, uint32_t lpb,
     CK(cudaEventSynchronize(e1));
     cudaEventElapsedTime(&ms, e0, e1);
     *ms_out = ms;
-    if (verbose) printf("  side %d-limb queue: %u jobs, %d rounds, %.1f ms\n",
-                        L, nj, S->rounds, ms);
+    /* Keyed on L, this said "side 3-limb queue" twice once both sides became
+     * mz<3> -- the same information loss the summary block below was fixed
+     * for. run_cofac calls rational first, then algebraic. */
+    if (verbose) printf("  %s queue: %u jobs, %d rounds, %.1f ms\n",
+                        side_name ? side_name : "cofactor", nj, S->rounds, ms);
 
     CK(cudaMemcpy(h_status, d_status, nj, cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(h_nfac, d_nfac, nj, cudaMemcpyDeviceToHost));
@@ -1449,7 +1487,7 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
     size_t sz = 0;
     uint32_t nrec = 0, n0 = 0, n1 = 0;
     cf_rest_t *rest = NULL;
-    mz<2> *j0 = NULL; mz<3> *j1 = NULL;
+    mz<3> *j0 = NULL; mz<3> *j1 = NULL;
     uint32_t *i0 = NULL, *i1 = NULL, *fac0 = NULL, *fac1 = NULL;
     uint8_t *st0 = NULL, *st1 = NULL, *nf0 = NULL, *nf1 = NULL;
     uint8_t *side0ok = NULL;
@@ -1474,7 +1512,7 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
     if (!nrec) { free(buf); return -1; }
 
     rest = (cf_rest_t *)malloc((size_t)nrec * sizeof(cf_rest_t));
-    j0 = (mz<2> *)malloc((size_t)nrec * sizeof(mz<2>));
+    j0 = (mz<3> *)malloc((size_t)nrec * sizeof(mz<3>));
     j1 = (mz<3> *)malloc((size_t)nrec * sizeof(mz<3>));
     i0 = (uint32_t *)malloc((size_t)nrec * 4);
     i1 = (uint32_t *)malloc((size_t)nrec * 4);
@@ -1501,10 +1539,10 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
                 char *c2 = c1 ? strchr(c1 + 1, ':') : NULL;
                 char *c3 = c2 ? strchr(c2 + 1, ':') : NULL;
                 char *c4 = c3 ? strchr(c3 + 1, ':') : NULL;
-                mz<2> v0; mz<3> v1; int ns0 = 0, ns1 = 0;
+                mz<3> v0, v1; int ns0 = 0, ns1 = 0;
                 if (!c1 || !c2 || !c3 || !c4) { fprintf(stderr, "cofac: line %u malformed\n", r); return -1; }
                 *c1 = 0; *c2 = 0; *c3 = 0; *c4 = 0;
-                if (!cf_from_dec<2>(&v0, p, &ns0) || !cf_from_dec<3>(&v1, c1 + 1, &ns1)) {
+                if (!cf_from_dec<3>(&v0, p, &ns0) || !cf_from_dec<3>(&v1, c1 + 1, &ns1)) {
                     fprintf(stderr, "cofac: line %u cofactor does not fit\n", r); return -1;
                 }
                 rest[r].ab = c2 + 1; rest[r].f0 = c3 + 1; rest[r].f1 = c4 + 1;
@@ -1537,8 +1575,8 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
     }
     sched.method = ecm; sched.rounds = rounds; sched.budget = budget;
     sched.curves = ecm_curves; sched.d_s = d_s; sched.ns = ns;
-    if (cf_run_side<2>(j0, n0, lim0, lpb0, st0, fac0, nf0,
-                       blocks, threads, 1, &ms0, &sched)) return -1;
+    if (cf_run_side<3>(j0, n0, lim0, lpb0, st0, fac0, nf0,
+                       blocks, threads, 1, &ms0, &sched, "rational")) return -1;
     for (uint32_t k = 0; k < n0; k++) {
         if (st0[k] == CF_OK) continue;
         side0ok[i0[k]] = 0;
@@ -1560,7 +1598,7 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
     st1 = (uint8_t *)malloc(n1 ? n1 : 1); nf1 = (uint8_t *)calloc(n1 ? n1 : 1, 1);
     fac1 = (uint32_t *)malloc((size_t)(n1 ? n1 : 1) * CF_MAXFAC * 4);
     if (cf_run_side<3>(j1, n1, lim1, lpb1, st1, fac1, nf1,
-                       blocks, threads, 1, &ms1, &sched)) return -1;
+                       blocks, threads, 1, &ms1, &sched, "algebraic")) return -1;
     for (uint32_t k = 0; k < n1; k++) {
         if (st1[k] == CF_DEAD) dead1++;
         else if (st1[k] == CF_INCOMPLETE) stuck1++;
@@ -1632,8 +1670,8 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
 
     printf("\n  --- cofactorisation ---\n");
     printf("  %-34s %8u\n", "candidate records", nrec);
-    printf("  %-34s %8.1f ms\n", "rational queue (2 limbs)", ms0);
-    printf("  %-34s %8.1f ms\n", "algebraic queue (3 limbs)", ms1);
+    printf("  %-34s %8.1f ms\n", "rational queue", ms0);
+    printf("  %-34s %8.1f ms\n", "algebraic queue", ms1);
     printf("  %-34s %8.1f ms\n", "host parse", thost);
     printf("  %-34s %8u   (%.2f%% of candidates)\n", "RELATIONS", nrel,
            100.0 * nrel / nrec);

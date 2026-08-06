@@ -65,8 +65,13 @@ void fb_free(fb_t *fb);
 extern int norm_verbose;
 
 double las_scale(double maxlog2);
+/* CADO's rule. Used only when --lambda0/--lambda1 asks for it explicitly. */
 double las_allowance(double maxlog2, double scale, double lambda,
                      unsigned lpb, unsigned mfb);
+/* OUR rule, and the default: mfb plus the slack our own approximation needs.
+ * Neither GGNFS's lambda nor CADO's transfers to this tool's survivor gate --
+ * see the comment on the definition for the measurements. */
+double sieve_allowance(double maxlog2, double scale, unsigned mfb);
 /* Restrict to bkthresh <= p < fb_bound, compacting in place. GGNFS truncates
  * the algebraic FB at the special-q; pass fb_bound = q to match it. */
 void fb_restrict(fb_t *fb, uint32_t bkthresh, uint32_t fb_bound);
@@ -115,6 +120,11 @@ typedef struct {
  * what the GGNFS test-sieve's own "Suggested rlambda: mfbr / log2(rlim)"
  * confirms. Returns 0 when either input is absent. */
 double job_allowance_bits(double lambda, uint32_t lim);
+
+/* 1 if f has a root mod 2 (affine or projective), so 2 can divide the
+ * algebraic norm and a factor base without p = 2 is truncated. 0 if it cannot,
+ * in which case the absence of p = 2 is correct and not a missing --cadofb. */
+int poly_has_root_mod2(const poly_t *P);
 
 /* Build the rational factor base: G(x) = Y1*x + Y0 has one root per prime,
  * r = -Y0/Y1 mod p, with p | Y1 encoded as r == p. Nothing on disk holds this
@@ -211,9 +221,18 @@ typedef struct {
     int      resieve_sweep; /* sweep resieve unroll depth and summary granularity */
     /* ---- both-sides pipeline: side 1 uses scale/allowance/lpb/mfb/lim ---- */
     int      pipeline;      /* run both sides in one process                    */
+    /* Which side carries the special-q. 1 (algebraic) for a GNFS job, which is
+     * every job this was built against; 0 (rational) for an SNFS job whose
+     * rational side is the hard one -- there the algebraic coefficients are
+     * tiny and the rational norms carry the difficulty, so the q belongs on
+     * the rational side and mfbr is the one asking for 3LP.
+     *
+     * This is NOT the same thing as `side` above, which selects which single
+     * side the benchmark harness measures. The pipeline runs both. */
+    int      sq_side;       /* side carrying the special-q  [1 = algebraic]     */
     int      verbose_q;     /* print a line per special-q rather than a summary */
     const char *qlist;      /* file of `q rho` pairs; one special-q per line     */
-    uint64_t qmin, qmax;    /* --qrange: take the band from the algebraic FB     */
+    uint64_t qmin, qmax;    /* --qrange: band from the SPECIAL-Q SIDE's FB      */
     int      cofactor;      /* split the cofactors inline, cross-q queue        */
     int      cof_rounds;    /* rho requeue rounds                               */
     uint32_t cof_budget;    /* rho iterations in the first round                */

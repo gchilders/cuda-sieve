@@ -35,9 +35,13 @@ static void usage(void)
 "                   --relations then holds every relation, not just TD's\n"
 "\n"
 "BAND SELECTION\n"
-"  --qrange MIN:MAX every (q, rho) in that range, taken from the algebraic\n"
-"                   factor base -- no root-finding and no q-list file needed.\n"
-"                   MIN: alone runs up to the factor-base bound\n"
+"  --qrange MIN:MAX every (q, rho) in that range, taken from the special-q\n"
+"                   side's factor base -- no root-finding, no q-list file.\n"
+"                   MIN: alone runs up to that side's bound\n"
+"  --sq-side S      which side carries the special-q: 1 = algebraic (GNFS,\n"
+"                   the default), 0 = rational. An SNFS job whose algebraic\n"
+"                   coefficients are tiny puts the difficulty on the rational\n"
+"                   side, and the q and the 3LP mfb go there with it\n"
 "  --qlist FILE     band of special-q: `q rho` per line (# comments ok)\n"
 "  --q N / --rho N  a single special-q          [120000011]  (las -v prints rho)\n"
 "  --nq N           stop after N special-q from the list\n"
@@ -51,11 +55,14 @@ static void usage(void)
 "  --rlim N / --alim N  factor base bounds, side 0 / side 1\n"
 "  --lpb N / --lpb0 N   large-prime bound in bits  [32 side 1, 31 side 0]\n"
 "  --mfb N / --mfb0 N   max cofactor bits          [92 side 1, 60 side 0]\n"
-"  --allowance B / --allowance0 B   survivor cofactor BITS. The unit both\n"
-"                   lambda conventions are really expressing; prefer it\n"
-"  --lambda0/1 L    survivor lambda in CADO units, i.e. multiples of lpb\n"
-"                   [0 = CADO's automatic 0.3 + mfb/lpb]. A .job file's\n"
-"                   lambda is in units of log2(lim) instead and is converted\n"
+"  --allowance B / --allowance0 B   survivor cofactor BITS, overriding the\n"
+"                   derived default. The default is mfb + the slack our own\n"
+"                   byte-quantised survivor test needs (~1.5 bits), NOT the\n"
+"                   .job file's lambda -- that is calibrated to GGNFS's gate\n"
+"                   and does not transfer. It is reported, not applied\n"
+"  --lambda0/1 L    opt back into CADO's rule: lambda in CADO units, i.e.\n"
+"                   multiples of lpb [0 = CADO's automatic 0.3 + mfb/lpb].\n"
+"                   Looser than the derived default on every job measured\n"
 "  --scale S / --scale0 S   las byte scale per side\n"
 "  --fbbound N      truncate FB at this p      [alim]  (GGNFS truncates at q)\n"
 "  --bkthresh N     bucket-sieve p >= this     [1<<logI]\n"
@@ -86,7 +93,7 @@ static void usage(void)
 "  --threads N      threads per block          [256]\n"
 "  --blocks N       0 = auto (6 per SM)        [0]\n"
 "  --blocking-sync  yield the CPU while waiting on the GPU instead of spinning.\n"
-"                   CUDA busy-waits by default, so a host thread that is 90%\n"
+"                   CUDA busy-waits by default, so a host thread that is 90%%\n"
 "                   idle still pegs a core; this frees it, at the cost of a\n"
 "                   wakeup latency per synchronisation\n"
 "\n"
@@ -115,6 +122,104 @@ static void usage(void)
 "  --resieve-sweep  sweep the resieve unroll depth and summary granularity\n"
 "  --dump PATH      write the sieve region in las byte convention\n"
 "  --probe i,j      read back that cell after apply (gate 5)\n");
+}
+
+/* Cofactoriser bounds. The representation is narrow ON PURPOSE -- split
+ * factors are emitted as a single uint32 limb and both cofactors are mz<3> --
+ * so a bound outside that design does not degrade, it silently truncates: a
+ * 33-bit factor is stored as its low 32 bits and the relation stops
+ * reconstructing its own norm. Refuse.
+ *
+ * This MUST run after the .job file has been read. It used to sit inline in
+ * main() ahead of poly_load, so it only ever saw command-line values -- and
+ * since --lpb/--mfb are already range-checked by the parser, the interesting
+ * cases (mfba 120 from a job file, or a 4LP mfb/lpb ratio) were exactly the
+ * ones it could not see. The RUNBOOK's own SNFS recipe takes mfbr and lpbr
+ * from the file. */
+static int check_cofactor_bounds(const bench_cfg_t *cfg, uint32_t alim,
+                                 uint32_t rlim, int cof_rounds,
+                                 uint32_t cof_budget)
+{
+    const uint32_t lpb1 = cfg->lpb ? cfg->lpb : 32;
+    const uint32_t mfb1 = cfg->mfb ? cfg->mfb : 92;
+    int bad = 0;
+    if (lpb1 > 32 || cfg->lpb0 > 32) {
+        fprintf(stderr, "lpb %u / side-0 %u: split factors are emitted as one"
+                " 32-bit limb, so lpb > 32 truncates them\n", lpb1, cfg->lpb0);
+        bad = 1;
+    }
+    if (mfb1 > 96) {
+        fprintf(stderr, "side-1 mfb %u: the cofactor is 3 limbs, so a residual"
+                " above 96 bits loses its high limbs\n", mfb1);
+        bad = 1;
+    }
+    if (cfg->mfb0 > 96) {
+        fprintf(stderr, "side-0 mfb %u: the cofactor is 3 limbs, so a residual"
+                " above 96 bits loses its high limbs\n", cfg->mfb0);
+        bad = 1;
+    }
+    /* ceil(mfb/lpb) parts must fit in CF_MAXFAC. 3LP is what an SNFS job with
+     * mfbr 88 / lpbr 31 asks for and is supported; 4LP is not, and it would
+     * present as CF_OVERFLOW on the records that need it -- a partial yield
+     * loss, not a failure -- so it is refused up front. */
+    {
+        const uint32_t p1 = (mfb1 + lpb1 - 1) / lpb1;
+        const uint32_t p0 = (cfg->mfb0 + cfg->lpb0 - 1) / cfg->lpb0;
+        if (p1 > 3 || p0 > 3) {
+            fprintf(stderr, "mfb/lpb asks for %u parts on side 1 and %u on"
+                    " side 0; the splitter handles at most 3\n", p1, p0);
+            bad = 1;
+        }
+    }
+    /* "prime by size" in mz_split rests on lim^2 > 2^lpb: below that a
+     * composite could sit under lim^2 and be emitted as a prime. */
+    {
+        const uint64_t l1 = cfg->lim ? cfg->lim : alim;
+        const uint64_t l0 = cfg->lim0 ? cfg->lim0 : rlim;
+        if ((double)l1 * l1 <= ldexp(1.0, (int)lpb1)) {
+            fprintf(stderr, "alim^2 (%.3g) <= 2^lpb: the prime-by-size test in"
+                    " mz_split is unsound\n", (double)l1 * l1);
+            bad = 1;
+        }
+        if ((double)l0 * l0 <= ldexp(1.0, (int)cfg->lpb0)) {
+            fprintf(stderr, "rlim^2 (%.3g) <= 2^lpb0: the prime-by-size test in"
+                    " mz_split is unsound\n", (double)l0 * l0);
+            bad = 1;
+        }
+    }
+    /* budget << r must not shift past the width, and a non-positive round
+     * count would run no splitting at all yet still exit successfully. */
+    if (cof_rounds < 1 || cof_rounds > 24) {
+        fprintf(stderr, "--cof-rounds %d: must be 1..24 (budget << r overflows"
+                " beyond that, and < 1 splits nothing)\n", cof_rounds);
+        bad = 1;
+    }
+    if (cfg->cof_rounds < 1 || cfg->cof_rounds > 24) {
+        fprintf(stderr, "pipeline cof-rounds %d: must be 1..24\n", cfg->cof_rounds);
+        bad = 1;
+    }
+    if (!cfg->cof_ecm) {
+        if (!cof_budget || (uint64_t)cof_budget << (cof_rounds - 1) > 0xFFFFFFFFull) {
+            fprintf(stderr, "--cof-budget %u with %d rounds overflows uint32"
+                    " (or is zero)\n", cof_budget, cof_rounds);
+            bad = 1;
+        }
+        if (!cfg->cof_budget ||
+            (uint64_t)cfg->cof_budget << (cfg->cof_rounds - 1) > 0xFFFFFFFFull) {
+            fprintf(stderr, "pipeline cof-budget %u with %d rounds overflows"
+                    " uint32 (or is zero)\n", cfg->cof_budget, cfg->cof_rounds);
+            bad = 1;
+        }
+    } else {
+        if (!cfg->ecm_curves) {
+            fprintf(stderr, "--ecm-curves 0 attempts no curves\n"); bad = 1;
+        }
+        if (cfg->ecm_b1 < 2 || cfg->ecm_b1 > 1000000u) {
+            fprintf(stderr, "--ecm-b1 %u: must be 2..1000000\n", cfg->ecm_b1);
+            bad = 1;
+        }
+    }
+    return bad;
 }
 
 int main(int argc, char **argv)
@@ -152,7 +257,7 @@ int main(int argc, char **argv)
      * survivor bound 128 on side 1 and 132 on side 0 (128 on both loses one of
      * las's 37 relations at the parity q), and the full algebraic factor base
      * to alim, since truncating at the special-q costs relations outright. */
-    cfg.pipeline = 0;
+    cfg.pipeline = 0; cfg.sq_side = 1;
     cfg.scale0 = 1.925; cfg.allowance0 = 68.1;
     cfg.lim0 = 0; cfg.lpb0 = 31; cfg.mfb0 = 60;
     cfg.relations = NULL; cfg.candidates = NULL;
@@ -173,6 +278,7 @@ int main(int argc, char **argv)
     int rlim_set = 0, alim_set = 0, lpb_set = 0, mfb_set = 0;
     int lpb0_set = 0, mfb0_set = 0, J_set = 0;
     double lambda0 = 0.0, lambda1 = 0.0;   /* 0 = CADO's automatic 0.3+mfb/lpb */
+    int lambda0_set = 0, lambda1_set = 0;  /* asked for CADO's rule at all?    */
     int cof_rounds = 6;
     uint32_t cof_budget = 4096;
 
@@ -222,6 +328,20 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--ab-resieve")) cfg.ab_resieve = 1;
         else if (!strcmp(argv[i], "--resieve-sweep")) cfg.resieve_sweep = 1;
         else if (!strcmp(argv[i], "--pipeline")) cfg.pipeline = 1;
+        /* strtol, not atoi: atoi("rational") is 0, which is a LEGAL value here,
+         * so a typo would silently configure the wrong side instead of being
+         * rejected. Every other numeric flag in this parser avoids atoi for
+         * the same reason. */
+        else if (!strcmp(argv[i], "--sq-side") && i + 1 < argc) {
+            char *end = NULL;
+            long v = strtol(argv[++i], &end, 10);
+            if (!end || *end || (v != 0 && v != 1)) {
+                fprintf(stderr, "--sq-side %s: want 1 (algebraic) or 0"
+                        " (rational)\n", argv[i]);
+                return 1;
+            }
+            cfg.sq_side = (int)v;
+        }
         else if (!strcmp(argv[i], "--cofac") && i + 1 < argc) cofac_in = argv[++i];
         else if (!strcmp(argv[i], "--cofactor")) cfg.cofactor = 1;
         else if (!strcmp(argv[i], "--cof-rounds") && i + 1 < argc) { cof_rounds = atoi(argv[++i]); cfg.cof_rounds = cof_rounds; }
@@ -236,7 +356,7 @@ int main(int argc, char **argv)
                             " ignored; drop it\n");
         else if (!strcmp(argv[i], "--blocking-sync")) blocking_sync = 1;
         else if (!strcmp(argv[i], "--lpb0") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 32) { fprintf(stderr, "--lpb0 %ld out of range 1..32\n", v); return 1; } cfg.lpb0 = (uint32_t)v; lpb0_set = 1; }
-        else if (!strcmp(argv[i], "--mfb0") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 64) { fprintf(stderr, "--mfb0 %ld out of range 1..64\n", v); return 1; } cfg.mfb0 = (uint32_t)v; mfb0_set = 1; }
+        else if (!strcmp(argv[i], "--mfb0") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 96) { fprintf(stderr, "--mfb0 %ld out of range 1..96\n", v); return 1; } cfg.mfb0 = (uint32_t)v; mfb0_set = 1; }
         /* Range-checked like --lpb0/--mfb0 above, and for the same reason. An
          * unchecked --lambda1 0.01 gives allowance 0.32, bound 1, and a band
          * that runs for hours and emits nothing with no diagnostic.
@@ -246,17 +366,22 @@ int main(int argc, char **argv)
          * refused is (0, 0.5), which no real lambda occupies -- CADO's
          * automatic lands near 2-3 -- and anything above 8. This is a guard
          * against a typo, not a tuning opinion, so the ends are loose. */
-        #define LAMBDA_ARG(flag, var)                                          \
+        /* `_set` is tracked separately from the value because 0 is a MEANINGFUL
+         * value here -- the documented sentinel for "use CADO's automatic" --
+         * so `var > 0.0` cannot stand in for "the user asked for CADO's rule".
+         * Testing the value instead routed --lambda1 0 to the derived default,
+         * silently giving mfb+1.5 where the script asked for 0.3+mfb/lpb. */
+        #define LAMBDA_ARG(flag, var, seen)                                    \
             else if (!strcmp(argv[i], flag) && i + 1 < argc) {                 \
-                var = atof(argv[++i]);                                         \
+                var = atof(argv[++i]); seen = 1;                               \
                 if (var < 0.0 || (var > 0.0 && var < 0.5) || var > 8.0) {      \
                     fprintf(stderr, "%s %g: want 0 (CADO's automatic) or"      \
                             " 0.5..8\n", flag, var);                           \
                     return 1;                                                  \
                 }                                                              \
             }
-        LAMBDA_ARG("--lambda0", lambda0)
-        LAMBDA_ARG("--lambda1", lambda1)
+        LAMBDA_ARG("--lambda0", lambda0, lambda0_set)
+        LAMBDA_ARG("--lambda1", lambda1, lambda1_set)
         #undef LAMBDA_ARG
         else if (!strcmp(argv[i], "--check-relations") && i + 1 < argc) check_rel = argv[++i];
         else if (!strcmp(argv[i], "--ecm-b1") && i + 1 < argc) cfg.ecm_b1 = (uint32_t)strtoul(argv[++i], 0, 10);
@@ -349,6 +474,22 @@ int main(int argc, char **argv)
         fprintf(stderr, "--J must be > 0, --reps >= 1, --threads in [32,1024]\n");
         return 1;
     }
+    /* Grid width is 6 resident blocks per SM, so it MUST come from the device.
+     * It was hardcoded 48*6 = 288 -- 48 being this box's 5070. On an 82-SM
+     * 3090 that is 3.5 blocks/SM, i.e. 58% of the occupancy every tuning
+     * decision in RESULTS.md assumed, which reads as the bigger card being
+     * slower. Resolve it once here; run_pipeline() and bench_kernels.cu both
+     * treat a nonzero cfg.blocks as final, so this reaches every launch. */
+    if (cfg.blocks == 0) {
+        cudaDeviceProp prop;
+        int dev = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess &&
+            cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
+            cfg.blocks = prop.multiProcessorCount * 6;
+            fprintf(stderr, "grid: %d SMs x 6 = %d blocks (%s)\n",
+                    prop.multiProcessorCount, cfg.blocks, prop.name);
+        }
+    }
     /* The small sieve's warp tier strides by nwarps = threads >> 5. Below 32
      * that is ZERO -- an infinite loop on the device. A non-multiple of 32
      * leaves a partial warp whose lanes re-run warp-tier entries, double-adding
@@ -399,82 +540,6 @@ int main(int argc, char **argv)
         }
     }
 
-    /* Cofactoriser bounds. The representation is narrow ON PURPOSE -- split
-     * factors are emitted as a single uint32 limb, the rational cofactor is
-     * mz<2> and the algebraic one mz<3> -- so a bound outside that design does
-     * not degrade, it silently truncates: a 33-bit factor is stored as its low
-     * 32 bits and the relation stops reconstructing its own norm. Refuse.
-     *
-     * These are also the values `atoi` would have turned into enormous
-     * unsigned bounds if given a negative number, which is why they are parsed
-     * into a signed long here and range-checked before the cast. */
-    {
-        const uint32_t lpb1 = cfg.lpb ? cfg.lpb : 32, mfb1 = cfg.mfb ? cfg.mfb : 92;
-        int bad = 0;
-        if (lpb1 > 32 || cfg.lpb0 > 32) {
-            fprintf(stderr, "--lpb %u / side-0 %u: split factors are emitted as one"
-                    " 32-bit limb, so lpb > 32 truncates them\n", lpb1, cfg.lpb0);
-            bad = 1;
-        }
-        if (mfb1 > 96) {
-            fprintf(stderr, "--mfb %u: the algebraic cofactor is 3 limbs, so a"
-                    " residual above 96 bits loses its high limbs\n", mfb1);
-            bad = 1;
-        }
-        if (cfg.mfb0 > 64) {
-            fprintf(stderr, "side-0 mfb %u: the rational cofactor is 2 limbs, so a"
-                    " residual above 64 bits loses its high limbs\n", cfg.mfb0);
-            bad = 1;
-        }
-        /* "prime by size" in mz_split rests on lim^2 > 2^lpb: below that a
-         * composite could sit under lim^2 and be emitted as a prime. */
-        {
-            const uint64_t l1 = cfg.lim ? cfg.lim : alim, l0 = cfg.lim0 ? cfg.lim0 : rlim;
-            if ((double)l1 * l1 <= ldexp(1.0, (int)lpb1)) {
-                fprintf(stderr, "alim^2 (%.3g) <= 2^lpb: the prime-by-size test in"
-                        " mz_split is unsound\n", (double)l1 * l1);
-                bad = 1;
-            }
-            if ((double)l0 * l0 <= ldexp(1.0, (int)cfg.lpb0)) {
-                fprintf(stderr, "rlim^2 (%.3g) <= 2^lpb0: the prime-by-size test in"
-                        " mz_split is unsound\n", (double)l0 * l0);
-                bad = 1;
-            }
-        }
-        /* budget << r must not shift past the width, and a non-positive round
-         * count would run no splitting at all yet still exit successfully. */
-        if (cof_rounds < 1 || cof_rounds > 24) {
-            fprintf(stderr, "--cof-rounds %d: must be 1..24 (budget << r overflows"
-                    " beyond that, and < 1 splits nothing)\n", cof_rounds);
-            bad = 1;
-        }
-        if (cfg.cof_rounds < 1 || cfg.cof_rounds > 24) {
-            fprintf(stderr, "pipeline cof-rounds %d: must be 1..24\n", cfg.cof_rounds);
-            bad = 1;
-        }
-        if (!cfg.cof_ecm) {
-            if (!cof_budget || (uint64_t)cof_budget << (cof_rounds - 1) > 0xFFFFFFFFull) {
-                fprintf(stderr, "--cof-budget %u with %d rounds overflows uint32"
-                        " (or is zero)\n", cof_budget, cof_rounds);
-                bad = 1;
-            }
-            if (!cfg.cof_budget ||
-                (uint64_t)cfg.cof_budget << (cfg.cof_rounds - 1) > 0xFFFFFFFFull) {
-                fprintf(stderr, "pipeline cof-budget %u with %d rounds overflows"
-                        " uint32 (or is zero)\n", cfg.cof_budget, cfg.cof_rounds);
-                bad = 1;
-            }
-        } else {
-            if (!cfg.ecm_curves) {
-                fprintf(stderr, "--ecm-curves 0 attempts no curves\n"); bad = 1;
-            }
-            if (cfg.ecm_b1 < 2 || cfg.ecm_b1 > 1000000u) {
-                fprintf(stderr, "--ecm-b1 %u: must be 2..1000000\n", cfg.ecm_b1);
-                bad = 1;
-            }
-        }
-        if (bad) return 1;
-    }
 
     /* Must precede any call that creates the CUDA context. */
     if (blocking_sync && cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync) != cudaSuccess) {
@@ -515,35 +580,39 @@ int main(int argc, char **argv)
         #undef JOB_TAKE
         if (used) printf("\n");
 
-        /* The lambdas are converted, not copied. A .job file's lambda is a
-         * multiple of log2(lim); CADO's is a multiple of lpb. Same symbol,
-         * different quantity -- for this c151 (alambda 2.5, alim 33.5M,
-         * lpba 30) the GGNFS reading is 62.5 bits and the CADO reading 75.0.
-         * The GGNFS one is TIGHTER, so mistaking one for the other loses
-         * relations with nothing failing, which is why the derivation is
-         * printed rather than just applied. */
-        if (!allowance_set && POLY.alambda > 0.0 && alim) {
-            cfg.allowance = job_allowance_bits(POLY.alambda, alim);
-            allowance_set = 1;
-            printf("  from job file:  alambda %.3g x log2(alim %u)"
-                   " = %.2f bits (side 1)\n", POLY.alambda, alim, cfg.allowance);
-        }
-        if (!allowance0_set && POLY.rlambda > 0.0 && rlim) {
-            cfg.allowance0 = job_allowance_bits(POLY.rlambda, rlim);
-            allowance0_set = 1;
-            printf("  from job file:  rlambda %.3g x log2(rlim %u)"
-                   " = %.2f bits (side 0)\n", POLY.rlambda, rlim, cfg.allowance0);
-        }
-        if ((POLY.alambda > 0.0 && lambda1 > 0.0) ||
-            (POLY.rlambda > 0.0 && lambda0 > 0.0))
-            fprintf(stderr, "note: --lambda0/--lambda1 are in CADO units"
-                            " (multiples of lpb) and override the job file's"
-                            " GGNFS-unit lambdas\n");
+        /* The .job file's lambdas are REPORTED, not applied.
+         *
+         * They are calibrated to GGNFS's survivor gate, and that calibration
+         * does not transfer: on the SNFS job, same q range, gnfs-lasieve4I14e
+         * loses 17.3% of its yield going from 91.8 to 87.5 bits where we lose
+         * 0.07% going to 88.0. Importing the number inherits another tool's
+         * tuning and, here, 13% of the trial-division input for one relation
+         * in ten thousand. CADO's automatic is no better a source -- on this
+         * job it is looser still (97.3 bits).
+         *
+         * So the default comes from sieve_allowance(), derived from our own
+         * quantisation. The file's value is printed anyway, because it is
+         * useful to see what the job's author intended and how far it sits
+         * from what we chose. --allowance / --allowance0 override; so do
+         * --lambda0 / --lambda1 if CADO's rule is wanted. */
+        if (POLY.alambda > 0.0 && alim)
+            printf("  job file: alambda %.3g -> %.2f bits (side 1), reported"
+                   " only; the allowance is derived below\n",
+                   POLY.alambda, job_allowance_bits(POLY.alambda, alim));
+        if (POLY.rlambda > 0.0 && rlim)
+            printf("  job file: rlambda %.3g -> %.2f bits (side 0), reported"
+                   " only; the allowance is derived below\n",
+                   POLY.rlambda, job_allowance_bits(POLY.rlambda, rlim));
     }
 
     /* CADO's convention, and the only value we have ever wanted. Deriving it
      * removes one more flag whose right answer is a function of another. */
     if (!J_set && cfg.logI > 1) cfg.J = 1u << (cfg.logI - 1);
+
+    /* HERE, not before poly_load: lpb/mfb/lim may all have come from the .job
+     * file just read, and validating only the command line was validating the
+     * half that the argument parser had already range-checked. */
+    if (check_cofactor_bounds(&cfg, alim, rlim, cof_rounds, cof_budget)) return 1;
 
     if (check_rel)
         return check_relations(check_rel, &POLY, cfg.lpb0,
@@ -567,7 +636,7 @@ int main(int argc, char **argv)
      * neither is the same defect either way. */
     if (!cfg.pipeline) {
         static const char *pipeline_only[] = {
-            "--target-rels", "--lambda0", "--lambda1", NULL
+            "--target-rels", "--lambda0", "--lambda1", "--sq-side", NULL
         };
         int nbad = 0;
         for (int i = 1; i < argc; i++)
@@ -610,10 +679,24 @@ int main(int argc, char **argv)
             fprintf(stderr, "  drop --pipeline to use them, or drop them.\n");
             return 2;
         }
-        /* The pipeline defaults to the full algebraic factor base. Truncating
-         * it at the special-q is a legitimate configuration (GGNFS does it)
-         * but it costs relations outright -- 30 of 1,851 cofactors at the
-         * parity q differ by exactly one prime in (q, alim]. */
+        /* The pipeline defaults to the FULL special-q-side factor base.
+         *
+         * This comment used to say that truncating at the special-q "costs
+         * relations outright -- 30 of 1,851 cofactors at the parity q differ
+         * by exactly one prime in (q, alim]". That measurement was right and
+         * the conclusion was wrong: those 30 are not lost, they are found
+         * again when the special-q reaches that larger prime. Counting what a
+         * single q loses, without asking whether a later q recovers it, is the
+         * error -- and GGNFS's FB_bound truncation is deliberate duplicate
+         * avoidance, not a limitation of its design.
+         *
+         * Measured on the SNFS job: 1.82 sq-side primes in range per relation
+         * and 72% re-found when that prime is later sieved as q, giving 1.34
+         * finds per unique relation -- ~25% of raw output is duplicates, and
+         * we pay full trial division and cofactorisation on every one.
+         * Calibrated against msieve's dedup of the c151: 10,594,292 duplicates
+         * in 67,165,877 relations, 15.8%, which back-solves to the same 0.73
+         * re-find probability. See task #26. */
         /* A placeholder scale for the THROWAWAY first parse of the factor
          * base, which exists only to supply the q list; the real scale is
          * derived below and the base is reparsed at it. Left at the c183's
@@ -626,10 +709,11 @@ int main(int argc, char **argv)
             return 2;
         }
         if (!cfg.qlist && !cfg.qmin && !rho) {
-            fprintf(stderr, "bench --pipeline: needs a real root of f mod q."
+            fprintf(stderr, "bench --pipeline: needs a real root of %s mod q."
                     " Pass --rho, or --qlist for a band.\n"
                     "  A synthetic root is fine for a sieve microbenchmark but"
-                    " not for a path that emits relations.\n");
+                    " not for a path that emits relations.\n",
+                    cfg.sq_side ? "f" : "G");
             return 2;
         }
         if (!fbbound_set) fbbound = alim;
@@ -674,41 +758,62 @@ int main(int argc, char **argv)
         fb_fill_logp(&fb1, cfg.scale);
         /* --qrange: every special-q in [qmin, qmax] with all of its roots.
          *
-         * No root-finding is needed and none is done. A special-q below alim
-         * is by definition an algebraic factor-base prime, and CADO's makefb
-         * output already lists every root of f mod it -- so the band is a
-         * WINDOW OF THE FACTOR BASE WE ARE ABOUT TO UPLOAD ANYWAY. Read here,
-         * before fb_restrict compacts fb1 in place.
+         * No root-finding is needed and none is done. A special-q below the sq
+         * side's lim is by definition one of that side's factor-base primes,
+         * and the base already lists every root -- so the band is a WINDOW OF
+         * A FACTOR BASE WE ARE BUILDING ANYWAY. Read before fb_restrict
+         * compacts in place.
+         *
+         * On side 1 that base is CADO's makefb output, already loaded. On side
+         * 0 it is rfb_build's, which is not built until after the scale is
+         * derived -- and the derivation needs ql[0] to make its lattice. So
+         * for a rational-side q the base is built HERE at the placeholder
+         * scale, walked, and freed; the real one is built later at the derived
+         * scale. That is the same throwaway-then-reparse the algebraic side
+         * already does, and for the same reason.
          *
          * Proper prime powers are skipped (a special-q is prime) and so are
          * projective roots, encoded as root >= p: those are roots at infinity,
          * which do not give a q-lattice. */
-        if (cfg.qmin && !cfg.qmax) cfg.qmax = alim ? alim - 1 : 0;
-        if (cfg.qmin) {
-            if (cfg.qmax >= fbbound)
-                printf("note: --qrange runs past the factor-base bound %u;"
-                       " q above it have no entry to read a root from\n", fbbound);
-            for (uint32_t i = 0; i < fb1.n; i++) {
-                uint32_t pp = fb1.primes[i];
-                if (pp < cfg.qmin) continue;
-                if (pp > cfg.qmax) break;
-                if (FB_ISPOW(&fb1, i) || fb1.roots[i] >= pp) continue;
-                if (nq == capq) {
-                    capq = capq ? capq * 2 : 1024;
-                    ql = (qsel_t *)realloc(ql, (size_t)capq * sizeof(qsel_t));
-                    if (!ql) return 1;
+        {
+            const uint32_t sqlim = cfg.sq_side ? alim : rlim;
+            fb_t fbq; int fbq_temp = 0;
+            if (cfg.qmin && !cfg.qmax) cfg.qmax = sqlim ? sqlim - 1 : 0;
+            if (cfg.qmin) {
+                if (cfg.sq_side) {
+                    fbq = fb1;                    /* borrowed, do not free */
+                } else {
+                    if (rfb_build(&POLY, rlim, maxbits, cfg.scale0, &fbq) != 0) return 1;
+                    fbq_temp = 1;
                 }
-                ql[nq].q = pp; ql[nq].rho = fb1.roots[i]; nq++;
-                if (cfg.nq_max && nq >= cfg.nq_max) break;
+                if (cfg.qmax >= sqlim)
+                    printf("note: --qrange runs past the special-q side's bound"
+                           " %u; q above it have no entry to read a root from\n",
+                           sqlim);
+                for (uint32_t i = 0; i < fbq.n; i++) {
+                    uint32_t pp = fbq.primes[i];
+                    if (pp < cfg.qmin) continue;
+                    if (pp > cfg.qmax) break;
+                    if (FB_ISPOW(&fbq, i) || fbq.roots[i] >= pp) continue;
+                    if (nq == capq) {
+                        capq = capq ? capq * 2 : 1024;
+                        ql = (qsel_t *)realloc(ql, (size_t)capq * sizeof(qsel_t));
+                        if (!ql) { if (fbq_temp) fb_free(&fbq); return 1; }
+                    }
+                    ql[nq].q = pp; ql[nq].rho = fbq.roots[i]; nq++;
+                    if (cfg.nq_max && nq >= cfg.nq_max) break;
+                }
+                if (fbq_temp) fb_free(&fbq);
+                if (!nq) {
+                    fprintf(stderr, "bench: no special-q in [%llu, %llu]\n",
+                            (unsigned long long)cfg.qmin, (unsigned long long)cfg.qmax);
+                    return 1;
+                }
+                printf("band: %u special-q (q, rho) from the %s factor base"
+                       " in [%llu, %llu]\n", nq,
+                       cfg.sq_side ? "algebraic" : "rational",
+                       (unsigned long long)cfg.qmin, (unsigned long long)cfg.qmax);
             }
-            if (!nq) {
-                fprintf(stderr, "bench: no special-q in [%llu, %llu]\n",
-                        (unsigned long long)cfg.qmin, (unsigned long long)cfg.qmax);
-                return 1;
-            }
-            printf("band: %u special-q (q, rho) from the algebraic factor base"
-                   " in [%llu, %llu]\n", nq,
-                   (unsigned long long)cfg.qmin, (unsigned long long)cfg.qmax);
         }
         /* Derive the byte scale and survivor allowance from the polynomial,
          * as las does. This is UNCONDITIONAL. It used to sit behind
@@ -736,8 +841,13 @@ int main(int argc, char **argv)
             P0.deg = 1; P0.c[0] = P0.y0; P0.c[1] = P0.y1;
             for (int z = 2; z < 8; z++) P0.c[z] = 0.0;
             qlat_build(&L0, q0, rh0, POLY.skew);
-            norm_setup(&N1, &POLY, &L0, cfg.logI, cfg.J, 1.0, 1);
-            norm_setup(&N0, &P0,   &L0, cfg.logI, cfg.J, 1.0, 0);
+            /* Only the sq side's norm carries a factor of q to divide out.
+             * Passing is_sqside=1 for side 1 unconditionally made side 0's
+             * maxnorm ~log2(q) too large and side 1's too small whenever the q
+             * lives on the rational side -- a ~25-bit error in both scales, in
+             * opposite directions. */
+            norm_setup(&N1, &POLY, &L0, cfg.logI, cfg.J, 1.0, cfg.sq_side == 1);
+            norm_setup(&N0, &P0,   &L0, cfg.logI, cfg.J, 1.0, cfg.sq_side == 0);
             m1 = (double)(N1.log2M - N1.bias);
             m0 = (double)(N0.log2M - N0.bias);
             /* An explicit --scale / --allowance is a deliberate override: it
@@ -778,13 +888,19 @@ int main(int argc, char **argv)
                     }
                 }
             }
+            /* Default: our own rule, mfb + the slack our approximation needs.
+             * --lambda0/--lambda1 opt back into CADO's rule for anyone who
+             * wants it; an explicit --allowance overrides both. */
             if (!allowance_set)
-                cfg.allowance  = las_allowance(m1, cfg.scale, lambda1,
-                                               cfg.lpb ? cfg.lpb : 32,
-                                               cfg.mfb ? cfg.mfb : 92);
+                cfg.allowance  = lambda1_set
+                    ? las_allowance(m1, cfg.scale, lambda1,
+                                    cfg.lpb ? cfg.lpb : 32,
+                                    cfg.mfb ? cfg.mfb : 92)
+                    : sieve_allowance(m1, cfg.scale, cfg.mfb ? cfg.mfb : 92);
             if (!allowance0_set)
-                cfg.allowance0 = las_allowance(m0, cfg.scale0, lambda0,
-                                               cfg.lpb0, cfg.mfb0);
+                cfg.allowance0 = lambda0_set
+                    ? las_allowance(m0, cfg.scale0, lambda0, cfg.lpb0, cfg.mfb0)
+                    : sieve_allowance(m0, cfg.scale0, cfg.mfb0);
             /* uint32_t, matching pipe_side_init. The (unsigned char) this used
              * to print through wrapped any bound above 255 -- legal against a
              * 16-bit cell with CINIT 4096 -- so the banner disagreed with the
@@ -796,6 +912,59 @@ int main(int argc, char **argv)
             printf("                    side 0 log2(maxnorm)=%.2f scale=%.3f"
                    " allowance=%.2f bound=%u\n", m0, cfg.scale0, cfg.allowance0,
                    (uint32_t)(cfg.allowance0 * cfg.scale0 + 1.0));
+            /* An allowance far above mfb admits survivors that classify will
+             * then reject: the sieve keeps a position whose cofactor is bigger
+             * than the cofactoriser is willing to touch, and the whole resieve
+             * and trial division for it is thrown away.
+             *
+             * SOME slack is right -- the survivor test is a byte-quantised log
+             * approximation, so a bound at exactly mfb loses relations to
+             * rounding. One byte unit is 1/scale bits, and ~1 bit of slack is
+             * what that buys. Beyond that it is pure waste. Measured on the
+             * SNFS job (rlambda 3.4 -> 91.80 against mfbr 88):
+             *
+             *     91.80  120,317 survivors/q   10,313 relations
+             *     89.00   99,808 survivors/q   10,312   (-0.01%)
+             *     88.00   90,782 survivors/q   10,306   (-0.07%)
+             *     85.00   74,849 survivors/q    9,668   (-6.25%)
+             *
+             * so 17% of the trial-division input was buying one relation in
+             * ten thousand. Warned rather than clamped: it is the job file's
+             * stated parameter and silently overriding it would make a run
+             * something other than what was asked for. */
+            {
+                const double sl1 = cfg.allowance  - (double)(cfg.mfb ? cfg.mfb : 92);
+                const double sl0 = cfg.allowance0 - (double)cfg.mfb0;
+                /* Compared against what the derivation WOULD have produced,
+                 * not against a fixed number of bits over mfb. A fixed 2.0
+                 * threshold fired on the derived default itself whenever
+                 * scale < 1 -- which happens for any maxnorm above 254 bits,
+                 * since slack is 2/scale -- telling the operator to "drop the
+                 * override" and use the very value already in force.
+                 *
+                 * Per side, too: one overridden side used to print and
+                 * "correct" both, naming a side-0 override that was never
+                 * passed. */
+                const double d1 = sieve_allowance(m1, cfg.scale,
+                                                  cfg.mfb ? cfg.mfb : 92);
+                const double d0 = sieve_allowance(m0, cfg.scale0, cfg.mfb0);
+                if (cfg.allowance > d1 + 0.01)
+                    fprintf(stderr,
+                        "note: side 1 allowance %.2f is %.2f bits looser than"
+                        " the derived %.2f; the surplus\n"
+                        "      admits survivors the cofactoriser then rejects"
+                        " (mfb %u).\n",
+                        cfg.allowance, cfg.allowance - d1, d1,
+                        cfg.mfb ? cfg.mfb : 92);
+                if (cfg.allowance0 > d0 + 0.01)
+                    fprintf(stderr,
+                        "note: side 0 allowance %.2f is %.2f bits looser than"
+                        " the derived %.2f; the surplus\n"
+                        "      admits survivors the cofactoriser then rejects"
+                        " (mfb %u).\n",
+                        cfg.allowance0, cfg.allowance0 - d0, d0, cfg.mfb0);
+                (void)sl1; (void)sl0;
+            }
             fb_free(&fb1);
             if (cfg.cadofb) { if (fb_load_cado(cfg.cadofb, cfg.scale, &fb1) != 0) return 1; }
             else if (fb_load(fbpath, &fb1) != 0) return 1;
@@ -812,7 +981,37 @@ int main(int argc, char **argv)
         {
             uint32_t i, n2 = 0;
             for (i = 0; i < fbs1.n; i++) if (fbs1.primes[i] == 2) n2++;
-            if (!n2) {
+            /* Absent p = 2 is only a defect if f actually HAS a root mod 2.
+             * When it does not -- true of the SNFS polynomial x^5+x^4-4x^3-
+             * 3x^2+3x+1, whose f(0), f(1) and leading coefficient are all odd
+             * -- the algebraic norm is always odd, makefb is right to emit no
+             * entry, and refusing the run rejects a perfectly good job. This
+             * guard used to test only for the entry's presence and did exactly
+             * that on the first SNFS job it saw. */
+            /* The p = 2 test was, in practice, what forced --cadofb: a GGNFS
+             * .afb.0 has neither p = 2 nor prime powers, and the missing 2 was
+             * the symptom that got caught. Exempting polynomials with no root
+             * mod 2 removed that gate for exactly the SNFS jobs -- which still
+             * need the prime powers, and would otherwise run to completion
+             * with every algebraic norm under-divided by p^(k-1), exiting 0
+             * having quietly lost yield.
+             *
+             * So the requirement is stated directly rather than inferred from
+             * a symptom. */
+            if (!cfg.cadofb && (cfg.relations || cfg.candidates || cfg.cofactor)) {
+                fprintf(stderr,
+                    "ERROR: relation-producing runs need --cadofb <makefb output>.\n"
+                    "         The GGNFS .afb.0 format carries neither p = 2 nor"
+                    " prime powers, so\n"
+                    "         algebraic norms are under-divided and the yield is"
+                    " silently short.\n");
+                return 1;
+            }
+            if (!n2 && !poly_has_root_mod2(&POLY)) {
+                printf("note: f has no root mod 2, so the algebraic norm is"
+                       " always odd and the factor base correctly has no"
+                       " p = 2 entry\n");
+            } else if (!n2) {
                 const int producing = cfg.relations || cfg.candidates || cfg.cofactor;
                 fprintf(stderr,
                         "%s: the algebraic factor base has no entry for p = 2"

@@ -19,10 +19,11 @@ bench/dumpcmp
 bench/mkcofbatch
 *.d
 
-# Per-job working directories: poly, factor base, relations, msieve state.
-# Reproducible from the RUNBOOK recipe, and the relation file alone is several
-# GB. Trailing slash so the directory itself is ignored, not just its contents.
-/c*run/
+# All per-job working state lives under work/: poly, factor base, relations,
+# msieve output. Reproducible from the RUNBOOK recipe, and a single relation
+# file runs to several GB. One rule rather than a pattern per job name, so a
+# new job directory cannot be committed by being named something unexpected.
+/work/
 
 # Root-finder scratch. Named NAME.tmp.PID and renamed on success, so a stray
 # one is the residue of an interrupted makefb-side run, never an input.

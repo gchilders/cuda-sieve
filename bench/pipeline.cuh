@@ -48,10 +48,15 @@ static void pside_free(pside_t *S)
     memset(S, 0, sizeof(*S));
 }
 
-/* Is rho really a root of f mod q? The pipeline subtracts log2(q) from the
- * algebraic norm and divides q out of every one, so a wrong root does not
- * degrade the output, it invalidates it. Cheap to check and it also catches a
- * malformed q-list. */
+/* Is rho really a root of the special-q side's polynomial mod q? The pipeline
+ * subtracts log2(q) from that side's norm and divides q out of every one, so a
+ * wrong root does not degrade the output, it invalidates it. Cheap to check and
+ * it also catches a malformed q-list.
+ *
+ * `P` must be the SQ SIDE's polynomial -- f for a q on side 1, G = Y1*x + Y0
+ * for one on side 0. Checking against the wrong side would pass every root of
+ * the wrong form and reject every root of the right one, so the caller builds
+ * the degree-1 variant when the q lives on the rational side. */
 static int pipe_check_root(const poly_t *P, uint64_t q, uint64_t rho)
 {
     uint64_t acc = 0;
@@ -195,7 +200,7 @@ static int pipe_side_perq(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
             P.deg = 1; P.c[0] = P.y0; P.c[1] = P.y1;
             for (int z = 2; z < 8; z++) P.c[z] = 0.0;
         }
-        norm_setup(&S->N, &P, L, cfg->logI, cfg->J, scale, side == 1);
+        norm_setup(&S->N, &P, L, cfg->logI, cfg->J, scale, side == cfg->sq_side);
     }
     S->CINIT = 4096u;
     S->BOUND = (uint32_t)(scale * allowance + 1.0);
@@ -642,7 +647,7 @@ static int pipe_td_perq(pipe_td_t *C, const fb_t *fb1, const fb_t *fbs1,
         cudaEventRecord(E[e + 1]);
         k_td<1, 0, 0><<<blocks, threads>>>(
             C->d_a, C->d_b, C->d_x, NULL, n, cfg->logI, C->d_poly[side],
-            side == 1 ? (uint32_t)L->q : 0u,
+            side == cfg->sq_side ? (uint32_t)L->q : 0u,
             C->d_plist[side], C->d_pcnt[side], PIPE_K,
             C->d_sm[side], C->nsm[side],
             C->d_cof[side], C->d_cofbits[side], C->d_flags, NULL, NULL, NULL, 0);
@@ -695,8 +700,18 @@ static int pipe_td_perq(pipe_td_t *C, const fb_t *fb1, const fb_t *fbs1,
     if (verify) {
         double v0 = host_ms();
         printf("\n  --- first-q validation (excluded from the band timing) ---\n");
-        if (pipe_td_verify(C, 1, n, cfg->logI, (uint32_t)L->q, cfg, blocks, threads) ||
-            pipe_td_verify(C, 0, n, cfg->logI, 0u, cfg, blocks, threads)) return -1;
+        /* The special-q goes to whichever side carries it, matching the k_td
+         * calls that produced d_cof[]. Hardcoding side 1 here survived
+         * --sq-side 0 in practice -- td_divide_out is a no-op when q does not
+         * divide, and the gate still passed 15,174 of 15,174 -- but the verify
+         * pass and the pass it is checking must be given the same q on the
+         * same side, or the agreement is luck rather than evidence. */
+        if (pipe_td_verify(C, 1, n, cfg->logI,
+                           cfg->sq_side == 1 ? (uint32_t)L->q : 0u,
+                           cfg, blocks, threads) ||
+            pipe_td_verify(C, 0, n, cfg->logI,
+                           cfg->sq_side == 0 ? (uint32_t)L->q : 0u,
+                           cfg, blocks, threads)) return -1;
         *t_verify = host_ms() - v0;
         printf("  --- validation took %.1f ms ---\n\n", *t_verify);
     }
@@ -710,7 +725,7 @@ static int pipe_td_perq(pipe_td_t *C, const fb_t *fb1, const fb_t *fbs1,
         const int side = si ? 0 : 1;
         k_td<1, 1, 1><<<blocks, threads>>>(
             C->d_a, C->d_b, C->d_x, C->d_sel, nacc, cfg->logI, C->d_poly[side],
-            side == 1 ? (uint32_t)L->q : 0u,
+            side == cfg->sq_side ? (uint32_t)L->q : 0u,
             C->d_plist[side], C->d_pcnt[side], PIPE_K,
             C->d_sm[side], C->nsm[side],
             C->d_ccof[side], C->d_cbits[side], C->d_flags, NULL,
@@ -872,6 +887,16 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     {
     const double t_band = host_ms();
     double t_report = t_band;
+    /* The polynomial the special-q is a root of. Built once: for a q on the
+     * rational side that is G = Y1*x + Y0, not f, and checking against f would
+     * reject every legitimate root. */
+    poly_t SQP = *POLY;
+    if (cfg->sq_side == 0) {
+        SQP.deg = 1;
+        memcpy(SQP.cs[0], POLY->y0s, sizeof SQP.cs[0]);
+        memcpy(SQP.cs[1], POLY->y1s, sizeof SQP.cs[1]);
+        for (int z = 2; z < 8; z++) SQP.cs[z][0] = 0;
+    }
     for (uint32_t qi = 0; qi < nq; qi++) {
         qlat_t Lq;
         float ts1 = 0, ts0 = 0, tis = 0;
@@ -888,10 +913,11 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
          * accumulate_stats being exact complements. */
         const int want_host = !cfg->cofactor || fc;
 
-        if (!pipe_check_root(POLY, qlist[qi].q, qlist[qi].rho)) {
-            fprintf(stderr, "  q=%llu: rho=%llu is not a root of f mod q\n",
+        if (!pipe_check_root(&SQP, qlist[qi].q, qlist[qi].rho)) {
+            fprintf(stderr, "  q=%llu: rho=%llu is not a root of %s mod q\n",
                     (unsigned long long)qlist[qi].q,
-                    (unsigned long long)qlist[qi].rho);
+                    (unsigned long long)qlist[qi].rho,
+                    cfg->sq_side ? "f" : "G");
             rc = -1; break;
         }
         qlat_build(&Lq, qlist[qi].q, qlist[qi].rho, POLY->skew);
@@ -1229,8 +1255,8 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         printf("  %-34s %8llu\n", "total candidates", (unsigned long long)acc_cand);
         if (cfg->cofactor) {
             printf("\n  --- cofactorisation, cross-q queue ---\n");
-            printf("  %-34s %8.2f ms\n", "rational queue (2 limbs)", Q.ms_rat / N);
-            printf("  %-34s %8.2f ms\n", "algebraic queue (3 limbs)", Q.ms_alg / N);
+            printf("  %-34s %8.2f ms\n", "rational queue", Q.ms_rat / N);
+            printf("  %-34s %8.2f ms\n", "algebraic queue", Q.ms_alg / N);
             printf("  %-34s %8.3f ms\n", "readback + emit of relations", Q.ms_host / N);
             printf("  %-34s %8.2f ms\n", "  = device time per q",
                    (Q.ms_rat + Q.ms_alg + Q.ms_host) / N);
