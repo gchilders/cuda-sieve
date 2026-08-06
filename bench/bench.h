@@ -46,6 +46,27 @@ int     fb_is_prime_power(uint32_t q);
 int     fb_is_proper_power(uint32_t q);   /* p^k, k >= 2 */
 int32_t fb_check_prime_powers(const fb_t *fb);
 void fb_free(fb_t *fb);
+
+/* CADO's byte scale and survivor allowance, derived rather than hardcoded.
+ * `maxlog2` is log2 of the largest norm over the sieve rectangle -- what
+ * norm_setup already computes as (log2M - bias). See las-norms.cpp:237.
+ *   scale = (255 - 1)/maxlog2, quantised to a multiple of 1/40
+ *   lambda = given, or CADO's automatic 0.3 + mfb/lpb
+ *   r     = min(maxlog2 - 1/scale, lambda*lpb)      <- our "allowance"
+ *   bound = (uint32_t)(r*scale + 1)
+ *
+ * Quantising the scale is what makes it stable across a band, which matters
+ * because the factor-base logs are baked at load time and CANNOT track a scale
+ * that moves. We derive the scale ONCE, from the first special-q of the band,
+ * and reuse it for every q after -- an assumption, not a checked invariant.
+ * Nothing re-derives it per q. See prototype.md. */
+/* 1 = norm_setup prints its per-q diagnostic; the band loop clears it after
+ * the first special-q. */
+extern int norm_verbose;
+
+double las_scale(double maxlog2);
+double las_allowance(double maxlog2, double scale, double lambda,
+                     unsigned lpb, unsigned mfb);
 /* Restrict to bkthresh <= p < fb_bound, compacting in place. GGNFS truncates
  * the algebraic FB at the special-q; pass fb_bound = q to match it. */
 void fb_restrict(fb_t *fb, uint32_t bkthresh, uint32_t fb_bound);
@@ -72,7 +93,28 @@ typedef struct {
                               /* the exact integer F(a,b), not its log. c0 is */
                               /* 147 bits on this job, so the double is only  */
                               /* good to 53 of them. See bigint.cuh.          */
+
+    /* Sieve parameters carried by a GGNFS .job file. Zero means ABSENT, which
+     * is the normal case for a CADO .poly -- the caller then falls back to a
+     * derived value or refuses. These were being parsed by the human and typed
+     * back in on the command line, eight flags transcribed from a file already
+     * open in this process.
+     *
+     * lambda is the one parameter that does NOT transfer between conventions:
+     * GGNFS's is a multiple of log2(lim), CADO's a multiple of lpb. These
+     * fields hold the GGNFS reading, because that is what a .job file means by
+     * them; job_allowance_bits() below does the conversion. Getting it
+     * backwards TIGHTENS the bound and silently costs relations. */
+    uint32_t rlim, alim;        /* factor-base bounds,  side 0 / side 1       */
+    uint32_t lpbr, lpba;        /* large-prime bounds,  bits                  */
+    uint32_t mfbr, mfba;        /* max cofactor bits                          */
+    double   rlambda, alambda;  /* GGNFS units: multiples of log2(lim)        */
 } poly_t;
+
+/* GGNFS lambda -> bits of tolerated cofactor. `lambda * log2(lim)`, which is
+ * what the GGNFS test-sieve's own "Suggested rlambda: mfbr / log2(rlim)"
+ * confirms. Returns 0 when either input is absent. */
+double job_allowance_bits(double lambda, uint32_t lim);
 
 /* Build the rational factor base: G(x) = Y1*x + Y0 has one root per prime,
  * r = -Y0/Y1 mod p, with p | Y1 encoded as r == p. Nothing on disk holds this
@@ -175,6 +217,7 @@ typedef struct {
     int      cofactor;      /* split the cofactors inline, cross-q queue        */
     int      cof_rounds;    /* rho requeue rounds                               */
     uint32_t cof_budget;    /* rho iterations in the first round                */
+    uint64_t target_rels;   /* stop the band once this many relations exist     */
     int      cof_ecm;       /* use ECM stage 1 instead of rho                   */
     uint32_t ecm_b1;        /* ECM stage-1 bound                                */
     uint32_t ecm_curves;    /* ECM curves attempted per round                   */

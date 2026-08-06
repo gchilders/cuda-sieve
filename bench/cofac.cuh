@@ -657,16 +657,18 @@ CF_FN int mz_split(const mz<L> *n0, const mz<L> *lim2, uint32_t lpb,
  * not yet worth its own code. That is a measurement to revisit, not a
  * principle.
  */
-/* SELECT runs the launch over a compacted index list instead of every slot.
+/* The launch always runs over a COMPACTED index list rather than every slot.
  * It matters more than a fall-through normally would: a lane that is already
  * resolved costs nothing itself, but its warp still runs for as long as its
  * slowest LIVE lane, so a warp holding one live lane and 31 dead ones pays a
  * full rho budget for one job. Packing the live lanes together is what turns
- * that back into 32 jobs per budget. `njp` is read on the device so the grid
- * never has to be sized from a host-visible count. */
-template <int L, int SELECT, int METHOD>
+ * that back into 32 jobs per budget -- measured at 1.32x on the stage.
+ *
+ * `njp` is read on the device so the grid never has to be sized from a
+ * host-visible count, which keeps the round loop free of synchronisation. */
+template <int L, int METHOD>
 __global__ void k_cofac(const mz<L> *__restrict n, mz<L> lim2, uint32_t lpb,
-                        uint32_t c0, uint32_t budget, uint32_t nj,
+                        uint32_t c0, uint32_t budget,
                         const uint32_t *__restrict sel,
                         const uint32_t *__restrict njp,
                         uint8_t *__restrict status,
@@ -674,10 +676,10 @@ __global__ void k_cofac(const mz<L> *__restrict n, mz<L> lim2, uint32_t lpb,
                         unsigned long long *__restrict iters,
                         const uint32_t *__restrict s, uint32_t ns)
 {
-    const uint32_t cnt = SELECT ? *njp : nj;
+    const uint32_t cnt = *njp;
     const uint32_t stride = gridDim.x * blockDim.x;
     for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < cnt; i += stride) {
-        const uint32_t t = SELECT ? sel[i] : i;
+        const uint32_t t = sel[i];
         uint32_t o[CF_MAXFAC];
         uint64_t acc = 0;
         int k = 0, st;
@@ -694,6 +696,95 @@ __global__ void k_cofac(const mz<L> *__restrict n, mz<L> lim2, uint32_t lpb,
     }
 }
 
+
+
+
+/* Flag the jobs a round still has to run, and pack their indices. Rebuilt
+ * before every round, so round r+1 sees only what round r left unresolved --
+ * which on the algebraic side is where the requeue cost actually lives. */
+__global__ void k_cof_selflags(uint32_t n, const uint8_t *__restrict st,
+                               uint32_t *__restrict flag)
+{
+    const uint32_t stride = gridDim.x * blockDim.x;
+    for (uint32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < n; t += stride)
+        flag[t] = (st[t] == CF_INCOMPLETE) ? 1u : 0u;
+}
+
+__global__ void k_cof_selscatter(uint32_t n, const uint32_t *__restrict flag,
+                                 const uint32_t *__restrict off,
+                                 uint32_t *__restrict sel, uint32_t *__restrict nsel)
+{
+    const uint32_t stride = gridDim.x * blockDim.x;
+    for (uint32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < n; t += stride) {
+        if (flag[t]) sel[off[t]] = t;
+        if (t == n - 1) *nsel = off[t] + flag[t];
+    }
+}
+
+/* ---- the one batch executor -------------------------------------------- *
+ *
+ * There used to be two of these: `cf_run_side` for the standalone `--cofac`
+ * batch and the loop inside `cofq_flush` for the inline cross-q queue. They
+ * diverged in exactly the way duplicated schedulers do -- the standalone one
+ * grew ECM support and never got per-round compaction, the inline one grew
+ * compaction and never received the ECM configuration, so `--cof-ecm` silently
+ * ran rho on the production path for as long as both existed. Neither defect
+ * was visible from inside its own path.
+ *
+ * So the schedule lives in one place now, parameterised by the two things that
+ * actually differ between callers: which method, and how much of it.
+ */
+typedef struct {
+    int      method;        /* 0 = Pollard-Brent rho, 1 = ECM stage 1        */
+    int      rounds;
+    uint32_t budget;        /* rho iterations in round 0; doubles each round */
+    uint32_t curves;        /* ECM curves attempted per round                */
+    const uint32_t *d_s;    /* ECM stage-1 prime powers, on device           */
+    uint32_t ns;
+} cf_sched_t;
+
+/* Scratch for the per-round compaction. The caller owns it because the inline
+ * queue already has these buffers allocated once per band and should not
+ * reallocate them per flush. */
+typedef struct {
+    uint32_t *d_flag, *d_off, *d_bsum, *d_sel, *d_nsel;
+} cf_work_t;
+
+/* Run one side of one batch to exhaustion of its round budget. Records that
+ * remain CF_INCOMPLETE are requeued into the next round with a different rho
+ * constant (or a fresh band of ECM sigmas) and, for rho, twice the budget --
+ * so an exhausted budget is never turned into a proof of anything. */
+template <int L>
+static void cf_run_rounds(const mz<L> *d_n, mz<L> lim2, uint32_t lpb, uint32_t n,
+                          uint8_t *d_status, uint32_t *d_fac, uint8_t *d_nfac,
+                          const cf_sched_t *S, const cf_work_t *W,
+                          unsigned long long *d_iters, int blocks, int threads)
+{
+    const uint32_t nb = (n + TD_SCAN_BLK - 1) / TD_SCAN_BLK;
+    if (!n) return;
+    for (int r = 0; r < S->rounds; r++) {
+        /* Ordered prefix scan, not an atomic append: the job order is then a
+         * function of the status array alone and the output stays reproducible
+         * byte for byte. Three small kernels over the batch -- microseconds
+         * against a stage that runs for tens of milliseconds. */
+        k_cof_selflags<<<blocks, threads>>>(n, d_status, W->d_flag);
+        k_scan_pass1<<<nb, TD_SCAN_BLK>>>(W->d_flag, n, W->d_off, W->d_bsum);
+        k_scan_pass2<<<1, 1024>>>(W->d_bsum, nb);
+        k_scan_pass3<<<nb, TD_SCAN_BLK>>>(W->d_off, n, W->d_bsum);
+        k_cof_selscatter<<<blocks, threads>>>(n, W->d_flag, W->d_off,
+                                              W->d_sel, W->d_nsel);
+        if (S->method)
+            k_cofac<L, 1><<<blocks, threads>>>(d_n, lim2, lpb, (uint32_t)(r + 1),
+                                               S->curves, W->d_sel, W->d_nsel,
+                                               d_status, d_fac, d_nfac, d_iters,
+                                               S->d_s, S->ns);
+        else
+            k_cofac<L, 0><<<blocks, threads>>>(d_n, lim2, lpb, (uint32_t)(r + 1),
+                                               S->budget << r, W->d_sel, W->d_nsel,
+                                               d_status, d_fac, d_nfac, d_iters,
+                                               NULL, 0);
+    }
+}
 
 /* ---- the cross-q device queue ------------------------------------------ *
  *
@@ -790,29 +881,6 @@ __global__ void k_cof_gate(uint32_t n, uint8_t *__restrict st0, uint8_t *__restr
     for (uint32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < n; t += stride)
         if (st0[t] != CF_OK && st1[t] == CF_INCOMPLETE) st1[t] = CF_DEAD;
 }
-
-/* Flag the jobs a round still has to run, and pack their indices. Rebuilt
- * before every round, so round r+1 sees only what round r left unresolved --
- * which on the algebraic side is where the requeue cost actually lives. */
-__global__ void k_cof_selflags(uint32_t n, const uint8_t *__restrict st,
-                               uint32_t *__restrict flag)
-{
-    const uint32_t stride = gridDim.x * blockDim.x;
-    for (uint32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < n; t += stride)
-        flag[t] = (st[t] == CF_INCOMPLETE) ? 1u : 0u;
-}
-
-__global__ void k_cof_selscatter(uint32_t n, const uint32_t *__restrict flag,
-                                 const uint32_t *__restrict off,
-                                 uint32_t *__restrict sel, uint32_t *__restrict nsel)
-{
-    const uint32_t stride = gridDim.x * blockDim.x;
-    for (uint32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < n; t += stride) {
-        if (flag[t]) sel[off[t]] = t;
-        if (t == n - 1) *nsel = off[t] + flag[t];
-    }
-}
-
 __global__ void k_rel_flags(uint32_t n, const uint8_t *__restrict st0,
                             const uint8_t *__restrict st1, uint32_t *__restrict flag)
 {
@@ -930,7 +998,15 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
         printf("  cofactor queue: ECM stage 1, B1 = %u, %u prime powers,"
                " %u curves per round\n", ecm_b1, Q->ns, ecm_curves);
     }
-    Q->rcap = cap / 4;              /* relations run ~2% of candidates */
+    /* Every enqueued record can become a relation, so the readback slots have
+     * to allow for that. This was cap/4, sized from c183's ~2% relation rate --
+     * which is a property of THAT job, not of the queue. The c123 turns 56% of
+     * its enqueued records into relations and overflowed it at the second
+     * flush; the run failed loudly and correctly, but it should not have been
+     * possible to hit at all. cap costs ~74 MB device and the same pinned,
+     * against a 12 GB card, and removes the failure mode instead of retuning
+     * the threshold for one more job. */
+    Q->rcap = cap;
     CK(cudaMalloc(&Q->d_c0, (size_t)cap * sizeof(mz<2>)));
     CK(cudaMalloc(&Q->d_c1, (size_t)cap * sizeof(mz<3>)));
     CK(cudaMalloc(&Q->d_st0, cap)); CK(cudaMalloc(&Q->d_st1, cap));
@@ -1003,48 +1079,24 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
      * and it is the ordered prefix scan, not an atomic append, so the job order
      * is a function of the status array alone and the output stays reproducible
      * byte for byte. */
-#define CQ_COMPACT(ST)                                                          \
-    do {                                                                        \
-        k_cof_selflags<<<blocks, threads>>>(n, (ST), Q->d_flag);                \
-        k_scan_pass1<<<nb, TD_SCAN_BLK>>>(Q->d_flag, n, Q->d_off, Q->d_bsum);   \
-        k_scan_pass2<<<1, 1024>>>(Q->d_bsum, nb);                               \
-        k_scan_pass3<<<nb, TD_SCAN_BLK>>>(Q->d_off, n, Q->d_bsum);              \
-        k_cof_selscatter<<<blocks, threads>>>(n, Q->d_flag, Q->d_off,           \
-                                              Q->d_sel, Q->d_nsel);            \
-    } while (0)
+    cf_work_t W;
+    cf_sched_t S;
+    W.d_flag = Q->d_flag; W.d_off = Q->d_off; W.d_bsum = Q->d_bsum;
+    W.d_sel = Q->d_sel;   W.d_nsel = Q->d_nsel;
+    S.method = Q->ecm; S.rounds = rounds; S.budget = budget;
+    S.curves = Q->ecm_curves; S.d_s = Q->d_s; S.ns = Q->ns;
 
     cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventCreate(&e2);
     cudaEventRecord(e0);
-    for (int r = 0; r < rounds; r++) {
-        CQ_COMPACT(Q->d_st0);
-        if (Q->ecm)
-            k_cofac<2, 1, 1><<<blocks, threads>>>(Q->d_c0, l0, lpb0, (uint32_t)(r + 1),
-                                                  Q->ecm_curves, n, Q->d_sel, Q->d_nsel,
-                                                  Q->d_st0, Q->d_sp0, Q->d_nsp0, NULL,
-                                                  Q->d_s, Q->ns);
-        else
-            k_cofac<2, 1, 0><<<blocks, threads>>>(Q->d_c0, l0, lpb0, (uint32_t)(r + 1),
-                                                  budget << r, n, Q->d_sel, Q->d_nsel,
-                                                  Q->d_st0, Q->d_sp0, Q->d_nsp0, NULL,
-                                                  NULL, 0);
-    }
+    cf_run_rounds<2>(Q->d_c0, l0, lpb0, n, Q->d_st0, Q->d_sp0, Q->d_nsp0,
+                     &S, &W, NULL, blocks, threads);
+    /* The class-aware gate: a record whose rational side did not split is dead
+     * whatever the algebraic side does, so its 3-limb job is never started. */
     k_cof_gate<<<blocks, threads>>>(n, Q->d_st0, Q->d_st1);
     cudaEventRecord(e1);
-    for (int r = 0; r < rounds; r++) {
-        CQ_COMPACT(Q->d_st1);
-        if (Q->ecm)
-            k_cofac<3, 1, 1><<<blocks, threads>>>(Q->d_c1, l1, lpb1, (uint32_t)(r + 1),
-                                                  Q->ecm_curves, n, Q->d_sel, Q->d_nsel,
-                                                  Q->d_st1, Q->d_sp1, Q->d_nsp1, NULL,
-                                                  Q->d_s, Q->ns);
-        else
-            k_cofac<3, 1, 0><<<blocks, threads>>>(Q->d_c1, l1, lpb1, (uint32_t)(r + 1),
-                                                  budget << r, n, Q->d_sel, Q->d_nsel,
-                                                  Q->d_st1, Q->d_sp1, Q->d_nsp1, NULL,
-                                                  NULL, 0);
-    }
+    cf_run_rounds<3>(Q->d_c1, l1, lpb1, n, Q->d_st1, Q->d_sp1, Q->d_nsp1,
+                     &S, &W, NULL, blocks, threads);
     cudaEventRecord(e2);
-#undef CQ_COMPACT
 
     k_rel_flags<<<blocks, threads>>>(n, Q->d_st0, Q->d_st1, Q->d_flag);
     k_scan_pass1<<<nb, TD_SCAN_BLK>>>(Q->d_flag, n, Q->d_off, Q->d_bsum);
@@ -1058,9 +1110,17 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     cudaEventDestroy(e0); cudaEventDestroy(e1); cudaEventDestroy(e2);
 
     CK(cudaMemcpy(&nr, Q->d_nrel, 4, cudaMemcpyDeviceToHost));
+    /* Unreachable while rcap == cap, which it now is: every relation comes from
+     * a distinct queued record, so nr <= n <= cap. It was reachable under the
+     * old rcap = cap/4, which assumed relations were at most a quarter of
+     * candidates -- true at the c183's 2%, false at the c123's 56%, and it
+     * failed a whole band. Kept as an assertion on that invariant rather than
+     * deleted, because it is one comparison per flush and the sizing is the
+     * kind of thing a later change quietly revisits. */
     if (nr > Q->rcap) {
         fprintf(stderr, "  cofac queue: %u relations in a flush of %u exceeds"
-                " the %u readback slots\n", nr, n, Q->rcap);
+                " the %u readback slots (rcap invariant broken)\n",
+                nr, n, Q->rcap);
         return -1;
     }
     Q->nseen += n; Q->nrel += nr;
@@ -1140,17 +1200,19 @@ typedef struct {
 template <int L>
 static int cf_run_side(mz<L> *h_n, uint32_t nj, uint64_t lim, uint32_t lpb,
                        uint8_t *h_status, uint32_t *h_fac, uint8_t *h_nfac,
-                       int rounds, uint32_t budget0, int blocks, int threads,
-                       int verbose, double *ms_out,
-                       int ecm, uint32_t ecm_curves, const uint32_t *d_s, uint32_t ns)
+                       int blocks, int threads, int verbose, double *ms_out,
+                       const cf_sched_t *S)
 {
     mz<L> *d_n = NULL; uint8_t *d_status = NULL, *d_nfac = NULL;
     uint32_t *d_fac = NULL;
     unsigned long long *d_iters = NULL, *h_iters = NULL;
+    cf_work_t W;
+    const uint32_t nb = (nj + TD_SCAN_BLK - 1) / TD_SCAN_BLK;
     mz<L> lim2;
     cudaEvent_t e0, e1;
     float ms = 0;
     if (!nj) { *ms_out = 0; return 0; }
+    memset(&W, 0, sizeof(W));
 
     {   /* lim^2, in L limbs */
         unsigned __int128 v = (unsigned __int128)lim * lim;
@@ -1162,6 +1224,14 @@ static int cf_run_side(mz<L> *h_n, uint32_t nj, uint64_t lim, uint32_t lpb,
     CK(cudaMalloc(&d_nfac, nj));
     CK(cudaMalloc(&d_fac, (size_t)nj * CF_MAXFAC * 4));
     CK(cudaMalloc(&d_iters, (size_t)nj * 8));
+    /* The standalone path used to run every slot every round, because the
+     * compaction lived only in the inline queue. Same executor now, so it gets
+     * the same scheduling -- and the same output, which the golden test pins. */
+    CK(cudaMalloc(&W.d_flag, (size_t)nj * 4));
+    CK(cudaMalloc(&W.d_off,  (size_t)nj * 4));
+    CK(cudaMalloc(&W.d_bsum, (size_t)nb * 4));
+    CK(cudaMalloc(&W.d_sel,  (size_t)nj * 4));
+    CK(cudaMalloc(&W.d_nsel, 4));
     CK(cudaMemcpy(d_n, h_n, (size_t)nj * sizeof(mz<L>), cudaMemcpyHostToDevice));
     CK(cudaMemset(d_status, CF_INCOMPLETE, nj));
     CK(cudaMemset(d_nfac, 0, nj));
@@ -1169,25 +1239,28 @@ static int cf_run_side(mz<L> *h_n, uint32_t nj, uint64_t lim, uint32_t lpb,
     cudaEventCreate(&e0); cudaEventCreate(&e1);
 
     cudaEventRecord(e0);
-    for (int r = 0; r < rounds; r++) {
-        if (ecm)
-            k_cofac<L, 0, 1><<<blocks, threads>>>(d_n, lim2, lpb, (uint32_t)(r + 1),
-                                                  ecm_curves, nj, NULL, NULL,
-                                                  d_status, d_fac, d_nfac, d_iters,
-                                                  d_s, ns);
-        else
-            k_cofac<L, 0, 0><<<blocks, threads>>>(d_n, lim2, lpb, (uint32_t)(r + 1),
-                                                  budget0 << r, nj, NULL, NULL,
-                                                  d_status, d_fac, d_nfac, d_iters,
-                                                  NULL, 0);
-        if (cudaGetLastError() != cudaSuccess) { fprintf(stderr, "  cofac: launch failed\n"); return -1; }
+    cf_run_rounds<L>(d_n, lim2, lpb, nj, d_status, d_fac, d_nfac,
+                     S, &W, d_iters, blocks, threads);
+    /* Release before returning. run_cofac calls this twice -- mz<2> for the
+     * rational side, then mz<3> for the algebraic -- on the same device, so a
+     * bare `return -1` here left the second call short by everything the first
+     * had allocated: on the 1.96M-record corpus, hundreds of MB, and the
+     * second side then fails for a reason that has nothing to do with itself. */
+    if (cudaGetLastError() != cudaSuccess) {
+        fprintf(stderr, "  cofac: launch failed\n");
+        cudaFree(d_n); cudaFree(d_status); cudaFree(d_nfac); cudaFree(d_fac);
+        cudaFree(d_iters);
+        cudaFree(W.d_flag); cudaFree(W.d_off); cudaFree(W.d_bsum);
+        cudaFree(W.d_sel); cudaFree(W.d_nsel);
+        cudaEventDestroy(e0); cudaEventDestroy(e1);
+        return -1;
     }
     cudaEventRecord(e1);
     CK(cudaEventSynchronize(e1));
     cudaEventElapsedTime(&ms, e0, e1);
     *ms_out = ms;
     if (verbose) printf("  side %d-limb queue: %u jobs, %d rounds, %.1f ms\n",
-                        L, nj, rounds, ms);
+                        L, nj, S->rounds, ms);
 
     CK(cudaMemcpy(h_status, d_status, nj, cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(h_nfac, d_nfac, nj, cudaMemcpyDeviceToHost));
@@ -1221,6 +1294,8 @@ static int cf_run_side(mz<L> *h_n, uint32_t nj, uint64_t lim, uint32_t lpb,
 
     cudaFree(d_n); cudaFree(d_status); cudaFree(d_nfac); cudaFree(d_fac);
     cudaFree(d_iters);
+    cudaFree(W.d_flag); cudaFree(W.d_off); cudaFree(W.d_bsum);
+    cudaFree(W.d_sel); cudaFree(W.d_nsel);
     cudaEventDestroy(e0); cudaEventDestroy(e1);
     return 0;
 }
@@ -1369,6 +1444,7 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
 {
     FILE *f = fopen(path, "rb");
     uint32_t *h_s = NULL, *d_s = NULL, ns = 0;
+    cf_sched_t sched;
     char *buf = NULL;
     size_t sz = 0;
     uint32_t nrec = 0, n0 = 0, n1 = 0;
@@ -1455,12 +1531,14 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
         if (!ns) { fprintf(stderr, "  cofac: empty ECM plan for B1=%u\n", ecm_b1); return -1; }
         CK(cudaMalloc(&d_s, (size_t)ns * 4));
         CK(cudaMemcpy(d_s, h_s, (size_t)ns * 4, cudaMemcpyHostToDevice));
+        free(h_s);
         printf("  ECM stage 1: B1 = %u, %u prime powers, %u curves per round,"
                " %d rounds\n", ecm_b1, ns, ecm_curves, rounds);
     }
+    sched.method = ecm; sched.rounds = rounds; sched.budget = budget;
+    sched.curves = ecm_curves; sched.d_s = d_s; sched.ns = ns;
     if (cf_run_side<2>(j0, n0, lim0, lpb0, st0, fac0, nf0,
-                       rounds, budget, blocks, threads, 1, &ms0,
-                       ecm, ecm_curves, d_s, ns)) return -1;
+                       blocks, threads, 1, &ms0, &sched)) return -1;
     for (uint32_t k = 0; k < n0; k++) {
         if (st0[k] == CF_OK) continue;
         side0ok[i0[k]] = 0;
@@ -1482,8 +1560,7 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
     st1 = (uint8_t *)malloc(n1 ? n1 : 1); nf1 = (uint8_t *)calloc(n1 ? n1 : 1, 1);
     fac1 = (uint32_t *)malloc((size_t)(n1 ? n1 : 1) * CF_MAXFAC * 4);
     if (cf_run_side<3>(j1, n1, lim1, lpb1, st1, fac1, nf1,
-                       rounds, budget, blocks, threads, 1, &ms1,
-                       ecm, ecm_curves, d_s, ns)) return -1;
+                       blocks, threads, 1, &ms1, &sched)) return -1;
     for (uint32_t k = 0; k < n1; k++) {
         if (st1[k] == CF_DEAD) dead1++;
         else if (st1[k] == CF_INCOMPLETE) stuck1++;

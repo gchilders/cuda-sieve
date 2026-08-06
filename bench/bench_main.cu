@@ -9,72 +9,110 @@ static void usage(void)
 {
     printf(
 "usage: bench [options]\n"
-"  --fb PATH        GGNFS .afb.0 factor base   [../oracle/input.job.afb.0]\n"
-"  --logI N         log2 of sieve width I      [15]  (I15e)\n"
-"  --J N            sieve height J             [16384]\n"
-"  --region N       log2 bucket region size    [14]  (16384 16-bit cells, 32 KB)\n"
-"  --bkthresh N     bucket-sieve p >= this     [1<<logI]\n"
-"  --fbbound N      truncate FB at this p      [q]  (GGNFS truncates at the special-q)\n"
-"  --q N            special-q                  [120000011]\n"
-"  --rho N          root of f mod q            [synthetic]  (las -v prints it)\n"
-"  --record-bytes N 2 | 4 | 8                  [4]\n"
-"  --mode M         atomic | twolevel          [atomic]  (twolevel lost by 2.7x)\n"
-"  --threads N      threads per block          [256]\n"
-"  --blocks N       0 = auto (6 per SM)        [0]\n"
-"  --reps N         timing repetitions         [3]\n"
-"  --survbits FILE  write a survivor bitmap (1 bit/position, x order)\n"
-"  --other-bits F   the other side's bitmap -> device intersect+gcd+compact\n"
-"  --emit FILE      write the compacted survivor list (x, a, b) here\n"
-"  --td             exact norms + trial division on the survivors\n"
-"  --ab-resieve     re-run the settled layout A/B resieve experiment (slow)\n"
-"  --resieve-sweep  sweep the resieve unroll depth and summary granularity\n"
+"\n"
+"RUNNING A JOB\n"
+"  A typical run needs six flags. Everything else has a right answer that is\n"
+"  derived from the polynomial or read from the .job file, and is printed:\n"
+"\n"
+"    bench --pipeline --cofactor --poly JOB.job --cadofb JOB.roots1 \\\n"
+"          --logI 14 --qrange 15000000: --target-rels 65000000 \\\n"
+"          --relations msieve.dat\n"
+"\n"
 "  --pipeline       BOTH SIDES in one process: sieve, intersect, TD, classify,\n"
 "                   join, and emit relations + cofactorisation candidates.\n"
-"                   Runs one fixed configuration; the harness-only options\n"
-"                   above (--mode, --cells, --norm, --stage, ...) are refused\n"
-"  --alim N         side-1 factor base bound   [134200000]\n"
-"  --scale0 S       side-0 byte scale          [1.925]\n"
-"  --allowance0 B   side-0 survivor bits       [68.1 -> bound 132]\n"
-"  --relations F    write complete relations here\n"
-"  --qlist FILE     band of special-q: `q rho` per line (# comments ok)\n"
-"  --qrange MIN:MAX every (q, rho) in that range, taken from the algebraic\n"
-"                   factor base -- no root-finding and no q-list file needed\n"
-"  --nq N           stop after N special-q from the list\n"
-"  --verbose-q      print a line per special-q instead of a band summary\n"
-"  --candidates F   write the cofactorisation batch here\n"
+"                   Runs one fixed configuration; the harness options below\n"
+"                   are refused rather than silently ignored\n"
+"  --poly PATH      polynomial. A GGNFS .job works directly, and its rlim,\n"
+"                   alim, lpbr/lpba, mfbr/mfba and lambdas are USED -- they do\n"
+"                   not need repeating below. A CADO .poly carries none of\n"
+"                   those, so state them or let them derive\n"
+"  --cadofb PATH    CADO makefb factor base. REQUIRED to emit relations: the\n"
+"                   GGNFS .afb.0 has neither p = 2 nor prime powers\n"
+"  --logI N         log2 of sieve width I      [15]   (gnfs-lasieve4I14e -> 14)\n"
+"  --J N            sieve height J             [2^(logI-1), CADO's convention]\n"
+"  --relations F    write complete relations here (GGNFS/msieve format)\n"
 "  --cofactor       split the cofactors INLINE, in a cross-q device queue;\n"
 "                   --relations then holds every relation, not just TD's\n"
-"  --cofac FILE     cofactorise a batch written by --candidates and emit the\n"
-"                   relations to --relations; needs no sieving\n"
+"\n"
+"BAND SELECTION\n"
+"  --qrange MIN:MAX every (q, rho) in that range, taken from the algebraic\n"
+"                   factor base -- no root-finding and no q-list file needed.\n"
+"                   MIN: alone runs up to the factor-base bound\n"
+"  --qlist FILE     band of special-q: `q rho` per line (# comments ok)\n"
+"  --q N / --rho N  a single special-q          [120000011]  (las -v prints rho)\n"
+"  --nq N           stop after N special-q from the list\n"
+"  --target-rels N  stop once N relations have been collected. Checked at\n"
+"                   flush boundaries, so it overshoots by under a flush.\n"
+"                   Pair with --qrange MIN: to sieve upward until satisfied\n"
+"\n"
+"PARAMETERS  (precedence: this flag > .job file > derived from the poly)\n"
+"  The byte scale and survivor allowance are ALWAYS derived, as las does, from\n"
+"  the largest norm over the sieve rectangle. Stating one overrides it.\n"
+"  --rlim N / --alim N  factor base bounds, side 0 / side 1\n"
+"  --lpb N / --lpb0 N   large-prime bound in bits  [32 side 1, 31 side 0]\n"
+"  --mfb N / --mfb0 N   max cofactor bits          [92 side 1, 60 side 0]\n"
+"  --allowance B / --allowance0 B   survivor cofactor BITS. The unit both\n"
+"                   lambda conventions are really expressing; prefer it\n"
+"  --lambda0/1 L    survivor lambda in CADO units, i.e. multiples of lpb\n"
+"                   [0 = CADO's automatic 0.3 + mfb/lpb]. A .job file's\n"
+"                   lambda is in units of log2(lim) instead and is converted\n"
+"  --scale S / --scale0 S   las byte scale per side\n"
+"  --fbbound N      truncate FB at this p      [alim]  (GGNFS truncates at q)\n"
+"  --bkthresh N     bucket-sieve p >= this     [1<<logI]\n"
+"  --region N       log2 bucket region size    [14]  (16384 16-bit cells, 32 KB)\n"
+"  --maxbits N      prime powers below 2^N      [15]\n"
+"\n"
+"COFACTORISATION\n"
 "  --cof-rounds N   rho requeue rounds, budget doubling each time\n"
 "                   [6 for --cofac; 2 for --pipeline --cofactor]\n"
 "  --cof-budget N   rho iterations in the first round\n"
 "                   [4096 for --cofac; 65536 for --pipeline --cofactor]\n"
-"  --cof-ecm        ECM stage 1 instead of Pollard-Brent rho\n"
-"  --check-relations F  verify an emitted relation file: every factor divides,\n"
-"                   both norms rebuild to 1, every prime within its lpb\n"
+"  --cof-ecm        ECM stage 1 instead of Pollard-Brent rho. Built and\n"
+"                   correct, but loses to rho 2.2-2.5x at matched yield\n"
 "  --ecm-b1 N       ECM stage-1 bound                              [1000]\n"
 "  --ecm-curves N   ECM curves attempted per round                 [16]\n"
-"  --lpb N          large-prime bound in bits  [32 side 1, 31 side 0]\n"
-"  --mfb N          max cofactor bits          [92 side 1, 60 side 0]\n"
+"  --candidates F   write the cofactorisation batch here\n"
+"  --cofac FILE     cofactorise a batch written by --candidates and emit the\n"
+"                   relations to --relations; needs no sieving\n"
+"\n"
+"CHECKING\n"
+"  --check-relations F  verify an emitted relation file: every factor divides,\n"
+"                   both norms rebuild to 1, every prime within its lpb\n"
 "  --cofgate FILE   gate the cofactors against CADO's own (a b cof0 cof1);\n"
 "                   under --pipeline this runs in the first-q validation\n"
-"  --emit-cof FILE  write (a, b, cofactor, bits) for every survivor here\n"
-"  --not-both-even  apply las's filter: i,j both even can never survive\n"
-"  --verify         run the CPU cross-check (slow)\n"
-"  --poly PATH      algebraic polynomial       [../oracle/c183.poly]\n"
+"  --verbose-q      print a line per special-q instead of a band summary\n"
+"\n"
+"RUNTIME\n"
+"  --threads N      threads per block          [256]\n"
+"  --blocks N       0 = auto (6 per SM)        [0]\n"
+"  --blocking-sync  yield the CPU while waiting on the GPU instead of spinning.\n"
+"                   CUDA busy-waits by default, so a host thread that is 90%\n"
+"                   idle still pegs a core; this frees it, at the cost of a\n"
+"                   wakeup latency per synchronisation\n"
+"\n"
+"BENCHMARK HARNESS  (single-side measurement; REFUSED under --pipeline)\n"
+"  These reproduce the numbers in RESULTS.md. They select configurations that\n"
+"  were measured and rejected, so they are not knobs to tune a real run with.\n"
+"  --fb PATH        GGNFS .afb.0 factor base   [../oracle/input.job.afb.0]\n"
+"  --side S         1 = algebraic (special-q side), 0 = rational  [1]\n"
+"  --record-bytes N 2 | 4 | 8                  [4]\n"
+"  --mode M         atomic | twolevel          [atomic]  (twolevel lost by 2.7x)\n"
 "  --stage S        fill | both | apply        [both]\n"
 "  --cells N        16 | 8 bits per sieve cell [16]  (8 is unsafe; cost only)\n"
 "  --norm M         horner | const             [horner]\n"
 "  --apply-mode M   atomic | plain             [atomic]  (plain is racy)\n"
 "  --apply-threads N  threads per apply block  [512]\n"
-"  --allowance B    survivor cofactor bits     [112 = alambda*lpba]\n"
+"  --reps N         timing repetitions         [3]\n"
+"  --verify         run the CPU cross-check (slow)\n"
 "  --no-smallsieve  skip the p < bkthresh line sieve\n"
-"  --side S         1 = algebraic (special-q side), 0 = rational  [1]\n"
-"  --rlim N         side-0 factor base bound   [67100000]\n"
-"  --scale S        las byte scale for the side [1.0 = raw bits]\n"
-"  --cadofb PATH    CADO makefb factor base (has prime powers)\n"
-"  --maxbits N      prime powers below 2^N      [15]\n"
+"  --not-both-even  apply las's filter: i,j both even can never survive\n"
+"  --survbits FILE  write a survivor bitmap (1 bit/position, x order)\n"
+"  --other-bits F   the other side's bitmap -> device intersect+gcd+compact\n"
+"  --emit FILE      write the compacted survivor list (x, a, b) here\n"
+"  --emit-cof FILE  write (a, b, cofactor, bits) for every survivor here\n"
+"  --td             exact norms + trial division on the survivors\n"
+"  --ab-resieve     re-run the settled layout A/B resieve experiment (slow)\n"
+"  --resieve-sweep  sweep the resieve unroll depth and summary granularity\n"
 "  --dump PATH      write the sieve region in las byte convention\n"
 "  --probe i,j      read back that cell after apply (gate 5)\n");
 }
@@ -119,20 +157,29 @@ int main(int argc, char **argv)
     cfg.lim0 = 0; cfg.lpb0 = 31; cfg.mfb0 = 60;
     cfg.relations = NULL; cfg.candidates = NULL;
     cfg.qlist = NULL; cfg.nq_max = 0; cfg.verbose_q = 0; cfg.td_verify = 1;
-    cfg.qmin = 0; cfg.qmax = 0;
+    cfg.qmin = 0; cfg.qmax = 0; cfg.target_rels = 0;
     cfg.cofactor = 0; cfg.cof_rounds = 2; cfg.cof_budget = 65536;
     cfg.cof_ecm = 0; cfg.ecm_b1 = 1000; cfg.ecm_curves = 16;
     int maxbits = 15;
-    int allowance_set = 0;
+    int allowance_set = 0, allowance0_set = 0, scale0_set = 0;
     const char *cofac_in = NULL;
     const char *check_rel = NULL;
+    int blocking_sync = 0;
+    /* Which values the COMMAND LINE supplied. Precedence is
+     *      explicit flag  >  job file  >  derived  >  refuse
+     * and these are what distinguishes the first level from the rest. A
+     * default that merely looks like the job file's value is not the same
+     * thing: the whole point is that a run says where each number came from. */
+    int rlim_set = 0, alim_set = 0, lpb_set = 0, mfb_set = 0;
+    int lpb0_set = 0, mfb0_set = 0, J_set = 0;
+    double lambda0 = 0.0, lambda1 = 0.0;   /* 0 = CADO's automatic 0.3+mfb/lpb */
     int cof_rounds = 6;
     uint32_t cof_budget = 4096;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--fb") && i + 1 < argc) fbpath = argv[++i];
         else if (!strcmp(argv[i], "--logI") && i + 1 < argc) cfg.logI = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--J") && i + 1 < argc) cfg.J = (uint32_t)strtoul(argv[++i], 0, 10);
+        else if (!strcmp(argv[i], "--J") && i + 1 < argc) { cfg.J = (uint32_t)strtoul(argv[++i], 0, 10); J_set = 1; }
         else if (!strcmp(argv[i], "--region") && i + 1 < argc) cfg.log_region = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--bkthresh") && i + 1 < argc) bkthresh = (uint32_t)strtoul(argv[++i], 0, 10);
         else if (!strcmp(argv[i], "--fbbound") && i + 1 < argc) { fbbound = (uint32_t)strtoul(argv[++i], 0, 10); fbbound_set = 1; }
@@ -164,7 +211,7 @@ int main(int argc, char **argv)
             { cfg.allowance = atof(argv[++i]); allowance_set = 1; }
         else if (!strcmp(argv[i], "--no-smallsieve")) cfg.small_sieve = 0;
         else if (!strcmp(argv[i], "--side") && i + 1 < argc) cfg.side = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--rlim") && i + 1 < argc) rlim = (uint32_t)strtoul(argv[++i], 0, 10);
+        else if (!strcmp(argv[i], "--rlim") && i + 1 < argc) { rlim = (uint32_t)strtoul(argv[++i], 0, 10); rlim_set = 1; }
         else if (!strcmp(argv[i], "--scale") && i + 1 < argc) { cfg.scale = atof(argv[++i]); scale_set = 1; }
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc) cfg.dump = argv[++i];
         else if (!strcmp(argv[i], "--cadofb") && i + 1 < argc) cfg.cadofb = argv[++i];
@@ -180,26 +227,63 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--cof-rounds") && i + 1 < argc) { cof_rounds = atoi(argv[++i]); cfg.cof_rounds = cof_rounds; }
         else if (!strcmp(argv[i], "--cof-budget") && i + 1 < argc) { cof_budget = (uint32_t)strtoul(argv[++i], 0, 10); cfg.cof_budget = cof_budget; }
         else if (!strcmp(argv[i], "--cof-ecm")) cfg.cof_ecm = 1;
+        /* Deriving is now unconditional, so this is accepted and ignored
+         * rather than rejected: it appears in RUNBOOK.md and in scripts, and
+         * breaking those to make a point about a flag that now describes the
+         * default helps nobody. The note fires so nobody keeps typing it. */
+        else if (!strcmp(argv[i], "--auto-params"))
+            fprintf(stderr, "note: --auto-params is the default now and is"
+                            " ignored; drop it\n");
+        else if (!strcmp(argv[i], "--blocking-sync")) blocking_sync = 1;
+        else if (!strcmp(argv[i], "--lpb0") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 32) { fprintf(stderr, "--lpb0 %ld out of range 1..32\n", v); return 1; } cfg.lpb0 = (uint32_t)v; lpb0_set = 1; }
+        else if (!strcmp(argv[i], "--mfb0") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 64) { fprintf(stderr, "--mfb0 %ld out of range 1..64\n", v); return 1; } cfg.mfb0 = (uint32_t)v; mfb0_set = 1; }
+        /* Range-checked like --lpb0/--mfb0 above, and for the same reason. An
+         * unchecked --lambda1 0.01 gives allowance 0.32, bound 1, and a band
+         * that runs for hours and emits nothing with no diagnostic.
+         *
+         * Exactly 0 stays legal: it is the documented sentinel for "use CADO's
+         * automatic", and scripts pass it to mean the default. The window
+         * refused is (0, 0.5), which no real lambda occupies -- CADO's
+         * automatic lands near 2-3 -- and anything above 8. This is a guard
+         * against a typo, not a tuning opinion, so the ends are loose. */
+        #define LAMBDA_ARG(flag, var)                                          \
+            else if (!strcmp(argv[i], flag) && i + 1 < argc) {                 \
+                var = atof(argv[++i]);                                         \
+                if (var < 0.0 || (var > 0.0 && var < 0.5) || var > 8.0) {      \
+                    fprintf(stderr, "%s %g: want 0 (CADO's automatic) or"      \
+                            " 0.5..8\n", flag, var);                           \
+                    return 1;                                                  \
+                }                                                              \
+            }
+        LAMBDA_ARG("--lambda0", lambda0)
+        LAMBDA_ARG("--lambda1", lambda1)
+        #undef LAMBDA_ARG
         else if (!strcmp(argv[i], "--check-relations") && i + 1 < argc) check_rel = argv[++i];
         else if (!strcmp(argv[i], "--ecm-b1") && i + 1 < argc) cfg.ecm_b1 = (uint32_t)strtoul(argv[++i], 0, 10);
         else if (!strcmp(argv[i], "--ecm-curves") && i + 1 < argc) cfg.ecm_curves = (uint32_t)strtoul(argv[++i], 0, 10);
         else if (!strcmp(argv[i], "--qlist") && i + 1 < argc) cfg.qlist = argv[++i];
         else if (!strcmp(argv[i], "--qrange") && i + 1 < argc) {
             unsigned long long lo, hi;
-            if (sscanf(argv[++i], "%llu:%llu", &lo, &hi) != 2 || lo > hi) {
-                fprintf(stderr, "bench: --qrange wants MIN:MAX\n"); return 2;
+            const char *a = argv[++i];
+            int got = sscanf(a, "%llu:%llu", &lo, &hi);
+            if (got == 1 && strchr(a, ':')) { hi = 0; got = 2; }   /* "MIN:" = open */
+            if (got != 2 || (hi && lo > hi)) {
+                fprintf(stderr, "bench: --qrange wants MIN:MAX, or MIN: for"
+                        " everything up to the factor-base bound\n"); return 2;
             }
-            cfg.qmin = lo; cfg.qmax = hi;
+            cfg.qmin = lo; cfg.qmax = hi;   /* 0 = fill in from alim below */
         }
         else if (!strcmp(argv[i], "--nq") && i + 1 < argc) cfg.nq_max = (uint32_t)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--target-rels") && i + 1 < argc)
+            cfg.target_rels = strtoull(argv[++i], 0, 10);
         else if (!strcmp(argv[i], "--verbose-q")) cfg.verbose_q = 1;
-        else if (!strcmp(argv[i], "--alim") && i + 1 < argc) alim = (uint32_t)strtoul(argv[++i], 0, 10);
-        else if (!strcmp(argv[i], "--scale0") && i + 1 < argc) cfg.scale0 = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--allowance0") && i + 1 < argc) cfg.allowance0 = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--alim") && i + 1 < argc) { alim = (uint32_t)strtoul(argv[++i], 0, 10); alim_set = 1; }
+        else if (!strcmp(argv[i], "--scale0") && i + 1 < argc) { cfg.scale0 = atof(argv[++i]); scale0_set = 1; }
+        else if (!strcmp(argv[i], "--allowance0") && i + 1 < argc) { cfg.allowance0 = atof(argv[++i]); allowance0_set = 1; }
         else if (!strcmp(argv[i], "--relations") && i + 1 < argc) cfg.relations = argv[++i];
         else if (!strcmp(argv[i], "--candidates") && i + 1 < argc) cfg.candidates = argv[++i];
-        else if (!strcmp(argv[i], "--lpb") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 32) { fprintf(stderr, "--lpb %ld out of range 1..32\n", v); return 1; } cfg.lpb = (uint32_t)v; }
-        else if (!strcmp(argv[i], "--mfb") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 96) { fprintf(stderr, "--mfb %ld out of range 1..96\n", v); return 1; } cfg.mfb = (uint32_t)v; }
+        else if (!strcmp(argv[i], "--lpb") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 32) { fprintf(stderr, "--lpb %ld out of range 1..32\n", v); return 1; } cfg.lpb = (uint32_t)v; lpb_set = 1; }
+        else if (!strcmp(argv[i], "--mfb") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 96) { fprintf(stderr, "--mfb %ld out of range 1..96\n", v); return 1; } cfg.mfb = (uint32_t)v; mfb_set = 1; }
         else if (!strcmp(argv[i], "--cofgate") && i + 1 < argc) cfg.cofgate = argv[++i];
         else if (!strcmp(argv[i], "--emit-cof") && i + 1 < argc) cfg.emit_cof = argv[++i];
         else if (!strcmp(argv[i], "--not-both-even")) cfg.not_both_even = 1;
@@ -297,6 +381,10 @@ int main(int argc, char **argv)
      * that fb_t carries. Refuse rather than saturate. */
     {
         const double cinit = (cfg.cell_bits == 16) ? 4096.0 : 255.0;
+        /* c183's norm sizes, and only a sanity bound on a user-supplied
+         * --scale in the single-side harness modes. The pipeline rechecks both
+         * sides against their REAL derived maxnorm and lim after the scale is
+         * derived; this one runs too early to see either. */
         const double maxnorm = (cfg.side == 1) ? 196.61 : 131.86;
         const double maxlogp = 27.0;           /* log2(alim) */
         if (cfg.scale * maxnorm > cinit) {
@@ -388,6 +476,11 @@ int main(int argc, char **argv)
         if (bad) return 1;
     }
 
+    /* Must precede any call that creates the CUDA context. */
+    if (blocking_sync && cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync) != cudaSuccess) {
+        fprintf(stderr, "warning: could not set blocking sync\n");
+    }
+
     printf("=== cuda-sieve bucket-fill benchmark ===\n");
 
 
@@ -395,6 +488,62 @@ int main(int argc, char **argv)
     if (poly_load(polypath, &POLY) != 0) return 1;
     printf("polynomial %s: algebraic degree %d, skew %.4g\n",
            polypath, POLY.deg, POLY.skew);
+
+    /* ---- sieve parameters: explicit flag > job file > derived > refuse ----
+     *
+     * A GGNFS .job file already carries rlim, alim, lpbr/lpba, mfbr/mfba and
+     * the two lambdas. They used to be retyped onto the command line -- eight
+     * flags transcribing a file this process has open -- which is both tedious
+     * and a place for the two to silently disagree.
+     *
+     * Whatever is taken from the file is PRINTED, because a parameter that
+     * appears from nowhere is worse than one that has to be typed. */
+    {
+        int used = 0;
+        #define JOB_TAKE(cond, dst, src, name)                                 \
+            do { if ((cond) && (src)) {                                        \
+                     (dst) = (src);                                            \
+                     printf("%s%s %u", used++ ? ", " : "  job file: ",         \
+                            name, (unsigned)(src));                            \
+                 } } while (0)
+        JOB_TAKE(!rlim_set, rlim,     POLY.rlim, "rlim");
+        JOB_TAKE(!alim_set, alim,     POLY.alim, "alim");
+        JOB_TAKE(!lpb0_set, cfg.lpb0, POLY.lpbr, "lpbr");
+        JOB_TAKE(!lpb_set,  cfg.lpb,  POLY.lpba, "lpba");
+        JOB_TAKE(!mfb0_set, cfg.mfb0, POLY.mfbr, "mfbr");
+        JOB_TAKE(!mfb_set,  cfg.mfb,  POLY.mfba, "mfba");
+        #undef JOB_TAKE
+        if (used) printf("\n");
+
+        /* The lambdas are converted, not copied. A .job file's lambda is a
+         * multiple of log2(lim); CADO's is a multiple of lpb. Same symbol,
+         * different quantity -- for this c151 (alambda 2.5, alim 33.5M,
+         * lpba 30) the GGNFS reading is 62.5 bits and the CADO reading 75.0.
+         * The GGNFS one is TIGHTER, so mistaking one for the other loses
+         * relations with nothing failing, which is why the derivation is
+         * printed rather than just applied. */
+        if (!allowance_set && POLY.alambda > 0.0 && alim) {
+            cfg.allowance = job_allowance_bits(POLY.alambda, alim);
+            allowance_set = 1;
+            printf("  from job file:  alambda %.3g x log2(alim %u)"
+                   " = %.2f bits (side 1)\n", POLY.alambda, alim, cfg.allowance);
+        }
+        if (!allowance0_set && POLY.rlambda > 0.0 && rlim) {
+            cfg.allowance0 = job_allowance_bits(POLY.rlambda, rlim);
+            allowance0_set = 1;
+            printf("  from job file:  rlambda %.3g x log2(rlim %u)"
+                   " = %.2f bits (side 0)\n", POLY.rlambda, rlim, cfg.allowance0);
+        }
+        if ((POLY.alambda > 0.0 && lambda1 > 0.0) ||
+            (POLY.rlambda > 0.0 && lambda0 > 0.0))
+            fprintf(stderr, "note: --lambda0/--lambda1 are in CADO units"
+                            " (multiples of lpb) and override the job file's"
+                            " GGNFS-unit lambdas\n");
+    }
+
+    /* CADO's convention, and the only value we have ever wanted. Deriving it
+     * removes one more flag whose right answer is a function of another. */
+    if (!J_set && cfg.logI > 1) cfg.J = 1u << (cfg.logI - 1);
 
     if (check_rel)
         return check_relations(check_rel, &POLY, cfg.lpb0,
@@ -410,6 +559,25 @@ int main(int argc, char **argv)
                          cfg.blocks ? cfg.blocks : 48 * 6, cfg.threads,
                          cfg.cof_ecm, cfg.ecm_b1 ? cfg.ecm_b1 : 1000,
                          cfg.ecm_curves ? cfg.ecm_curves : 16) ? 1 : 0;
+    }
+
+    /* Only the pipeline reads these, so outside it they were silent no-ops --
+     * the very thing the harness_only block below calls an error in the other
+     * direction. A run quoted as relation-targeted or lambda-tuned when it was
+     * neither is the same defect either way. */
+    if (!cfg.pipeline) {
+        static const char *pipeline_only[] = {
+            "--target-rels", "--lambda0", "--lambda1", NULL
+        };
+        int nbad = 0;
+        for (int i = 1; i < argc; i++)
+            for (int k = 0; pipeline_only[k]; k++)
+                if (!strcmp(argv[i], pipeline_only[k])) {
+                    fprintf(stderr, "bench: %s applies to --pipeline only\n",
+                            argv[i]);
+                    nbad++;
+                }
+        if (nbad) { fprintf(stderr, "  add --pipeline, or drop them.\n"); return 2; }
     }
 
     if (cfg.pipeline) {
@@ -446,12 +614,12 @@ int main(int argc, char **argv)
          * it at the special-q is a legitimate configuration (GGNFS does it)
          * but it costs relations outright -- 30 of 1,851 cofactors at the
          * parity q differ by exactly one prime in (q, alim]. */
-        /* The pipeline's documented configuration is bound 128 on side 1 and
-         * 132 on side 0. Side 1's scale and allowance were being left at the
-         * single-side benchmark defaults (1.0 and 112), which gives bound 113
-         * and a materially larger trial-division input. */
+        /* A placeholder scale for the THROWAWAY first parse of the factor
+         * base, which exists only to supply the q list; the real scale is
+         * derived below and the base is reparsed at it. Left at the c183's
+         * value because a plausible magnitude keeps the discarded logp pass
+         * from overflowing, not because it is used for anything measured. */
         if (!scale_set) cfg.scale = 1.275;
-        if (!allowance_set) cfg.allowance = 100.0;
         if (cfg.qlist && cfg.qmin) {
             fprintf(stderr, "bench --pipeline: --qlist and --qrange both give"
                     " the band; pass one\n");
@@ -470,6 +638,36 @@ int main(int argc, char **argv)
         if (!cfg.lpb)  cfg.lpb  = 32;
         if (!cfg.mfb)  cfg.mfb  = 92;
 
+        /* --qlist is read HERE, before the factor base, for two reasons. It
+         * needs nothing from the base, so a missing or malformed list should
+         * fail before a 29 MB parse rather than after it. And the scale
+         * derivation below reads ql[0] to build its lattice: this block used
+         * to sit ~90 lines further down, past that point, so --qlist left nq
+         * at 0 and the derivation silently fell back to the hardcoded default
+         * q -- a c183-sized lattice for whatever job was actually running,
+         * with the wrong scale applied to the entire band. --qrange was
+         * unaffected only because it happens to populate ql[] earlier. */
+        if (cfg.qlist) {
+            FILE *f = fopen(cfg.qlist, "r");
+            char line[256];
+            if (!f) { perror(cfg.qlist); return 1; }
+            while (fgets(line, sizeof line, f)) {
+                unsigned long long qq, rr;
+                if (line[0] == '#') continue;
+                if (sscanf(line, "%llu %llu", &qq, &rr) != 2) continue;
+                if (nq == capq) {
+                    capq = capq ? capq * 2 : 256;
+                    ql = (qsel_t *)realloc(ql, (size_t)capq * sizeof(qsel_t));
+                    if (!ql) { fclose(f); return 1; }
+                }
+                ql[nq].q = qq; ql[nq].rho = rr; nq++;
+                if (cfg.nq_max && nq >= cfg.nq_max) break;
+            }
+            fclose(f);
+            if (!nq) { fprintf(stderr, "%s: no `q rho` pairs\n", cfg.qlist); return 1; }
+            printf("band: %u special-q from %s\n", nq, cfg.qlist);
+        }
+
         if (cfg.cadofb) {
             if (fb_load_cado(cfg.cadofb, cfg.scale, &fb1) != 0) return 1;
         } else if (fb_load(fbpath, &fb1) != 0) return 1;
@@ -485,6 +683,7 @@ int main(int argc, char **argv)
          * Proper prime powers are skipped (a special-q is prime) and so are
          * projective roots, encoded as root >= p: those are roots at infinity,
          * which do not give a q-lattice. */
+        if (cfg.qmin && !cfg.qmax) cfg.qmax = alim ? alim - 1 : 0;
         if (cfg.qmin) {
             if (cfg.qmax >= fbbound)
                 printf("note: --qrange runs past the factor-base bound %u;"
@@ -510,6 +709,97 @@ int main(int argc, char **argv)
             printf("band: %u special-q (q, rho) from the algebraic factor base"
                    " in [%llu, %llu]\n", nq,
                    (unsigned long long)cfg.qmin, (unsigned long long)cfg.qmax);
+        }
+        /* Derive the byte scale and survivor allowance from the polynomial,
+         * as las does. This is UNCONDITIONAL. It used to sit behind
+         * --auto-params, whose "off" state was not a mode but a frozen copy of
+         * the c183's derived constants -- correct for exactly one polynomial
+         * and quietly wrong for every other. An explicit --scale/--allowance
+         * still overrides, which is the override that was actually wanted.
+         *
+         * The scale depends on the largest norm over the sieve rectangle,
+         * which needs a q-lattice, which for --qrange needs the factor base.
+         * So the base is parsed once to get the q list, the scale is derived
+         * from the first lattice, and the base is reparsed at that scale. One
+         * extra parse per RUN, against bands of thousands of q.
+         *
+         * The alternative -- carrying CADO's per-entry exponents so the logs
+         * could be recomputed in place -- means threading three more arrays
+         * through the loader's merge sort, which is a lot of new surface for a
+         * one-off startup cost. */
+        {
+            qlat_t L0; norm_t N1, N0;
+            double m1, m0;
+            uint64_t q0  = nq ? ql[0].q   : q;
+            uint64_t rh0 = nq ? ql[0].rho : (rho ? rho : 1);
+            poly_t P0 = POLY;      /* side 0's norm is G = Y1*x + Y0, degree 1 */
+            P0.deg = 1; P0.c[0] = P0.y0; P0.c[1] = P0.y1;
+            for (int z = 2; z < 8; z++) P0.c[z] = 0.0;
+            qlat_build(&L0, q0, rh0, POLY.skew);
+            norm_setup(&N1, &POLY, &L0, cfg.logI, cfg.J, 1.0, 1);
+            norm_setup(&N0, &P0,   &L0, cfg.logI, cfg.J, 1.0, 0);
+            m1 = (double)(N1.log2M - N1.bias);
+            m0 = (double)(N0.log2M - N0.bias);
+            /* An explicit --scale / --allowance is a deliberate override: it
+             * is how a swept operating point, or a bound the job file does not
+             * express, gets stated. */
+            if (!scale_set)  cfg.scale  = las_scale(m1);
+            if (!scale0_set) cfg.scale0 = las_scale(m0);
+            if (cfg.scale <= 0.0 || cfg.scale0 <= 0.0) {
+                fprintf(stderr, "derived scale: degenerate maxnorm"
+                        " (side1 %.2f, side0 %.2f)\n", m1, m0);
+                return 1;
+            }
+            /* The startup guards on --scale ran long before this point and
+             * against the c183's norm sizes, so a DERIVED scale never met
+             * them. fb_load's logp is a uint8 that saturates silently at 255,
+             * which is exactly what those guards exist to prevent. Recheck
+             * here, on both sides, against the real bounds. */
+            {
+                const double cinit = (cfg.cell_bits == 16) ? 4096.0 : 255.0;
+                const struct { double sc, mx; uint32_t lim; const char *nm; } chk[2] = {
+                    { cfg.scale,  m1, fbbound, "side 1" },
+                    { cfg.scale0, m0, rlim,    "side 0" }
+                };
+                for (int z = 0; z < 2; z++) {
+                    const double lg = chk[z].lim > 1
+                        ? log((double)chk[z].lim) / log(2.0) : 0.0;
+                    if (chk[z].sc * chk[z].mx > cinit) {
+                        fprintf(stderr, "%s: scale %.3f x log2(maxnorm) %.1f"
+                                " exceeds CINIT %.0f\n",
+                                chk[z].nm, chk[z].sc, chk[z].mx, cinit);
+                        return 1;
+                    }
+                    if (chk[z].sc * lg > 255.0) {
+                        fprintf(stderr, "%s: scale %.3f x log2(lim) %.1f exceeds"
+                                " the 8-bit per-ideal log\n",
+                                chk[z].nm, chk[z].sc, lg);
+                        return 1;
+                    }
+                }
+            }
+            if (!allowance_set)
+                cfg.allowance  = las_allowance(m1, cfg.scale, lambda1,
+                                               cfg.lpb ? cfg.lpb : 32,
+                                               cfg.mfb ? cfg.mfb : 92);
+            if (!allowance0_set)
+                cfg.allowance0 = las_allowance(m0, cfg.scale0, lambda0,
+                                               cfg.lpb0, cfg.mfb0);
+            /* uint32_t, matching pipe_side_init. The (unsigned char) this used
+             * to print through wrapped any bound above 255 -- legal against a
+             * 16-bit cell with CINIT 4096 -- so the banner disagreed with the
+             * bound the sieve actually ran. */
+            printf("params from q=%llu: side 1 log2(maxnorm)=%.2f scale=%.3f"
+                   " allowance=%.2f bound=%u\n", (unsigned long long)q0, m1,
+                   cfg.scale, cfg.allowance,
+                   (uint32_t)(cfg.allowance * cfg.scale + 1.0));
+            printf("                    side 0 log2(maxnorm)=%.2f scale=%.3f"
+                   " allowance=%.2f bound=%u\n", m0, cfg.scale0, cfg.allowance0,
+                   (uint32_t)(cfg.allowance0 * cfg.scale0 + 1.0));
+            fb_free(&fb1);
+            if (cfg.cadofb) { if (fb_load_cado(cfg.cadofb, cfg.scale, &fb1) != 0) return 1; }
+            else if (fb_load(fbpath, &fb1) != 0) return 1;
+            fb_fill_logp(&fb1, cfg.scale);
         }
         if (fb_split_small(&fb1, bkthresh, &fbs1) != 0) return 1;
         /* The GGNFS .afb.0 format carries neither p = 2 nor any prime power, so
@@ -555,27 +845,11 @@ int main(int argc, char **argv)
                " line-sieved %u\n", bkthresh, rlim, fb0.n, fbs0.n);
 
         {
-            if (cfg.qlist) {
-                FILE *f = fopen(cfg.qlist, "r");
-                char line[256];
-                if (!f) { perror(cfg.qlist); return 1; }
-                while (fgets(line, sizeof line, f)) {
-                    unsigned long long qq, rr;
-                    if (line[0] == '#') continue;
-                    if (sscanf(line, "%llu %llu", &qq, &rr) != 2) continue;
-                    if (nq == capq) {
-                        capq = capq ? capq * 2 : 256;
-                        ql = (qsel_t *)realloc(ql, (size_t)capq * sizeof(qsel_t));
-                        if (!ql) { fclose(f); return 1; }
-                    }
-                    ql[nq].q = qq; ql[nq].rho = rr; nq++;
-                    if (cfg.nq_max && nq >= cfg.nq_max) break;
-                }
-                fclose(f);
-                if (!nq) { fprintf(stderr, "%s: no `q rho` pairs\n", cfg.qlist); return 1; }
-                printf("band: %u special-q from %s\n", nq, cfg.qlist);
-            } else if (!nq) {
+            /* Neither --qlist nor --qrange: the single-q path, read above and
+             * at the --qrange block respectively. */
+            if (!nq) {
                 ql = (qsel_t *)malloc(sizeof(qsel_t));
+                if (!ql) return 1;
                 ql[0].q = q;
                 ql[0].rho = rho ? rho : (uint64_t)(0x9E3779B97F4A7C15ull % q);
                 nq = 1;

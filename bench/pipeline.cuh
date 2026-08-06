@@ -304,6 +304,7 @@ typedef struct {
     bn_t      *d_cof[2];
     uint8_t   *d_cofbits[2], *d_status[2];
     tdpoly_t  *d_poly[2];
+    uint32_t  *d_stats;          /* {already-relations, candidates, overflows} */
     tdsmall_t *d_sm[2], *h_sm[2];
     uint32_t   nsm[2], nsmcap[2];
     tdpoly_t   hpoly[2];
@@ -325,6 +326,7 @@ static void pipe_td_free(pipe_td_t *C)
     cudaFree(C->d_ca); cudaFree(C->d_cb);
     if (C->h_ca) cudaFreeHost(C->h_ca);
     if (C->h_cb) cudaFreeHost(C->h_cb);
+    cudaFree(C->d_stats);
     for (int s = 0; s < 2; s++) {
         cudaFree(C->d_plist[s]); cudaFree(C->d_pcnt[s]);
         cudaFree(C->d_cof[s]); cudaFree(C->d_cofbits[s]); cudaFree(C->d_status[s]);
@@ -441,6 +443,8 @@ static int pipe_td_init(pipe_td_t *C, const fb_t *fbs1, const fb_t *fbs0,
     CK(cudaMalloc(&C->d_flags, 4));
     CK(cudaMalloc(&C->d_ovf, 8));
     CK(cudaMalloc(&C->d_nacc, 4));
+    CK(cudaMalloc(&C->d_stats, 12));
+    CK(cudaMemset(C->d_stats, 0, 12));      /* accumulates over the whole band */
     for (int s = 0; s < 2; s++) {
         if (td_build_poly(&C->hpoly[s], POLY, s)) {
             fprintf(stderr, "  pipeline: could not parse side %d coefficients\n", s);
@@ -575,7 +579,7 @@ static int pipe_td_perq(pipe_td_t *C, const fb_t *fb1, const fb_t *fbs1,
                         const uint32_t *d_two, uint32_t xmax,
                         int blocks, int threads, int verify,
                         uint32_t *n_out, uint32_t *nacc_out, pipe_tm_t *tm,
-                        double *t_verify)
+                        double *t_verify, int want_host, int accumulate_stats)
 {
     const fb_t *fb[2];
     const pside_t *S[2];
@@ -716,7 +720,25 @@ static int pipe_td_perq(pipe_td_t *C, const fb_t *fb1, const fb_t *fbs1,
     CK(cudaEventSynchronize(E[13])); CK(cudaGetLastError());
     tm->record += time_kernel(E[12], E[13]);
 
+    /* Counts the host loop used to produce, computed where the data already is.
+     * They ACCUMULATE across the band and are read at flush points, because a
+     * blocking 12-byte readback per q costs about as much as the ~618 bytes per
+     * candidate this change removes -- a device round trip per q is the thing
+     * the rest of this pipeline is built to avoid. */
+    if (accumulate_stats) {
+        k_cand_stats<<<blocks, threads>>>(nacc, C->d_cbits[0], C->d_cbits[1],
+                                          C->d_cfn[0], C->d_cfn[1],
+                                          cfg->lpb0, cfg->lpb, TD_FMAX,
+                                          C->d_stats);
+        CK(cudaGetLastError());
+    }
+
     h0 = host_ms();
+    /* `want_host` is false under inline cofactorisation with no candidate file:
+     * the queue has already taken everything it needs straight from device
+     * memory, so the ~618 bytes per candidate this used to move existed only to
+     * be counted. k_cand_stats counts them in place. */
+    if (!want_host) { tm->readback += host_ms() - h0; return 0; }
     CK(cudaMemcpy(C->h_ca, C->d_ca, (size_t)nacc * 8, cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(C->h_cb, C->d_cb, (size_t)nacc * 8, cudaMemcpyDeviceToHost));
     for (int s = 0; s < 2; s++) {
@@ -750,6 +772,8 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     pipe_tm_t tm;
     cofq_t Q; cofq_out_t QO;
     uint8_t *d_bucket = NULL;
+    double vram_prev = 0;
+    size_t need = 0;
     uint32_t *d_cursor = NULL, *d_overflow = NULL, *d_two = NULL;
     uint32_t *d_n = NULL;
     unsigned long long *d_pre = NULL;
@@ -775,7 +799,8 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     est = est1 > est0 ? est1 : est0;
     cap = (uint32_t)(est / nregion) + 256;
     {
-        size_t need = (size_t)nregion * cap * 4, freeB = 0, totalB = 0;
+        size_t freeB = 0, totalB = 0;
+        need = (size_t)nregion * cap * 4;
         CK(cudaMemGetInfo(&freeB, &totalB));
         printf("  bucket array %u x %u x 4 B = %.2f GB, shared by both sides"
                " (%.2f GB free)\n", nregion, cap, need / 1073741824.0,
@@ -790,11 +815,33 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     CK(cudaMalloc(&d_overflow, 4));
 
     /* ---- one-time setup, hoisted out of the q loop ---- */
+    /* Device memory, by stage. The bucket array dominates on a big-area job
+     * like c183 and is a minority of the total on a small-area one like the
+     * c151, so "the bucket array is the footprint" is only true at one end.
+     * Print the actual split rather than inviting anyone to model it. */
+#define VRAM_MARK(label)                                                        \
+    do {                                                                        \
+        size_t fb_ = 0, tb_ = 0;                                                \
+        cudaMemGetInfo(&fb_, &tb_);                                             \
+        printf("    %-28s %6.2f GB   (%.2f GB free)\n", label,                  \
+               (vram_prev - (double)fb_) / 1073741824.0, fb_ / 1073741824.0);   \
+        vram_prev = (double)fb_;                                                \
+    } while (0)
+    {
+        size_t fb_ = 0, tb_ = 0;
+        cudaMemGetInfo(&fb_, &tb_);
+        vram_prev = (double)fb_;
+        printf("  device memory by stage:\n");
+        vram_prev += (double)need;   /* the bucket array is already allocated */
+        VRAM_MARK("bucket array");
+    }
     if (pipe_side_init(fb1, fbs1, cfg, &S1) ||
         pipe_side_init(fb0, fbs0, cfg, &S0)) { rc = -1; goto done; }
+    VRAM_MARK("factor bases + bitmaps");
     CK(cudaMalloc(&d_two, (size_t)nbitword * 4));
     CK(cudaMalloc(&d_n, 4)); CK(cudaMalloc(&d_pre, 8));
     if (pipe_td_init(&C, fbs1, fbs0, POLY, nbitword)) { rc = -1; goto done; }
+    VRAM_MARK("trial division context");
     /* The cross-q cofactor queue. Per-q the candidate count is ~1,956, which
      * would run the rho kernel at 3% occupancy; the queue accumulates across
      * special-q and flushes ~67 q worth at a time. With it resident, only the
@@ -802,6 +849,8 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
      * candidate file and its ~3 ms/q of host emission are gone. */
     if (cfg->cofactor && cofq_init(&Q, &QO, CQ_FLUSH, cfg->cof_ecm,
                                    cfg->ecm_b1, cfg->ecm_curves)) { rc = -1; goto done; }
+    if (cfg->cofactor) VRAM_MARK("cofactor queue");
+#undef VRAM_MARK
 
     if (cfg->relations && cfg->candidates &&
         !strcmp(cfg->relations, cfg->candidates)) {
@@ -820,11 +869,24 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     }
 
     /* ---- the band ---- */
+    {
+    const double t_band = host_ms();
+    double t_report = t_band;
     for (uint32_t qi = 0; qi < nq; qi++) {
         qlat_t Lq;
         float ts1 = 0, ts0 = 0, tis = 0;
         double th1 = 0, th0 = 0, qwall = host_ms(), tv = 0;
         uint32_t hn = 0, nacc = 0, ncand = 0, nrel = 0;
+        /* The host loop exists to write files. With inline cofactorisation and
+         * no candidate file, nothing reads the host mirrors, so neither the
+         * copies nor the loop have to happen.
+         *
+         * cfg->emit_cof is NOT a third case: --emit-cof is in harness_only and
+         * is rejected outright under --pipeline, so it is always NULL here.
+         * Including it made this look like it had three outcomes when it has
+         * two, and the end-of-band stats fold-in depends on this and
+         * accumulate_stats being exact complements. */
+        const int want_host = !cfg->cofactor || fc;
 
         if (!pipe_check_root(POLY, qlist[qi].q, qlist[qi].rho)) {
             fprintf(stderr, "  q=%llu: rho=%llu is not a root of f mod q\n",
@@ -866,7 +928,8 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
             uint32_t n = 0;
             if (pipe_td_perq(&C, fb1, fbs1, fb0, fbs0, &Lq, cfg, &S1, &S0,
                              d_two, xmax, blocks, cfg->threads, qi == 0,
-                             &n, &nacc, &tm, &tv)) { rc = -1; break; }
+                             &n, &nacc, &tm, &tv, want_host,
+                             !want_host)) { rc = -1; break; }
             if (n != hn) {
                 fprintf(stderr, "  q=%llu: intersect counted %u survivors,"
                         " rank scan %u\n", (unsigned long long)qlist[qi].q, hn, n);
@@ -908,7 +971,11 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         }
         tm.cofac += host_ms() - cf0;
         jn0 = host_ms();
-        for (uint32_t k = 0; k < nacc; k++) {
+        /* want_host is constant for the whole run, so it gates the loop rather
+         * than being retested per candidate. Hoisting it also makes visible
+         * what the inline path skips -- including the TD_FMAX overflow check
+         * below, which is why that check is repeated after the band. */
+        for (uint32_t k = 0; want_host && k < nacc; k++) {
             int64_t a = C.h_ca[k], b = C.h_cb[k];
             const uint32_t c0 = C.h_cfn[0][k], c1 = C.h_cfn[1][k];
             const uint32_t *f0 = C.h_cfac[0] + (size_t)k * TD_FMAX;
@@ -977,16 +1044,114 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         tm.join += host_ms() - jn0;
         acc_sieve += ts1 + ts0; acc_isect += tis; acc_host += th1 + th0;
         acc_wall += host_ms() - qwall - tv;
-        acc_surv += hn; acc_cand += ncand; acc_rel += nrel;
+        acc_surv += hn; acc_cand += ncand; acc_rel += nrel;   /* host path only */
         nqdone++;
-        if (cfg->verbose_q)
-            printf("  q=%llu: %u survivors, %u joint candidates, %u relations\n",
-                   (unsigned long long)qlist[qi].q, hn, ncand, nrel);
-        if (!cfg->verbose_q && ((qi % 10) == 9 || qi + 1 == nq))
-            printf("    %u/%u q done, %llu relations, %llu candidates\r",
-                   qi + 1, nq, (unsigned long long)acc_rel,
-                   (unsigned long long)acc_cand);
+        norm_verbose = 0;      /* the first q's setup is printed; the rest are not */
+        /* --target-rels: stop once enough relations exist. Under inline
+         * cofactorisation the only running total the host has without a per-q
+         * readback is Q.nrel, which advances at FLUSH boundaries -- so this
+         * overshoots by at most one flush (~256 q here, well under 1% of any
+         * useful target). Sieving upward until satisfied is what you actually
+         * want when the question is "enough for the matrix", since the yield
+         * per q falls as q grows and guessing the range wastes either time or
+         * relations. */
+        if (cfg->target_rels) {
+            unsigned long long have = cfg->cofactor ? Q.nrel
+                                                    : (unsigned long long)acc_rel;
+            if (have >= cfg->target_rels) {
+                printf("\n  --target-rels %llu reached after %u q (%llu relations)\n",
+                       (unsigned long long)cfg->target_rels, nqdone, have);
+                break;
+            }
+        }
+        /* ncand and nrel are produced by the host join loop, which does not run
+         * under inline cofactorisation -- so printing them there reported a
+         * flat "0 joint candidates, 0 relations" for every q of the band. The
+         * progress line below was fixed for this; this branch was not, and it
+         * is the one somebody passes --verbose-q to read. Report what is
+         * actually known per q rather than a variable that stayed at its
+         * initialiser; the device counters are folded in after the band. */
+        if (cfg->verbose_q) {
+            if (want_host)
+                printf("  q=%llu: %u survivors, %u joint candidates,"
+                       " %u relations\n",
+                       (unsigned long long)qlist[qi].q, hn, ncand, nrel);
+            else
+                printf("  q=%llu: %u survivors, %u joint candidates"
+                       " (relations counted on the device; see band summary)\n",
+                       (unsigned long long)qlist[qi].q, hn, nacc);
+        }
+        /* Under inline cofactorisation the host has no per-q relation count --
+         * the counters accumulate on the device and Q.nrel only advances at a
+         * flush. Reporting acc_rel there showed a flat 0 for the whole run,
+         * which on a multi-hour band looks exactly like failure.
+         *
+         * Progress is reported against whichever goal is actually in force: a
+         * relation target if one was given (in which case nq is meaningless --
+         * `--qrange MIN:` makes it the whole factor base), otherwise the q
+         * count. Rate-limited to one update every 30 s: it is a single \r line,
+         * but a band runs for hours and nobody needs it faster than that.
+         */
+        if (!cfg->verbose_q && (host_ms() - t_report > 30000.0 || qi + 1 == nq)) {
+            const unsigned long long rels = cfg->cofactor
+                ? Q.nrel : (unsigned long long)acc_rel;
+            const double el = (host_ms() - t_band) / 1000.0;
+            const double rps = el > 0 ? rels / el : 0.0;
+            double frac, eta;
+            t_report = host_ms();
+            if (cfg->target_rels) {
+                frac = (double)rels / (double)cfg->target_rels;
+                eta  = rps > 0 ? ((double)cfg->target_rels - rels) / rps : 0.0;
+            } else {
+                frac = (double)(qi + 1) / nq;
+                eta  = frac > 0 ? el * (1.0 / frac - 1.0) : 0.0;
+            }
+            if (frac > 1.0) frac = 1.0;
+            if (eta < 0.0) eta = 0.0;
+            /* Clamp before the cast. Under --cofactor the relation count only
+             * advances at a flush, so an early report can see a handful of
+             * relations against a 65M target and compute an ETA of ~3e10
+             * seconds -- which `(int)eta` cannot represent, and converting it
+             * is undefined rather than merely wrong. Anything past 99h is
+             * "unknown" in practice, so saturate there and show it. */
+            if (eta > 359999.0) eta = 359999.0;         /* 99h 59m */
+            printf("    q=%llu  %u q  %llu rel  %.0f rel/s  %.1f%%  ETA %dh %02dm      \r",
+                   (unsigned long long)qlist[qi].q, qi + 1, rels, rps,
+                   100.0 * frac, (int)eta / 3600, ((int)eta / 60) % 60);
+        }
         fflush(stdout);
+    }
+
+    {   /* Steady-state footprint. The per-q buffers (survivor lists, prime
+         * lists, candidate records) grow on demand as q vary, so the band's
+         * high-water mark is not knowable from the init sizes -- it is the
+         * larger part of the total on a small-area job. */
+        size_t fb_ = 0, tb_ = 0;
+        cudaMemGetInfo(&fb_, &tb_);
+        printf("\n  device memory, steady state: %.2f GB in use of %.2f GB"
+               " (%.2f GB free)\n",
+               (tb_ - fb_) / 1073741824.0, tb_ / 1073741824.0,
+               fb_ / 1073741824.0);
+    }
+    }   /* t_band scope */
+
+    /* Fold in the device-side candidate counters. Under inline cofactorisation
+     * the host loop never ran, so acc_cand and acc_rel are still zero and these
+     * are the only counts there are. The overflow check lands here rather than
+     * per q: the alternative was a blocking readback every q, which cost more
+     * than the host loop it replaced. A truncated factor list still fails the
+     * run -- just at the end of the band rather than inside it. */
+    if (!rc && cfg->cofactor && !fc) {      /* exactly !want_host */
+        uint32_t cs[3] = {0, 0, 0};
+        if (cudaMemcpy(cs, C.d_stats, 12, cudaMemcpyDeviceToHost) != cudaSuccess) rc = -1;
+        else {
+            acc_rel += cs[0]; acc_cand += cs[1];
+            if (cs[2]) {
+                fprintf(stderr, "  %u candidates in this band have more than the"
+                        " %d recorded factors; raise TD_FMAX\n", cs[2], TD_FMAX);
+                rc = -1;
+            }
+        }
     }
 
     /* The last partial flush happens AFTER the band loop, so its cost is not

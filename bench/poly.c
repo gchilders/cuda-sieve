@@ -46,14 +46,58 @@ int poly_load(const char *path, poly_t *P)
             P->y1 = strtod(line + 3, NULL);
             sscanf(line + 3, " %79s", P->y1s);
         }
+        /* Sieve parameters. A GGNFS .job file carries all of these; a CADO
+         * .poly carries none, and every one stays 0 so the caller can tell
+         * "absent" from "zero". Both loaders used to stop at Y1 and the human
+         * retyped the rest onto the command line. */
+        else if (!strncmp(line, "rlim:", 5))    P->rlim    = strtoul(line + 5, NULL, 10);
+        else if (!strncmp(line, "alim:", 5))    P->alim    = strtoul(line + 5, NULL, 10);
+        else if (!strncmp(line, "lpbr:", 5))    P->lpbr    = strtoul(line + 5, NULL, 10);
+        else if (!strncmp(line, "lpba:", 5))    P->lpba    = strtoul(line + 5, NULL, 10);
+        else if (!strncmp(line, "mfbr:", 5))    P->mfbr    = strtoul(line + 5, NULL, 10);
+        else if (!strncmp(line, "mfba:", 5))    P->mfba    = strtoul(line + 5, NULL, 10);
+        else if (!strncmp(line, "rlambda:", 8)) P->rlambda = strtod(line + 8, NULL);
+        else if (!strncmp(line, "alambda:", 8)) P->alambda = strtod(line + 8, NULL);
     }
     fclose(f);
     if (P->deg < 1) { fprintf(stderr, "poly_load: no algebraic coefficients\n"); return -1; }
     return 0;
 }
 
+double job_allowance_bits(double lambda, uint32_t lim)
+{
+    if (lambda <= 0.0 || lim < 2) return 0.0;
+    return lambda * (log((double)lim) / log(2.0));
+}
+
 /* allowance_bits: how many bits of unfactored cofactor we tolerate before a
  * position stops being a survivor. las derives this from lambda*lpb. */
+/* norm_setup's two diagnostic lines are per side PER SPECIAL-Q. That is fine
+ * for a single-q run and ruinous for a band: a 378,000-q job printed over a
+ * million lines and shredded the \r progress display. The band loop prints the
+ * first q's setup and then clears this. */
+int norm_verbose = 1;
+
+double las_scale(double maxlog2)
+{
+    double s;
+    if (maxlog2 <= 0.0) return 0.0;
+    s = (255.0 - 1.0) / maxlog2;          /* UCHAR_MAX - LOGNORM_GUARD_BITS */
+    return (double)(int)(s * 40.0) * 0.025;
+}
+
+double las_allowance(double maxlog2, double scale, double lambda,
+                     unsigned lpb, unsigned mfb)
+{
+    double r;
+    if (scale <= 0.0) return 0.0;
+    /* CADO's automatic lambda when none is given. */
+    if (lambda <= 0.0) lambda = 0.3 + (double)mfb / (double)lpb;
+    r = maxlog2 - 1.0 / scale;            /* LOGNORM_GUARD_BITS / scale */
+    if (r > lambda * (double)lpb) r = lambda * (double)lpb;
+    return r;
+}
+
 void norm_setup(norm_t *N, const poly_t *P, const qlat_t *L,
                 int logI, uint32_t J, double scale, int is_sqside)
 {
@@ -103,12 +147,19 @@ void norm_setup(norm_t *N, const poly_t *P, const qlat_t *L,
      * factor of q to the sq side. */
     N->bias = (float)(is_sqside ? log((double)L->q) / log(2.0) : 0.0);
 
+    /* The unbalanced-terms warning means the q-lattice was reduced without the
+     * skew, which is a real defect -- it is reported on every q regardless. */
+    if (nclamp)
+        printf("  ** q=%llu side %d: %d normalised term(s) flushed to zero"
+               " -- terms are unbalanced **\n",
+               (unsigned long long)L->q, is_sqside, nclamp);
+    if (!norm_verbose) return;
     printf("  norm setup: deg %d, A=%.4e B=%.4e, log2(maxnorm)=%.2f, scale=%.3f%s\n",
            P->deg, A, B, N->log2M - N->bias, N->scale,
            is_sqside ? "  (sq side: log2(q) divided out)" : "");
     printf("  normalised coeffs d[0..%d] =", P->deg);
     for (k = 0; k <= P->deg; k++) printf(" %.3g", N->d[k]);
-    printf("%s\n", nclamp ? "   ** unbalanced: terms flushed to zero **" : "");
+    printf("\n");
 }
 
 /* Host mirror of the device norm evaluation, used by the correctness gate. */

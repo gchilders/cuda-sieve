@@ -4265,6 +4265,286 @@ loop is too high a price for a cosmetic number.
 The band output is **byte-for-byte identical to before the review** at 3,147
 relations, and the whole gate suite passes.
 
+## The two schedulers became one
+
+Task 15, and the structural fix for the class of bug the review found.
+`cf_run_side` (standalone `--cofac`) and the loop inside `cofq_flush` (the
+inline cross-q queue) were two independent implementations of the same
+round-and-requeue schedule. They diverged exactly as duplicated schedulers do:
+the standalone one grew ECM and never got per-round compaction, the inline one
+grew compaction and never received the ECM configuration. **Each worked
+perfectly when tested on its own**, which is why neither defect was visible
+until someone ran the production path with `--cof-ecm` and checked the number.
+
+Now there is one `cf_run_rounds`, parameterised by a `cf_sched_t` holding the
+only things that actually differ between callers -- method, rounds, budget,
+curves, the ECM plan. Two consequences beyond the obvious:
+
+- **`k_cofac` lost its `SELECT` template parameter.** The uncompacted variant
+  existed only for the compaction A/B, whose result is recorded above; keeping
+  it meant keeping a second code path for a measurement already made. Always
+  compact.
+- **The standalone path inherited compaction**, which it never had: its
+  algebraic side went 958.5 -> ~865 ms on the 67-q corpus, ~9.7% faster, with
+  byte-identical output.
+
+A `dense_first` flag was written to skip the round-0 scan on the standalone path
+(where `memset` makes every job live, so the scan can only produce the identity)
+and then **reverted**: it did not pay above noise, and it reintroduced a
+per-caller behavioural difference, which is the precise thing this task exists
+to remove.
+
+## The inline path is now device-resident, and it did not show on the clock
+
+Task 16. Under `--cofactor` the pipeline was copying every candidate's
+coordinates, cofactors, factor counts and two 64-entry factor arrays to the host
+-- about 618 bytes each, ~1.2 MB per q -- and looping over all of them, to do
+three things: validate the factor count, count relations, count candidates. The
+queue had already taken what it needed straight from device memory, and
+`cq_emit_side` sorts for itself, so even the host-side `std::sort` was sorting
+copies nobody read.
+
+`k_cand_stats` replaces all of it with three counters. `readback of candidates`
+and `join and emit` both went to **0.000 ms/q** from 0.34 and 0.22.
+
+**The wall clock did not move**: 108.0-109.4 ms/q against a 108.0-108.6
+baseline. The removed 0.55 ms/q is 0.5% of the wall, and this machine's
+run-to-run spread is ~2%. **The change is below the noise floor and is not
+claimed as a speedup.**
+
+It is still the right shape, and one wrong turn inside it is worth recording.
+The first version read the three counters back **per q**, and that blocking
+12-byte readback cost ~0.45 ms/q -- it consumed nearly the whole saving, because
+on this hardware a device round trip per q costs more than the megabyte of PCIe
+traffic it was replacing. The counters now accumulate across the band and are
+read once at the end. The overflow check moved with them: a truncated factor
+list still fails the run, at band granularity rather than per q. **A per-q
+synchronisation is what the rest of this pipeline is built to avoid, and adding
+one back to save a copy was a bad trade that only measurement caught.**
+
+## The 8 B bucket record, re-costed and closed for good
+
+Task 14. This document refused the 8 B record twice on the argument that it taxes
+the largest stage to save a smaller one. Both sides of that trade had moved --
+the sieve is ~66-69 ms/q and post-sieve ~33, and resieve is walk-dominated with
+a ~7.1 ms/q floor -- so the refusal was due a re-cost against measurements
+rather than a third repetition. Measured, `--record-bytes 4` vs `8`, same q,
+same factor base:
+
+| | 4 B | 8 B |
+|---|---:|---:|
+| bucket array | 1.38 GB | 2.76 GB |
+| fill | **12.40 ms** | **17.66 ms** |
+
+**The fill tax is +5.26 ms/q, 42%** -- and `apply` is not even implemented for
+8 B records, though it reads every record and would see twice the volume.
+
+But the decisive number is on the benefit side, and it is not the one the
+earlier arguments were about. Carrying the factor-base index does not make
+resieve free; it **replaces a re-walk of the factor base with a re-read of the
+bucket array**, and those two are not the same size:
+
+| | objects | bytes |
+|---|---:|---:|
+| factor base (what resieve re-walks) | 11.56 M x 16 B | **0.185 GB** |
+| bucket records (what 8 B would re-read) | 610.7 M x 8 B | **4.89 GB** |
+
+**26x more data.** At an optimistic 600 GB/s the replacement pass alone is
+~8.1 ms/q, against the 9.99 ms/q resieve currently costs -- and that is before
+the +5.26 ms fill tax, before whatever `apply` gives up, and before the scatter,
+which still has to happen either way.
+
+So the trade is not close: **~13+ ms/q of new cost to remove 9.99 ms/q**, with
+the memory footprint doubling on a 12 GB card. And the reason resieve is cheap
+is now stated properly rather than assumed: **it re-walks 185 MB of factor base
+precisely to avoid re-reading 4.9 GB of bucket records.** Its ~7.1 ms/q floor is
+not a defect to engineer around; it is close to what re-deriving that
+information has to cost on this hardware.
+
+**Closed. The remaining post-sieve levers are not in resieve, and the sieve
+itself -- 66-69 ms/q, two thirds of the wall and untouched all session -- is
+where the next real work is.**
+
+## A second job: the c123, with parameters derived rather than tuned
+
+Task 17, and the first evidence that any of this generalises. `--auto-params`
+implements CADO's own derivation (`las-norms.cpp:237`) instead of the constants
+hand-fitted to c183:
+
+```
+maxlog2 = log2(largest norm over the sieve rectangle)
+scale   = (255 - 1) / maxlog2,  quantised to (int)(scale*40) * 0.025
+lambda  = given, or CADO's automatic 0.3 + mfb/lpb
+r       = min(maxlog2 - 1/scale, lambda*lpb)          <- our "allowance"
+bound   = (unsigned char)(r*scale + 1)
+```
+
+**It reproduces both hardcoded constants from the polynomial alone**: scale
+1.2750 on side 1 and 1.9250 on side 0, which is what they were tuned to. The
+derived allowances (101.60, 69.30) land within 1.5% of the values our own
+sweeps found (100.0, 68.1) -- CADO's automatic lambda and our measured optimum
+agree, which is reassuring about both.
+
+Run on a live c123 (I=13, lim 6M/3.5M, lpb 29/28, mfb 57/53 -- a 2LP job on
+both sides, nothing like c183's 3LP), with no code changes, only flags:
+
+| | las | ours |
+|---|---|---|
+| side 0 | log2(maxnorm)=93.15, scale=2.73, **bound=145** | 93.15, 2.725, **bound=145** |
+| side 1 | 142.97-144.23, scale 1.75-1.78, bound 100-101 | 145.91, 1.725, bound 99 |
+
+Over q in [400000, 401000], 74 special-q:
+
+| | |
+|---|---:|
+| las's distinct relations | 27,074 |
+| **ours** | **27,594** |
+| of las's, we found | **27,039 (99.87%)** |
+| **found by us, not by las** | **555** |
+| las's we missed | 35 |
+| **reconstruction gate** | **27,605 / 27,605 exact** |
+
+The 555 extra are the same effect seen on c183: las is running `-ncurves0 11
+-ncurves1 13`, a bounded ECM effort, against our rho at rounds 2 / budget 65536.
+The 35 missed are our side-1 bound being one unit tight, which has a known
+cause.
+
+### The one real inaccuracy this exposed
+
+Our `maxlog2` is the largest single homogeneous term; CADO's is the true maximum
+of |F| over the rectangle. That makes us **~2 bits conservative on side 1**
+(145.91 against 142.97-144.23), hence bound 99 against 100-101, and it costs
+0.13% of las's relations. Side 0, being degree 1, matches exactly.
+
+Also worth recording: **las re-derives the scale per special-q** -- it printed
+1.78 for one q and 1.75 for the next -- and re-slices its factor base to match.
+We bake the factor-base logs once per run, so a band-wide fixed scale is an
+approximation. It held here, but it is an assumption that should be checked per
+q rather than trusted.
+
+## The c123, factored end to end
+
+Task 18. GPU sieve -> msieve filtering -> msieve GPU linear algebra -> square
+root -> factors, on a job the code had never seen, with survivor bounds derived
+from the polynomial rather than tuned.
+
+```
+p42 factor: 131980915436137426858863181246116560763169
+p82 factor: 1691057659004520172717782898437809080597503666034065786710818800020911277994733649
+```
+
+`p * q == N`, verified independently.
+
+| stage | wall |
+|---|---:|
+| GPU sieve, q in [400000, 1900000], 107,813 special-q | 1,093 s |
+| msieve filtering (`-nc1`) | 171 s |
+| msieve linear algebra on GPU (`-nc2`) | 61 s |
+| square root (`-nc3`) | 153 s |
+
+29,339,495 relations. msieve found 849,784 cycles against 825,717 needed, and
+built an 823,418 x 823,845 matrix. **We generate no free relations** -- CADO
+generated 122,390 of them for the same job -- and filtering still cleared its
+target, so they are not load-bearing at this size.
+
+### Against CADO on the same job
+
+The comparison is close to apples-to-apples: same N, same polynomial, same
+factor-base bounds, 107,813 special-q against 103,957, and yields within 1.8%
+(272.1 vs 267.4 relations/q). CADO's own log confirms the parallelism:
+18,489.9 s CPU over 2,220 s elapsed is 8.33x, matching its 8 sieve instances.
+
+| | CADO (8 instances) | GPU |
+|---|---:|---:|
+| special-q | 103,957 | 107,813 |
+| relations | 27,798,825 | 29,339,495 |
+| **sieving wall clock** | **2,220 s** | **1,093 s** |
+| ms per special-q | 21.36 | **10.14** |
+| relations/sec | 12,522 | **26,839** |
+
+**2.03x on wall clock, 2.11x per special-q.**
+
+### A correction worth recording
+
+An earlier version of this comparison claimed **17x**, from reading CADO's
+`Total time: 18489.9s` as wall clock. It is the SUM over sieve instances; eight
+ran at once. Kyle caught it. The same mistake then propagated into a 14.7x
+perf/watt figure.
+
+The perf/watt number also mixed two configurations: the 206.7 W GPU figure in
+the power table above was measured when the GPU side was **sieve only**, before
+trial division, classify and cofactorisation existed, and it was being combined
+with a 128.5 W reading from the current full pipeline. On the measured-but-stale
+proxies the c123 comes out at **~1.85x relations/sec/watt**, which is the right
+order but should be treated as provisional until both sides are re-measured with
+the current code.
+
+**Two lessons, and the first is the one that keeps recurring in this document:**
+a number quoted from a log is not a measurement until you know what the log
+means. And a power figure is tied to the configuration that produced it -- the
+206.7 W was never wrong, it was answering a different question.
+
+## Device memory, measured rather than modelled
+
+`bench --pipeline` now prints its allocations by stage and the band's steady
+state, because a model of them was wrong twice in one session. On the c151
+(A=27, alim 33.5M):
+
+```
+    bucket array                   0.34 GB
+    factor bases + bitmaps         0.15 GB
+    trial division context         0.03 GB
+    cofactor queue                 0.14 GB
+  device memory, steady state: 1.85 GB in use of 11.94 GB
+```
+
+**Our named allocations are 0.66 GB**; CUDA reports 1.85 GB in use including its
+context; `nvidia-smi` reports ~4.1 GB. The last gap is not an allocation we
+make -- under WSL2/WDDM the driver reserves and accounts memory differently, and
+the desktop is on the same card. Do not reconcile those three numbers; measure
+the one you mean.
+
+The 4000-4100 MB oscillation Kyle observed is `pipe_td_grow` / `pipe_td_grow_cand`
+freeing and reallocating as per-q survivor and candidate counts vary. Not a
+leak: free memory was unchanged across a 4,000-q band.
+
+### What actually scales with area
+
+Only two things: the bucket array (`4 B x 1.15 x area x sum(1/p)`, formula
+validated against c183 at 0.2%) and the survivor bitmaps (`area/8` bytes each,
+three of them).
+
+| | 2^27 (c151) | 2^29 (c183) | 2^31 | 2^32 (AS276) |
+|---|---:|---:|---:|---:|
+| bucket array, 4 B | 0.34 | 1.38 | 5.53 | **11.06** |
+| survivor bitmaps | 0.05 | 0.20 | 0.81 | **1.61** |
+
+**An earlier claim that "the bucket array is the whole story" was wrong** -- it
+is 8% of the c151's footprint and most of c183's. It is right about *scaling*,
+which is what a projection needs, but not about absolute size at small areas.
+
+## The host thread is CPU-saturated, and it is not spin
+
+`bench` sits at ~96-99% of one core for an entire run. The obvious explanation
+is CUDA's default busy-wait at synchronisation points. **Measured, that is not
+it.** Adding `--blocking-sync` (`cudaDeviceScheduleBlockingSync`):
+
+| | wall | user | CPU |
+|---|---:|---:|---:|
+| spin (default) | 99.13 s | 97.61 s | 99% |
+| `--blocking-sync` | 97.46 s | 92.83 s | 99% |
+
+A 5% reduction, where pure spin would have collapsed it. The host thread is
+doing real work: per-q table building (~1.7 ms of a 24.75 ms/q on the c151) and
+the launch overhead of 50-100 kernels per q, plus whatever WSL2's GPU
+virtualisation layer burns, which no device flag reaches.
+
+**This is a serialisation limit, not a capacity one.** The box has 16 threads
+with ~3 busy; the pipeline uses one, and that one issues every launch and does
+every per-q host computation, with the GPU idle across it. That is a plausible
+share of the 8% utilisation gap at 92%. The fix is overlap -- build the next q's
+tables while the current q's kernels run -- not more cores.
+
 ## Caveat on everything numeric above
 
 Measured during this review, on a busy box (so the only timing quoted from it

@@ -12,7 +12,9 @@ set -e
 
 FB=../oracle/c183.fb1
 POLY=../oracle/c183.poly
-Q=--qrange=120000053:120000053
+# Two words on purpose: the parser takes `--qrange VALUE`, not `--qrange=VALUE`,
+# and the latter hits the unknown-option branch. Used unquoted so it splits.
+Q="--qrange 120000053:120000053"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 fail=0
@@ -53,10 +55,56 @@ expect_rel "ECM, inline queue"             37 --cofactor --cof-ecm --ecm-b1 2000
 expect_rel "ECM honoured, not silently rho"  7 --cofactor --cof-ecm --ecm-b1 2 --ecm-curves 1
 expect_refused "zero ECM curves"               --cofactor --cof-ecm --ecm-curves 0
 
+# ---- job-file parameters -------------------------------------------------
+# ../oracle/input.job is the SAME polynomial as c183.poly, plus the sieve keys.
+# So the two must agree once the one thing that differs -- the lambdas, which
+# c183.poly does not carry -- is stated explicitly on both.
+#
+# The counts are compared to EACH OTHER rather than pinned, deliberately. What
+# is being tested is that reading the job file changes nothing it should not;
+# pinning a number here would also pin the derived allowance, which is a
+# separate thing with its own case above.
+JOB=../oracle/input.job
+got=$(./bench --pipeline --cadofb $FB --poly $JOB $Q --relations $TMP/j.txt 2>&1 \
+      | grep -c 'job file: rlim 67100000, alim 134200000, lpbr 31, lpba 32, mfbr 60, mfba 92')
+if [ "$got" = "1" ]; then
+    printf 'PASS   %-34s all six keys\n' "job file parsed"
+else
+    printf 'FAIL   %-34s banner line not found\n' "job file parsed"; fail=1
+fi
+
+# GGNFS units: alambda 3.5 * log2(alim 134200000) = 94.5 bits. If this is ever
+# read as CADO units (3.5 * lpba 32 = 112) the bound LOOSENS by 17 bits and the
+# error is invisible in the relation count -- it just costs time. Pin the
+# conversion itself.
+got=$(./bench --pipeline --cadofb $FB --poly $JOB $Q --relations $TMP/j.txt 2>&1 \
+      | grep -c 'alambda 3.5 x log2(alim 134200000) = 94.5[0-9]* bits')
+if [ "$got" = "1" ]; then
+    printf 'PASS   %-34s 3.5 -> 94.5 bits, not 112\n' "GGNFS lambda conversion"
+else
+    printf 'FAIL   %-34s wrong or missing conversion\n' "GGNFS lambda conversion"; fail=1
+fi
+
+# Explicit flags outrank the job file. With both allowances stated, the job
+# file and the bare poly must produce the identical relation set.
+a=$(run --cofactor --cof-rounds 2 --cof-budget 65536 --allowance 112 --allowance0 68.1 --relations $TMP/p1.txt | grep 'total relations' | tail -1 | awk '{print $NF}')
+b=$(./bench --pipeline --cadofb $FB --poly $JOB --qrange 120000053:120000053 \
+        --cofactor --cof-rounds 2 --cof-budget 65536 --allowance 112 --allowance0 68.1 \
+        --relations $TMP/p2.txt 2>&1 | grep 'total relations' | tail -1 | awk '{print $NF}')
+if [ -n "$a" ] && [ "$a" = "$b" ] && cmp -s $TMP/p1.txt $TMP/p2.txt; then
+    printf 'PASS   %-34s %s each, byte-identical\n' "explicit flags outrank job file" "$a"
+else
+    printf 'FAIL   %-34s poly %s vs job %s\n' "explicit flags outrank job file" "$a" "$b"; fail=1
+fi
+
 expect_refused "lpb above the 32-bit limb"    --cofactor --lpb 33
 expect_refused "mfb above the 3-limb cofactor" --cofactor --mfb 97
 expect_refused "zero rho budget"              --cofactor --cof-budget 0
 expect_refused "rho rounds overflowing shift" --cofactor --cof-rounds 40
+expect_refused "lambda in the typo window"    --cofactor --lambda1 0.01
+expect_refused "lambda absurdly large"        --cofactor --lambda1 99
+# 0 is the documented "use CADO's automatic" sentinel and must stay legal.
+expect_rel     "lambda 0 == automatic"     37 --cofactor --cof-rounds 2 --cof-budget 65536 --lambda1 0
 
 # The GGNFS default factor base has no p = 2, so algebraic cofactors stay even
 # and mz_n0inv's odd-modulus contract is broken. Relation-producing runs must

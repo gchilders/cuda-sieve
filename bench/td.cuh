@@ -124,6 +124,38 @@ __device__ __forceinline__ void td_divide_out(bn_t *N, uint32_t p, uint64_t reci
     }
 }
 
+/* Per-q candidate bookkeeping, on device.
+ *
+ * Under inline cofactorisation the host used to read back every candidate's
+ * coordinates, cofactors, factor counts and two 64-entry factor arrays -- about
+ * 618 bytes each -- purely to count them and check for overflow, because the
+ * queue had already taken everything it needed straight from device memory.
+ * Three counters replace all of it.
+ *
+ * out[0] = records that are already relations (both sides within lpb)
+ * out[1] = records still needing cofactorisation
+ * out[2] = records whose factor list overflowed TD_FMAX -- these must FAIL the
+ *          run, since the enqueue clamps the count and the missing factors
+ *          would leave the norm undivided with nothing downstream to notice.
+ */
+__global__ void k_cand_stats(uint32_t n,
+                             const uint8_t *__restrict bits0,
+                             const uint8_t *__restrict bits1,
+                             const uint32_t *__restrict fn0,
+                             const uint32_t *__restrict fn1,
+                             uint32_t lpb0, uint32_t lpb1, uint32_t fmax,
+                             uint32_t *__restrict out)
+{
+    const uint32_t stride = gridDim.x * blockDim.x;
+    for (uint32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < n; t += stride) {
+        if (fn0[t] > fmax || fn1[t] > fmax) { atomicAdd(&out[2], 1u); continue; }
+        if ((uint32_t)bits0[t] <= lpb0 && (uint32_t)bits1[t] <= lpb1)
+            atomicAdd(&out[0], 1u);
+        else
+            atomicAdd(&out[1], 1u);
+    }
+}
+
 /* ---- survivor rank ----------------------------------------------------- */
 
 /* The compacted survivor list is written in rank order over the two-sided
