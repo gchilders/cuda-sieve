@@ -140,6 +140,7 @@ static int pipe_side_perq(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                           int side, double scale, double allowance,
                           uint8_t *d_bucket, uint32_t *d_cursor, uint32_t cap,
                           uint32_t *d_overflow, int blocks, int fblocks,
+                          int fthreads,
                           pside_t *S, float t_stage[3], double *t_host)
 {
     const uint32_t xmax = (1u << cfg->logI) * cfg->J;
@@ -222,7 +223,7 @@ static int pipe_side_perq(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     cudaEventRecord(e1);
     CK(cudaMemset(d_cursor, 0, (size_t)nregion * 4));
     CK(cudaMemset(d_overflow, 0, 4));
-    k_fill_atomic<4><<<fblocks, cfg->threads>>>(S->plat, S->slice, fb->n, xmax,
+    k_fill_atomic<4><<<fblocks, fthreads>>>(S->plat, S->slice, fb->n, xmax,
         cfg->logI, log_region, d_cursor, d_bucket, cap, d_overflow);
     cudaEventRecord(e2);
     CK(cudaMemset(S->d_nsurv, 0, 4));
@@ -783,6 +784,7 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     const int blocks = cfg->blocks ? cfg->blocks : 48 * 6;
     /* Fill's grid is absolute, not per-SM -- see FILL_BLOCKS_DEFAULT. */
     const int fblocks = cfg->fill_blocks ? cfg->fill_blocks : FILL_BLOCKS_DEFAULT;
+    const int fthreads = cfg->fill_threads ? cfg->fill_threads : FILL_THREADS_DEFAULT;
 
     pside_t S1, S0;
     pipe_td_t C;
@@ -953,10 +955,10 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
 
         if (pipe_side_perq(fb1, fbs1, &Lq, POLY, cfg, 1, cfg->scale,
                            cfg->allowance, d_bucket, d_cursor, cap, d_overflow,
-                           blocks, fblocks, &S1, ts1, &th1) ||
+                           blocks, fblocks, fthreads, &S1, ts1, &th1) ||
             pipe_side_perq(fb0, fbs0, &Lq, POLY, cfg, 0, cfg->scale0,
                            cfg->allowance0, d_bucket, d_cursor, cap, d_overflow,
-                           blocks, fblocks, &S0, ts0, &th0)) { rc = -1; break; }
+                           blocks, fblocks, fthreads, &S0, ts0, &th0)) { rc = -1; break; }
 
         CK(cudaMemset(d_n, 0, 4)); CK(cudaMemset(d_pre, 0, 8));
         CK(cudaMemset(d_two, 0, (size_t)nbitword * 4));

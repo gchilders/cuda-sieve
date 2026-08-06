@@ -231,12 +231,21 @@ typedef struct {
     int      fill_mode;     /* see FILL_* below */
     int      threads;       /* threads per block */
     int      blocks;        /* 0 = auto (6 per SM) */
-    /* Fill gets its OWN grid, and it is an absolute block count rather than a
-     * per-SM one. Measured minimum is 144 blocks on both a 48-SM 5070 (3/SM)
-     * and a 128-SM 4090 (1.1/SM) -- the same work in flight on cards 2.7x
-     * apart in width, so SM count is the wrong axis entirely. Overshooting
-     * costs 27% on the 4090 at its old 768. See RESULTS.md finding 51. */
+    /* Fill gets its OWN grid AND its own block width, because its optimum is
+     * nothing like the rest of the pipeline's. Measured on 5070, 4090 and 5090:
+     * fill wants MANY NARROW blocks -- 1152 x 32 -- while transform, intersect,
+     * TD, resieve and the cofactor kernels are tuned at 256. Sharing --threads
+     * meant the fill optimum was unreachable without wrecking five other
+     * stages, so it stayed at the 144 x 256 that finding 51 found by sweeping
+     * blocks alone at a fixed 256 threads.
+     *
+     * Both are ABSOLUTE, not per-SM: the 1152-block knee is the same on a
+     * 48-SM 5070 and a 170-SM 5090, so SM count is the wrong axis. Past the
+     * knee it is flat (<=1.7% to 9216 blocks on two of three cards), so
+     * overshooting is cheap and undershooting is not. See RESULTS.md
+     * finding 52. */
     int      fill_blocks;   /* 0 = auto (FILL_BLOCKS_DEFAULT) */
+    int      fill_threads;  /* 0 = auto (FILL_THREADS_DEFAULT) */
     int      reps;          /* timing repetitions */
     int      verify;        /* run CPU cross-check */
     /* ---- Path 2 ---- */
@@ -297,23 +306,62 @@ typedef struct {
 #define FILL_ATOMIC   0     /* (a) direct global atomicAdd per record   */
 #define FILL_TWOLEVEL 1     /* (c) smem-staged, flush full cache lines  */
 
-/* Fill's grid, in blocks -- absolute, NOT scaled by SM count. At 256 threads
- * this is 36,864 threads in flight. Both the 5070 and the 4090 minimise here,
- * and both degrade in BOTH directions from it: the 5070 is flat out to 1536
- * and falls off below 96, the 4090 climbs steadily to +38% by 768. Fill is not
- * parallelism-limited past this point; more concurrency thrashes whatever
- * fixed-rate resource it is actually waiting on rather than saturating it.
+/* Fill's grid -- both numbers ABSOLUTE, NOT scaled by SM count.
+ *
+ * 1152 x 32 is the knee on all three cards swept (5070, 4090, 5090), which is
+ * the useful part: one geometry, not a per-card constant. Past 1152 blocks it
+ * is FLAT -- 9216 blocks buys a further 1.7% on the 4090, 0.04% on the 5090
+ * and 3.8% on the 5070 (whose own run-to-run spread is ~3%). Below it the cost
+ * is steep: 288 blocks is 15-38% worse. Overshooting is nearly free,
+ * undershooting is not, so this sits at the knee rather than below it.
+ *
+ * NOTE THE SIGN AGAINST FINDING 51, which recorded the 4090 DEGRADING 38% from
+ * 144 to 768 blocks and called it an Ada-specific penalty. Both are real and
+ * they are not in conflict: that sweep held threads at 256, this one at 32. At
+ * 256 the 4090 gets worse with more blocks; at 32 it gets better. The
+ * architecture-specific block response in finding 51 -- Ada degrading,
+ * Blackwell flat -- was itself an artifact of the fixed 256, and dissolves at
+ * 32 where all three cards behave alike.
+ *
+ * Against the previous 144 x 256 default: 7.5% (5070), 8.8% (4090), 16.7%
+ * (5090) off fill.
+ *
+ * WHY 32 THREADS, AND WHY A SEPARATE FLAG. Sweeping blocks at a fixed 256
+ * threads -- which is all finding 51 did -- found a 144-block minimum and read
+ * it as a hard saturation point. That was an artifact of never varying the
+ * block WIDTH. Width is NOT a free parameter: at a constant 576 blocks the
+ * 5090 measures 2.716 / 2.711 / 3.147 / 4.289 ms at 64 / 128 / 256 / 512
+ * threads, so 256 is 16% off the optimum and 512 is 58% off. Between 32 and
+ * 128 it flattens (2.716 vs 2.711), which is the only band in which thread
+ * count is genuinely uncritical.
+ *
+ * That 16% is what --fill-threads buys and why raising FILL_BLOCKS_DEFAULT
+ * alone would not do: --threads also drives transform, intersect, TD, resieve
+ * and the cofactor kernels, all tuned at 256, so fill's optimum was
+ * unreachable without moving theirs. (1152 x 256 specifically has not been
+ * measured -- the sweeps cover 1152 at 32 and 576 at 256. The 16% gap is
+ * measured at 576 and inferred at 1152.)
+ *
+ * It is a work-granularity result -- fine chunks balance the tail -- and it
+ * does NOT support the L2 mechanisms: capacity was already dead (finding 51),
+ * write-combining decay was that finding's surviving candidate, and one
+ * geometry fitting cards with 48, 72 and 96 MB of L2 argues against both.
  *
  * Measured at logI 14, J 8192, 8192 buckets, 77.4M records, on k_fill_atomic.
  * The optimum plausibly moves with bucket and record count, which is not yet
- * measured -- override with --fill-blocks when characterising a new job shape.
+ * measured -- override with --fill-blocks/--fill-threads for a new job shape.
  *
- * Applies to k_fill_atomic (the shipping path) and k_fill_l1. NOT to
- * k_fill_segmented, which is a different algorithm in the experimental section
- * and was never swept; pushing an unmeasured constant onto it would be
- * inventing a number. It stays on the per-SM grid. k_fill_l2 is data-driven
- * (one block per super-bucket) and has no grid to tune. */
-#define FILL_BLOCKS_DEFAULT 144
+ * Applies to k_fill_atomic, the shipping path, and to nothing else by default.
+ * k_fill_l1 takes an explicit --fill-blocks but defaults to FILL_L1_BLOCKS
+ * (never swept, different write pattern). k_fill_segmented is a different
+ * algorithm in the experimental section and stays on the per-SM grid; pushing
+ * an unmeasured constant onto it would be inventing a number. k_fill_l2 is
+ * data-driven (one block per super-bucket) and has no grid to tune. */
+#define FILL_BLOCKS_DEFAULT  1152
+#define FILL_THREADS_DEFAULT 32
+
+/* k_fill_l1's grid, frozen at what it has always run. See the launch site. */
+#define FILL_L1_BLOCKS 144
 
 #define STAGE_FILL    0
 #define STAGE_BOTH    1

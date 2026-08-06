@@ -45,11 +45,16 @@ Cards with measured band data: **RTX 5070** (WSL2), **RTX 5090**, **RTX 4090**,
 ## Measured, and what it means
 
 - **Fill does not scale with the GPU.** 5090 has 3.5× the SMs of a 5070 and
-  returns 1.20× on fill, against 3.33× transform and 2.01× apply. All swept
-  cards saturate at the same **absolute 144 blocks**. Above saturation
-  Blackwell is flat, Ada degrades ~38%. Mechanism unresolved; the surviving
-  candidate is L2 write-combining decay, and it is a candidate, not a
-  conclusion. `ncu` is blocked on the rented boxes (`ERR_NVGPUCTRPERM`).
+  returns far less than that on fill, against 3.33× transform and 2.01× apply.
+  All three swept cards reach the same **absolute knee at 1152 blocks × 32
+  threads**, flat above it. Mechanism unresolved; the leading candidate is now
+  **work granularity** (fine chunks balance the tail), which fits the plateau.
+  Both L2 stories are out: capacity was already dead, and one geometry fitting
+  48/72/96 MB of L2 argues against write-combining decay too. `ncu` is blocked
+  on the rented boxes (`ERR_NVGPUCTRPERM`).
+- **Finding 51's Ada-vs-Blackwell block response was an artifact.** It held
+  `--threads` at 256; at 32 the 4090's degradation reverses to improvement and
+  all three cards behave alike. See finding 52.
 - **rel/J is flat between the 5070 and 5090** — 28.1 vs 29.5 on sampled board
   power, i.e. a tie, with the 5090 1.68× faster. The Ada 4090 is the outlier at
   18.1. Generation separates these cards; width does not.
@@ -57,8 +62,11 @@ Cards with measured band data: **RTX 5070** (WSL2), **RTX 5090**, **RTX 4090**,
   design "does not want wide expensive GPUs". It is retracted — see the
   RETRACTED block in `RESULTS.md`. Do not quote the old numbers.
 
-Projected but **not** measured end-to-end: the 4090's 27.6% fill gain from
-`--fill-blocks 144`, taken from a standalone sweep.
+Measured end-to-end on the 5070 (c147 band, 1340 q, same binary, geometry the
+only variable): fill −6.1%, apply +0.06%, wall −2.1%, relations byte-identical.
+Projected but **not** measured end-to-end: the same A/B on the 5090, where the
+standalone gain is largest (16.7%), and `1152 × 256` — the one cell that would
+show whether `--fill-threads` is needed at all.
 
 ## Known defects
 
@@ -69,10 +77,10 @@ Projected but **not** measured end-to-end: the 4090's 27.6% fill gain from
 - **Duplicate share 15.8–25%** from the full special-q-side factor base, at
   ~1.34× the downstream TD/cofactor work for the same unique yield. Whether
   truncating at `q` wins is untested — it also shortens the q range needed.
-- **Fill geometry is entangled with `--threads`.** The 144-block default was
-  swept at 256 threads, so the real invariant may be ~36,864 threads. The same
-  144 is applied to `k_fill_l1`, which launches at a hardwired 512 threads and
-  was never swept.
+- **`k_fill_l1` (twolevel path) has never been swept** at any geometry. It
+  takes an explicit `--fill-blocks` but defaults to its own 144 × 512, because
+  the 1152 × 32 result was measured on `k_fill_atomic` — a different kernel
+  with a different write pattern.
 - **Power is board-only.** The metric of record is whole-box
   relations/sec/watt; host draw is unmeasured. The A100 has no sampled power.
 
@@ -81,15 +89,19 @@ Projected but **not** measured end-to-end: the 4090's 27.6% fill gain from
 1. **Concurrent-q throughput.** Two independent fill workspaces, two q or two
    sides in separate streams, 144 blocks each, sweep 1/2/4. This is the
    decisive test for whether wide cards are a poor fit or are simply being fed
-   too little independent work — and it discriminates the write-combining
-   hypothesis: if two independent 144-block fills scale while one 288-block
-   fill does not, the problem is decomposition within one bucket set, not a
-   whole-card ceiling. Note the two architectures predict differently here:
-   Blackwell's flatness fits "idle capacity", Ada's *degradation* does not.
-2. **Fill geometry independent of `--threads`**, plus an opt-in startup
-   autotune over ~(96,144,288) × (128,256,512). Opt-in, not default: a default
-   autotuner makes every number in `RESULTS.md` non-reproducible, and
-   comparability has caught more errors on this project than anything else.
+   too little independent work. **Design it at the new knee**: the old framing
+   ("two 144-block fills vs one 288-block fill") is now measured entirely below
+   saturation, where any configuration scales, so it would have credited
+   streams for reaching a thread count one kernel already reaches. Compare
+   2 streams × 1152 against 1 kernel × 2304 instead. The old note here said the
+   two architectures predict differently — Blackwell's flatness fitting "idle
+   capacity" and Ada's degradation not. That distinction is gone: at 32 threads
+   all three cards flatten, so one prediction covers them all.
+2. **Startup fill autotune.** `--fill-threads` is done; the autotuner is not.
+   Sweep both axes, since holding one fixed is how the old default was reached.
+   Opt-in for the standalone benchmark, where reproducibility is the point;
+   default-on is defensible for `--pipeline`, where a per-job knee cannot be
+   derived and 15 trial fills cost ~60 ms of a multi-hour run.
 3. **Full vs q-truncated factor base**, compared at equal *deduplicated* yield.
    `nactive = lower_bound(primes, q)` on the already-sorted base, passed to
    transform/fill/resieve — no rebuild, no re-upload.

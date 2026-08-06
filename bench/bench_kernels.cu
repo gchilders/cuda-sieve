@@ -1769,6 +1769,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     int blocks = cfg->blocks ? cfg->blocks : 48 * 6;
     /* Fill's grid is absolute, not per-SM -- see FILL_BLOCKS_DEFAULT. */
     const int fblocks = cfg->fill_blocks ? cfg->fill_blocks : FILL_BLOCKS_DEFAULT;
+    const int fthreads = cfg->fill_threads ? cfg->fill_threads : FILL_THREADS_DEFAULT;
     float t_trans = 0, t_fill = 0, t_l1 = 0, t_l2 = 0;
 
     /* ---- stage T ---- *
@@ -1827,13 +1828,13 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
         for (int rep = 0; rep < cfg->reps; rep++) {
             CK(cudaMemset(D.cursor, 0, (size_t)nregion * 4));
             if (cfg->record_bytes == 2)
-                k_fill_atomic<2><<<fblocks, cfg->threads>>>(D.plat, D.slice, fb->n, xmax,
+                k_fill_atomic<2><<<fblocks, fthreads>>>(D.plat, D.slice, fb->n, xmax,
                     cfg->logI, log_region, D.cursor, D.out, cap, D.overflow);
             else if (cfg->record_bytes == 4)
-                k_fill_atomic<4><<<fblocks, cfg->threads>>>(D.plat, D.slice, fb->n, xmax,
+                k_fill_atomic<4><<<fblocks, fthreads>>>(D.plat, D.slice, fb->n, xmax,
                     cfg->logI, log_region, D.cursor, D.out, cap, D.overflow);
             else
-                k_fill_atomic<8><<<fblocks, cfg->threads>>>(D.plat, D.slice, fb->n, xmax,
+                k_fill_atomic<8><<<fblocks, fthreads>>>(D.plat, D.slice, fb->n, xmax,
                     cfg->logI, log_region, D.cursor, D.out, cap, D.overflow);
         }
         cudaEventRecord(e3);
@@ -1877,7 +1878,21 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
         cudaEventRecord(e2);
         for (int rep = 0; rep < cfg->reps; rep++) {
             CK(cudaMemset(D.l1cnt, 0, (size_t)nsuper * 4));
-            k_fill_l1<<<fblocks, 512>>>(D.plat, fb->n, xmax, cfg->logI, log_super,
+            /* Its own DEFAULT, but --fill-blocks still reaches it. k_fill_l1 is
+             * the twolevel path's level-1 kernel and has never been swept; the
+             * 1152 x 32 geometry was measured on k_fill_atomic, a different
+             * kernel with a different write pattern, so inheriting it as a
+             * default would move an experimental path nobody remeasured.
+             *
+             * Pinning it outright was worse: it made --fill-blocks a silent
+             * no-op under --mode twolevel while the startup line still printed
+             * the requested number, which is how a run gets quoted as a sweep
+             * that never happened. An explicit value wins here as everywhere
+             * else; only the default differs. Threads stay at 512 -- never
+             * swept either, and --fill-threads has no measured meaning for this
+             * kernel. */
+            k_fill_l1<<<cfg->fill_blocks ? cfg->fill_blocks : FILL_L1_BLOCKS,
+                        512>>>(D.plat, fb->n, xmax, cfg->logI, log_super,
                 D.l1cnt, D.l1, l1cap, D.overflow);
         }
         cudaEventRecord(e3);

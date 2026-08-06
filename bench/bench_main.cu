@@ -93,7 +93,10 @@ static void usage(void)
 "RUNTIME\n"
 "  --threads N      threads per block, multiple of 32  [256]\n"
 "  --blocks N       0 = auto (6 per SM)        [0]\n"
-"  --fill-blocks N  fill only; 0 = auto (144, absolute -- NOT per SM) [0]\n"
+"  --fill-blocks N  fill only; 0 = auto (1152, absolute -- NOT per SM) [0]\n"
+"  --fill-threads N fill only; 0 = auto (32), else a multiple of 32 in\n"
+"                   [32,1024]. Independent of --threads: fill wants many\n"
+"                   narrow blocks, the other kernels do not.            [0]\n"
 "  --blocking-sync  yield the CPU while waiting on the GPU instead of spinning.\n"
 "                   CUDA busy-waits by default, so a host thread that is 90%%\n"
 "                   idle still pegs a core; this frees it, at the cost of a\n"
@@ -244,7 +247,8 @@ int main(int argc, char **argv)
      * reproduced a path nobody would ship. */
     cfg.logI = 15; cfg.J = 16384; cfg.log_region = 14;
     cfg.record_bytes = 4; cfg.fill_mode = FILL_ATOMIC;
-    cfg.threads = 256; cfg.blocks = 0; cfg.fill_blocks = 0; cfg.reps = 3; cfg.verify = 0;
+    cfg.threads = 256; cfg.blocks = 0; cfg.fill_blocks = 0; cfg.fill_threads = 0;
+    cfg.reps = 3; cfg.verify = 0;
     cfg.stage = STAGE_BOTH; cfg.cell_bits = 16; cfg.norm_mode = NORM_HORNER;
     cfg.apply_atomic = 1; cfg.apply_threads = 0; cfg.allowance = 3.5 * 32.0;
     cfg.small_sieve = 1; cfg.side = 1;
@@ -300,7 +304,28 @@ int main(int argc, char **argv)
         }
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) cfg.threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--blocks") && i + 1 < argc) cfg.blocks = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--fill-blocks") && i + 1 < argc) cfg.fill_blocks = atoi(argv[++i]);
+        /* strtol, not atoi, for these two ALONE -- not a style preference. Both
+         * treat 0 as "auto", and atoi maps any malformed argument to 0, so
+         * `--fill-threads 64x` would run at the default, print no [--flag] tag,
+         * and be indistinguishable from an unswept run. A sweep over a typo'd
+         * list then reports N identical timings, which reads as flatness --
+         * precisely the shape of the conclusion these flags exist to test. */
+        else if (!strcmp(argv[i], "--fill-blocks") && i + 1 < argc) {
+            char *e; long v = strtol(argv[++i], &e, 10);
+            if (*e || e == argv[i]) {
+                fprintf(stderr, "--fill-blocks: not a number: %s\n", argv[i]);
+                return 1;
+            }
+            cfg.fill_blocks = (int)v;
+        }
+        else if (!strcmp(argv[i], "--fill-threads") && i + 1 < argc) {
+            char *e; long v = strtol(argv[++i], &e, 10);
+            if (*e || e == argv[i]) {
+                fprintf(stderr, "--fill-threads: not a number: %s\n", argv[i]);
+                return 1;
+            }
+            cfg.fill_threads = (int)v;
+        }
         else if (!strcmp(argv[i], "--reps") && i + 1 < argc) cfg.reps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--verify")) cfg.verify = 1;
         else if (!strcmp(argv[i], "--poly") && i + 1 < argc) polypath = argv[++i];
@@ -496,6 +521,32 @@ int main(int argc, char **argv)
                 " have\n", cfg.threads);
         return 1;
     }
+    /* Fill has no warp-collective code, so a partial warp here would not be
+     * wrong -- just wasteful, since the tail lanes are launched and idle. The
+     * range matters more: 0 means "auto" so it can never be passed through, and
+     * above 1024 every launch fails at runtime with a message that does not
+     * mention this flag. */
+    if (cfg.fill_threads != 0 &&
+        (cfg.fill_threads < 32 || cfg.fill_threads > 1024
+         || (cfg.fill_threads & 31))) {
+        fprintf(stderr, "--fill-threads must be 0 (auto) or a multiple of 32 in"
+                " [32,1024], got %d\n", cfg.fill_threads);
+        return 1;
+    }
+    /* Bounded ABOVE, and the bound is not cosmetic. k_fill_atomic strides by
+     * `uint32_t stride = gridDim.x * blockDim.x` (bench_kernels.cu:98). CUDA
+     * accepts gridDim.x up to 2^31-1, so --fill-blocks 134217728 at 32 threads
+     * launches fine and computes a stride of 2^32 == 0: the grid-stride loop
+     * never advances and the device hangs until the watchdog fires. Products
+     * that overflow to a nonzero value are worse -- primes get skipped or
+     * walked twice and the run completes with a plausible smaller record count.
+     * 1<<20 blocks is ~900x the measured knee, so nothing legitimate is lost. */
+    if (cfg.fill_blocks < 0 || cfg.fill_blocks > (1 << 20)) {
+        fprintf(stderr, "--fill-blocks must be in [0, %d] (0 = auto), got %d:"
+                " the fill kernels stride by gridDim.x*blockDim.x in 32 bits\n",
+                1 << 20, cfg.fill_blocks);
+        return 1;
+    }
     /* The grid-width query used to sit HERE. It now runs after the
      * --check-relations return further down, so that gate works on a box with
      * no GPU -- see the comment there. */
@@ -659,19 +710,38 @@ int main(int argc, char **argv)
                     " fall back to a hardcoded grid width\n");
             return 1;
         }
+        /* L2 size rides on the card name, on BOTH branches. The fill geometry
+         * is an absolute block count that is the same on every card measured,
+         * which is itself the interesting thing -- L2 capacity does not explain
+         * it (finding 51 already killed capacity, and 1152 x 32 fits cards with
+         * 48, 72 and 96 MB alike). It is printed so a sweep log carries the
+         * number instead of someone reconstructing it later from a card name.
+         * Printing it only in the default branch would hide it from exactly the
+         * --blocks A/B that wants it -- the defect the paragraph above this
+         * block records having already fixed once. */
         if (cfg.blocks == 0) {
             cfg.blocks = prop.multiProcessorCount * 6;
-            printf("grid: %d SMs x 6 = %d blocks (%s)\n",
-                   prop.multiProcessorCount, cfg.blocks, prop.name);
+            printf("grid: %d SMs x 6 = %d blocks (%s, %d MB L2)\n",
+                   prop.multiProcessorCount, cfg.blocks, prop.name,
+                   prop.l2CacheSize >> 20);
         } else {
-            printf("grid: %d blocks on %d SMs (%s)  [--blocks; auto would be"
-                   " %d]\n", cfg.blocks, prop.multiProcessorCount, prop.name,
+            printf("grid: %d blocks on %d SMs (%s, %d MB L2)  [--blocks; auto"
+                   " would be %d]\n", cfg.blocks, prop.multiProcessorCount,
+                   prop.name, prop.l2CacheSize >> 20,
                    prop.multiProcessorCount * 6);
         }
-        if (cfg.fill_blocks == 0) cfg.fill_blocks = FILL_BLOCKS_DEFAULT;
-        printf("grid: %d blocks for fill (absolute, not per SM)%s\n",
-               cfg.fill_blocks,
-               cfg.fill_blocks == FILL_BLOCKS_DEFAULT ? "" : "  [--fill-blocks]");
+        /* Reported, NOT resolved. cfg.fill_blocks/fill_threads stay 0 for
+         * "auto" all the way to the launch sites, because k_fill_atomic and
+         * k_fill_l1 have different defaults (the 1152 x 32 sweep was run on the
+         * former only) and collapsing 0 here would erase the distinction they
+         * need. Every ?: at a launch site is therefore live, not a dead
+         * fallback -- and there is exactly one place per kernel that knows its
+         * own default. */
+        printf("grid: %d x %d for fill (absolute, not per SM)%s%s\n",
+               cfg.fill_blocks  ? cfg.fill_blocks  : FILL_BLOCKS_DEFAULT,
+               cfg.fill_threads ? cfg.fill_threads : FILL_THREADS_DEFAULT,
+               cfg.fill_blocks  ? "  [--fill-blocks]"  : "",
+               cfg.fill_threads ? "  [--fill-threads]" : "");
     }
 
     /* ---- both sides in one process ---- */

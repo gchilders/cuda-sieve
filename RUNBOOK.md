@@ -236,7 +236,8 @@ Grid width comes from `multiProcessorCount`. Every run opens with the line it
 derived, on stdout, including when `--blocks` overrides it:
 
 ```
-grid: 48 SMs x 6 = 288 blocks (NVIDIA GeForce RTX 5070)
+grid: 48 SMs x 6 = 288 blocks (NVIDIA GeForce RTX 5070, 48 MB L2)
+grid: 1152 x 32 for fill (absolute, not per SM)
 ```
 
 **Check that line first**, and check it names the card you meant. The SM count
@@ -248,29 +249,40 @@ There is no `cudaSetDevice` and no `--device` flag: device 0 is always used.
 On a multi-GPU box select another card with `CUDA_VISIBLE_DEVICES=1` and
 confirm it on this line.
 
-**Fill has its own grid, and it does not scale with the card.** `--blocks` is
-6 per SM; fill instead uses a fixed **144 blocks** (`--fill-blocks` to
-override). A 48-SM 5070, a 128-SM 4090 and a 170-SM 5090 all saturate at that
-same absolute count — 3, 1.1 and 0.85 blocks per SM respectively — and all
-three fall off sharply below it. Above it Blackwell is flat but Ada degrades,
-costing the 4090 27% under the old per-SM rule.
+**Fill has its own grid AND its own block width, and neither scales with the
+card.** `--blocks` is 6 per SM; fill instead uses a fixed **1152 blocks of 32
+threads** (`--fill-blocks` / `--fill-threads` to override). A 48-SM 5070, a
+128-SM 4090 and a 170-SM 5090 all reach the knee at that same absolute
+geometry. Above it every card is flat, so overshooting is nearly free; below it
+the cost is steep (288 blocks is 15–38% worse), so undershoot is the expensive
+mistake.
+
+**`--fill-threads` is separate from `--threads` on purpose.** Fill wants many
+narrow blocks; transform, intersect, TD, resieve and the cofactor kernels are
+all tuned at 256. At a constant 576 blocks the 5090 measures 2.711 ms at 128
+threads against 3.147 at 256 — **16%** — so tuning fill through `--threads`
+would have cost five other stages to buy one.
 
 Don't expect a faster card to fix a slow fill: a 5090 with 3.5× the 5070's
-hardware returns 20% on this stage, against 2–3.3× on every other stage. The
-optimum was measured at one job shape (8192 buckets, 77.4M records) and
-plausibly moves with bucket and record count, so sweep it when characterising a
-new job:
+hardware still returns far less than that ratio on this stage. The geometry was
+measured at one job shape (8192 buckets, 77.4M records) and plausibly moves
+with bucket and record count, so sweep it when characterising a new job — and
+sweep **both** axes, because holding one fixed is exactly how the old 144 × 256
+default was arrived at:
 
 ```sh
-for b in 96 144 288 576; do
-  printf "fill-blocks %-4s " $b
-  bench --poly JOB.job --cadofb JOB.roots1 --logI 14 --J 8192 \
-        --reps 100 --stage fill --fill-blocks $b | grep "fill:"
+for t in 32 64 128 256; do
+  for b in 576 1152 2304 4608; do
+    printf "fill %4s x %-3s " $b $t
+    bench --poly JOB.job --cadofb JOB.roots1 --logI 14 --J 8192 \
+          --reps 100 --stage fill --fill-blocks $b --fill-threads $t | grep "fill:"
+  done
 done
 ```
 
-Note `--blocks` does **not** move fill any more — the two grids are separate,
-and the startup lines print both. See RESULTS.md finding 51.
+Note `--blocks` and `--threads` do **not** move fill — the grids are fully
+separate, and the startup lines print both. See RESULTS.md finding 52 (and 51,
+which it supersedes on the geometry).
 
 Two rules for comparing cards, both learned the hard way (RESULTS.md
 findings 48–51):

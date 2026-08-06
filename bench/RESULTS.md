@@ -1785,6 +1785,14 @@ not reported. A rerun at `--reps 100` on the current tree would tighten them.
 
 ## Finding 51 — fill saturates at 144 blocks on every card and does not scale with the GPU
 
+> **SUPERSEDED by finding 52 on the geometry, 2026-08-06.** Every block sweep
+> below holds `--threads` at 256 and varies blocks alone. Varying the block
+> *width* moves the optimum to **1152 × 32** and dissolves the
+> architecture-specific block response recorded here — the 4090's "+38% by 768"
+> degradation reverses sign at 32 threads. `FILL_BLOCKS_DEFAULT` is 1152, not
+> the 144 asserted below. What survives is the *scaling* result: fill still
+> returns far less than the hardware ratio, on the corrected geometry too.
+
 Adding the RTX 4090 (AD102, 128 SM × 2.52 GHz) and RTX 5090 (GB202, 170 SM ×
 2.41 GHz) to the finding 50 set produced a result no hypothesis on the table
 predicted. Same `--logI 14 --J 8192`:
@@ -1970,6 +1978,108 @@ of finding 48, which had not been found yet. The grid fix remains correct on
 occupancy grounds for transform, TD, classify, resieve and the cofactor kernels;
 **its effect on fill was nil and the ~20 → ~14 ms should not be attributed to
 it.**
+
+## Finding 52 — fill wants 1152 x 32, and finding 51's architecture split was an artifact of a fixed 256 threads
+
+Finding 51 swept fill's **block count** at a fixed `--threads 256` and read the
+resulting 144-block minimum as a hard saturation point, with an
+architecture-specific response above it (Ada degrading 38% by 768 blocks,
+Blackwell flat). Block **width** was never varied. It is not a free parameter.
+
+### At constant total threads, narrower blocks always win
+
+36,864 threads throughout, so every row is the same work differently cut up.
+Standalone `--logI 14 --J 8192 --reps 100`, fill ms:
+
+| T x B | 5070 | 4090 | 5090 |
+|---|---:|---:|---:|
+| 192 x 192 | 3.612 | 4.482 | 2.893 |
+| 128 x 288 | 3.553 | 4.654 | 2.830 |
+| 96 x 384 | 3.455 | 4.407 | 2.760 |
+| 64 x 576 | 3.530 | 4.419 | 2.716 |
+| **32 x 1152** | **3.454** | **4.384** | **2.636** |
+
+### Thread count matters above 128, and not below it
+
+At a constant 576 blocks the 5090 measures **2.716 / 2.711 / 3.147 / 4.289 ms**
+at 64 / 128 / 256 / 512 threads. So 256 is **16% off** and 512 is 58% off,
+while 32-128 is flat to 0.2%. Two consequences: a sweep pinned at 256 was
+16% off the optimum before it began, and fill's width cannot be tuned through
+`--threads`, which also drives transform, intersect, TD, resieve and the
+cofactor kernels. Hence `--fill-threads`.
+
+### The knee is 1152 blocks on all three cards
+
+At `--threads 32`, fill ms:
+
+| blocks | 5070 | 4090 | 5090 |
+|---|---:|---:|---:|
+| 288 | 3.909 | 5.089 | 3.629 |
+| 576 | 3.487 | 4.626 | 2.983 |
+| **1152** | **3.444** | **4.360** | **2.633** |
+| 2304 | 3.410 | 4.407 | 2.668 |
+| 4608 | 3.312 | 4.327 | 2.656 |
+| 9216 | 3.312 | 4.285 | 2.632 |
+
+Past 1152 the remaining movement is 1.7% (4090), 0.04% (5090) and 3.8% (5070,
+whose own run-to-run spread is ~3%) — flat, not falling. Below it the cost is
+steep. Overshooting is nearly free and undershooting is not, so the default
+sits **at** the knee. Against the old 144 x 256: **7.5% / 8.8% / 16.7%**.
+
+### The Ada/Blackwell split dissolves
+
+Finding 51's headline architectural claim was that the 4090 *degrades* with
+more blocks while Blackwell stays flat. At 32 threads the 4090 **improves**
+monotonically over the same range. Both sweeps are correct; they differ only in
+the fixed thread count. The block response is not a property of the
+architecture, it is a property of the width you happen to hold fixed — and at
+32 all three cards behave alike, which is why one geometry serves all of them.
+
+### It is not L2
+
+L2 capacity was already dead (finding 51's own list); write-combining decay was
+that finding's surviving candidate. A single 1152 x 32 optimum across cards
+with **48, 72 and 96 MB** of L2 argues against both. The behaviour it does fit
+is **work granularity**: fine chunks balance the tail, and the effect saturates
+once chunks are numerous enough — which is exactly the flat plateau above.
+Still a candidate, not a conclusion; `ncu` remains blocked on the rented boxes.
+
+### Verified end to end, not just in the microbenchmark
+
+Same binary, same session, geometry the only variable. c147 band, 1340 q,
+RTX 5070:
+
+| | 144 x 256 | 1152 x 32 | delta |
+|---|---:|---:|---:|
+| wall clock/q | 25.00 ms | 24.47 ms | **-2.1%** |
+| sieve, both sides | 17.94 | 17.48 | -2.6% |
+| transform | 0.766 | 0.764 | -0.3% |
+| **fill** | 7.576 | 7.113 | **-6.1%** |
+| **apply** | 9.601 | 9.607 | **+0.06%** |
+| relations | 159,837 | 159,837 | **byte-identical** |
+
+Apply was the risk worth checking: it reads the bucket array fill writes, and
+the write interleaving changed 32-fold. It did not move. The sorted relation
+files compare equal, both reconstruction gates pass with the same 1747/1952
+factor counts, and `cofcheck.sh` is 30/30. The pipeline gain (6.1%) is smaller
+than the standalone predicted (7.5%), so expect the 5090's 16.7% to land nearer
+13-14% in a band.
+
+**Methodological note.** The first version of this A/B compared against a fill
+figure captured in an earlier session and appeared to show apply regressing
+2.4%. It had not: this box's apply drifts ~2.3% between sessions, and the
+controlled same-binary run showed +0.06%. **Do not A/B against a captured
+number from another session on this box** — rerun the control.
+
+### Not yet measured
+
+- **1152 x 256.** The sweeps cover 1152 at 32 threads and 576 at 256. The 16%
+  width penalty is measured at 576 and *inferred* at 1152. If it vanished at
+  1152, `--fill-threads` would be unnecessary and raising the block default
+  alone would suffice.
+- The pipeline A/B is 5070-only; the 5090 is where the largest gain is claimed.
+- `k_fill_l1` (twolevel path) has never been swept at any geometry and keeps its
+  own 144 x 512 default.
 
 ## Not addressed in this round
 
