@@ -42,7 +42,8 @@ static void usage(void)
 "                   the default), 0 = rational. An SNFS job whose algebraic\n"
 "                   coefficients are tiny puts the difficulty on the rational\n"
 "                   side, and the q and the 3LP mfb go there with it\n"
-"  --qlist FILE     band of special-q: `q rho` per line (# comments ok)\n"
+"  --qlist FILE     band of special-q: `q rho` per line (# comments ok);\n"
+"                   q must be prime, rho is reduced mod q, bad lines are fatal\n"
 "  --q N / --rho N  a single special-q          [120000011]  (las -v prints rho)\n"
 "  --nq N           stop after N special-q from the list\n"
 "  --target-rels N  stop once N relations have been collected. Checked at\n"
@@ -90,8 +91,9 @@ static void usage(void)
 "  --verbose-q      print a line per special-q instead of a band summary\n"
 "\n"
 "RUNTIME\n"
-"  --threads N      threads per block          [256]\n"
+"  --threads N      threads per block, multiple of 32  [256]\n"
 "  --blocks N       0 = auto (6 per SM)        [0]\n"
+"  --fill-blocks N  fill only; 0 = auto (144, absolute -- NOT per SM) [0]\n"
 "  --blocking-sync  yield the CPU while waiting on the GPU instead of spinning.\n"
 "                   CUDA busy-waits by default, so a host thread that is 90%%\n"
 "                   idle still pegs a core; this frees it, at the cost of a\n"
@@ -242,7 +244,7 @@ int main(int argc, char **argv)
      * reproduced a path nobody would ship. */
     cfg.logI = 15; cfg.J = 16384; cfg.log_region = 14;
     cfg.record_bytes = 4; cfg.fill_mode = FILL_ATOMIC;
-    cfg.threads = 256; cfg.blocks = 0; cfg.reps = 3; cfg.verify = 0;
+    cfg.threads = 256; cfg.blocks = 0; cfg.fill_blocks = 0; cfg.reps = 3; cfg.verify = 0;
     cfg.stage = STAGE_BOTH; cfg.cell_bits = 16; cfg.norm_mode = NORM_HORNER;
     cfg.apply_atomic = 1; cfg.apply_threads = 0; cfg.allowance = 3.5 * 32.0;
     cfg.small_sieve = 1; cfg.side = 1;
@@ -298,6 +300,7 @@ int main(int argc, char **argv)
         }
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) cfg.threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--blocks") && i + 1 < argc) cfg.blocks = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--fill-blocks") && i + 1 < argc) cfg.fill_blocks = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--reps") && i + 1 < argc) cfg.reps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--verify")) cfg.verify = 1;
         else if (!strcmp(argv[i], "--poly") && i + 1 < argc) polypath = argv[++i];
@@ -474,42 +477,28 @@ int main(int argc, char **argv)
         fprintf(stderr, "--J must be > 0, --reps >= 1, --threads in [32,1024]\n");
         return 1;
     }
-    /* Grid width is 6 resident blocks per SM, so it MUST come from the device.
-     * It was hardcoded 48*6 = 288 -- 48 being this box's 5070. On an 82-SM
-     * 3090 that is 3.5 blocks/SM, i.e. 58% of the occupancy every tuning
-     * decision in RESULTS.md assumed, which reads as the bigger card being
-     * slower. Resolve it once here; run_pipeline() and bench_kernels.cu both
-     * treat a nonzero cfg.blocks as final, so this reaches every launch.
+    /* Same rule --apply-threads has enforced all along, and for the same class
+     * of reason -- it was simply never applied to the block width every OTHER
+     * kernel launches with. k_intersect_compact runs a warp-wide inclusive scan
+     * under a hardcoded 0xffffffff mask and broadcasts the atomic base from
+     * lane 31 (bench_kernels.cu:899-910). A partial final warp has no lane 31,
+     * so the base every thread in it reads is undefined.
      *
-     * Queried and printed UNCONDITIONALLY, on stdout with every other startup
-     * line. Printing only in the default case hid the number from exactly the
-     * --blocks A/B that wants it, stderr dropped it from any run redirected
-     * with `> log`, and a failed query used to leave cfg.blocks at 0 so the
-     * three `48 * 6` fallbacks silently reinstated the 5070's SM count with no
-     * diagnostic. There is no useful run on a device we cannot query, so a
-     * failure here is fatal rather than a default.
-     *
-     * Device 0 always. There is no cudaSetDevice and no --device flag; select
-     * another GPU with CUDA_VISIBLE_DEVICES and confirm it on this line. */
-    {
-        cudaDeviceProp prop;
-        int dev = 0;
-        if (cudaGetDevice(&dev) != cudaSuccess ||
-            cudaGetDeviceProperties(&prop, dev) != cudaSuccess) {
-            fprintf(stderr, "bench: cannot query the CUDA device -- refusing to"
-                    " fall back to a hardcoded grid width\n");
-            return 1;
-        }
-        if (cfg.blocks == 0) {
-            cfg.blocks = prop.multiProcessorCount * 6;
-            printf("grid: %d SMs x 6 = %d blocks (%s)\n",
-                   prop.multiProcessorCount, cfg.blocks, prop.name);
-        } else {
-            printf("grid: %d blocks on %d SMs (%s)  [--blocks; auto would be"
-                   " %d]\n", cfg.blocks, prop.multiProcessorCount, prop.name,
-                   prop.multiProcessorCount * 6);
-        }
+     * --threads 33 was accepted and ran to completion, reporting "intersect
+     * counted 262538 survivors, rank scan 270888". The independent second count
+     * turned that into a band FAILED rather than bad relations, which is the
+     * gate working -- but it costs a whole band to say what one modulo says
+     * here. */
+    if (cfg.threads & 31) {
+        fprintf(stderr, "--threads must be a multiple of 32 (got %d): the"
+                " intersection kernel scans under a full warp mask and reads"
+                " its atomic base from lane 31, which a partial warp does not"
+                " have\n", cfg.threads);
+        return 1;
     }
+    /* The grid-width query used to sit HERE. It now runs after the
+     * --check-relations return further down, so that gate works on a box with
+     * no GPU -- see the comment there. */
     /* The small sieve's warp tier strides by nwarps = threads >> 5. Below 32
      * that is ZERO -- an infinite loop on the device. A non-multiple of 32
      * leaves a partial warp whose lanes re-run warp-tier entries, double-adding
@@ -634,9 +623,56 @@ int main(int argc, char **argv)
      * half that the argument parser had already range-checked. */
     if (check_cofactor_bounds(&cfg, alim, rlim, cof_rounds, cof_budget)) return 1;
 
+    /* --check-relations is pure host code -- it re-derives both norms from the
+     * polynomial and divides. It cannot run before this point because lpb0/lpb
+     * may have just come from the .job file, and it must run before the device
+     * query below, because a fatal "cannot query the CUDA device" on a machine
+     * with no GPU is exactly what stops an emitted relation file from being
+     * verified on the box that has the file rather than the card. */
     if (check_rel)
         return check_relations(check_rel, &POLY, cfg.lpb0,
                               cfg.lpb ? cfg.lpb : 32) ? 1 : 0;
+
+    /* Grid width is 6 resident blocks per SM, so it MUST come from the device.
+     * It was hardcoded 48*6 = 288 -- 48 being this box's 5070. On an 82-SM
+     * 3090 that is 3.5 blocks/SM, i.e. 58% of the occupancy every tuning
+     * decision in RESULTS.md assumed, which reads as the bigger card being
+     * slower. Resolve it once here; run_pipeline() and bench_kernels.cu both
+     * treat a nonzero cfg.blocks as final, so this reaches every launch.
+     *
+     * Queried and printed UNCONDITIONALLY, on stdout with every other startup
+     * line. Printing only in the default case hid the number from exactly the
+     * --blocks A/B that wants it, stderr dropped it from any run redirected
+     * with `> log`, and a failed query used to leave cfg.blocks at 0 so the
+     * three `48 * 6` fallbacks silently reinstated the 5070's SM count with no
+     * diagnostic. There is no useful run on a device we cannot query, so a
+     * failure here is fatal rather than a default.
+     *
+     * Device 0 always. There is no cudaSetDevice and no --device flag; select
+     * another GPU with CUDA_VISIBLE_DEVICES and confirm it on this line. */
+    {
+        cudaDeviceProp prop;
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaGetDeviceProperties(&prop, dev) != cudaSuccess) {
+            fprintf(stderr, "bench: cannot query the CUDA device -- refusing to"
+                    " fall back to a hardcoded grid width\n");
+            return 1;
+        }
+        if (cfg.blocks == 0) {
+            cfg.blocks = prop.multiProcessorCount * 6;
+            printf("grid: %d SMs x 6 = %d blocks (%s)\n",
+                   prop.multiProcessorCount, cfg.blocks, prop.name);
+        } else {
+            printf("grid: %d blocks on %d SMs (%s)  [--blocks; auto would be"
+                   " %d]\n", cfg.blocks, prop.multiProcessorCount, prop.name,
+                   prop.multiProcessorCount * 6);
+        }
+        if (cfg.fill_blocks == 0) cfg.fill_blocks = FILL_BLOCKS_DEFAULT;
+        printf("grid: %d blocks for fill (absolute, not per SM)%s\n",
+               cfg.fill_blocks,
+               cfg.fill_blocks == FILL_BLOCKS_DEFAULT ? "" : "  [--fill-blocks]");
+    }
 
     /* ---- both sides in one process ---- */
     if (cofac_in) {
@@ -755,10 +791,52 @@ int main(int argc, char **argv)
             FILE *f = fopen(cfg.qlist, "r");
             char line[256];
             if (!f) { perror(cfg.qlist); return 1; }
+            unsigned long lno = 0;
             while (fgets(line, sizeof line, f)) {
                 unsigned long long qq, rr;
-                if (line[0] == '#') continue;
-                if (sscanf(line, "%llu %llu", &qq, &rr) != 2) continue;
+                const char *s = line;
+                lno++;
+                while (*s == ' ' || *s == '\t') s++;
+                if (*s == '#' || *s == '\n' || *s == '\r' || !*s) continue;
+                /* Was `continue`. A typo'd or wrongly-columned q-list then ran
+                 * as a SHORTER band with no diagnostic at all -- the count
+                 * printed below was the only hint, and only if you knew what it
+                 * should have been. */
+                if (sscanf(s, "%llu %llu", &qq, &rr) != 2) {
+                    fprintf(stderr, "%s:%lu: expected `q rho`, got: %s",
+                            cfg.qlist, lno, line);
+                    fclose(f); free(ql); return 1;
+                }
+                /* pipe_check_root is NOT a substitute for these two, which is
+                 * why they belong here rather than there. Everything is 0 mod
+                 * 1, so q = 1 passes the root test outright and then reaches a
+                 * full-multiplicity division by 1. A composite q with a genuine
+                 * root mod q also passes, gets divided out of every norm on its
+                 * side, and is emitted as though it were a prime relation
+                 * factor -- a wrong relation that reconstructs.
+                 *
+                 * --qrange cannot reach either case: it draws q from the factor
+                 * base, prime by construction. A hand-written --qlist is the
+                 * only way in, which is exactly why nothing downstream looks. */
+                if (qq < 2 || (qq >> 32)) {
+                    fprintf(stderr, "%s:%lu: q = %llu is not in [2, 2^32)\n",
+                            cfg.qlist, lno, qq);
+                    fclose(f); free(ql); return 1;
+                }
+                if (!bench_is_prime32((uint32_t)qq)) {
+                    fprintf(stderr, "%s:%lu: q = %llu is composite\n",
+                            cfg.qlist, lno, qq);
+                    fclose(f); free(ql); return 1;
+                }
+                /* Canonicalise. This is NOT about getting a different lattice:
+                 * <(q,0),(rho,1)> and <(q,0),(rho+kq,1)> generate the same one,
+                 * and Gauss reduction converges to the same basis either way --
+                 * measured, an unreduced rho reproduces the golden 37 relations
+                 * exactly. What it is not safe against is SIZE. qlat_build
+                 * casts rho straight to int64_t, so a rho at or above 2^63
+                 * arrives negative, and its reduction is bounded at 200
+                 * iterations. One modulo here removes both. */
+                rr %= qq;
                 if (nq == capq) {
                     capq = capq ? capq * 2 : 256;
                     ql = (qsel_t *)realloc(ql, (size_t)capq * sizeof(qsel_t));

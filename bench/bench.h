@@ -47,6 +47,41 @@ int     fb_is_proper_power(uint32_t q);   /* p^k, k >= 2 */
 int32_t fb_check_prime_powers(const fb_t *fb);
 void fb_free(fb_t *fb);
 
+/* Deterministic primality over the WHOLE 32-bit range -- not probabilistic and
+ * not a bound to check before calling. {2, 7, 61} is a verified witness set for
+ * every n < 4,759,123,141, which covers uint32 with room to spare.
+ *
+ * Header-inline because two callers that share nothing else both need it: the
+ * relation gate has to reject a composite masquerading as a prime factor, and
+ * the --qlist parser has to reject a composite special-q. Both were previously
+ * satisfied by weaker checks that a composite passes -- exact division and a
+ * root test respectively -- so neither could see the failure that matters. */
+static inline int bench_is_prime32(uint32_t n)
+{
+    static const uint32_t witness[3] = { 2, 7, 61 };
+    uint32_t d = n - 1;
+    int s = 0, i;
+    if (n < 2) return 0;
+    if (!(n & 1)) return n == 2;
+    if (n % 3 == 0) return n == 3;
+    while (!(d & 1)) { d >>= 1; s++; }
+    for (i = 0; i < 3; i++) {
+        uint64_t a = witness[i] % n, x = 1, p = a;
+        uint32_t e = d;
+        int r, composite;
+        if (!a) continue;                 /* n divides the witness: n <= 61 */
+        while (e) { if (e & 1) x = x * p % n; p = p * p % n; e >>= 1; }
+        if (x == 1 || x == (uint64_t)n - 1) continue;
+        composite = 1;
+        for (r = 1; r < s; r++) {
+            x = x * x % n;
+            if (x == (uint64_t)n - 1) { composite = 0; break; }
+        }
+        if (composite) return 0;
+    }
+    return 1;
+}
+
 /* CADO's byte scale and survivor allowance, derived rather than hardcoded.
  * `maxlog2` is log2 of the largest norm over the sieve rectangle -- what
  * norm_setup already computes as (log2M - bias). See las-norms.cpp:237.
@@ -195,7 +230,13 @@ typedef struct {
     int      record_bytes;  /* 2, 4 or 8 */
     int      fill_mode;     /* see FILL_* below */
     int      threads;       /* threads per block */
-    int      blocks;        /* 0 = auto */
+    int      blocks;        /* 0 = auto (6 per SM) */
+    /* Fill gets its OWN grid, and it is an absolute block count rather than a
+     * per-SM one. Measured minimum is 144 blocks on both a 48-SM 5070 (3/SM)
+     * and a 128-SM 4090 (1.1/SM) -- the same work in flight on cards 2.7x
+     * apart in width, so SM count is the wrong axis entirely. Overshooting
+     * costs 27% on the 4090 at its old 768. See RESULTS.md finding 51. */
+    int      fill_blocks;   /* 0 = auto (FILL_BLOCKS_DEFAULT) */
     int      reps;          /* timing repetitions */
     int      verify;        /* run CPU cross-check */
     /* ---- Path 2 ---- */
@@ -255,6 +296,24 @@ typedef struct {
 
 #define FILL_ATOMIC   0     /* (a) direct global atomicAdd per record   */
 #define FILL_TWOLEVEL 1     /* (c) smem-staged, flush full cache lines  */
+
+/* Fill's grid, in blocks -- absolute, NOT scaled by SM count. At 256 threads
+ * this is 36,864 threads in flight. Both the 5070 and the 4090 minimise here,
+ * and both degrade in BOTH directions from it: the 5070 is flat out to 1536
+ * and falls off below 96, the 4090 climbs steadily to +38% by 768. Fill is not
+ * parallelism-limited past this point; more concurrency thrashes whatever
+ * fixed-rate resource it is actually waiting on rather than saturating it.
+ *
+ * Measured at logI 14, J 8192, 8192 buckets, 77.4M records, on k_fill_atomic.
+ * The optimum plausibly moves with bucket and record count, which is not yet
+ * measured -- override with --fill-blocks when characterising a new job shape.
+ *
+ * Applies to k_fill_atomic (the shipping path) and k_fill_l1. NOT to
+ * k_fill_segmented, which is a different algorithm in the experimental section
+ * and was never swept; pushing an unmeasured constant onto it would be
+ * inventing a number. It stays on the per-SM grid. k_fill_l2 is data-driven
+ * (one block per super-bucket) and has no grid to tune. */
+#define FILL_BLOCKS_DEFAULT 144
 
 #define STAGE_FILL    0
 #define STAGE_BOTH    1

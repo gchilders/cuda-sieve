@@ -223,4 +223,47 @@ else
     printf 'FAIL   %-34s corruption NOT detected\n' "reconstruction negative control"; fail=1
 fi
 
+# The corruption control above only proves the gate notices a factor that does
+# not DIVIDE. It says nothing about the failure that is actually likely here: a
+# cofactor split that stops early and emits p*q as one "prime". That divides
+# perfectly, rebuilds the norm to 1, and passed every check this gate had until
+# the primality test was added -- so it needs its own control, built by merging
+# a relation's first two side-0 factors into their product.
+made=0
+while IFS= read -r ln; do
+    if [ $made = 0 ]; then
+        case ${ln%%:*} in \#*) printf '%s\n' "$ln"; continue;; esac
+        ab=${ln%%:*}; rest=${ln#*:}; s0=${rest%%:*}; s1=${rest#*:}
+        case $s0 in
+        *,*) f1=${s0%%,*}; tl=${s0#*,}; f2=${tl%%,*}; tl2=${tl#*,}
+             p=$(( 0x$f1 * 0x$f2 ))
+             # Must stay under 2^32 or the range check rejects it first and the
+             # control passes without ever exercising primality.
+             if [ $p -le 4294967295 ]; then
+                 if [ "$tl" = "$f2" ]; then s0=$(printf '%x' $p)
+                 else s0="$(printf '%x' $p),$tl2"; fi
+                 ln="$ab:$s0:$s1"; made=1
+             fi ;;
+        esac
+    fi
+    printf '%s\n' "$ln"
+done < $TMP/inline.txt > $TMP/composite.txt
+if [ $made = 0 ]; then
+    printf 'SKIP   %-34s no relation with two small side-0 factors\n' \
+        "primality negative control"
+elif ./bench --check-relations $TMP/composite.txt --poly $POLY 2>&1 | grep -q FAIL; then
+    printf 'PASS   %-34s composite factor detected\n' "primality negative control"
+else
+    printf 'FAIL   %-34s composite NOT detected\n' "primality negative control"; fail=1
+fi
+
+# A partial warp has no lane 31 for k_intersect_compact to broadcast its atomic
+# base from. This used to be caught only by the survivor/rank cross-check, i.e.
+# after a full band had run.
+if ./bench --threads 33 --poly $POLY 2>&1 | grep -q 'multiple of 32'; then
+    printf 'PASS   %-34s --threads 33 rejected\n' "warp-multiple guard"
+else
+    printf 'FAIL   %-34s --threads 33 accepted\n' "warp-multiple guard"; fail=1
+fi
+
 [ $fail = 0 ] && echo "cofactor golden test passed" || { echo "cofactor golden test FAILED"; exit 1; }

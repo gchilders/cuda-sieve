@@ -1,5 +1,9 @@
 # Path 1 — bucket-fill microbenchmark results
 
+> **This is a lab notebook, in discovery order, including refuted findings.**
+> For what the siever does *today* — architecture, validated jobs and cards,
+> measured vs projected, open experiments — read **`STATUS.md`** instead.
+
 **Hardware:** RTX 5070 (sm_120, 48 SM, 48 MB L2, 99 KB opt-in smem, 672.0 GB/s)
 **Toolchain:** CUDA 13.2.78; sm_120 + sm_89 + sm_86 native, compute_80 PTX (finding 49)
 **Also measured:** RTX 3090 (sm_86), A100 80GB PCIe (sm_80) — finding 50
@@ -1652,8 +1656,20 @@ rounds before anyone checked whether the metric was stable.
 **Fixed** by an untimed warm-up launch ahead of the timed loop, with the
 `nproj`/`nlost` memsets moved after it (they are accumulators divided by reps).
 That removes ~92% of the artifact — reps 3: 71.18 → 6.05, reps 100: 3.18 →
-0.645 — but not all of it, so **`--reps 100` is the floor for any cross-machine
-comparison** and low-reps transform numbers stay untrustworthy.
+0.645 — but not all of it *on this box*, so **`--reps 100` is the floor for any
+cross-machine comparison** and low-reps transform numbers stay untrustworthy.
+
+**The residual is WSL2-specific.** The 5090 in finding 51 ran this same fixed
+binary (commit `ad958cc`) on native Linux and reported transform at **0.149 ms
+at `--reps 3`**. That is its true cost, not an inflated one: its pipeline
+transform is 0.231 ms for both sides (3.13M ideals), and the standalone sieves
+side 1 alone (2.06M), so the expected standalone figure is 0.231 × 2.06/3.13 =
+**0.152 ms**. Measured 0.149.
+
+So the warm-up fully solves the problem on native Linux, while WSL2 retains
+~12× inflation at reps 3 (6.05 against a true ~0.50). The reps floor is a rule
+for *this* box. Numbers other people took at low reps on native Linux were
+probably fine; what actually broke was comparing across the two platforms.
 
 The general rule this establishes: **a stage whose reported time depends on
 `--reps` is not measuring the kernel.** Fill passes that test at reps 3; apply
@@ -1729,14 +1745,16 @@ an explanation offered, not a fit tested.
 measured 1.88× — **and fails for the A100**, predicted 1.58×, measured 2.47×.
 That miss is unexplained.
 
-The working hypothesis is cursor contention: fill scatters into 8192 bucket
-cursors fixed by `--region`, not by the GPU, so wider cards pile more SMs onto
-the same contention points, and the miss grows with SM count in the right
-order. The control run says the 5070 is not contending — fill is flat at
-**3.729 / 3.742 / 3.965 ms** for 8192 / 16384 / 32768 cursors (`--region`
-14/13/12) — which makes `--region 13` a clean discriminator on a 108-SM card.
-Not a proposed default either way: apply degrades hard as regions shrink
-(5.51 → 8.28 → 13.36 ms over the same sweep).
+**REFUTED — see finding 51.** The hypothesis here was cursor contention: fill
+scatters into 8192 cursors fixed by `--region` rather than by the GPU, so wider
+cards were thought to pile more SMs onto the same contention points. `--region
+13` on a 128-SM 4090 made fill *worse* (6.785 → 7.028) and left the 4090/5070
+ratio unchanged, so cursor count is not the variable. The right axis is total
+concurrency, and the INT32 model above is refuted with it — finding 51 has the
+sweep. The 5070 control recorded here stands as data: fill is flat at **3.729 /
+3.742 / 3.965 ms** for 8192 / 16384 / 32768 cursors, and apply degrades hard as
+regions shrink (5.51 → 8.28 → 13.36 ms over the same sweep), so `--region` is
+not a tuning knob in either direction.
 
 **Whole-pipeline consequence.** Same command, same work (1340 q, ~159.8K
 relations):
@@ -1765,7 +1783,199 @@ Caveat on the A100 rows: they were taken before finding 48's warm-up landed, at
 `--reps 3`, so fill and apply are trustworthy (reps-stable) and transform is
 not reported. A rerun at `--reps 100` on the current tree would tighten them.
 
+## Finding 51 — fill saturates at 144 blocks on every card and does not scale with the GPU
+
+Adding the RTX 4090 (AD102, 128 SM × 2.52 GHz) and RTX 5090 (GB202, 170 SM ×
+2.41 GHz) to the finding 50 set produced a result no hypothesis on the table
+predicted. Same `--logI 14 --J 8192`:
+
+| | transform | fill | apply | chain |
+|---|---:|---:|---:|---:|
+| RTX 5070 | 0.504 | **3.777** | 5.482 | 9.763 |
+| RTX 4090 | 0.250 | 6.785 | **2.814** | 9.849 |
+| RTX 5090 | 0.149 | 3.250 | 1.908 | 5.307 |
+
+The 4090 tied the 5070 on the total from stages differing ~2× in both
+directions. The 5090 rows are `--reps 3`, but on the warm-up-fixed binary
+(`ad958cc`) and on native Linux, where that is enough — its 0.149 ms transform
+matches the 0.152 predicted from its own pipeline figure. See finding 48 for
+why the same reps setting is worthless on the WSL2 box.
+
+A dead heat on the total, from stages that differ by ~2× in both directions.
+The full pipeline was the same story: **25.97 ms/q on the 4090 against 25.28
+on the 5070** — the wider, hotter, more expensive card losing by 2.7%.
+
+### Three mechanisms, all refuted by measurement
+
+1. **L2 capacity** (the original hypothesis). Dead: the 4090 has 1.5× the
+   5070's L2, 1.5× the bandwidth and 2.67× the SMs, and its fill is 1.80×
+   slower.
+2. **INT32 lane count** (finding 50's model, which fit the 3090 to 8%). Dead:
+   the 4090's INT32 peak is 20.6 T against the 5070's 15.4 — **1.34× more**
+   integer throughput, 1.80× slower fill.
+3. **Bucket-cursor contention** (finding 50's stated hypothesis, with the
+   5070's flat `--region` sweep as its control). Dead: doubling cursors on the
+   4090 via `--region 13` made fill *worse*, 6.785 → 7.028, and the
+   4090/5070 ratio was unchanged at 1.82× vs 1.88×. Finding 50's contention
+   note is withdrawn.
+
+### What is actually true: an absolute concurrency optimum
+
+Sweeping `--blocks` with `--stage fill`:
+
+| blocks | threads | 5070 (48 SM) | 4090 (128 SM) | 5090 (170 SM) |
+|---:|---:|---:|---:|---:|
+| 32 | 8,192 | 5.383 | 6.680 | — |
+| 48 | 12,288 | 4.827 | 6.384 | — |
+| 64 | 16,384 | 4.828 | 5.392 | — |
+| 96 | 24,576 | 4.778 | 6.039 | 4.362 |
+| **144** | **36,864** | **3.726** | **4.806** | **3.156** |
+| 288 | 73,728 | 3.854 | 5.638 | **3.113** |
+| 576 | 147,456 | 3.906 | 6.473 | 3.145 |
+| 768 | 196,608 | 3.955 | 6.636 | — |
+| 1020 | 261,120 | — | — | 3.238 |
+| 1536 | 393,216 | 3.901 | 6.524 | — |
+
+**All three cards saturate at the same absolute 144 blocks** — 3 per SM on the
+5070, 1.1 on the 4090, 0.85 on the 5090. Every one of them falls off sharply
+below it (96 blocks costs 22–28%) and none gains anything above it. Three cards
+spanning **3.5× in SM count** want the same ~37K threads in flight, so SM count
+is the wrong axis for this kernel, not merely the wrong constant.
+
+Above saturation the architectures split. **Blackwell is flat** — the 5070
+varies 6% out to 1536 blocks, the 5090 4% out to 1020. **Ada degrades**, the
+4090 climbing 38% by 768. So the earlier reading that both cards "degrade in
+both directions" was wrong: only Ada degrades upward, and the 4090's 27% was a
+penalty specific to it rather than a gain available everywhere.
+
+144 is nonetheless the right default on all three: at or within noise of the
+best point on every card, and it avoids Ada's penalty entirely.
+
+The Ada/Blackwell split also fits the two fill misses finding 50 could not
+explain — the A100 at 648 blocks and the 3090 at 492 were both far past 144 on
+pre-Blackwell parts, though neither was swept to confirm it.
+
+### Fill does not scale with the GPU
+
+The 5090 has **3.5× the SMs, 2.7× the bandwidth and 3.4× the FP32/INT32** of
+the 5070. Measured at each card's best:
+
+| stage | 5070 | 5090 | speedup |
+|---|---:|---:|---:|
+| transform | 0.770 | 0.231 | 3.33× |
+| apply | 9.385 | 4.681 | 2.01× |
+| TD + classify (device) | 3.091 | 2.567 | 1.20× |
+| **fill** | **3.726** | **3.113** | **1.20×** |
+
+Every stage scales except fill, which returns 20% for 3.5× the hardware. Across
+all five cards measured, fill spans only 3.11–9.42 ms while apply spans
+1.91–6.18 tracking FP32 cleanly. **Fill is a near-fixed cost that GPU money
+does not buy down**, and it is 40–56% of sieve time. A 5070 lands within 20% of
+the best fill any card tested achieves.
+
+The dominant sieve stage is insensitive to everything that makes a GPU
+expensive. Note carefully what that does and does not imply: it bounds
+relations per **dollar**, not relations per **joule**. A card that cannot use
+its width also does not draw for it — the measured-power table below shows the
+5090 idling at 47% of nameplate — so flat fill scaling and low draw are the
+same fact, and it is only the throughput half of it that costs anything. This
+paragraph previously ran on to call the result central *for a probe graded on
+relations/sec/watt*, which had the sign backwards.
+
+The surviving candidate mechanism is L2 write-combining decay: more concurrent
+walks interleave each bucket's writes further apart, so 32 B sectors evict
+before they fill. It is consistent with every observation including the mild
+more-buckets-is-worse trend on both cards. **It is a candidate and nothing
+more** — three mechanisms that also fit the data at the time have already been
+refuted here, and confirming this one needs counters (`lts__t_sectors_op_write`
+vs `dram__bytes_write` per card). `ncu` on a rented Vast box hits
+ERR_NVGPUCTRPERM, which is a host module parameter and not fixable from inside
+the container.
+
+### The fix
+
+`FILL_BLOCKS_DEFAULT = 144` in `bench.h`, an absolute count, with
+`--fill-blocks N` to override. Fill's grid is now decoupled from the
+`multiProcessorCount * 6` grid the other kernels use, and **`--blocks` no
+longer moves fill** — the sweeps in this finding were taken with the old
+binary where it did. Both grids are echoed at startup.
+
+Measured at one job shape (8192 buckets, 77.4M records). The optimum plausibly
+moves with bucket and record count; that is not measured, so characterise a new
+job shape with `--fill-blocks` before trusting the default on it.
+
+### Consequences
+
+Projecting the 4090's 27.6% fill gain onto its pipeline: sieve loses ~3.5 ms,
+wall goes 25.97 → **~22.5 ms/q, an 11% win over the 5070** rather than a 2.7%
+loss. Projected, not measured. The 5070 and 5090 are unaffected — for them 144
+is inside run-to-run noise of what they already ran (the 5070's 144 point
+measured 3.726 and 3.850 in two sweeps, ~3%).
+
+**RETRACTED: the efficiency conclusion was an artifact of nameplate TDP.**
+
+This section previously read "the efficiency conclusion holds across four
+cards" and concluded **"this design does not want wide expensive GPUs"** from a
+rel/J table built on *nameplate* TDP. That table is withdrawn. Measured board
+draw, sampled at 5 Hz through a running band with
+`nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits -lms 200`,
+removes the result:
+
+| | ms/q | rel/s | nameplate | measured draw | % plate | old rel/J | **rel/J** |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| RTX 5070 | 25.15 | 4,742 | 250 W | **168.7 W** (590 samples) | 67% | 19.0 | **28.1** |
+| **RTX 5090** | 14.95 | 7,978 | 575 W | **270.4 W** (369 samples) | 47% | 13.9 | **29.5** |
+| RTX 4090 | 25.97 (→ ~22.5) | 4,593 | 450 W¹ | **254.2 W** (423 samples) | 64%¹ | 10.2 | **18.1** |
+| A100 80GB | 37.02 | 3,222 | 300 W | *unsampled* | — | 10.7 | — |
+
+¹ This particular 4090 is capped at **400 W**, so even the nameplate row was
+wrong for the card that produced the number; the percentage is against 400.
+
+**Every card draws far under nameplate, and not by the same factor** — 47% for
+the 5090 against 67% for the 5070. TDP was therefore not a constant offset that
+cancelled in the ratios, which is the assumption the old table's "treat the
+ratios as indicative" hedge silently made. It penalised the widest card
+hardest, precisely because the widest card is the one that idles.
+
+**The corrected result is a tie, not a reversal.** The 5090 and 5070 land at
+29.5 and 28.1 rel/J — within 5%, inside the run-to-run spread this project has
+measured elsewhere. The 5090 is not more efficient in any way worth defending.
+What it is, is **equally efficient while being 1.68× faster.**
+
+That is a different claim from the retracted one and it points the opposite
+way. If rel/J is flat across a 3.5× SM range, relations/joule stops
+discriminating between these cards at all, and the decision falls to relations
+per **dollar** and throughput per box.
+
+**The split that does survive is architectural, and it is not width.** Both
+Blackwell cards sit at 28–30 rel/J; the Ada 4090 sits at 18.1, worse by 36%
+than a 5070 costing a third as much. That is the same division finding 51 found
+in fill scaling — Blackwell flat above saturation, Ada degrading 38% — now
+visible in the power domain. **Generation, not size, is what the measured data
+separates.**
+
+**Still not established.** Board draw excludes the host, and the metric of
+record is whole-box relations/sec/watt; the A100 is unsampled; and all four
+throughput figures are one-q-at-a-time. See "concurrent-q throughput" in the
+open experiments — the 5090's 47% draw is headroom, and if that idleness is
+schedulable its rel/J moves up from a tie, not down.
+
+### Correction to finding 49
+
+Finding 49 credits the grid fix with moving the reporter's 3090 standalone fill
+from ~20 ms to ~14 ms. Given fill is flat from 144 to 1536 blocks, 288 → 492
+cannot have produced that. The likely cause is that the "before" figure was a
+`SIEVE CHAIN` total at low `--reps`, dominated by the transform startup artifact
+of finding 48, which had not been found yet. The grid fix remains correct on
+occupancy grounds for transform, TD, classify, resieve and the cofactor kernels;
+**its effect on fill was nil and the ~20 → ~14 ms should not be attributed to
+it.**
+
 ## Not addressed in this round
+
+> **This section is a snapshot of one round, not a current status list**, and it
+> sits directly after finding 51 where it reads like one. Items superseded since
+> are struck through with the date. For what exists *now*, read `STATUS.md`.
 
 - ~~**The survivor-set gate passes on counts**~~ **DONE — 2026-08-03/04.** This
   item is superseded; see `../prototype.md`, "The gate was built and run" and
@@ -1788,16 +1998,16 @@ not reported. A rerun at `--reps 100` on the current tree would tighten them.
   - What this establishes is **in-region sieve correctness, not yield
     equivalence.** Final relation yield must come from cofactoring our own
     region.
-- **The primitive-point filter is host-side only.** `dumpcmp` applies
-  `gcd(i,j) == 1` at intersection time; the device still emits both-even
-  survivors and nothing on the GPU compacts or gcd-filters them. That is the
-  next pipeline stage, not a finished one.
-- **The primary post-sieve GPU path is unbuilt.** No GPU resieve/factor
+- ~~**The primitive-point filter is host-side only.**~~ **DONE.** The device
+  intersection, compaction and gcd filter are built and gated.
+- ~~**The primary post-sieve GPU path is unbuilt.** No GPU resieve/factor
   recovery, regular TD, or hard-cofactor stage consumes the compacted
-  candidates. The local YAFU tree has an NFS-facing CUDA/OpenCL cofactor path
-  with 64/96-bit ECM kernels and known coverage limitations. Finding 47 gives
-  it a promising preliminary C164 `31/31` rate, but there is still no measured
-  result for this C183 `31/32` job and no integrated device-resident stage.
+  candidates.~~ **DONE — 2026-08-05/06.** Intersection, GPU trial division,
+  classification, resieve and cofactorisation (rho and ECM) all exist, emit
+  relations, and are gated by `cofcheck.sh` (28 cases) plus the post-cofactor
+  reconstruction gate. The whole-band runs quoted in findings 48–51 are of that
+  complete path. (The struck text went on to weigh borrowing YAFU's CUDA/OpenCL
+  ECM kernels; we wrote our own instead, so that option is moot.)
 - **Per-region offset hashes** are still not done — counts cannot see a
   permutation within a region, and the verify gate compares counts.
 - **`--maxbits > 15` is now safe but untested**: the transform handles bucketed

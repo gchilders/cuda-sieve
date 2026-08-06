@@ -1381,7 +1381,7 @@ static int cf_check_relations(const char *path, const poly_t *poly,
     char *line = NULL;
     size_t cap = 0;
     long nl = 0;
-    uint32_t nok = 0, nbad = 0, nprime = 0;
+    uint32_t nok = 0, nbad = 0, nprime = 0, ncomp = 0;
     if (!f) { perror(path); return -1; }
     if (td_build_poly(&tp[1], poly, 1) || td_build_poly(&tp[0], poly, 0)) {
         fprintf(stderr, "check-relations: polynomial does not fit\n");
@@ -1410,9 +1410,27 @@ static int cf_check_relations(const char *path, const poly_t *poly,
                 const uint32_t lpb = side ? lpb1 : lpb0;
                 char *q = fld[side];
                 while (*q) {
-                    unsigned long v = strtoul(q, &e, 16);
+                    unsigned long long v = strtoull(q, &e, 16);
                     if (e == q) { bad = 1; break; }
-                    if (!v || (lpb < 32 && v >= (1ul << lpb))) { nprime++; bad = 1; break; }
+                    /* 64-bit throughout, and the lpb test is no longer skipped
+                     * at lpb == 32. strtoul already returned 64 bits on LP64,
+                     * so a 33-bit factor was in range of the variable and
+                     * exempt from the bound -- caught only if it also happened
+                     * not to divide. `v > 0xffffffff` now rejects it directly,
+                     * which also makes `1ull << 32` safe to evaluate. */
+                    if (!v || v > 0xffffffffull || v >= (1ull << lpb)) {
+                        nprime++; bad = 1; break;
+                    }
+                    /* THE GATE'S BLIND SPOT UNTIL NOW. Exact division cannot
+                     * see a composite: replace a relation's `p,q` with the
+                     * single value p*q and the norm still divides down to 1,
+                     * so every other check here passes. That is precisely the
+                     * shape an incompletely split cofactor has -- the most
+                     * likely real defect in the ECM/rho path, and the one
+                     * failure this gate exists to catch. */
+                    if (!bench_is_prime32((uint32_t)v)) {
+                        ncomp++; bad = 1; break;
+                    }
                     {   /* exact division: a factor that does not divide is a
                          * reconstruction failure, not a rounding question */
                         bn_t t = N[side];
@@ -1434,7 +1452,8 @@ static int cf_check_relations(const char *path, const poly_t *poly,
     free(line); fclose(f);
     printf("  relation reconstruction gate: %u of %u rebuild both norms exactly",
            nok, nok + nbad);
-    if (nprime) printf(", %u carried a prime above lpb", nprime);
+    if (nprime) printf(", %u carried a factor outside [2, 2^lpb)", nprime);
+    if (ncomp)  printf(", %u carried a COMPOSITE factor", ncomp);
     printf("  %s\n", nbad ? "<-- FAIL" : "PASS");
     (void)nl;
     return (int)nbad;

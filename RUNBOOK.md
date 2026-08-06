@@ -72,10 +72,16 @@ its source, so a run says where every number came from:
 
 ```
   job file: rlim 16700000, alim 33500000, lpbr 29, lpba 30, mfbr 56, mfba 59
-  job file:  alambda 2.5 x log2(alim 33500000) = 62.50 bits (side 1)
-  job file:  rlambda 2.4 x log2(rlim 16700000) = 57.60 bits (side 0)
-params from q=15000017: side 1 log2(maxnorm)=... scale=... allowance=62.50 bound=...
+  job file: alambda 2.5 -> 62.50 bits (side 1), reported only; the allowance is derived below
+  job file: rlambda 2.4 -> 57.60 bits (side 0), reported only; the allowance is derived below
+params from q=15000017: side 1 log2(maxnorm)=... scale=... allowance=<derived> bound=...
 ```
+
+**The lambda lines and the allowance are unrelated numbers** — the example
+above used to print `allowance=62.50`, the same value as `alambda`'s, which
+read as the job file's lambda flowing through into the bound. It does not; see
+"Lambda: we ignore it, on purpose" below. The `reported only` suffix is what
+the binary actually prints, and it is there to stop exactly that misreading.
 
 Anything you state explicitly wins over the file; anything the file carries
 wins over the derivation. A CADO `.poly` carries none of these keys, so there
@@ -242,8 +248,32 @@ There is no `cudaSetDevice` and no `--device` flag: device 0 is always used.
 On a multi-GPU box select another card with `CUDA_VISIBLE_DEVICES=1` and
 confirm it on this line.
 
+**Fill has its own grid, and it does not scale with the card.** `--blocks` is
+6 per SM; fill instead uses a fixed **144 blocks** (`--fill-blocks` to
+override). A 48-SM 5070, a 128-SM 4090 and a 170-SM 5090 all saturate at that
+same absolute count — 3, 1.1 and 0.85 blocks per SM respectively — and all
+three fall off sharply below it. Above it Blackwell is flat but Ada degrades,
+costing the 4090 27% under the old per-SM rule.
+
+Don't expect a faster card to fix a slow fill: a 5090 with 3.5× the 5070's
+hardware returns 20% on this stage, against 2–3.3× on every other stage. The
+optimum was measured at one job shape (8192 buckets, 77.4M records) and
+plausibly moves with bucket and record count, so sweep it when characterising a
+new job:
+
+```sh
+for b in 96 144 288 576; do
+  printf "fill-blocks %-4s " $b
+  bench --poly JOB.job --cadofb JOB.roots1 --logI 14 --J 8192 \
+        --reps 100 --stage fill --fill-blocks $b | grep "fill:"
+done
+```
+
+Note `--blocks` does **not** move fill any more — the two grids are separate,
+and the startup lines print both. See RESULTS.md finding 51.
+
 Two rules for comparing cards, both learned the hard way (RESULTS.md
-findings 48–50):
+findings 48–51):
 
 - **Use `--reps 100` or more.** Below that, the standalone bench's `transform`
   line reports amortized CUDA startup rather than kernel time — it moves 98×
