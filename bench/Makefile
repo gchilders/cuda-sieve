@@ -11,6 +11,7 @@ CC        ?= gcc
 # Ampere card at all -- the previous default was unrunnable on a 3090.
 # The only sub-sm_80 intrinsic used is __shfl_*_sync (sm_70+).
 NVCC_ARCH ?= -gencode arch=compute_120,code=sm_120 \
+             -gencode arch=compute_89,code=sm_89 \
              -gencode arch=compute_86,code=sm_86 \
              -gencode arch=compute_80,code=compute_80
 
