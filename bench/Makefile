@@ -10,9 +10,15 @@ CC        ?= gcc
 # target >= the virtual arch, so a compute_89 fallback cannot load on any
 # Ampere card at all -- the previous default was unrunnable on a 3090.
 # The only sub-sm_80 intrinsic used is __shfl_*_sync (sm_70+).
+# sm_80 is native, not PTX: the A100 is a comparison target (RESULTS.md finding
+# 50), and JIT-ing the whole module from PTX on first load costs seconds on a
+# cold ~/.nv/ComputeCache -- far more than the ~170-220 ms of module load that
+# finding 48's --reps 100 floor is calibrated against, and it recurs every
+# process start if the cache is disabled or evicted.
 NVCC_ARCH ?= -gencode arch=compute_120,code=sm_120 \
              -gencode arch=compute_89,code=sm_89 \
              -gencode arch=compute_86,code=sm_86 \
+             -gencode arch=compute_80,code=sm_80 \
              -gencode arch=compute_80,code=compute_80
 
 # Extra -D's for pricing experiments, e.g. make DEFS=-DNORM_CANCEL_TOL=0.0f.

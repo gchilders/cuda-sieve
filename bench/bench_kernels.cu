@@ -1769,7 +1769,19 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     int blocks = cfg->blocks ? cfg->blocks : 48 * 6;
     float t_trans = 0, t_fill = 0, t_l1 = 0, t_l2 = 0;
 
-    /* ---- stage T ---- */
+    /* ---- stage T ---- *
+     * Untimed warm-up. k_transform is the FIRST kernel of the run, so without
+     * this it absorbs the whole one-time CUDA cost -- module load for a
+     * four-architecture fatbin, context setup -- and reports it divided by
+     * reps. Measured on WSL2 that fixed cost is ~170-220 ms, which put the
+     * "transform" line at 71.2 ms at --reps 3 against a true 0.55 ms: a 98x
+     * swing across --reps 3..1000 while fill and apply moved under 1%. Two
+     * different people compared that number across GPUs before anyone noticed
+     * it was measuring startup. The memsets follow the warm-up because nproj
+     * and nlost are accumulators divided by reps. */
+    k_transform<<<blocks, cfg->threads>>>(D.primes, D.roots, D.plat, fb->n,
+        cfg->logI, cfg->J, L->a0, L->a1, L->b0, L->b1, D.nproj, D.nlost);
+    CK(cudaDeviceSynchronize());
     CK(cudaMemset(D.nproj, 0, 4));
     CK(cudaMemset(D.nlost, 0, 8));
     cudaEventRecord(e0);
@@ -2502,13 +2514,13 @@ after_apply:
     }
     if (t_apply > 0)
         printf("  %-26s %8.3f ms\n", "apply (init+add+scan)", t_apply);
-    /* Guideposts, not floors. Both descend from the GGNFS breakdown at the
-     * MEASURED N_eff = 10.24 (was 182/56 under the assumed 13). ~225 ms is the
-     * replaceable sieve work; ~71 ms is what a HYBRID would retain on the CPU
-     * for TD and cofactoring. The primary target is GPU-resident, where no CPU
-     * stage is a floor at all -- see RESULTS.md findings 43 and 45. Printing
-     * the old numbers made the sieve look done when it is one stage of five. */
-    printf("  %-26s %8.3f ms  <-- vs ~225 ms replaceable / ~71 ms hybrid-retained\n",
+    /* The old "vs ~225 ms replaceable / ~71 ms hybrid-retained" suffix is gone.
+     * Those were fixed constants from the GGNFS breakdown at N_eff = 10.24 --
+     * a different job at a different logI/J -- printed on every run whatever
+     * was actually being sieved, which read as a per-run comparison and is not
+     * one. The surviving numbers live in RESULTS.md findings 43 and 45, where
+     * the config they belong to is stated. */
+    printf("  %-26s %8.3f ms\n",
            "SIEVE CHAIN ms/special-q", t_trans + t_fill + t_apply);
     /* Per-q HOST work. Not part of the sieve chain above -- it runs on the CPU,
      * once per special-q per side, and cudaEvent timing cannot see it. Goal 1

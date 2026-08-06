@@ -140,7 +140,7 @@ static int pipe_side_perq(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                           int side, double scale, double allowance,
                           uint8_t *d_bucket, uint32_t *d_cursor, uint32_t cap,
                           uint32_t *d_overflow, int blocks, pside_t *S,
-                          float *t_side, double *t_host)
+                          float t_stage[3], double *t_host)
 {
     const uint32_t xmax = (1u << cfg->logI) * cfg->J;
     const int log_region = cfg->log_region;
@@ -254,7 +254,7 @@ static int pipe_side_perq(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
         printf("  side %d: transform %.3f + fill %.3f + apply %.3f = %7.3f ms,"
                " %8u survivors (bound %u)\n",
                side, t_t, t_f, t_a, t_t + t_f + t_a, S->nsurv, S->BOUND);
-    *t_side = t_t + t_f + t_a;
+    t_stage[0] = t_t; t_stage[1] = t_f; t_stage[2] = t_a;
     return 0;
 }
 
@@ -794,7 +794,14 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     unsigned long long *d_pre = NULL;
     uint64_t est1, est0, est;
     uint32_t cap, nqdone = 0;
-    double acc_sieve = 0, acc_isect = 0, acc_host = 0, acc_wall = 0;
+    double acc_isect = 0, acc_host = 0, acc_wall = 0;
+    /* The three sieve stages, broken out because the band total alone cannot be
+     * compared against the standalone bench (no --pipeline), which reports the
+     * same three. When the two disagreed on the A100 only the split showed that
+     * the whole discrepancy was transform. "sieve, both sides" is their sum --
+     * derived, not accumulated separately, so the printed total and its three
+     * children cannot drift apart. */
+    double acc_tr = 0, acc_fi = 0, acc_ap = 0;
     double acc_td = 0, t_verify = 0, td0 = 0, jn0 = 0, cf0 = 0, cofac_tail = 0;
     unsigned long long acc_surv = 0, acc_cand = 0, acc_rel = 0;
     FILE *fr = NULL, *fc = NULL;
@@ -855,6 +862,22 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     VRAM_MARK("factor bases + bitmaps");
     CK(cudaMalloc(&d_two, (size_t)nbitword * 4));
     CK(cudaMalloc(&d_n, 4)); CK(cudaMalloc(&d_pre, 8));
+    /* Untimed warm-up, n = 0 so it touches nothing. Everything above this line
+     * is cudaMalloc/cudaMemcpy, so without it k_transform is the first kernel
+     * launched and the one-time CUDA cost -- module load, and on a card with
+     * no native cubin the PTX JIT -- lands inside the FIRST q's transform
+     * window and is then divided by the band length. At 1340 q that is ~0.15 ms
+     * on a 0.954 ms figure; on a 50-q band it is ~4 ms on the same figure.
+     * run_bench got this fix (finding 48) and this path, which the RUNBOOK
+     * points at as the honest source for transform, did not.
+     *
+     * Lazy module loading is per-kernel, so this warms k_transform only; fill
+     * and apply still pay their own first-launch cost inside q0. They are the
+     * reps-stable stages and the cost is one-time either way, but a band short
+     * enough to care should be treated as a warm-up run, not a measurement. */
+    k_transform<<<blocks, cfg->threads>>>(S1.primes, S1.roots, S1.plat, 0u,
+        cfg->logI, cfg->J, 1, 0, 0, 1, S1.d_nproj, S1.d_nlost);
+    CK(cudaDeviceSynchronize()); CK(cudaGetLastError());
     if (pipe_td_init(&C, fbs1, fbs0, POLY, nbitword)) { rc = -1; goto done; }
     VRAM_MARK("trial division context");
     /* The cross-q cofactor queue. Per-q the candidate count is ~1,956, which
@@ -899,7 +922,7 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     }
     for (uint32_t qi = 0; qi < nq; qi++) {
         qlat_t Lq;
-        float ts1 = 0, ts0 = 0, tis = 0;
+        float ts1[3] = {0,0,0}, ts0[3] = {0,0,0}, tis = 0;
         double th1 = 0, th0 = 0, qwall = host_ms(), tv = 0;
         uint32_t hn = 0, nacc = 0, ncand = 0, nrel = 0;
         /* The host loop exists to write files. With inline cofactorisation and
@@ -928,10 +951,10 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
 
         if (pipe_side_perq(fb1, fbs1, &Lq, POLY, cfg, 1, cfg->scale,
                            cfg->allowance, d_bucket, d_cursor, cap, d_overflow,
-                           blocks, &S1, &ts1, &th1) ||
+                           blocks, &S1, ts1, &th1) ||
             pipe_side_perq(fb0, fbs0, &Lq, POLY, cfg, 0, cfg->scale0,
                            cfg->allowance0, d_bucket, d_cursor, cap, d_overflow,
-                           blocks, &S0, &ts0, &th0)) { rc = -1; break; }
+                           blocks, &S0, ts0, &th0)) { rc = -1; break; }
 
         CK(cudaMemset(d_n, 0, 4)); CK(cudaMemset(d_pre, 0, 8));
         CK(cudaMemset(d_two, 0, (size_t)nbitword * 4));
@@ -1068,7 +1091,10 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         if (rc) break;
 
         tm.join += host_ms() - jn0;
-        acc_sieve += ts1 + ts0; acc_isect += tis; acc_host += th1 + th0;
+        acc_tr += ts1[0] + ts0[0];
+        acc_fi += ts1[1] + ts0[1];
+        acc_ap += ts1[2] + ts0[2];
+        acc_isect += tis; acc_host += th1 + th0;
         acc_wall += host_ms() - qwall - tv;
         acc_surv += hn; acc_cand += ncand; acc_rel += nrel;   /* host path only */
         nqdone++;
@@ -1210,12 +1236,16 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         const double N = nqdone;
         const double dev = (tm.rank + tm.emit + tm.summary + tm.resieve + tm.td
                             + tm.classify + tm.compact + tm.record) / N;
+        const double acc_sieve = acc_tr + acc_fi + acc_ap;
         printf("\n\n  --- band of %u special-q ---\n", nqdone);
         if (t_verify > 0)
             printf("  (first-q reconstruction gate: %.1f ms, excluded below)\n",
                    t_verify);
         printf("  %-34s %8.2f ms\n", "wall clock per q", acc_wall / N);
         printf("  %-34s %8.2f ms\n", "  sieve, both sides", acc_sieve / N);
+        printf("  %-34s %8.3f ms\n", "    transform + plattice", acc_tr / N);
+        printf("  %-34s %8.3f ms\n", "    fill", acc_fi / N);
+        printf("  %-34s %8.3f ms\n", "    apply", acc_ap / N);
         printf("  %-34s %8.3f ms\n", "  intersect + gcd", acc_isect / N);
         printf("  %-34s %8.3f ms\n", "  host per-q (sieve tables, staging)",
                acc_host / N);

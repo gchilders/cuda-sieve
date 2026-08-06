@@ -1,7 +1,8 @@
 # Path 1 — bucket-fill microbenchmark results
 
 **Hardware:** RTX 5070 (sm_120, 48 SM, 48 MB L2, 99 KB opt-in smem, 672.0 GB/s)
-**Toolchain:** CUDA 13.2.78, `-gencode arch=compute_120,code=sm_120`
+**Toolchain:** CUDA 13.2.78; sm_120 + sm_89 + sm_86 native, compute_80 PTX (finding 49)
+**Also measured:** RTX 3090 (sm_86), A100 80GB PCIe (sm_80) — finding 50
 **Date:** 2026-08-01
 **Input:** `oracle/input.job.afb.0` — the real C183 algebraic factor base, no synthetic data
 **Config unless stated:** I15e (`logI=15`, `J=16384`, A=5.369e8), region 2^15, q=120000011,
@@ -1619,6 +1620,151 @@ buffers, a batch-size/queue-depth sweep, exact output validation, and
 simultaneous CPU/GPU power sampling. Until that run exists, use 4.92 ms/q as a
 promising sizing datum—not as a Path-5 result.
 
+## Finding 48 — the standalone bench's `transform` line was measuring CUDA startup
+
+k_transform is the first kernel of a standalone run (no `--pipeline`), so it
+absorbed the entire one-time CUDA cost — module load for the fatbin, context
+setup — and reported it divided by `--reps`. On WSL2 that fixed cost measures
+~170–220 ms.
+
+RTX 5070, c147, `--logI 14 --J 8192`, idle GPU:
+
+| `--reps` | transform | fill | apply |
+|---:|---:|---:|---:|
+| 3 | **71.181** | 3.812 | 5.424 |
+| 20 | 11.969 | 3.840 | 5.494 |
+| 100 | 3.177 | 3.832 | 5.567 |
+| 300 | 1.123 | 3.843 | 5.560 |
+| 1000 | **0.728** | 3.846 | 5.583 |
+
+Transform swings **98×** across a 333× range. Fill moves 0.9% (3.812 → 3.846)
+and apply 2.9% (5.424 → 5.583) — apply's drift is small but monotone, so it is
+not pure noise, and apply is the one stage that should be quoted with its reps
+setting rather than treated as reps-free. The true transform cost is ~0.55 ms;
+the pipeline, where it runs once per q against a warm context, independently
+reports **0.954 ms** for both sides.
+
+The damage was not hypothetical. Three GPUs were compared on this number at
+three different `--reps` settings, and the resulting nonsense — an RTX 3090
+appearing to transform 10× faster than a 5070 — was taken seriously for two
+rounds before anyone checked whether the metric was stable.
+
+**Fixed** by an untimed warm-up launch ahead of the timed loop, with the
+`nproj`/`nlost` memsets moved after it (they are accumulators divided by reps).
+That removes ~92% of the artifact — reps 3: 71.18 → 6.05, reps 100: 3.18 →
+0.645 — but not all of it, so **`--reps 100` is the floor for any cross-machine
+comparison** and low-reps transform numbers stay untrustworthy.
+
+The general rule this establishes: **a stage whose reported time depends on
+`--reps` is not measuring the kernel.** Fill passes that test at reps 3; apply
+passes to within 3%; transform fails it by two orders of magnitude.
+
+The same gap existed in `run_pipeline`, which launched no kernel before
+`k_transform` and so charged the whole one-time cost to the first q's transform
+window before dividing by the band length. Fixed the same way. At 1340 q it was
+worth ~0.15 ms on a 0.954 ms figure (+16%); on a 50-q band it would have been
+~4 ms. Lazy module loading is per-kernel, so both warm-ups cover transform only
+— fill and apply still pay their first-launch cost inside q0.
+
+## Finding 49 — the grid width was hardcoded to this box's SM count
+
+`blocks = cfg->blocks ? cfg->blocks : 48 * 6` appeared in three places, and no
+`cudaGetDeviceProperties` call existed anywhere in the tree. The 48 is this
+5070's SM count, so every other GPU ran the 6-blocks-per-SM tuning at whatever
+occupancy 288 blocks happened to give it: 3.5 blocks/SM on an 82-SM 3090 (58%),
+2.25 on a 128-SM 4090 (37%).
+
+It reached `k_transform`, `k_fill_atomic`, `k_td`, `k_classify`,
+`k_resieve_scatter` and the cofactor kernels. `k_apply` launches `nregion`
+blocks and was never affected.
+
+Now resolved from `multiProcessorCount * 6` and echoed on stdout at startup —
+unconditionally, including when `--blocks` overrides it, since that is exactly
+the A/B that wants the number. A failed device query is now fatal: it used to
+leave `cfg.blocks` at 0, and the three `48 * 6` fallbacks then silently
+reinstated this box's SM count with no diagnostic. Those three constants remain
+as unreachable fallbacks; they are dead only so long as every entry point
+routes through `main()`'s validation.
+
+Unchanged on this box by construction. The reporter's 3090 saw the standalone
+fill benchmark move from ~20 ms to ~14 ms, and ~6% end-to-end on the pipeline
+(fill being ~21% of wall). **Those two figures are on the reporter's own
+config, which was never recorded** — they are not comparable with finding 50's
+3090 fill of 7.19 ms at `--logI 14 --J 8192 --reps 100`, and the ~1.4× ratio is
+the only thing to take from them.
+
+Related: `NVCC_ARCH` shipped an sm_120 cubin plus **compute_89 PTX**. The driver
+only JITs PTX to a target ≥ the virtual arch, so that build could not load on
+any Ampere card at all. Now sm_120 + sm_89 + sm_86 native, compute_80 PTX.
+
+## Finding 50 — the design ports across architectures; fill is the whole gap
+
+Three GPUs, c147 at `--logI 14 --J 8192`. Transform excluded per finding 48.
+
+| | SMs × GHz | INT32 | FP32 | `--reps` | fill | apply |
+|---|---:|---:|---:|---:|---:|---:|
+| RTX 5070 (sm_120) | 48 × 2.51 | 15.4 T | 15.4 T | 100 | **3.83** | 5.57 |
+| RTX 3090 (sm_86) | 82 × 1.70 | 8.9 T | 17.8 T | 100 | 7.19 | **3.92** |
+| A100 80GB (sm_80) | 108 × 1.41 | 9.8 T | 9.8 T | **3** | 9.42 | 6.18 |
+
+INT32 is ops/s; FP32 is FMA/s; both are T. Consumer Ampere has 128 FP32 lanes
+per SM but only 64 that accept INT32; Blackwell unified all 128. GA100 has 64
+of each.
+
+The A100 rows predate finding 48's `--reps 100` floor. Fill is reps-stable so
+that row stands; apply carries up to ~3% of reps drift and should be re-taken.
+Transform is omitted for all three because no reps setting makes it comparable
+across machines.
+
+**Apply's FP32 ranking is exact; its magnitudes are not.** Predicted ranking
+3090 > 5070 > A100, measured 3.92 < 5.57 < 6.18 — three for three. But the
+3090's predicted ratio (15.4/17.8 = 0.865 → 4.82 ms) misses the measured 3.92
+by 19%, which is the same order of error as the fill miss flagged below as
+unexplained. The ranking is evidence the stage is FP32-led; the model does not
+predict its size. The A100 reaching near-parity on 0.63× the FP32 is consistent
+with apply being 58% DRAM-bound (finding 8) on 2.9× the bandwidth, but that is
+an explanation offered, not a fit tested.
+
+**Fill tracks INT32 for the 3090** — predicted 1.73× slower than the 5070,
+measured 1.88× — **and fails for the A100**, predicted 1.58×, measured 2.47×.
+That miss is unexplained.
+
+The working hypothesis is cursor contention: fill scatters into 8192 bucket
+cursors fixed by `--region`, not by the GPU, so wider cards pile more SMs onto
+the same contention points, and the miss grows with SM count in the right
+order. The control run says the 5070 is not contending — fill is flat at
+**3.729 / 3.742 / 3.965 ms** for 8192 / 16384 / 32768 cursors (`--region`
+14/13/12) — which makes `--region 13` a clean discriminator on a 108-SM card.
+Not a proposed default either way: apply degrades hard as regions shrink
+(5.51 → 8.28 → 13.36 ms over the same sweep).
+
+**Whole-pipeline consequence.** Same command, same work (1340 q, ~159.8K
+relations):
+
+| | 5070 | A100 |
+|---|---:|---:|
+| wall/q | 25.10 | 37.02 |
+| sieve, both sides | 17.74 | 29.73 |
+| — transform / fill / apply | 0.954 / 7.459 / 9.322 | — |
+| TD + classify, device | 3.121 | 4.420 |
+| host per-q | 0.811 | 0.892 |
+
+The sieve gap (11.99 ms) **is** the wall gap (11.92 ms). TD, cofactorisation
+and host work contribute nothing net — the Amdahl risk the project was designed
+around did not materialise here. Within the sieve, fill accounts for ~11.0 ms,
+**92% of the total deficit**.
+
+Two conclusions for the probe. The kernels are portable: nothing
+architecture-specific broke, and the ranking is explained by published lane
+counts rather than by anything in the design. And **fill is the only lever left
+worth pulling** — 42% of sieve time on this box, and essentially the entire
+difference against datacenter silicon. Production transform is 0.954 ms, 5% of
+sieve; there is nothing there.
+
+Caveat on the A100 rows: they were taken before finding 48's warm-up landed, at
+`--reps 3`, so fill and apply are trustworthy (reps-stable) and transform is
+not reported. A rerun at `--reps 100` on the current tree would tighten them.
+
 ## Not addressed in this round
 
 - ~~**The survivor-set gate passes on counts**~~ **DONE — 2026-08-03/04.** This
@@ -1733,6 +1879,29 @@ weighting each plateau by its printed stage time.
 Defaults are `--mode atomic --record-bytes 4 --region 14 --apply-threads 512`
 as of 2026-08-02; before that they were `twolevel` and `--region 15`, so
 commands below that omit those flags reproduced a path that had already lost.
+
+**`--reps 100` is the floor for any cross-machine comparison** (finding 48).
+Below that the transform line reports amortized CUDA startup rather than
+kernel time — it swings 98× between reps 3 and 1000 while fill and apply move
+under 1%. The grid width now comes from `multiProcessorCount` and is echoed at
+startup, so confirm the `grid: N SMs x 6` line matches the card before
+comparing anything (finding 49).
+
+**Cross-GPU profile** — the command all three cards in finding 50 ran:
+
+```
+./bench --poly c147.job --cadofb c147.roots1 --logI 14 --J 8192 --reps 100
+./bench --pipeline --cofactor --poly c147.job --cadofb c147.roots1 \
+        --logI 14 --qrange 15000000: --target-rels 100000 --relations OUT.dat
+```
+
+The standalone bench (no `--pipeline`) sieves one side at a fixed
+`q=120000011`; the pipeline sieves both sides across a real band. They agree
+once transform is excluded: A100/5070 on standalone fill+apply is **1.69×**
+comparing like reps (both at `--reps 3`: 15.605/9.236), or 1.66× against the
+5070's `--reps 100` row in finding 50's table (15.60/9.40). Pipeline sieve is
+**1.68×**. The reconciliation holds either way; the residual spread is apply's
+reps drift, not a disagreement between the two harnesses.
 
 **CPU-only gates** (no GPU, safe to run on a busy box):
 

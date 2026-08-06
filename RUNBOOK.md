@@ -212,6 +212,55 @@ file's GGNFS-unit lambdas, and say so when they do.
 > flag is accepted and ignored, so old scripts keep working; drop it when you
 > next touch them.
 
+## Running on a different GPU
+
+The build ships native cubins for sm_120, sm_89, sm_86 and sm_80, plus
+compute_80 PTX. Anything from Ampere onward runs without editing the Makefile.
+
+Two cases still want a Makefile line. **Older than sm_80** needs its own
+`compute_XX`, because the driver only JITs PTX to a target **at or above** the
+virtual arch — a PTX fallback never reaches down. **Newer than sm_120, or
+sm_90 (H100)**, runs from PTX, and that JIT costs seconds on a cold
+`~/.nv/ComputeCache` and repeats every process start if the cache is disabled
+or evicted. It is far larger than the ~200 ms of module load the `--reps 100`
+floor below is calibrated against, so add a native `-gencode` for any card you
+intend to publish numbers for.
+
+Grid width comes from `multiProcessorCount`. Every run opens with the line it
+derived, on stdout, including when `--blocks` overrides it:
+
+```
+grid: 48 SMs x 6 = 288 blocks (NVIDIA GeForce RTX 5070)
+```
+
+**Check that line first**, and check it names the card you meant. The SM count
+is queried at runtime, so it always matches the device actually in use — a
+wrong number means the wrong GPU was selected, not a stale binary. A *stale*
+binary shows up as the line being **absent**.
+
+There is no `cudaSetDevice` and no `--device` flag: device 0 is always used.
+On a multi-GPU box select another card with `CUDA_VISIBLE_DEVICES=1` and
+confirm it on this line.
+
+Two rules for comparing cards, both learned the hard way (RESULTS.md
+findings 48–50):
+
+- **Use `--reps 100` or more.** Below that, the standalone bench's `transform`
+  line reports amortized CUDA startup rather than kernel time — it moves 98×
+  between `--reps 3` and `--reps 1000` on the same hardware, while `fill` moves
+  0.9% and `apply` 2.9%. A stage whose time depends on `--reps` is not
+  measuring the kernel. Quote `apply` with its reps setting; `fill` is safe
+  without one.
+- **Compare stages, never the total.** `fill` and `apply` respond to completely
+  different limits — fill to integer throughput, apply to FP32 and memory
+  bandwidth — and cards rank differently on each. A 3090 loses `fill` to a 5070
+  and wins `apply` against it. `SIEVE CHAIN` averages that away into a number
+  that cannot be reasoned about.
+
+The pipeline prints the same three stages under `sieve, both sides`, which is
+the honest source for transform: there it runs once per q against a warm
+context, the way production does.
+
 ## Checking the output
 
 ```sh

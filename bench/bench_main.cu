@@ -479,15 +479,35 @@ int main(int argc, char **argv)
      * 3090 that is 3.5 blocks/SM, i.e. 58% of the occupancy every tuning
      * decision in RESULTS.md assumed, which reads as the bigger card being
      * slower. Resolve it once here; run_pipeline() and bench_kernels.cu both
-     * treat a nonzero cfg.blocks as final, so this reaches every launch. */
-    if (cfg.blocks == 0) {
+     * treat a nonzero cfg.blocks as final, so this reaches every launch.
+     *
+     * Queried and printed UNCONDITIONALLY, on stdout with every other startup
+     * line. Printing only in the default case hid the number from exactly the
+     * --blocks A/B that wants it, stderr dropped it from any run redirected
+     * with `> log`, and a failed query used to leave cfg.blocks at 0 so the
+     * three `48 * 6` fallbacks silently reinstated the 5070's SM count with no
+     * diagnostic. There is no useful run on a device we cannot query, so a
+     * failure here is fatal rather than a default.
+     *
+     * Device 0 always. There is no cudaSetDevice and no --device flag; select
+     * another GPU with CUDA_VISIBLE_DEVICES and confirm it on this line. */
+    {
         cudaDeviceProp prop;
         int dev = 0;
-        if (cudaGetDevice(&dev) == cudaSuccess &&
-            cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaGetDeviceProperties(&prop, dev) != cudaSuccess) {
+            fprintf(stderr, "bench: cannot query the CUDA device -- refusing to"
+                    " fall back to a hardcoded grid width\n");
+            return 1;
+        }
+        if (cfg.blocks == 0) {
             cfg.blocks = prop.multiProcessorCount * 6;
-            fprintf(stderr, "grid: %d SMs x 6 = %d blocks (%s)\n",
-                    prop.multiProcessorCount, cfg.blocks, prop.name);
+            printf("grid: %d SMs x 6 = %d blocks (%s)\n",
+                   prop.multiProcessorCount, cfg.blocks, prop.name);
+        } else {
+            printf("grid: %d blocks on %d SMs (%s)  [--blocks; auto would be"
+                   " %d]\n", cfg.blocks, prop.multiProcessorCount, prop.name,
+                   prop.multiProcessorCount * 6);
         }
     }
     /* The small sieve's warp tier strides by nwarps = threads >> 5. Below 32
