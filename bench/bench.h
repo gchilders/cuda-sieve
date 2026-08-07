@@ -331,16 +331,25 @@ typedef struct {
  * it as a hard saturation point. That was an artifact of never varying the
  * block WIDTH. Width is NOT a free parameter: at a constant 576 blocks the
  * 5090 measures 2.716 / 2.711 / 3.147 / 4.289 ms at 64 / 128 / 256 / 512
- * threads, so 256 is 16% off the optimum and 512 is 58% off. Between 32 and
- * 128 it flattens (2.716 vs 2.711), which is the only band in which thread
- * count is genuinely uncritical.
+ * threads, so 256 is 16% off the optimum and 512 is 58% off. Between 64 and
+ * 128 it flattens (2.716 vs 2.711), which is the only band measured in which
+ * thread count is uncritical. NOTE 64, not 32: 576 x 32 was never run, so
+ * flatness is established down to 64 and ASSUMED below it. The 1152-block row
+ * shows the two axes interact strongly, so do not extrapolate -- if you need
+ * 32-thread behaviour at some other block count, measure it.
  *
- * That 16% is what --fill-threads buys and why raising FILL_BLOCKS_DEFAULT
- * alone would not do: --threads also drives transform, intersect, TD, resieve
- * and the cofactor kernels, all tuned at 256, so fill's optimum was
- * unreachable without moving theirs. (1152 x 256 specifically has not been
- * measured -- the sweeps cover 1152 at 32 and 576 at 256. The 16% gap is
- * measured at 576 and inferred at 1152.)
+ * At the SHIPPED 1152 blocks the gap is wider still: the 5090 measures 2.633 ms
+ * at 32 threads against 3.239 at 256, a 23% penalty. The width cost grows with
+ * block count rather than washing out, and 1152 x 256 (3.239) is even worse
+ * than 576 x 256 (3.147) -- at 256 threads more blocks still hurts, which is
+ * the finding-51 behaviour, while at 32 threads more blocks helps.
+ *
+ * That 23% is what --fill-threads buys, and it is why raising
+ * FILL_BLOCKS_DEFAULT alone would not do: --threads also drives transform,
+ * intersect, TD, resieve and the cofactor kernels, all tuned at 256, so fill's
+ * optimum is unreachable without moving theirs. Measured, not inferred -- the
+ * 1152 x 256 cell was run specifically to test whether the flag earns its
+ * keep.
  *
  * It is a work-granularity result -- fine chunks balance the tail -- and it
  * does NOT support the L2 mechanisms: capacity was already dead (finding 51),

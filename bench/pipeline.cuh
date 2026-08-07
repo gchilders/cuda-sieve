@@ -1280,6 +1280,48 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         printf("  %-34s %8.2f ms\n", "  unaccounted",
                (acc_wall - acc_sieve - acc_isect - acc_host - acc_td - tm.join
                 - tm.cofac) / N);
+        /* The one number that makes host starvation visible. Every stage above
+         * is either a cudaEvent (blind to what the CPU is doing) or a host
+         * clock, so a contended box prints PERFECT kernel times next to a bad
+         * wall clock and nothing says why. Finding 53: saturating this box's 16
+         * cores left fill and apply flat within 1% while wall went 24.30 ->
+         * 31.27 ms/q. No idle/loaded pair is quoted here on purpose: the first
+         * one measured (0.824 / 0.661) used an earlier expression that kept the
+         * cofactor queue in the denominator only, and no pair has yet been
+         * taken with THIS one on a box confirmed idle. Finding 53 is canonical
+         * and says so; a number duplicated into a comment is a number that
+         * drifts, which is how the 0.824 and a hand-derived 0.85 ended up in
+         * the docs and this file describing the same measurement.
+         *
+         * THE COFACTOR QUEUE IS OUT OF BOTH SIDES. dev covers only the
+         * event-timed TD/classify kernels; the queue's flush is measured with a
+         * host clock (tm.cofac) and mixes device and host, so it can go in
+         * neither term. Leaving it in the denominator alone made the ratio move
+         * with SURVIVOR DENSITY -- a band with more candidates flushes more and
+         * reads as a contended host on a perfectly idle box, which is the exact
+         * misdiagnosis this line exists to prevent.
+         *
+         * Even so the numerator is a LOWER BOUND on device time: k_cof_enqueue,
+         * k_cand_stats and the flush's own kernels are real GPU work that no
+         * event times, so the ratio understates utilisation by a small fixed
+         * amount. That is tolerable for the comparison it is for and fatal for
+         * the one it is not -- hence:
+         *
+         * Deliberately NO threshold and no warning text. The healthy value is a
+         * function of the card and the job -- a faster GPU spends relatively
+         * more of its wall on the same host work, so it sits LOWER when
+         * perfectly healthy -- and a hardcoded "good" constant here would be
+         * the same mistake as the 144-block default: one box's number promoted
+         * to a universal one. Compare it against your own idle baseline on the
+         * same card, job AND band length; that comparison is valid, an absolute
+         * reading is not.
+         *
+         * Band length matters because acc_wall excludes the final cofactor
+         * flush (see the comment on cofac_tail above). On a band shorter than
+         * one flush that tail IS the whole cofactorisation, so a short smoke
+         * run and a production band are not comparable to each other. */
+        printf("  %-34s %8.3f\n", "GPU-accounted / wall (excl cofac)",
+               (acc_sieve + acc_isect + dev * N) / (acc_wall - tm.cofac));
         printf("  %-34s %8.1f\n", "two-sided primitive survivors/q",
                (double)acc_surv / N);
         printf("  %-34s %8.2f\n", "cofactorisation candidates/q",

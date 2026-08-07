@@ -284,8 +284,26 @@ Note `--blocks` and `--threads` do **not** move fill — the grids are fully
 separate, and the startup lines print both. See RESULTS.md finding 52 (and 51,
 which it supersedes on the geometry).
 
-Two rules for comparing cards, both learned the hard way (RESULTS.md
-findings 48–51):
+Three rules for comparing cards, all learned the hard way (RESULTS.md
+findings 48–53):
+
+- **Run on an IDLE host, and say whether you did.** GPU kernel times come from
+  `cudaEvent`, so they are blind to host contention: saturating this box's 16
+  cores left `fill` and `apply` flat within 1% while wall clock went **24.30 →
+  31.27 ms/q**. As throughput that is a **22.3% relation-rate loss**, and half
+  the cores already costs **18.4%**, so there is no safe headroom. A busy box therefore reports *perfect* kernel numbers and a
+  bad ETA — which is exactly what a card looks like when it is fine and the
+  host is not. Never compare a wall-clock or ETA figure across boxes without
+  knowing the host load on both; rented and shared boxes are the risk.
+
+  **The pipeline** prints `GPU-accounted / wall (excl cofac)` for this — the
+  standalone does not, so a wall-clock or ETA claim has to come from a pipeline
+  run. There is no universal "good" value: a faster card spends relatively more
+  of its wall on the same host work and so reads *lower* while perfectly
+  healthy. Take an idle baseline per card, job and band length, and compare
+  against that; a drop against your own baseline is the signal, the absolute
+  number is not. (Published values are pending a re-measurement — the first
+  pair was taken with a formula since corrected. See RESULTS.md finding 53.)
 
 - **Use `--reps 100` or more.** Below that, the standalone bench's `transform`
   line reports amortized CUDA startup rather than kernel time — it moves 98×

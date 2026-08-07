@@ -2003,10 +2003,27 @@ Standalone `--logI 14 --J 8192 --reps 100`, fill ms:
 
 At a constant 576 blocks the 5090 measures **2.716 / 2.711 / 3.147 / 4.289 ms**
 at 64 / 128 / 256 / 512 threads. So 256 is **16% off** and 512 is 58% off,
-while 32-128 is flat to 0.2%. Two consequences: a sweep pinned at 256 was
-16% off the optimum before it began, and fill's width cannot be tuned through
-`--threads`, which also drives transform, intersect, TD, resieve and the
-cofactor kernels. Hence `--fill-threads`.
+while **64-128** is flat to 0.2%. Note 64, not 32 — 576 × 32 was never
+measured, so flatness is established down to 64 and assumed below it.
+
+At the shipped 1152 blocks the gap is **wider**, not narrower — 2.633 at 32
+threads against **3.239 at 256, a 23% penalty**:
+
+| 5090, fill ms | 32 thr | 128 thr | 256 thr |
+|---|---:|---:|---:|
+| 576 blocks | — | 2.711 | 3.147 |
+| **1152 blocks** | **2.633** | — | 3.239 |
+
+Note 1152 × 256 (3.239) is worse than 576 × 256 (3.147): **at 256 threads more
+blocks still hurts** — the finding-51 behaviour — while at 32 threads more
+blocks helps. The two axes interact strongly and neither can be swept alone.
+
+Two consequences: a sweep pinned at 256 threads was 16-23% off the optimum
+before it began, and fill's width cannot be tuned through `--threads`, which
+also drives transform, intersect, TD, resieve and the cofactor kernels. Hence
+`--fill-threads`. This cell was run specifically to test whether that flag
+earns its keep rather than being an over-engineered alternative to raising
+`FILL_BLOCKS_DEFAULT`; raising blocks alone would have landed on 3.239.
 
 ### The knee is 1152 blocks on all three cards
 
@@ -2073,13 +2090,192 @@ number from another session on this box** — rerun the control.
 
 ### Not yet measured
 
-- **1152 x 256.** The sweeps cover 1152 at 32 threads and 576 at 256. The 16%
-  width penalty is measured at 576 and *inferred* at 1152. If it vanished at
-  1152, `--fill-threads` would be unnecessary and raising the block default
-  alone would suffice.
 - The pipeline A/B is 5070-only; the 5090 is where the largest gain is claimed.
 - `k_fill_l1` (twolevel path) has never been swept at any geometry and keeps its
   own 144 x 512 default.
+
+## Finding 53 — host contention costs 29% of wall clock and every GPU counter we have is blind to it
+
+Reported by the 3090 tester: a saturated CPU leaves the CUDA timings untouched
+but moves wall clock. Reproduced here on the 5070, c147 band, 1340 q, same
+binary, load applied with N spinning shells:
+
+| | idle | 8/16 cores | 16/16 cores |
+|---|---:|---:|---:|
+| **wall clock/q** | **24.30 ms** | **29.79 (+22.6%)** | **31.27 (+28.7%)** |
+| sieve, both sides | 17.48 | 18.94 | 17.41 |
+| — transform | 0.764 | — | 0.822 |
+| — fill | 7.113 | — | 7.085 |
+| — apply | 9.607 | — | 9.505 |
+| intersect + gcd | 0.074 | — | 0.105 |
+| host per-q (tables, staging) | 0.699 | 1.249 | **1.994** |
+| TD + classify, wall | 4.11 | 5.73 | **7.06** |
+| host: small-prime tables | 0.467 | — | 0.833 |
+| host: unaccounted | 0.528 | 1.594 | **2.869** |
+| cofactorisation flushes | 0.56 | — | 0.97 |
+| relations | 159,837 | 159,837 | 159,837 |
+
+The sieve row at half load (18.94) is above both other columns, so it is
+run-to-run noise, not a trend — the full-load column (17.41 against 17.48
+idle) is the one to read for whether the GPU stages move. They do not.
+
+**Replication status: each column is a single run.** That noise disclaimer
+concedes an ~8% spread on the largest term, so the wall deltas carry an
+uncertainty this finding does not quantify, and "every kernel within ~1%" rests
+on the one column that happened to land close. A replication attempt was made
+and had to be discarded: the box turned out to be running a production snfs236
+sieve on the same GPU plus a 14-thread msieve, which put wall clock at ~53 ms —
+so the contamination signature is unmistakable, and its absence from the 24-25
+ms idle runs is the evidence that those were clean. **Re-run all three columns
+n>=3 on a confirmed-idle box before quoting these as hardware constants.**
+
+**The kernels are flat and the wall clock is not.** Every `cudaEvent`-timed
+stage is within ~1% (`fill` -0.4%, `apply` -1.1%). Everything host-side scales
+with contention, worst of all `unaccounted` — wall minus device time inside
+TD/classify, i.e. launch and synchronisation overhead — at **+443%**.
+
+### Why this is a measurement hazard and not just a scheduling tip
+
+Our instrumentation is *structurally* unable to see the largest environmental
+effect on throughput. A host-starved box reports flawless kernel times next to
+a bad ETA, which reads as "the GPU is fine, the ETA is inexplicable" — the exact
+shape of the original 3090 report that opened findings 48-52. Any wall-clock or
+ETA comparison across boxes is invalid without knowing host load on both, and
+the rented boxes used for findings 50-52 are shared machines.
+
+The A100 is the one prior result worth re-examining on these grounds, and it is
+**not cleared**. An earlier version of this paragraph said its host per-q of
+0.892 ms beat "this box's 1.080", concluding its 37.02 ms wall stands. That
+1.080 is unsourced and appears nowhere in this repo. Finding 50's own table —
+same job, same 1340 q — records **5070 = 0.811 against A100 = 0.892**: the
+A100's host was 10% *slower*, the opposite of what was claimed.
+
+A 10% host gap is well inside what two different host CPUs produce, so it
+neither establishes contention nor rules it out. **The A100 wall figure is
+unverified** and stays so until a band is run there with the ratio line, on a
+host confirmed idle.
+
+### It is far larger for us than the reporter's numbers imply
+
+Their host per-q rose **33%** (0.288 → 0.384 ms); ours rose **185%** (0.699 →
+1.994). Quote the two percentages rather than a ratio of them — an earlier
+heading here said "~4x", which matches no derivation: the relative growths
+differ by 5.6×, the multipliers by 2.1×, the absolute milliseconds by 13.5×.
+The difference is which harness was run. The standalone bench does almost no host work — a
+transform, a sort and one H2D — while the pipeline carries TD tables, staging
+and cofactor flushes. **The standalone structurally understates this effect**,
+and the standalone is what testers are usually asked to run.
+
+### There is no free headroom
+
+Half the cores costs most of what all of them cost. State it as **throughput**,
+not as percent-of-baseline-wall — an earlier version of this section did the
+latter and inflated the decision rule:
+
+| | wall/q | wall vs idle | **relation-rate loss** |
+|---|---:|---:|---:|
+| idle | 24.30 ms | — | — |
+| 8/16 cores | 29.79 | +22.6% | **18.4%** |
+| 16/16 cores | 31.27 | +28.7% | **22.3%** |
+
+A +28.7% wall is a 22.3% throughput loss (1/1.287 = 0.777), not a 29% one. So
+co-scheduling CPU-NFS work beside the GPU siever pays only if that work is
+worth more than ~18% of the GPU's relation output at half load, or ~22% at
+full — not the "more than a quarter" this section previously claimed, which
+overstated the bar by 27% at half load.
+
+### The pipeline now reports this directly
+
+`GPU-accounted / wall (excl cofac)` prints on every band: event-timed device
+time (sieve + intersect + the TD/classify device total) over wall clock, with
+the cofactor queue removed from **both** sides.
+
+**Values pending re-measurement.** A first version was measured at 0.824 idle /
+0.661 loaded, but with the cofactor queue in the denominator only — which made
+the ratio move with survivor density, so a candidate-dense band read as a
+contended host on an idle box. That is the exact misdiagnosis the line exists
+to prevent, so the expression was corrected and those two numbers no longer
+describe what the code prints. Re-taking them needs a confirmed-idle box.
+
+The numerator remains a **lower bound** on device time: `k_cof_enqueue`,
+`k_cand_stats` and the flush's own kernels are real GPU work that no event
+times. The ratio therefore understates utilisation by a small amount that is
+roughly fixed for a given job — tolerable for comparing a box against its own
+baseline, which is the only comparison it is for.
+
+It is **not** the most sensitive signal available. An earlier version of this
+section claimed it separates the two conditions "where every individual stage
+timing does not"; that is false. Two already-printed timings separate them far
+more sharply — `host per-q` at +185% and `host: unaccounted` at +443%, against
+the ratio's −20%. Its merit is being one scale-free summary that needs no
+baseline table to read, not being the sharpest.
+
+No threshold and no warning text is attached, deliberately. The healthy value
+depends on card and job — a faster GPU spends relatively more of its wall on
+the same host work and therefore reads *lower* while perfectly healthy — so a
+hardcoded "good" constant would repeat the 144-block mistake of promoting one
+box's number to a universal one. Take an idle baseline per card, job **and band
+length** and compare against it: `acc_wall` excludes the final cofactor flush,
+so on a band shorter than one flush that tail is the entire cofactorisation and
+a smoke run is not comparable to a production band.
+
+### What to do about it: the host work is three problems, not one
+
+The 1.694 ms does not have a single fix, because two thirds of it is *prep* and
+one third is *launch overhead*:
+
+| | idle | loaded | what it is |
+|---|---:|---:|---|
+| host per-q (tables, staging) | 0.699 | 1.994 | prep: tiers, staging, H2D |
+| host: small-prime tables | 0.467 | 0.833 | prep: derived from the lattice |
+| host: unaccounted | 0.528 | **2.869** | launch + sync overhead |
+
+**Overlap beats threading for the prep, and not narrowly.** Both prep terms
+depend only on the q-lattice and on no GPU result, so q+1's host work can be
+done during q's kernels — double-buffering, not parallelism. The arithmetic is
+lopsided: **1.166 ms of prep against ~20.7 ms of GPU work per q**, so it fits
+inside the GPU's shadow with 18x room and perfect overlap takes it to zero on
+the critical path. Threading the same work reaches perhaps 0.4 ms on four
+threads and leaves it *on* the critical path — strictly worse on the arithmetic
+alone.
+
+**But the arithmetic is not the whole cost, and an earlier version of this
+paragraph implied it was** by calling threading's downside "a synchronisation
+problem that does not currently exist." The host does not sit idle through that
+20.7 ms shadow: it blocks at six points per q — `cudaEventSynchronize(e3)` once
+per side (`pipeline.cuh:240`), the intersect sync (`:975`), two inside
+`pipe_td_perq` (`:671`, `:736`), and `cudaDeviceSynchronize` after
+`k_cof_enqueue` (`:1021`). Single-threaded overlap requires splicing q+1's prep
+in *ahead* of those syncs, i.e. restructuring them — which is most of the work
+sub-item 2's graph capture wants anyway. Overlap is still ranked first because
+it and (2) share that restructuring, not because it is free.
+
+**`unaccounted` needs the opposite treatment.** It is wall minus device time
+inside TD/classify: the CPU issuing launches and waiting on syncs. It is
+interleaved with GPU execution by nature, so overlap cannot hide it, and it is
+the term that grew **443%** under contention — it is what makes a box fragile
+rather than merely slow. The per-q kernel sequence is fixed, so fewer and
+larger launches, fewer sync points, or a captured CUDA graph replayed per q all
+attack it directly.
+
+**The micro-optimisation is the least valuable third.** Replacing the per-q
+stable sort with a three-way partition and fusing the twice-done small-ideal
+transform was previously the whole of open experiment 4. After overlap, that
+work is hidden in the GPU shadow and its cost stops mattering. Order: overlap,
+then graphs, then the partition.
+
+### Consequences
+
+- Open experiment 4 (host cost) is reordered on the strength of the above, and
+  gets more valuable — though not on the idle-case arithmetic: 1.694 ms/q of a
+  24.30 ms wall is only **7%**. Reducing it buys robustness on shared hardware
+  more than throughput on a quiet box, and against open experiment 3's
+  15.8-25% duplicate share it is the smaller prize.
+- **It interacts with open experiment 1.** Running two concurrent special-q
+  roughly doubles host work per unit time, so the concurrency experiment can
+  come back negative for host reasons that have nothing to do with the GPU.
+  Run it on a verified-idle box and check `GPU-accounted / wall` first.
+- Correctness is unaffected: all three runs emit exactly 159,837 relations.
 
 ## Not addressed in this round
 
