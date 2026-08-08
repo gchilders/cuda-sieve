@@ -110,6 +110,7 @@ int main(int argc, char **argv)
     unsigned long nline = 0, nout = 0, nfull = 0;
     int lpbr = 31, lpba = 32, rc = 0, s0, s1;
     char tmp[2048], rtmp[2048], relname[2048];
+    size_t outlen;
 
     if (argc < 4) {
         fprintf(stderr,
@@ -120,15 +121,19 @@ int main(int argc, char **argv)
     }
     if (argc > 4) lpbr = atoi(argv[4]);
     if (argc > 5) lpba = atoi(argv[5]);
-    if (strlen(argv[3]) + 32 >= sizeof relname) {
+    outlen = strlen(argv[3]);
+    if (outlen > sizeof rtmp - sizeof(".relations.tmp")) {
         fprintf(stderr, "mkcofbatch: output path too long\n");
         return 2;
     }
     /* Write through temporaries: a failed join must not leave a file that
      * looks like a usable batch. */
-    snprintf(tmp, sizeof tmp, "%s.tmp", argv[3]);
-    snprintf(relname, sizeof relname, "%s.relations", argv[3]);
-    snprintf(rtmp, sizeof rtmp, "%s.tmp", relname);
+    memcpy(tmp, argv[3], outlen);
+    memcpy(tmp + outlen, ".tmp", sizeof(".tmp"));
+    memcpy(relname, argv[3], outlen);
+    memcpy(relname + outlen, ".relations", sizeof(".relations"));
+    memcpy(rtmp, argv[3], outlen);
+    memcpy(rtmp + outlen, ".relations.tmp", sizeof(".relations.tmp"));
 
     f0 = fopen(argv[1], "r"); f1 = fopen(argv[2], "r");
     o = fopen(tmp, "w"); ro = fopen(rtmp, "w");
