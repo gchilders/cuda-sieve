@@ -6,24 +6,34 @@ and verified), 2026-08-05. Nothing in it is from memory.
 ## What you need
 
 1. **A polynomial file.** A GGNFS `.job` works directly — `n:`, `skew:`,
-   `c0:`..`c5:`, `Y0:`, `Y1:`. The extra keys (`rlim:`, `lpbr:`, `alambda:` …)
-   are ignored by both our loader and CADO's `makefb`, so `result.job` needs no
+   `c0:` through `c8:`, `Y0:`, `Y1:`. The extra keys (`rlim:`, `lpbr:`, `alambda:` …)
+   are ignored by `fbgen`, so `result.job` needs no
    conversion. A CADO `.poly` works too.
 
-2. **An algebraic factor base from CADO's `makefb`.** This is required, not
+2. **An algebraic factor base from the native `fbgen`.** This is required, not
    optional: the GGNFS `.afb.0` format carries neither p = 2 nor prime powers,
    and without p = 2 the algebraic cofactors stay even, which Montgomery
    arithmetic cannot split. `bench` refuses to produce relations without it.
 
    ```sh
-   makefb -poly JOB.job -lim ALIM -maxbits LOGI -out JOB.roots1
+   make -C /path/to/cuda-sieve/bench fbgen
+   /path/to/cuda-sieve/bench/fbgen --poly JOB.job --lim ALIM \
+       --maxbits LOGI --threads 6 --out JOB.roots1
    ```
 
-   `-maxbits` is the sieve's `logI`. 5 s for a c151.
+   `--lim` defaults to `alim` when the `.job` carries it. `--maxbits` should be
+   the sieve's `logI`: this includes the useful prime-power ladders through the
+   sieve width. Old files made with `maxbits=1` remain valid and loadable, but
+   are prime-only and normally lower-yielding; `bench` warns if a file's header
+   disagrees with `--maxbits`. The native output is byte-for-byte compatible
+   with CADO's text format, so existing `.roots1` files need no conversion.
+   Named output is staged through `NAME.part` and renamed only after every
+   worker succeeds, so a failed build cannot replace a good cache with a
+   plausible truncated file.
 
 ## Where to put things
 
-`makefb` and `bench` take paths and do not care about the working directory.
+`fbgen` and `bench` take paths and do not care about the working directory.
 **msieve does** — it looks for `cub/`, the lanczos kernels and its default
 `msieve.dat` / `msieve.fb` / `worktodo.ini` relative to wherever you launch it.
 So: one directory per job, and run msieve from inside it.
@@ -31,7 +41,7 @@ So: one directory per job, and run msieve from inside it.
 ```
 ~/nfs/c151/
   c151.job                 copy of result.job — the poly
-  c151.roots1              makefb output
+  c151.roots1              native fbgen output
   msieve.dat               relations: sieve STRAIGHT into this, no copy step
   msieve.fb                N, poly and bounds (see below)
   worktodo.ini             N on one line
@@ -41,7 +51,7 @@ So: one directory per job, and run msieve from inside it.
   sieve.log
 ```
 
-Run `makefb` and `bench` from anywhere with `-out` / `--relations` pointing
+Run `fbgen` and `bench` from anywhere with `--out` / `--relations` pointing
 into the job directory; run `msieve` from inside it.
 
 Two practical notes:
@@ -59,7 +69,7 @@ Two practical notes:
 
 ```sh
 bench --pipeline --cofactor \
-      --poly JOB.job --cadofb JOB.roots1 \
+      --poly JOB.job --fb1 JOB.roots1 \
       --logI 14 \
       --qrange 15000000: --target-rels 65000000 \
       --relations ~/nfs/c151/msieve.dat
@@ -131,17 +141,17 @@ An SNFS polynomial often has tiny algebraic coefficients — `x^5 + x^4 - 4x^3 -
 side, and the special-q and the 3LP `mfb` go there with it. Pass `--sq-side 0`:
 
 ```sh
-bench --pipeline --cofactor --poly snfs236.job --cadofb snfs236.roots1 \
+bench --pipeline --cofactor --poly snfs236.job --fb1 snfs236.roots1 \
       --sq-side 0 --logI 14 --qrange 30000000: --relations msieve.dat
 ```
 
-`--cadofb` is still the **algebraic** base — that side needs prime powers
-regardless of where the q lives. `makefb -lim` takes `alim` as usual.
+`--fb1` is still the **algebraic** base — that side needs prime powers
+regardless of where the q lives. `fbgen --lim` takes `alim` as usual.
 
 Two things that look like errors and are not:
 
 - **"f has no root mod 2"**. That polynomial has `f(0) = 1`, `f(1) = -1` and an
-  odd leading coefficient, so 2 can never divide the algebraic norm and makefb
+  odd leading coefficient, so 2 can never divide the algebraic norm and fbgen
   correctly emits no `p = 2`. The run says so and continues. The `p = 2` check
   only fires when f *does* have a root mod 2 and the entry is missing anyway.
 - **`--qrange MIN:` resolving to an empty band** when you also lower `--rlim`
@@ -285,7 +295,7 @@ default was arrived at:
 for t in 32 64 128 256; do
   for b in 576 1152 2304 4608; do
     printf "fill %4s x %-3s " $b $t
-    bench --poly JOB.job --cadofb JOB.roots1 --logI 14 --J 8192 \
+    bench --poly JOB.job --fb1 JOB.roots1 --logI 14 --J 8192 \
           --reps 100 --stage fill --fill-blocks $b --fill-threads $t | grep "fill:"
   done
 done

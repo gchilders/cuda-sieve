@@ -1,4 +1,4 @@
-/* Loader for CADO's text factor base (the output of makefb).
+/* Loader for the native fbgen/CADO-compatible text factor-base format.
  *
  * Using this instead of GGNFS's .afb.0 buys two things that matter for parity:
  * prime powers (which .afb.0 has none of), and the exact per-entry log
@@ -19,8 +19,8 @@
  * The file is grouped by base prime with the powers of each listed inside the
  * group, so it is NOT globally sorted by q -- and everything downstream
  * (fb_split_small, fb_restrict, the slice builder) needs ascending q. The k==1
- * entries do arrive in ascending order and the powers are few (makefb was run
- * with -maxbits 15, so every power is <= 32768), so a merge is enough and a
+ * entries do arrive in ascending order and the powers are few (with the usual
+ * maxbits 15, every power is <= 32768), so a merge is enough and a
  * full sort of 7.6M entries is not.
  */
 #define _GNU_SOURCE
@@ -75,6 +75,7 @@ int fb_load_cado(const char *path, double scale, fb_t *fb)
     uint32_t *qa, *ra, *qb, *rb, i, j, k;
     uint8_t  *la, *lb;
     unsigned long linenr = 0;
+    int file_maxbits = 0;
 
     memset(fb, 0, sizeof(*fb));
     if (!f) { fprintf(stderr, "fb_load_cado: cannot open %s\n", path); return -1; }
@@ -93,7 +94,12 @@ int fb_load_cado(const char *path, double scale, fb_t *fb)
         int nexp = 1, oldexp = 0, kk = 1;
         uint8_t lg;
         linenr++;
-        if (*s == '#' || *s == '\n') continue;
+        if (*s == '#') {
+            int mb;
+            if (sscanf(s, "# maxbits = %d", &mb) == 1) file_maxbits = mb;
+            continue;
+        }
+        if (*s == '\n') continue;
         q = (uint32_t)strtoul(s, &e, 10);
         if (e == s || *e != ':') continue;
         s = e + 1;
@@ -159,6 +165,7 @@ int fb_load_cado(const char *path, double scale, fb_t *fb)
     }
 
     fb->n      = na + nb;
+    fb->maxbits = file_maxbits;
     fb->primes = (uint32_t *)malloc((size_t)fb->n * 4);
     fb->roots  = (uint32_t *)malloc((size_t)fb->n * 4);
     fb->logp   = (uint8_t  *)malloc((size_t)fb->n);
@@ -174,7 +181,7 @@ int fb_load_cado(const char *path, double scale, fb_t *fb)
         else       { fb->primes[k] = qb[j]; fb->roots[k] = rb[j]; fb->logp[k] = lb[j];
                      fb->ispow[k] = 1; j++; }
     }
-    printf("CADO factor base %s: %u ideals (%u prime, %u prime-power)"
+    printf("text factor base %s: %u ideals (%u prime, %u prime-power)"
            " at scale %.3f\n", path, fb->n, na, nb, scale);
     free(qa); free(ra); free(la); free(qb); free(rb); free(lb);
     return 0;

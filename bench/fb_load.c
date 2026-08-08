@@ -23,6 +23,7 @@ int fb_load(const char *path, fb_t *fb)
     }
 
     fb->n      = n;
+    fb->maxbits = 1;                 /* .afb.0 contains base primes only */
     fb->primes = (uint32_t *)malloc((size_t)n * 4);
     fb->roots  = (uint32_t *)malloc((size_t)n * 4);
     /* .afb.0 has no prime powers at all -- that is one of the two reasons the
@@ -44,38 +45,7 @@ void fb_free(fb_t *fb)
 {
     free(fb->primes); free(fb->roots); free(fb->logp); free(fb->ispow);
     fb->primes = fb->roots = NULL; fb->logp = NULL; fb->ispow = NULL; fb->n = 0;
-}
-
-static uint32_t mulmod32(uint32_t a, uint32_t b, uint32_t m)
-{
-    return (uint32_t)(((uint64_t)a * b) % m);
-}
-
-static uint32_t powmod32(uint32_t a, uint32_t e, uint32_t m)
-{
-    uint32_t r = 1;
-    a %= m;
-    while (e) { if (e & 1u) r = mulmod32(r, a, m); a = mulmod32(a, a, m); e >>= 1; }
-    return r;
-}
-
-/* Deterministic Miller-Rabin: bases {2,7,61} decide primality for all 32-bit n. */
-static int is_prime32(uint32_t n)
-{
-    static const uint32_t bases[3] = {2u, 7u, 61u};
-    uint32_t d = n - 1, i;
-    int s = 0, k;
-    if (n < 2) return 0;
-    for (i = 0; i < 3; i++) { if (n == bases[i]) return 1; if (n % bases[i] == 0) return 0; }
-    while (!(d & 1u)) { d >>= 1; s++; }
-    for (k = 0; k < 3; k++) {
-        uint32_t x = powmod32(bases[k], d, n);
-        int j;
-        if (x == 1 || x == n - 1) continue;
-        for (j = 1; j < s; j++) { x = mulmod32(x, x, n); if (x == n - 1) break; }
-        if (j == s) return 0;
-    }
-    return 1;
+    fb->maxbits = 0;
 }
 
 /* Is q a prime power (including a prime)?
@@ -88,7 +58,7 @@ int fb_is_prime_power(uint32_t q)
 {
     uint32_t d;
     if (q < 2) return 0;
-    if (is_prime32(q)) return 1;
+    if (bench_is_prime32(q)) return 1;
     for (d = 2; (uint64_t)d * d <= (uint64_t)q; d++) {
         if (q % d) continue;
         while (q % d == 0) q /= d;
@@ -101,7 +71,7 @@ int fb_is_prime_power(uint32_t q)
  * row-confined (g > 1), which the bucket walk cannot express. */
 int fb_is_proper_power(uint32_t q)
 {
-    return q >= 4 && !is_prime32(q) && fb_is_prime_power(q);
+    return q >= 4 && !bench_is_prime32(q) && fb_is_prime_power(q);
 }
 
 /* Every modulus in a factor base must be a prime power: the root transform's
@@ -178,6 +148,7 @@ int fb_split_small(const fb_t *fb, uint32_t bkthresh, fb_t *small)
 {
     uint32_t i, k = 0, cap = 0;
     memset(small, 0, sizeof(*small));
+    small->maxbits = fb->maxbits;
     if (getenv("TD_DUMP_SMALL")) {
         uint32_t n2 = 0, np = 0;
         for (i = 0; i < fb->n; i++) {

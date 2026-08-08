@@ -279,7 +279,7 @@ __global__ void k_apply(const uint32_t *__restrict buckets,
                 float aabs = fabsf(N.d[N.deg]), vpa = 1.0f;
                 const float au = fabsf(u), av = fabsf(v);
                 #pragma unroll
-                for (int k = 6; k >= 0; k--)
+                for (int k = BENCH_MAX_DEGREE - 1; k >= 0; k--)
                     if (k < N.deg) {
                         vp  *= v;  acc  = fmaf(acc,  u,  N.d[k] * vp);
                         vpa *= av; aabs = fmaf(aabs, au, fabsf(N.d[k]) * vpa);
@@ -294,7 +294,7 @@ __global__ void k_apply(const uint32_t *__restrict buckets,
                     const double ud = a / N.A, vd = b / N.B;
                     double accd = N.dd[N.deg], vpd = 1.0;
                     #pragma unroll
-                    for (int k = 6; k >= 0; k--)
+                    for (int k = BENCH_MAX_DEGREE - 1; k >= 0; k--)
                         if (k < N.deg) { vpd *= vd; accd = accd * ud + N.dd[k] * vpd; }
                     s = (float)fabs(accd);
                 }
@@ -964,7 +964,7 @@ static uint32_t build_slices(const fb_t *fb, uint16_t *slice,
 static int td_build_poly(tdpoly_t *T, const poly_t *P, int side)
 {
     memset(T, 0, sizeof(*T));
-    for (int k = 0; k < 8; k++) T->sign[k] = 1;
+    for (int k = 0; k < BENCH_NCOEFF; k++) T->sign[k] = 1;
     if (side == 0) {
         int s0 = 1, s1 = 1;
         T->deg = 1;
@@ -1143,6 +1143,7 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     tdpoly_t h_poly;
     int rc = 0;
     uint32_t n = 0, nsm = 0, hflags = 0;
+
     unsigned long long hovf = 0;
     cudaEvent_t t0, t1;
     float ms_rank = 0, ms_emit = 0, ms_sum = 0, ms_scatter = 1e30f, ms_td = 1e30f;
@@ -1612,6 +1613,21 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     const uint32_t nbitword = xmax >> 5;   /* survivor bitmap, 1 bit/position */
     const int log_super = log_region + 7;             /* 128 regions/super */
     const uint32_t nsuper = xmax >> log_super;
+    norm_t N;
+
+    /* Exact trial division constructs the full homogeneous norm. Reject a
+     * shape that cannot fit before allocating or launching anything on the
+     * GPU; the logarithmic sieve itself remains usable at any supported
+     * degree. */
+    memset(&N, 0, sizeof(N));
+    norm_setup(&N, POLY, L, cfg->logI, cfg->J, cfg->scale, cfg->side == 1);
+    if (cfg->td && !norm_fits_exact(&N, BN_LIMBS * 32)) {
+        fprintf(stderr,
+                "  exact degree-%d norm may require %.2f bits;"
+                " the trial-division type holds %d\n",
+                POLY->deg, norm_exact_bound_bits(&N), BN_LIMBS * 32);
+        return -1;
+    }
 
     size_t freeB = 0, totalB = 0;
     CK(cudaMemGetInfo(&freeB, &totalB));
@@ -1740,8 +1756,6 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     }
 
     /* ---- norm initialisation constants ---- */
-    norm_t N; memset(&N, 0, sizeof(N));
-    norm_setup(&N, POLY, L, cfg->logI, cfg->J, cfg->scale, cfg->side == 1);
     const uint32_t CINIT = (cfg->cell_bits == 16) ? 4096u : 255u;
     /* las's survivor test is S = max(T - sum, 0) <= bound with
      * bound = round(scale * lambda * lpb). Ours holds CINIT - T + sum, so

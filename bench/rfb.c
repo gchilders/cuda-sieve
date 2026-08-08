@@ -71,48 +71,44 @@ static uint32_t big_mod(const bigint_t *B, uint32_t p)
 int rfb_build(const poly_t *P, uint32_t lim, int maxbits, double scale, fb_t *fb)
 {
     bigint_t Y0, Y1;
-    unsigned char *sieve;                  /* odd numbers only: bit k <-> 2k+3 */
-    uint32_t nodd, i, k = 0, cap;
+    uint32_t *plist;
+    size_t nprime;
+    size_t i;
+    uint32_t k = 0, cap;
     uint32_t nproj = 0, npow = 0, nprojpow = 0;
-    const uint32_t powmax = (maxbits > 0 && maxbits < 31) ? (1u << maxbits) : 0;
+    uint32_t powmax;
 
     memset(fb, 0, sizeof(*fb));
+    if (maxbits < 1 || maxbits > 31) {
+        fprintf(stderr, "rfb_build: maxbits must be in [1,31]\n");
+        return -1;
+    }
+    powmax = 1u << maxbits;
+    fb->maxbits = maxbits;
     if (big_parse(P->y0s, &Y0) || big_parse(P->y1s, &Y1)) {
         fprintf(stderr, "rfb_build: Y0/Y1 too large for %d limbs\n", MAXLIMB);
         return -1;
     }
     if (lim < 8) return -1;
 
-    nodd  = (lim - 1) / 2;                 /* candidates 3,5,...,<=lim */
-    sieve = (unsigned char *)calloc(nodd / 8 + 1, 1);
-    if (!sieve) return -1;
-    for (i = 0; (uint64_t)(2 * i + 3) * (2 * i + 3) <= (uint64_t)lim; i++) {
-        uint32_t p, j;
-        if (sieve[i >> 3] & (1u << (i & 7))) continue;
-        p = 2 * i + 3;
-        for (j = (p * p - 3) / 2; j < nodd; j += p)
-            sieve[j >> 3] |= (uint8_t)(1u << (j & 7));
-    }
+    plist = prime_list_build(lim, &nprime);
+    if (!plist) return -1;
 
-    /* pi(x) ~ x/ln x; 12% headroom is plenty and this is a one-time alloc */
-    cap = (uint32_t)((double)lim / (log((double)lim) - 1.1)) + 4096;
+    /* One entry per prime plus ample room for every ladder through 2^31. */
+    cap = (uint32_t)nprime + 65536;
     fb->primes = (uint32_t *)malloc((size_t)cap * 4);
     fb->roots  = (uint32_t *)malloc((size_t)cap * 4);
     fb->logp   = (uint8_t  *)malloc((size_t)cap);
     fb->ispow  = (uint8_t  *)malloc((size_t)cap);
-    if (!fb->primes || !fb->roots || !fb->logp || !fb->ispow) { free(sieve); return -1; }
+    if (!fb->primes || !fb->roots || !fb->logp || !fb->ispow) { free(plist); return -1; }
 
     /* p = 2 first, then the odd primes in order -- fb_split_small and
      * fb_restrict both assume non-decreasing p. pl_invmod_any dispatches on
      * the parity of the modulus, so 2 needs no separate code path. */
-    for (i = 0; i < nodd + 1 && k < cap; i++) {
+    for (i = 0; i < nprime && k < cap; i++) {
         uint32_t p, y0, y1, qk;
         int e, proj;
-        if (i == 0) p = 2;
-        else {
-            if (sieve[(i - 1) >> 3] & (1u << ((i - 1) & 7))) continue;
-            p = 2 * (i - 1) + 3;
-        }
+        p = plist[i];
         y1 = big_mod(&Y1, p);
         y0 = big_mod(&Y0, p);
         /* G(x) = Y1*x + Y0, so the root is the point (Y0 : -Y1) of P^1. Exactly
@@ -134,7 +130,7 @@ int rfb_build(const poly_t *P, uint32_t lim, int maxbits, double scale, fb_t *fb
                                        * pl_invmod_any(y1, p)) % (uint64_t)p);
         }
         k++;
-        /* Prime powers, exactly as makefb emits them: modulus p^e, root lifted
+        /* Prime powers, exactly as fbgen/makefb emit them: modulus p^e, root lifted
          * mod p^e (for a linear polynomial no Hensel step is needed -- one
          * inverse mod p^e is enough), and the log increment is the MARGINAL
          * fb_log(p^e) - fb_log(p^(e-1)), not log(p^e).
@@ -148,7 +144,7 @@ int rfb_build(const poly_t *P, uint32_t lim, int maxbits, double scale, fb_t *fb
         for (e = 2, qk = p; e <= 31 && k < cap; e++) {
             uint64_t nq = (uint64_t)qk * p;
             uint32_t yy1, yy0, num, den;
-            if (!powmax || nq > powmax) break;
+            if (nq > powmax) break;
             qk = (uint32_t)nq;
             yy1 = big_mod(&Y1, qk);
             yy0 = big_mod(&Y0, qk);
@@ -164,7 +160,7 @@ int rfb_build(const poly_t *P, uint32_t lim, int maxbits, double scale, fb_t *fb
             k++; npow++; if (proj) nprojpow++;
         }
     }
-    free(sieve);
+    free(plist);
     fb->n = k;
     /* powers were emitted next to their base prime, so q is not yet ascending */
     {

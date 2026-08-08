@@ -11,6 +11,16 @@ extern "C" {
 
 /* ---- factor base ------------------------------------------------------ */
 
+/* GNFS normally uses degree 5 or 6, but octic SNFS polynomials are valid and
+ * occur in the local job corpus.  Keep one named bound across parsing, norm
+ * setup and exact trial division so c8 cannot overrun a degree-7 array. */
+#define BENCH_MAX_DEGREE 8
+#define BENCH_NCOEFF (BENCH_MAX_DEGREE + 1)
+
+/* Odd-only Eratosthenes sieve shared by both native factor-base builders.
+ * The returned ascending array belongs to the caller. */
+uint32_t *prime_list_build(uint32_t lim, size_t *count);
+
 /* GGNFS .afb.0 layout, decoded in oracle/ggnfs_afb_format.txt:
  *   word 0        : uint32 n
  *   words 1..n    : uint32 primes[n]     (non-decreasing)
@@ -24,6 +34,7 @@ typedef struct {
     uint32_t *roots;    /* root mod that modulus; >= modulus means projective */
     uint8_t  *logp;     /* las's log increment for this ideal, at a given scale */
     uint8_t  *ispow;    /* 1 if the modulus is p^k with k >= 2; may be NULL */
+    int       maxbits;  /* source power bound; 0 if the input did not say */
 } fb_t;
 
 /* Is entry i a proper prime power? Uses the flag the loader already set --
@@ -33,8 +44,8 @@ typedef struct {
 #define FB_ISPOW(fb, i)  ((fb)->ispow ? (fb)->ispow[i] : fb_is_proper_power((fb)->primes[i]))
 
 int  fb_load(const char *path, fb_t *fb);          /* 0 on success */
-/* CADO's makefb text format: carries prime powers and the exact per-ideal log
- * increment, neither of which GGNFS's .afb.0 has. */
+/* fbgen/CADO-compatible text format: carries prime powers and the exact
+ * per-ideal log increment, neither of which GGNFS's .afb.0 has. */
 int  fb_load_cado(const char *path, double scale, fb_t *fb);
 /* Fill logp with floor(log2(p)*scale + 0.5) for factor bases that did not come
  * with one (i.e. .afb.0). No-op if logp is already set. */
@@ -126,10 +137,10 @@ void qlat_build(qlat_t *L, uint64_t q, uint64_t rho, double skew);
 
 typedef struct {
     int    deg;
-    double c[8];              /* algebraic coefficients, as doubles           */
+    double c[BENCH_NCOEFF];   /* algebraic coefficients, as doubles           */
     double skew, y0, y1;      /* doubles are fine for norms (a logarithm)...  */
     char   y0s[80], y1s[80];  /* ...but roots need Y0,Y1 exactly. See rfb.c.  */
-    char   cs[8][80];         /* ...and so does TRIAL DIVISION, which factors */
+    char   cs[BENCH_NCOEFF][80]; /* ...and so does TRIAL DIVISION, which factors */
                               /* the exact integer F(a,b), not its log. c0 is */
                               /* 147 bits on this job, so the double is only  */
                               /* good to 53 of them. See bigint.cuh.          */
@@ -171,7 +182,7 @@ int poly_load(const char *path, poly_t *P);
 /* Everything the apply kernel needs to compute log2|F(a,b)| in fp32.
  * See poly.c for why the homogeneous normalisation is mandatory. */
 typedef struct {
-    float d[8];                  /* c_k A^k B^(deg-k) / M, all O(1)          */
+    float d[BENCH_NCOEFF];       /* c_k A^k B^(deg-k) / M, all O(1)          */
     float ua, ub, va, vb;        /* u = ua*i + ub*j ; v = va*i + vb*j        */
     float log2M;                 /* log2 of the normalisation constant       */
     float bias;                  /* log2(q) on the sq side only, else 0      */
@@ -184,7 +195,7 @@ typedef struct {
      * root lines round to the wrong sieve-log value, error -3.31 to +2.57
      * units, BOTH SIGNS -- so both false survivors and lost relations. Cells
      * that cancel are recomputed from these. */
-    double dd[8];                /* the same normalised coefficients, fp64    */
+    double dd[BENCH_NCOEFF];     /* the same normalised coefficients, fp64    */
     double A, B;                 /* u = a/A, v = b/B                          */
     int64_t a0, a1, b0, b1;      /* so (a,b) can be formed exactly in int64   */
 } norm_t;
@@ -203,6 +214,12 @@ typedef struct {
 #endif
 
 double norm_acc_fp64(const norm_t *N, int32_t i, uint32_t j);
+
+/* Conservative log2 bound for the exact homogeneous norm: every one of the
+ * deg+1 terms is at most 2^log2M over the rectangle. Trial division constructs
+ * the full norm before removing the special-q, so N->bias is not subtracted. */
+double norm_exact_bound_bits(const norm_t *N);
+int norm_fits_exact(const norm_t *N, unsigned bits);
 
 void  norm_setup(norm_t *N, const poly_t *P, const qlat_t *L,
                  int logI, uint32_t J, double scale, int is_sqside);
@@ -261,7 +278,7 @@ typedef struct {
     const char *dump;       /* write the region in las byte convention here     */
     int32_t  probe_i;            /* gate 5: read back this cell after apply  */
     uint32_t probe_j;            /* 0xFFFFFFFF = no probe                    */
-    const char *cadofb;     /* CADO makefb text factor base (has powers)       */
+    const char *cadofb;     /* fbgen/CADO text factor base (has powers)        */
     const char *survbits;   /* write a 1-bit-per-position survivor bitmap here  */
     int      not_both_even; /* apply las's not_both_even filter (see k_apply)   */
     const char *other_bits; /* the OTHER side's bitmap; enables device intersect */

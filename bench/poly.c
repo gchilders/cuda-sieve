@@ -31,6 +31,12 @@ int poly_load(const char *path, poly_t *P)
     while (fgets(line, sizeof line, f)) {
         if (line[0] == 'c' && line[1] >= '0' && line[1] <= '9' && line[2] == ':') {
             int k = line[1] - '0';
+            if (k > BENCH_MAX_DEGREE) {
+                fprintf(stderr, "poly_load: degree %d exceeds supported maximum %d\n",
+                        k, BENCH_MAX_DEGREE);
+                fclose(f);
+                return -1;
+            }
             P->c[k] = strtod(line + 3, NULL);
             /* Keep the exact decimal too. The double is what the norm-init
              * needs (it is taking a logarithm); trial division needs the
@@ -69,7 +75,7 @@ int poly_load(const char *path, poly_t *P)
  * If it does not, 2 NEVER divides the algebraic norm, and a factor base with
  * no p = 2 entry is correct rather than truncated. That is not a corner case:
  * the SNFS polynomial x^5 + x^4 - 4x^3 - 3x^2 + 3x + 1 has f(0) = 1, f(1) = -1
- * and an odd leading coefficient, so makefb emits no p = 2 and the norms are
+ * and an odd leading coefficient, so fbgen emits no p = 2 and the norms are
  * always odd.
  *
  * Parity is read off the EXACT decimal strings, not the doubles: c0 runs to
@@ -181,7 +187,7 @@ void norm_setup(norm_t *N, const poly_t *P, const qlat_t *L,
      * overflow no matter where in the region we land. */
     const double A = 0.5 * I * fabs((double)L->a0) + (double)J * fabs((double)L->b0);
     const double B = 0.5 * I * fabs((double)L->a1) + (double)J * fabs((double)L->b1);
-    double d[8], M = 0.0;
+    double d[BENCH_NCOEFF], M = 0.0;
     int k, nclamp = 0;
 
     for (k = 0; k <= P->deg; k++) {
@@ -203,10 +209,10 @@ void norm_setup(norm_t *N, const poly_t *P, const qlat_t *L,
         if (fabs(r) < 1e-37) { N->d[k] = 0.0f; nclamp += (d[k] != 0.0); }
         else N->d[k] = (float)r;
     }
-    for (; k < 8; k++) N->d[k] = 0.0f;
+    for (; k < BENCH_NCOEFF; k++) N->d[k] = 0.0f;
 
     for (k = 0; k <= P->deg; k++) N->dd[k] = d[k] / M;
-    for (; k < 8; k++) N->dd[k] = 0.0;
+    for (; k < BENCH_NCOEFF; k++) N->dd[k] = 0.0;
     N->A = A; N->B = B;
     N->a0 = L->a0; N->a1 = L->a1; N->b0 = L->b0; N->b1 = L->b1;
 
@@ -284,6 +290,18 @@ double norm_acc_fp64(const norm_t *N, int32_t i, uint32_t j)
     int k;
     for (k = N->deg - 1; k >= 0; k--) { vp *= v; acc = acc * u + N->dd[k] * vp; }
     return acc;
+}
+
+double norm_exact_bound_bits(const norm_t *N)
+{
+    return (double)N->log2M + log2((double)N->deg + 1.0);
+}
+
+int norm_fits_exact(const norm_t *N, unsigned bits)
+{
+    /* log2M is stored as float; a millibit keeps a downward rounding at the
+     * exact boundary from admitting a norm that needs one more limb. */
+    return norm_exact_bound_bits(N) + 1e-3 < (double)bits;
 }
 
 float norm_target_host(const norm_t *N, int32_t i, uint32_t j)

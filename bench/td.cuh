@@ -31,8 +31,8 @@
  * c[1] = Y1, c[0] = Y0 -- G(a,b) = Y1*a + Y0*b is the same homogeneous form,
  * so one kernel covers both sides. */
 typedef struct {
-    bn_t    c[8];
-    int32_t sign[8];
+    bn_t    c[BENCH_NCOEFF];
+    int32_t sign[BENCH_NCOEFF];
     int32_t deg;
 } tdpoly_t;
 

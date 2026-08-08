@@ -14,7 +14,7 @@ static void usage(void)
 "  A typical run needs six flags. Everything else has a right answer that is\n"
 "  derived from the polynomial or read from the .job file, and is printed:\n"
 "\n"
-"    bench --pipeline --cofactor --poly JOB.job --cadofb JOB.roots1 \\\n"
+"    bench --pipeline --cofactor --poly JOB.job --fb1 JOB.roots1 \\\n"
 "          --logI 14 --qrange 15000000: --target-rels 65000000 \\\n"
 "          --relations msieve.dat\n"
 "\n"
@@ -26,8 +26,9 @@ static void usage(void)
 "                   alim, lpbr/lpba, mfbr/mfba and lambdas are USED -- they do\n"
 "                   not need repeating below. A CADO .poly carries none of\n"
 "                   those, so state them or let them derive\n"
-"  --cadofb PATH    CADO makefb factor base. REQUIRED to emit relations: the\n"
+"  --fb1 PATH       native fbgen factor base. REQUIRED to emit relations: the\n"
 "                   GGNFS .afb.0 has neither p = 2 nor prime powers\n"
+"  --cadofb PATH    legacy alias for --fb1 (CADO files remain compatible)\n"
 "  --logI N         log2 of sieve width I      [15]   (gnfs-lasieve4I14e -> 14)\n"
 "  --J N            sieve height J             [2^(logI-1), CADO's convention]\n"
 "  --relations F    write complete relations here (GGNFS/msieve format)\n"
@@ -68,7 +69,7 @@ static void usage(void)
 "  --fbbound N      truncate FB at this p      [alim]  (GGNFS truncates at q)\n"
 "  --bkthresh N     bucket-sieve p >= this     [1<<logI]\n"
 "  --region N       log2 bucket region size    [14]  (16384 16-bit cells, 32 KB)\n"
-"  --maxbits N      prime powers below 2^N      [15]\n"
+"  --maxbits N      prime powers below 2^N      [logI]\n"
 "\n"
 "COFACTORISATION\n"
 "  --cof-rounds N   rho requeue rounds, budget doubling each time\n"
@@ -271,7 +272,7 @@ int main(int argc, char **argv)
     cfg.qmin = 0; cfg.qmax = 0; cfg.target_rels = 0;
     cfg.cofactor = 0; cfg.cof_rounds = 2; cfg.cof_budget = 65536;
     cfg.cof_ecm = 0; cfg.ecm_b1 = 1000; cfg.ecm_curves = 16;
-    int maxbits = 15;
+    int maxbits = 0, maxbits_set = 0;
     int allowance_set = 0, allowance0_set = 0, scale0_set = 0;
     const char *cofac_in = NULL;
     const char *check_rel = NULL;
@@ -348,7 +349,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--rlim") && i + 1 < argc) { rlim = (uint32_t)strtoul(argv[++i], 0, 10); rlim_set = 1; }
         else if (!strcmp(argv[i], "--scale") && i + 1 < argc) { cfg.scale = atof(argv[++i]); scale_set = 1; }
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc) cfg.dump = argv[++i];
-        else if (!strcmp(argv[i], "--cadofb") && i + 1 < argc) cfg.cadofb = argv[++i];
+        else if ((!strcmp(argv[i], "--fb1") || !strcmp(argv[i], "--cadofb")) && i + 1 < argc)
+            cfg.cadofb = argv[++i];
         else if (!strcmp(argv[i], "--survbits") && i + 1 < argc) cfg.survbits = argv[++i];
         else if (!strcmp(argv[i], "--other-bits") && i + 1 < argc) cfg.other_bits = argv[++i];
         else if (!strcmp(argv[i], "--emit") && i + 1 < argc) cfg.emit = argv[++i];
@@ -440,7 +442,9 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--cofgate") && i + 1 < argc) cfg.cofgate = argv[++i];
         else if (!strcmp(argv[i], "--emit-cof") && i + 1 < argc) cfg.emit_cof = argv[++i];
         else if (!strcmp(argv[i], "--not-both-even")) cfg.not_both_even = 1;
-        else if (!strcmp(argv[i], "--maxbits") && i + 1 < argc) maxbits = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--maxbits") && i + 1 < argc) {
+            maxbits = atoi(argv[++i]); maxbits_set = 1;
+        }
         else if (!strcmp(argv[i], "--probe") && i + 1 < argc) {
             int pi; unsigned pj;
             if (sscanf(argv[++i], "%d,%u", &pi, &pj) != 2) {
@@ -454,6 +458,11 @@ int main(int argc, char **argv)
     /* logI bounds FIRST: every default below shifts by it (bkthresh, the area
      * check, the probe range), and an out-of-range shift is undefined. */
     if (cfg.logI < 2 || cfg.logI > 20) { usage(); return 1; }
+    if (!maxbits_set) maxbits = cfg.logI;
+    if (maxbits < 1 || maxbits > 31) {
+        fprintf(stderr, "--maxbits must be in [1,31]\n");
+        return 1;
+    }
     /* las's survivor bound is scale*lambda*lpb per side; ours is the same
      * quantity in unscaled bits (16-bit cells need no scale). */
     if (!allowance_set && cfg.side == 0) cfg.allowance = 2.35 * 31.0;
@@ -932,7 +941,7 @@ int main(int argc, char **argv)
          * A FACTOR BASE WE ARE BUILDING ANYWAY. Read before fb_restrict
          * compacts in place.
          *
-         * On side 1 that base is CADO's makefb output, already loaded. On side
+         * On side 1 that base is fbgen/CADO text output, already loaded. On side
          * 0 it is rfb_build's, which is not built until after the scale is
          * derived -- and the derivation needs ql[0] to make its lattice. So
          * for a rational-side q the base is built HERE at the placeholder
@@ -1007,7 +1016,7 @@ int main(int argc, char **argv)
             uint64_t rh0 = nq ? ql[0].rho : (rho ? rho : 1);
             poly_t P0 = POLY;      /* side 0's norm is G = Y1*x + Y0, degree 1 */
             P0.deg = 1; P0.c[0] = P0.y0; P0.c[1] = P0.y1;
-            for (int z = 2; z < 8; z++) P0.c[z] = 0.0;
+            for (int z = 2; z < BENCH_NCOEFF; z++) P0.c[z] = 0.0;
             qlat_build(&L0, q0, rh0, POLY.skew);
             /* Only the sq side's norm carries a factor of q to divide out.
              * Passing is_sqside=1 for side 1 unconditionally made side 0's
@@ -1138,6 +1147,13 @@ int main(int argc, char **argv)
             else if (fb_load(fbpath, &fb1) != 0) return 1;
             fb_fill_logp(&fb1, cfg.scale);
         }
+        if (cfg.cadofb && fb1.maxbits > 0 && fb1.maxbits != maxbits)
+            fprintf(stderr,
+                    "note: algebraic factor base says maxbits=%d, while --maxbits=%d;\n"
+                    "      the file controls algebraic powers and the flag controls rational powers.\n"
+                    "      maxbits=1 is supported but prime-only and normally lower-yielding;\n"
+                    "      regenerate the file or pass its bound explicitly with --maxbits.\n",
+                    fb1.maxbits, maxbits);
         if (fb_split_small(&fb1, bkthresh, &fbs1) != 0) return 1;
         /* The GGNFS .afb.0 format carries neither p = 2 nor any prime power, so
          * the default factor base silently under-divides every algebraic norm by
@@ -1152,7 +1168,7 @@ int main(int argc, char **argv)
             /* Absent p = 2 is only a defect if f actually HAS a root mod 2.
              * When it does not -- true of the SNFS polynomial x^5+x^4-4x^3-
              * 3x^2+3x+1, whose f(0), f(1) and leading coefficient are all odd
-             * -- the algebraic norm is always odd, makefb is right to emit no
+             * -- the algebraic norm is always odd, fbgen is right to emit no
              * entry, and refusing the run rejects a perfectly good job. This
              * guard used to test only for the entry's presence and did exactly
              * that on the first SNFS job it saw. */
@@ -1168,7 +1184,7 @@ int main(int argc, char **argv)
              * a symptom. */
             if (!cfg.cadofb && (cfg.relations || cfg.candidates || cfg.cofactor)) {
                 fprintf(stderr,
-                    "ERROR: relation-producing runs need --cadofb <makefb output>.\n"
+                    "ERROR: relation-producing runs need --fb1 <fbgen output>.\n"
                     "         The GGNFS .afb.0 format carries neither p = 2 nor"
                     " prime powers, so\n"
                     "         algebraic norms are under-divided and the yield is"
@@ -1188,7 +1204,7 @@ int main(int argc, char **argv)
                         " cofactors are EVEN --\n"
                         "         and mz_n0inv requires an odd modulus, so they"
                         " cannot be split at all.\n"
-                        "         Pass --cadofb <makefb output>.\n",
+                        "         Pass --fb1 <fbgen output>.\n",
                         producing ? "ERROR" : "WARNING",
                         fbs1.n, fbs1.n ? fbs1.primes[0] : 0);
                 /* A sieve-only run may reasonably continue: it never reaches the
@@ -1234,6 +1250,11 @@ int main(int argc, char **argv)
     if (cfg.side == 1) {
         if (cfg.cadofb) {
             if (fb_load_cado(cfg.cadofb, cfg.scale, &fb) != 0) return 1;
+            if (fb.maxbits > 0 && fb.maxbits != maxbits)
+                fprintf(stderr,
+                        "note: factor base maxbits=%d differs from --maxbits=%d;"
+                        " maxbits=1 is valid but normally lower-yielding\n",
+                        fb.maxbits, maxbits);
         } else {
             if (fb_load(fbpath, &fb) != 0) return 1;
             printf("\nfactor base %s: %u (p,r) pairs\n", fbpath, fb.n);
@@ -1244,7 +1265,7 @@ int main(int argc, char **argv)
         /* side 0 is G(x) = Y1*x + Y0: degree 1, and its norms are what the
          * apply kernel must initialise cells with */
         POLY.deg = 1; POLY.c[0] = POLY.y0; POLY.c[1] = POLY.y1;
-        for (int z = 2; z < 8; z++) POLY.c[z] = 0.0;
+        for (int z = 2; z < BENCH_NCOEFF; z++) POLY.c[z] = 0.0;
         printf("\nside 0 (rational): degree 1, G(x) = Y1*x + Y0\n");
     }
     fb_fill_logp(&fb, cfg.scale);

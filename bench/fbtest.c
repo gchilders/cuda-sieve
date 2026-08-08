@@ -17,7 +17,7 @@
  *      cannot see placement (that is what gate 1 is for), but it is the one
  *      number that exercises parse, powers, log deltas and scale at once.
  *
- * usage: fbtest [--poly P] [--cadofb F] [--rlim N] [--maxbits N]
+ * usage: fbtest [--poly P] [--fb1 F] [--rlim N] [--maxbits N]
  *               [--q N] [--rho N] [--scale S] [--qmax N]
  */
 #include "bench.h"
@@ -118,7 +118,8 @@ int main(int argc, char **argv)
 
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--poly") && i + 1 < argc) polypath = argv[++i];
-        else if (!strcmp(argv[i], "--cadofb") && i + 1 < argc) cadofb = argv[++i];
+        else if ((!strcmp(argv[i], "--fb1") || !strcmp(argv[i], "--cadofb")) && i + 1 < argc)
+            cadofb = argv[++i];
         else if (!strcmp(argv[i], "--rlim") && i + 1 < argc) rlim = (uint32_t)strtoul(argv[++i], 0, 10);
         else if (!strcmp(argv[i], "--maxbits") && i + 1 < argc) maxbits = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--q") && i + 1 < argc) q = strtoull(argv[++i], 0, 10);
@@ -173,7 +174,7 @@ int main(int argc, char **argv)
             poly_t R = P;
             if (rfb_build(&R, rlim, maxbits, scale0, &fb) != 0) return 1;
             R.deg = 1; R.c[0] = R.y0; R.c[1] = R.y1;
-            for (int z = 2; z < 8; z++) R.c[z] = 0.0;
+            for (int z = 2; z < BENCH_NCOEFF; z++) R.c[z] = 0.0;
             trace_side("side 0", &fb, &L, &R, ti, tj, bkthresh, 15, 16384,
                        scale0, 0, 0, 40);
             fb_free(&fb);
@@ -214,7 +215,7 @@ int main(int argc, char **argv)
         }
         fb_free(&fbs); fb_free(&fb);
     } else {
-        printf("       (skipped: pass --cadofb ../oracle/c183.fb1)\n");
+        printf("       (skipped: pass --fb1 ../oracle/c183.fb1)\n");
     }
 
     {
@@ -244,6 +245,19 @@ int main(int argc, char **argv)
                        " (gate runs at scale 1.0 only)\n", got, scale);
         }
         fb_free(&fbs); fb_free(&fb);
+    }
+
+    printf("\n[3] exact-norm width admission\n");
+    {
+        norm_t W;
+        memset(&W, 0, sizeof(W));
+        W.deg = 8;
+        W.log2M = 252.0f;       /* + log2(9) = 255.17: fits 256 bits */
+        ok("octic below 256-bit bound", norm_fits_exact(&W, 256),
+           "upper bound %.2f bits", norm_exact_bound_bits(&W));
+        W.log2M = 253.0f;       /* + log2(9) = 256.17: must be refused */
+        ok("octic above 256-bit bound", !norm_fits_exact(&W, 256),
+           "upper bound %.2f bits refused", norm_exact_bound_bits(&W));
     }
 
     printf("\n%s\n", fail ? "*** FAILED ***" : "all gates passed");

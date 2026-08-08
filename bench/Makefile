@@ -1,5 +1,5 @@
 # Standalone bucket-fill benchmark for the GPU NFS sieve feasibility probe.
-# No CADO, no msieve, no GMP. Loads a GGNFS .afb.0 factor base directly.
+# No CADO, no msieve, no GMP. Builds or loads factor bases directly.
 # Pattern copied from ~/msieve-s/gerbicz_bench/Makefile, which worked well.
 
 NVCC      ?= nvcc
@@ -34,13 +34,13 @@ NVCC_FLAGS = $(NVCC_ARCH) -O3 -std=c++17 -lineinfo -MMD -MP -Xcompiler "-O3 -Wal
 CFLAGS     = -O3 -march=native -Wall -Wextra -std=c11 -MMD -MP $(DEFS)
 
 CU_SRCS = bench_main.cu bench_kernels.cu
-C_SRCS  = fb_load.c verify_cpu.c poly.c rfb.c fb_cado.c
+C_SRCS  = fb_load.c verify_cpu.c poly.c primes.c rfb.c fb_cado.c
 
 CU_OBJS = $(CU_SRCS:.cu=.o)
 C_OBJS  = $(C_SRCS:.c=.o)
 OBJS    = $(CU_OBJS) $(C_OBJS)
 
-all: bench fbtest dumpcmp mkcofbatch
+all: bench fbtest fbgen dumpcmp mkcofbatch
 
 bench: $(OBJS)
 	$(NVCC) $(NVCC_ARCH) -o $@ $^ -lcudart -lm
@@ -49,6 +49,11 @@ bench: $(OBJS)
 # machines without the card.
 fbtest: fbtest.c $(C_OBJS)
 	$(CC) $(CFLAGS) -o $@ fbtest.c $(C_OBJS) -lm
+
+# Native algebraic factor-base generator; deliberately CPU-only and free of
+# CADO/GMP dependencies. It shares the job/poly parser and prime enumerator.
+fbgen: fbgen.c poly.o primes.o
+	$(CC) $(CFLAGS) -o $@ fbgen.c poly.o primes.o -lm -pthread
 
 dumpcmp: dumpcmp.c
 	$(CC) $(CFLAGS) -o $@ $< -lm
@@ -66,15 +71,18 @@ mkcofbatch: mkcofbatch.c
 -include $(OBJS:.o=.d)
 
 clean:
-	rm -f bench fbtest dumpcmp mkcofbatch *.o *.d
+	rm -f bench fbtest fbgen dumpcmp mkcofbatch *.o *.d
 
-.PHONY: all clean check cofcheck
+.PHONY: all clean check cofcheck fbgencheck
 
 # `check` depended on fbtest alone, so the whole CUDA path -- kernels, the
 # cofactoriser, the pipeline -- could fail to compile while the gates reported
 # "all gates passed". Depend on `all`.
-check: all cofcheck
-	./fbtest --cadofb ../oracle/c183.fb1
+check: all cofcheck fbgencheck
+	./fbtest --fb1 ../oracle/c183.fb1
+
+fbgencheck: fbgen
+	./fbgencheck.sh
 
 # A GPU golden test over the cofactoriser: rho and ECM on the parity special-q,
 # the even-cofactor invariant, the bounds refusals, and a candidate file with no

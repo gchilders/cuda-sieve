@@ -1,0 +1,16 @@
+# Synthetic octic used to cover factor-base generation above degree 6.
+# The composite leading coefficient deliberately creates projective branches.
+n: 123456789012345678901234567890123456789
+skew: 1.0
+c0: -123456789012345678901234567890123456789
+c1: 9876543210123456789
+c2: -37
+c3: 0
+c4: 55
+c5: -7
+c6: 3
+c7: -2
+c8: 30
+Y0: 0
+Y1: 1
+alim: 100000

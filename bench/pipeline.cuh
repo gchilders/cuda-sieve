@@ -199,9 +199,19 @@ static int pipe_side_perq(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
         poly_t P = *POLY;
         if (side == 0) {
             P.deg = 1; P.c[0] = P.y0; P.c[1] = P.y1;
-            for (int z = 2; z < 8; z++) P.c[z] = 0.0;
+            for (int z = 2; z < BENCH_NCOEFF; z++) P.c[z] = 0.0;
         }
         norm_setup(&S->N, &P, L, cfg->logI, cfg->J, scale, side == cfg->sq_side);
+        {
+            double bits = norm_exact_bound_bits(&S->N);
+            if (!norm_fits_exact(&S->N, BN_LIMBS * 32)) {
+                fprintf(stderr,
+                        "  exact side-%d degree-%d norm may require %.2f bits;"
+                        " the trial-division type holds %d\n",
+                        side, P.deg, bits, BN_LIMBS * 32);
+                return -1;
+            }
+        }
     }
     S->CINIT = 4096u;
     S->BOUND = (uint32_t)(scale * allowance + 1.0);
@@ -922,7 +932,7 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         SQP.deg = 1;
         memcpy(SQP.cs[0], POLY->y0s, sizeof SQP.cs[0]);
         memcpy(SQP.cs[1], POLY->y1s, sizeof SQP.cs[1]);
-        for (int z = 2; z < 8; z++) SQP.cs[z][0] = 0;
+        for (int z = 2; z < BENCH_NCOEFF; z++) SQP.cs[z][0] = 0;
     }
     for (uint32_t qi = 0; qi < nq; qi++) {
         qlat_t Lq;
