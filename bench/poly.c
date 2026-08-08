@@ -194,8 +194,13 @@ void norm_setup(norm_t *N, const poly_t *P, const qlat_t *L,
         /* below fp32 denormal range the term cannot affect the leading bits.
          * If this fires for a leading coefficient the homogeneous terms are
          * not balanced, which means the q-lattice was reduced without the
-         * skew -- see qlat_build. */
-        if (fabs(r) < 1e-37) { N->d[k] = 0.0f; nclamp++; }
+         * skew -- see qlat_build.
+         *
+         * A coefficient that is ZERO in the polynomial is not evidence of
+         * that. Sparse SNFS forms are all zeros: x^5 - 6032531 has c1..c4 = 0
+         * and flushed four terms on every q. Count only terms that were
+         * nonzero and lost, which is the case the check was written for. */
+        if (fabs(r) < 1e-37) { N->d[k] = 0.0f; nclamp += (d[k] != 0.0); }
         else N->d[k] = (float)r;
     }
     for (; k < 8; k++) N->d[k] = 0.0f;
@@ -222,17 +227,25 @@ void norm_setup(norm_t *N, const poly_t *P, const qlat_t *L,
     N->bias = (float)(is_sqside ? log((double)L->q) / log(2.0) : 0.0);
 
     /* The unbalanced-terms warning means the q-lattice was reduced without the
-     * skew, which is a real defect -- it is reported on every q regardless. */
-    /* Named by DEGREE, not by is_sqside. This printed is_sqside in a field
+     * skew, which is a real defect.
+     *
+     * It does NOT apply to the degree-1 rational form, which has no balance to
+     * lose: G = Y1*a + Y0*b, and an SNFS job routinely has |Y0| = 1 against a
+     * 136-bit Y1, so Y0*B/(Y1*A) is ~1e-42 by construction and no choice of
+     * skew moves it. Dropping that term is also free -- it is 18 orders below
+     * what an fp32 sum can represent, and the only place it could matter (the
+     * near-cancellation line) falls back to norm_acc_fp64, which reads the
+     * unflushed dd[]. So warn on the homogeneous form only.
+     *
+     * Named by DEGREE, not by is_sqside. This printed is_sqside in a field
      * labelled "side", which was only ever right while is_sqside == (side==1);
      * --sq-side 0 broke that and the warning then pointed at the wrong
      * polynomial. norm_setup does not know the side index, but it knows the
      * degree, and that identifies the form unambiguously. */
-    if (nclamp)
-        printf("  ** q=%llu %s (deg %d): %d normalised term(s) flushed to zero"
-               " -- terms are unbalanced **\n",
-               (unsigned long long)L->q,
-               P->deg == 1 ? "rational" : "algebraic", P->deg, nclamp);
+    if (nclamp && P->deg > 1 && norm_verbose)
+        printf("  ** q=%llu algebraic (deg %d): %d normalised term(s) flushed"
+               " to zero -- terms are unbalanced **\n",
+               (unsigned long long)L->q, P->deg, nclamp);
     if (!norm_verbose) return;
     printf("  norm setup: deg %d, A=%.4e B=%.4e, log2(maxnorm)=%.2f, scale=%.3f%s\n",
            P->deg, A, B, N->log2M - N->bias, N->scale,

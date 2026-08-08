@@ -450,7 +450,35 @@ Calibrated against ground truth: msieve's filtering of the **c151** found
 10,594,292 duplicates in 67,165,877 relations — **15.8%**, 1.187 finds per
 unique. Back-solving that run gives P(re-find) = **0.728**, against the 0.718
 measured directly on the SNFS job, so the model holds across two independent
-jobs. (An earlier version of this table said 37%, from the naive
+jobs.
+
+**Confirmed directly, 2026-08-07**, by replaying both corpora off disk instead
+of back-solving — no GPU, and the tool reproduces msieve's duplicate count on
+the c151 exactly (10,594,292 in 67,043,952 lines, 15.80%, 1.1877 finds per
+unique):
+
+| | measured here | n | this table |
+|---|---:|---:|---:|
+| mean sq-side primes, [30M, rlim], SNFS | 1.7918 | 19.6M rel | 1.82 |
+| P(re-found), SNFS job | **70.2%** | 1,089,564 | 71.8% (n=1,023) |
+| P(re-found), c151 | **72.3%** | 13,709,863 | 0.728 (back-solved) |
+
+Two traps, both of which bit on the way to those numbers. **The raw
+slot-take rate is biased low** — a relation is in the corpus only because one
+slot already hit, so subtracting that forced hit from both numerator and
+denominator understates P; at k = 2 the correction is exact, `P = 2r/(1+r)`,
+turning a raw 54.1%/56.6% into 70.2%/72.3%. And **the band must come from the
+run log, not from the corpus**: an ordinary prime p divides ~N/p relations, so
+on a 67M-line corpus every prime near 1M looks like a special-q. Taking the
+c151's band as [1M, 33.5M] rather than [15M, 33.5M] drops P to 18.6%, with
+whole separation buckets reading exactly 0.0% — the tell that the low-end
+"q" were never sieved at all. The 1,088,865 count above is the cross-check.
+
+P(re-found) also decays with separation, gently: 74% at q₂/q₁ ≈ 1.04 down to
+61% by q₂/q₁ ≈ 2 (bias-corrected, c151). Treating it as one constant is fine
+for a whole-band estimate and wrong for a narrow A/B.
+
+(An earlier version of this table said 37%, from the naive
 `1 + (mean-1) x P`. That is wrong: a relation with k eligible primes still only
 needs ONE hit to appear at all, so the correct form is
 `P / sum_k (f_k/k)(1-(1-P)^k)` with the population recovered as `n_k ~ f_k/k` —
@@ -469,6 +497,20 @@ unique; the 46.14 rel/q in the table above are not, so the honest comparison is
 *more* unique relations per special-q than we do, because it collects each one
 only once. What we buy for that is not needing to sieve the full q range to
 find a relation whose largest sq-side prime sits above `qmax`.
+
+That last clause is the whole risk in truncating, and it is now measured. Under
+truncation a relation is found at its **largest** sq-side factor-base prime, so
+if the band stops below that prime it is not deduplicated — it is never found.
+On the c147's as-run band ([15.00M, 15.15M], 0.4% of `alim`) the `mfb` ceiling
+alone says truncation would find **nothing at all for 22.68%** of unique
+relations. Truncation is yield-neutral only over a band reaching `lim`.
+
+And the dedup it buys is capped by `mfb` headroom, because an unsieved prime in
+`(q, lim]` does not disappear — it lands in the cofactor. Measured floors over
+a band reaching `lim`: **−15.0%** of emissions on the c151 and **−17.3%** on
+the c147 (both `mfb` 59), but only **−6.1%** on the SNFS job (`mfbr` 88). The
+rest of the way down to 1.00× is the survivor gate's to give, which makes this
+one experiment with "our gate is looser than GGNFS's" below, not two.
 
 The `ms per relation` row above is therefore **raw**, not unique. Against
 unique relations it is ~1.13 ms, so ~20× one core rather than 26.7×. And the

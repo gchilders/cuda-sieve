@@ -2419,11 +2419,27 @@ comparing like reps (both at `--reps 3`: 15.605/9.236), or 1.66× against the
 **1.68×**. The reconciliation holds either way; the residual spread is apply's
 reps drift, not a disagreement between the two harnesses.
 
-**CPU-only gates** (no GPU, safe to run on a busy box):
+**The one CPU-only gate.** `fbtest` is the only thing here that touches
+neither the GPU nor `nvcc`:
 
 ```
-make check                                       # == ./fbtest --cadofb ../oracle/c183.fb1
+./fbtest --cadofb ../oracle/c183.fb1
 ```
+
+`make check` is **not** a substitute and is **not safe alongside a running
+job**. It used to be exactly the line above; it is now `check: all cofcheck`
+(`Makefile:73`), so it compiles the whole CUDA path and then runs `cofcheck`
+*on the GPU*. That change was deliberate — the CUDA path could previously fail
+to compile while the gates still reported "all gates passed" — but it means
+`make check` now contends for the card.
+
+Nor is "CPU-only" the same as "safe on a busy box". Finding 53 measures host
+contention at an **18.4–22.3% relation-rate loss** with every `cudaEvent`
+timer still flat within 1%, so a parallel `nvcc` build both slows the running
+job and silently corrupts any timing that job reports. On a box that is
+sieving, run neither.
+
+**GPU gates** (these run kernels — do not use them to check a busy box):
 
 ```
 ./bench --verify --logI 12 --J 512 --region 12   # correctness vs CPU reference
