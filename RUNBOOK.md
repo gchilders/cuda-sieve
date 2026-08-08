@@ -102,13 +102,24 @@ you either state them or let them derive.
 One `\r` line, updated every 30 s, reported against whichever goal is in force:
 
 ```
-q=15020857  1222 q  78251 rel  2608 rel/s  26.1%  ETA 0h 01m
+q=15020857  1222 q  78251 rel +111390 cand  2608 rel/s  26.1%  ETA 0h 01m
 ```
 
 With `--target-rels` the percentage and ETA track the relation target — which
 is what you want, because `--qrange MIN:` makes the q count meaningless (it is
 the whole factor base, 1,088,865 special-q for the c151). Without a target they
 track the q count instead.
+
+**`+N cand` is the cofactorisation queue's occupancy, not pending relations.**
+Roughly two thirds of those records become relations on the SNFS job, and the
+band summary reports the two separately. It is on the line because it is the
+only field that advances on *every* q: `rel` cannot move until a flush, and a
+flush is 131,072 candidates — about 67 q on the c183, but 686 q (~40 s) on the
+SNFS job, which enqueues 191 records per q instead of 1,956. Before the first
+flush the rate and ETA print as `-- rel/s` and `ETA --h --m`, because they are
+unknown rather than zero; `+N cand` climbing is how you tell a healthy run from
+a stalled one in that window. `--relations` also stages to `NAME.part` until the
+band ends, so `ls` shows nothing during it either.
 
 The relation figure advances at queue flush boundaries rather than per q, so it
 moves in steps and the rate is slightly understated early in a run. It settles.
@@ -453,9 +464,18 @@ measured directly on the SNFS job, so the model holds across two independent
 jobs.
 
 **Confirmed directly, 2026-08-07**, by replaying both corpora off disk instead
-of back-solving — no GPU, and the tool reproduces msieve's duplicate count on
-the c151 exactly (10,594,292 in 67,043,952 lines, 15.80%, 1.1877 finds per
-unique):
+of back-solving — no GPU. On the c151 the replay finds **10,594,292**
+duplicates, digit-for-digit the count above, at 1.1877 finds per unique.
+
+**But over a different total, and that is not yet explained.** The paragraph
+above quotes msieve's count over 67,165,877 relations; the file on disk holds
+67,043,952, which is also what the run record at the top of this document says.
+Those 121,925 lines make the duplicate share 15.77% by msieve's pair of numbers
+and 15.80% by the replay's. An exact match on the *count* across different
+totals is what you would see if the extra lines were all unique — free
+relations being the obvious candidate — which would validate the
+duplicate-detection logic and leave only the denominator open. Until someone
+checks that, this is a strong agreement, not an exact reproduction:
 
 | | measured here | n | this table |
 |---|---:|---:|---:|

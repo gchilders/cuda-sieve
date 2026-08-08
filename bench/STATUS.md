@@ -177,7 +177,8 @@ absent from every document in the repo.
    derived without a meter. Item 6 now has one, including the host constant
    (~105 W), so the comparison can be made in joules per special-q rather than
    in seconds against an assumed wattage. **Assuming the 16-worker CPU
-   baseline is this same box** — it has 16 cores, but confirm it:
+   baseline is this same box** — it is a 9800X3D, 8 cores / 16 threads, so a
+   16-worker sweep fits it, but confirm it:
 
    Both sides' wattage is now measured (item 6). The GPU side draws ~270 W
    whole-box; the CPU side draws 220 W and its throughput was measured in the
@@ -256,10 +257,18 @@ absent from every document in the repo.
    pipeline, where all three kernels still take the full `fb->n`
    (`pipeline.cuh:221`, `:227`, `:644`).
 
-   **Measured 2026-08-07 over relations already on disk, no GPU.** Validated
-   against ground truth: on the c151 the tool reproduces msieve's own
-   filtering exactly — 10,594,292 duplicates in 67,043,952 relations, 15.80%,
-   1.1877 finds per unique.
+   **Measured 2026-08-07 over relations already on disk, no GPU.** Checked
+   against ground truth on the c151: the tool finds **10,594,292 duplicates**,
+   digit-for-digit the count msieve's own filtering reported (`RUNBOOK.md:461`).
+   **The denominators do not match, though** — msieve quotes that count over
+   67,165,877 relations, while the file on disk holds 67,043,952, which is also
+   what this repo's own run record says (`RUNBOOK.md:399`). The 121,925 gap
+   makes the ratios 15.77% and 15.80% rather than one number. An exact match on
+   the duplicate count across different totals is what you would see if those
+   extra lines were all unique — free relations are the obvious candidate — so
+   the duplicate-detection logic looks validated and the *denominator* is what
+   remains unreconciled. Do not quote this as "reproduces msieve exactly" until
+   it is.
 
    | corpus | band as run | band / lim | `mfb` | raw inflation | truncation floor |
    |---|---|---:|---:|---:|---:|
@@ -366,10 +375,14 @@ absent from every document in the repo.
    - **Renice the competing work.** Raising your own processes' nice value
      needs no privileges. With the sieve at nice 0 and everything else at 19,
      CFS weights the sieve ~1024 to 15 and it wins essentially every contest.
-   - **Leave the core.** 14 `ecm` workers plus one spinning sieve thread is 15
-     of 16 cores — one core of slack, and interactive use is the 16th. Sizing
-     batch work to `nproc - 2` keeps the sieve and the desktop out of each
-     other's way.
+   - **Leave headroom, but know what you are leaving.** This box is 8 physical
+     cores / 16 threads, so 14 `ecm` workers plus one spinning sieve thread is
+     15 of 16 *threads* and **every physical core is loaded** — there is no
+     idle core to fall back on, and the sieve thread shares a core with an ECM
+     worker whatever you do. Dropping batch work to `nproc - 2` frees two
+     threads, i.e. one core's worth of SMT capacity, not a quiet core. That is
+     why the renice lever matters more here than on a wide box: on 8 cores you
+     cannot isolate the sieve by subtraction, only by priority.
 
    **The live instrument is GPU utilisation, not the summary.**
    `GPU-accounted / wall` only prints at the end of a run, but `nvidia-smi`
@@ -542,11 +555,19 @@ absent from every document in the repo.
     **Grade this on wall power, not board power — item 6 first.** Capping cuts
     board watts but lengthens the run, and the ~115 W host constant (item 6) is
     paid for that whole extra time. It is ~37% of a sieving box, and that is
-    enough to change the answer, not merely shade it. Worked example: a cap
-    trading 15% throughput for 40% less board power reads as a **14% win on
-    board rel/J** and as **roughly a wash on whole-box rel/J**. A sweep graded
-    on the board sensor will therefore pick a cap that is too low and report a
-    gain that the wall meter does not see. Under WSL2
+    enough to change the answer, not merely shade it. Worked example, a cap
+    trading 15% throughput for 40% less board power, using item 6's measured
+    115 W host and 155 W card:
+
+    | | stock | capped | rel/J |
+    |---|---:|---:|---:|
+    | board only | 155 W | 93 W | 0.85 / 0.60 = **+42%** |
+    | whole box | 270 W | 208 W | 0.85 × 270/208 = **+10%** |
+
+    So the board sensor reports a **4× larger win than the wall meter sees**.
+    Both are gains here, so the sign does not flip — but a sweep graded on the
+    board will keep capping well past the point where the wall stops improving,
+    and will pick a cap that is too low. Under WSL2
     set the cap from the Windows side (`nvidia-smi -pl` as administrator) —
     the WSL-side tool can read power but generally cannot set limits.
 11. **Apply breakdown** *(added 2026-08-06)*. Fill got findings 48–52's

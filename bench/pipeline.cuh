@@ -1142,6 +1142,17 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
          * flush. Reporting acc_rel there showed a flat 0 for the whole run,
          * which on a multi-hour band looks exactly like failure.
          *
+         * Q.nrel is not enough on its own either. It advances at a FLUSH, and a
+         * flush is 131,072 candidates -- ~67 q on the c183 this was tuned
+         * against, but 686 q on the SNFS job, which enqueues 191 records per q
+         * instead of 1,956. That is 41 s of "0 rel" before the counter can
+         * move at all, and `--relations` stages to NAME.part until the band
+         * ends, so `ls` agrees with it. A run that was working normally, with
+         * 63,000 candidates queued that went on to yield 39,710 relations, read
+         * as a dead run. So carry the queue occupancy alongside -- it advances
+         * every q, on every job -- and label it as candidates, which is what it
+         * counts.
+         *
          * Progress is reported against whichever goal is actually in force: a
          * relation target if one was given (in which case nq is meaningless --
          * `--qrange MIN:` makes it the whole factor base), otherwise the q
@@ -1171,9 +1182,37 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
              * is undefined rather than merely wrong. Anything past 99h is
              * "unknown" in practice, so saturate there and show it. */
             if (eta > 359999.0) eta = 359999.0;         /* 99h 59m */
-            printf("    q=%llu  %u q  %llu rel  %.0f rel/s  %.1f%%  ETA %dh %02dm      \r",
-                   (unsigned long long)qlist[qi].q, qi + 1, rels, rps,
-                   100.0 * frac, (int)eta / 3600, ((int)eta / 60) % 60);
+            {   /* Q.n counts queued CANDIDATE records, not relations -- only
+                 * ~2/3 of them survive splitting on this job, and the band
+                 * summary keeps nseen and nrel apart for that reason. Labelled
+                 * "cand" so the line cannot be read as pending relations.
+                 *
+                 * Shown only while the queue holds work the relation count
+                 * cannot see yet, so a steady-state line stays as it was --
+                 * which means the line CHANGES WIDTH when cofq_flush resets
+                 * Q.n to 0. A \r without an erase leaves the tail of the longer
+                 * line on screen ("...ETA 0h 12m  cand"), so clear to
+                 * end-of-line rather than trusting a trailing pad to cover the
+                 * widest case. */
+                char queued[32] = "";
+                if (cfg->cofactor && Q.n)
+                    snprintf(queued, sizeof queued, " +%u cand", Q.n);
+                /* rps == 0 means "no relation has flushed yet", not "done".
+                 * eta is 0 there as a sentinel, and printing it as 0h 00m says
+                 * the band is finishing at the exact moment nothing has been
+                 * counted -- which is the reading this line exists to prevent. */
+                if (rps > 0.0)
+                    printf("    q=%llu  %u q  %llu rel%s  %.0f rel/s  %.1f%%"
+                           "  ETA %dh %02dm\033[K\r",
+                           (unsigned long long)qlist[qi].q, qi + 1, rels, queued,
+                           rps, 100.0 * frac, (int)eta / 3600,
+                           ((int)eta / 60) % 60);
+                else
+                    printf("    q=%llu  %u q  %llu rel%s  -- rel/s  %.1f%%"
+                           "  ETA --h --m\033[K\r",
+                           (unsigned long long)qlist[qi].q, qi + 1, rels, queued,
+                           100.0 * frac);
+            }
         }
         fflush(stdout);
     }

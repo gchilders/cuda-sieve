@@ -2428,7 +2428,7 @@ neither the GPU nor `nvcc`:
 
 `make check` is **not** a substitute and is **not safe alongside a running
 job**. It used to be exactly the line above; it is now `check: all cofcheck`
-(`Makefile:73`), so it compiles the whole CUDA path and then runs `cofcheck`
+(`Makefile:76`), so it compiles the whole CUDA path and then runs `cofcheck`
 *on the GPU*. That change was deliberate — the CUDA path could previously fail
 to compile while the gates still reported "all gates passed" — but it means
 `make check` now contends for the card.

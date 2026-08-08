@@ -230,19 +230,35 @@ void norm_setup(norm_t *N, const poly_t *P, const qlat_t *L,
      * skew, which is a real defect.
      *
      * It does NOT apply to the degree-1 rational form, which has no balance to
-     * lose: G = Y1*a + Y0*b, and an SNFS job routinely has |Y0| = 1 against a
-     * 136-bit Y1, so Y0*B/(Y1*A) is ~1e-42 by construction and no choice of
-     * skew moves it. Dropping that term is also free -- it is 18 orders below
-     * what an fp32 sum can represent, and the only place it could matter (the
-     * near-cancellation line) falls back to norm_acc_fp64, which reads the
-     * unflushed dd[]. So warn on the homogeneous form only.
+     * lose: G = Y1*a + Y0*b has one huge coefficient and one small one, in
+     * whichever orientation the poly generator chose -- input.job has |Y0| = 1
+     * against a 136-bit Y1, work/snfs236 has it the other way round -- and the
+     * ratio of the two terms is |Y0|B/(|Y1|A), which for this job is ~1e-42. No
+     * choice of skew moves that: it is the size of the polynomial, not the
+     * shape of the lattice, and skew is fitted to the algebraic side anyway.
+     *
+     * Dropping the small term is safe, but NOT because of the near-cancellation
+     * fallback -- that fallback cannot fire here. Both this file (below) and the
+     * device build `aabs` from the already-flushed d[], so with one of two
+     * deg-1 terms zeroed, |acc| == aabs identically and `s < TOL*aabs` is never
+     * true; norm_acc_fp64 is unreachable on the rational side. What makes it
+     * safe is that the estimate is only wrong where the SURVIVING term is
+     * smaller than the flushed one, and at a 42-order gap that needs a == 0
+     * exactly. A reduced q-lattice has gcd(a0,b0) = 1, so i*a0 + j*b0 == 0 only
+     * at i = j = 0, which is outside the region (j >= 1). Zero cells, not few.
      *
      * Named by DEGREE, not by is_sqside. This printed is_sqside in a field
      * labelled "side", which was only ever right while is_sqside == (side==1);
      * --sq-side 0 broke that and the warning then pointed at the wrong
      * polynomial. norm_setup does not know the side index, but it knows the
-     * degree, and that identifies the form unambiguously. */
-    if (nclamp && P->deg > 1 && norm_verbose)
+     * degree, and that identifies the form unambiguously.
+     *
+     * Deliberately NOT gated on norm_verbose, which the band loop clears after
+     * the first q: this is a defect report, not a setup dump, and a lattice that
+     * reduces without the skew at q=10^8 has to be able to say so. The zero-term
+     * and deg-1 filters above are what make it quiet; the gate would have made
+     * it silent. */
+    if (nclamp && P->deg > 1)
         printf("  ** q=%llu algebraic (deg %d): %d normalised term(s) flushed"
                " to zero -- terms are unbalanced **\n",
                (unsigned long long)L->q, P->deg, nclamp);
