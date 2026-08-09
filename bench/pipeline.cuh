@@ -785,7 +785,7 @@ static int pipe_td_perq(pipe_td_t *C, const fb_t *fb1, const fb_t *fbs1,
 
 extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                             const fb_t *fb0, const fb_t *fbs0,
-                            const qsel_t *qlist, uint32_t nq,
+                            const qsel_t *qlist, uint32_t nq, sqgen_t *qgen,
                             const poly_t *POLY, const bench_cfg_t *cfg)
 {
     const uint32_t xmax = (1u << cfg->logI) * cfg->J;
@@ -820,7 +820,9 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     unsigned long long acc_surv = 0, acc_cand = 0, acc_rel = 0;
     FILE *fr = NULL, *fc = NULL;
     char rtmp[2048] = "", ctmp[2048] = "";
-    int rc = 0;
+    int rc = 0, source_exhausted = 0, count_limit_reached = 0;
+    int target_reached = 0;
+    qsel_t last_q = {0, 0};
     cudaEvent_t ea, eb;
 
     memset(&S1, 0, sizeof S1); memset(&S0, 0, sizeof S0);
@@ -828,7 +830,10 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     memset(&Q, 0, sizeof Q); memset(&QO, 0, sizeof QO);
     cudaEventCreate(&ea); cudaEventCreate(&eb);
 
-    printf("\n=== pipeline: both sides in one process, %u special-q ===\n", nq);
+    if (qgen)
+        printf("\n=== pipeline: both sides in one process, streaming special-q ===\n");
+    else
+        printf("\n=== pipeline: both sides in one process, %u special-q ===\n", nq);
 
     est1 = pipe_est_records(fb1, xmax);
     est0 = pipe_est_records(fb0, xmax);
@@ -934,7 +939,9 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         memcpy(SQP.cs[1], POLY->y1s, sizeof SQP.cs[1]);
         for (int z = 2; z < BENCH_NCOEFF; z++) SQP.cs[z][0] = 0;
     }
-    for (uint32_t qi = 0; qi < nq; qi++) {
+    for (uint32_t qi = 0;; qi++) {
+        qsel_t generated;
+        const qsel_t *cur;
         qlat_t Lq;
         float ts1[3] = {0,0,0}, ts0[3] = {0,0,0}, tis = 0;
         double th1 = 0, th0 = 0, qwall = host_ms(), tv = 0;
@@ -950,18 +957,44 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
          * accumulate_stats being exact complements. */
         const int want_host = !cfg->cofactor || fc;
 
-        if (!pipe_check_root(&SQP, qlist[qi].q, qlist[qi].rho)) {
+        if (qi < nq) {
+            cur = &qlist[qi];
+        } else if (qgen) {
+            const int qr = sqgen_next(qgen, &generated);
+            if (qr < 0) {
+                fprintf(stderr, "  special-q generator failed after %u q\n",
+                        nqdone);
+                rc = -1; break;
+            }
+            if (qr == 0) {
+                if (cfg->nq_max && nqdone >= cfg->nq_max)
+                    count_limit_reached = 1;
+                else
+                    source_exhausted = 1;
+                break;
+            }
+            cur = &generated;
+        } else {
+            if (cfg->nq_max && nqdone >= cfg->nq_max)
+                count_limit_reached = 1;
+            else
+                source_exhausted = 1;
+            break;
+        }
+        last_q = *cur;
+
+        if (!pipe_check_root(&SQP, cur->q, cur->rho)) {
             fprintf(stderr, "  q=%llu: rho=%llu is not a root of %s mod q\n",
-                    (unsigned long long)qlist[qi].q,
-                    (unsigned long long)qlist[qi].rho,
+                    (unsigned long long)cur->q,
+                    (unsigned long long)cur->rho,
                     cfg->sq_side ? "f" : "G");
             rc = -1; break;
         }
-        qlat_build(&Lq, qlist[qi].q, qlist[qi].rho, POLY->skew);
+        qlat_build(&Lq, cur->q, cur->rho, POLY->skew);
         if (cfg->verbose_q)
             printf("\n  q = %llu, rho = %llu\n",
-                   (unsigned long long)qlist[qi].q,
-                   (unsigned long long)qlist[qi].rho);
+                   (unsigned long long)cur->q,
+                   (unsigned long long)cur->rho);
 
         if (pipe_side_perq(fb1, fbs1, &Lq, POLY, cfg, 1, cfg->scale,
                            cfg->allowance, d_bucket, d_cursor, cap, d_overflow,
@@ -995,7 +1028,7 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                              !want_host)) { rc = -1; break; }
             if (n != hn) {
                 fprintf(stderr, "  q=%llu: intersect counted %u survivors,"
-                        " rank scan %u\n", (unsigned long long)qlist[qi].q, hn, n);
+                        " rank scan %u\n", (unsigned long long)cur->q, hn, n);
                 rc = -1; break;
             }
             t_verify += tv;
@@ -1020,7 +1053,7 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                            cfg->threads, fr)) { rc = -1; break; }
             if (nacc > Q.cap) {
                 fprintf(stderr, "  q=%llu: %u candidates exceeds the %u-slot"
-                        " cofactor queue\n", (unsigned long long)qlist[qi].q,
+                        " cofactor queue\n", (unsigned long long)cur->q,
                         nacc, Q.cap);
                 rc = -1; break;
             }
@@ -1052,7 +1085,7 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
             if (c0 > TD_FMAX || c1 > TD_FMAX) {
                 fprintf(stderr, "  q=%llu: a candidate has %u/%u factors,"
                         " more than the %d recorded; raise TD_FMAX\n",
-                        (unsigned long long)qlist[qi].q, c0, c1, TD_FMAX);
+                        (unsigned long long)cur->q, c0, c1, TD_FMAX);
                 rc = -1; break;
             }
             /* Canonical order: the resieve scatters through an atomicAdd on
@@ -1127,6 +1160,7 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
             if (have >= cfg->target_rels) {
                 printf("\n  --target-rels %llu reached after %u q (%llu relations)\n",
                        (unsigned long long)cfg->target_rels, nqdone, have);
+                target_reached = 1;
                 break;
             }
         }
@@ -1141,11 +1175,11 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
             if (want_host)
                 printf("  q=%llu: %u survivors, %u joint candidates,"
                        " %u relations\n",
-                       (unsigned long long)qlist[qi].q, hn, ncand, nrel);
+                       (unsigned long long)cur->q, hn, ncand, nrel);
             else
                 printf("  q=%llu: %u survivors, %u joint candidates"
                        " (relations counted on the device; see band summary)\n",
-                       (unsigned long long)qlist[qi].q, hn, nacc);
+                       (unsigned long long)cur->q, hn, nacc);
         }
         /* Under inline cofactorisation the host has no per-q relation count --
          * the counters accumulate on the device and Q.nrel only advances at a
@@ -1164,12 +1198,13 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
          * counts.
          *
          * Progress is reported against whichever goal is actually in force: a
-         * relation target if one was given (in which case nq is meaningless --
-         * `--qrange MIN:` makes it the whole factor base), otherwise the q
-         * count. Rate-limited to one update every 30 s: it is a single \r line,
-         * but a band runs for hours and nobody needs it faster than that.
+         * relation target if one was given, otherwise an explicit --nq count,
+         * generated numeric q interval, or list length. Rate-limited to one
+         * update every 30 s: it is a single \r line, but a band runs for hours
+         * and nobody needs it faster than that.
          */
-        if (!cfg->verbose_q && (host_ms() - t_report > 30000.0 || qi + 1 == nq)) {
+        if (!cfg->verbose_q &&
+            (host_ms() - t_report > 30000.0 || (!qgen && qi + 1 == nq))) {
             const unsigned long long rels = cfg->cofactor
                 ? Q.nrel : (unsigned long long)acc_rel;
             const double el = (host_ms() - t_band) / 1000.0;
@@ -1179,19 +1214,19 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
             if (cfg->target_rels) {
                 frac = (double)rels / (double)cfg->target_rels;
                 eta  = rps > 0 ? ((double)cfg->target_rels - rels) / rps : 0.0;
+            } else if (qgen && cfg->nq_max) {
+                frac = (double)(qi + 1) / cfg->nq_max;
+                eta  = frac > 0 ? el * (1.0 / frac - 1.0) : 0.0;
+            } else if (qgen && cfg->qmax) {
+                const double span = (double)(cfg->qmax - cfg->qmin) + 1.0;
+                frac = ((double)(cur->q - cfg->qmin) + 1.0) / span;
+                eta  = frac > 0 ? el * (1.0 / frac - 1.0) : 0.0;
             } else {
                 frac = (double)(qi + 1) / nq;
                 eta  = frac > 0 ? el * (1.0 / frac - 1.0) : 0.0;
             }
             if (frac > 1.0) frac = 1.0;
             if (eta < 0.0) eta = 0.0;
-            /* Clamp before the cast. Under --cofactor the relation count only
-             * advances at a flush, so an early report can see a handful of
-             * relations against a 65M target and compute an ETA of ~3e10
-             * seconds -- which `(int)eta` cannot represent, and converting it
-             * is undefined rather than merely wrong. Anything past 99h is
-             * "unknown" in practice, so saturate there and show it. */
-            if (eta > 359999.0) eta = 359999.0;         /* 99h 59m */
             {   /* Q.n counts queued CANDIDATE records, not relations -- only
                  * ~2/3 of them survive splitting on this job, and the band
                  * summary keeps nseen and nrel apart for that reason. Labelled
@@ -1211,20 +1246,52 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                  * eta is 0 there as a sentinel, and printing it as 0h 00m says
                  * the band is finishing at the exact moment nothing has been
                  * counted -- which is the reading this line exists to prevent. */
-                if (rps > 0.0)
+                if (rps > 0.0 && isfinite(eta)) {
+                    /* Do not cast the complete ETA to an int: immediately
+                     * after the first cofactor flush it can legitimately be
+                     * millions of hours. Keep the unbounded hour count as a
+                     * double and cast only the modulo-60 minute component. */
+                    const double eta_hours = floor(eta / 3600.0);
+                    const int eta_minutes =
+                        (int)fmod(floor(eta / 60.0), 60.0);
                     printf("    q=%llu  %u q  %llu rel%s  %.0f rel/s  %.1f%%"
-                           "  ETA %dh %02dm\033[K\r",
-                           (unsigned long long)qlist[qi].q, qi + 1, rels, queued,
-                           rps, 100.0 * frac, (int)eta / 3600,
-                           ((int)eta / 60) % 60);
-                else
+                           "  ETA %.0fh %02dm\033[K\r",
+                           (unsigned long long)cur->q, qi + 1, rels, queued,
+                           rps, 100.0 * frac, eta_hours, eta_minutes);
+                } else if (rps > 0.0) {
+                    printf("    q=%llu  %u q  %llu rel%s  %.0f rel/s  %.1f%%"
+                           "  ETA inf\033[K\r",
+                           (unsigned long long)cur->q, qi + 1, rels, queued,
+                           rps, 100.0 * frac);
+                } else {
                     printf("    q=%llu  %u q  %llu rel%s  -- rel/s  %.1f%%"
                            "  ETA --h --m\033[K\r",
-                           (unsigned long long)qlist[qi].q, qi + 1, rels, queued,
+                           (unsigned long long)cur->q, qi + 1, rels, queued,
                            100.0 * frac);
+                }
             }
         }
         fflush(stdout);
+    }
+
+    /* A streamed source discovers its end only when the NEXT pull returns 0,
+     * so the in-loop 30-second reporter cannot know that the preceding q was
+     * terminal. Give it an explicit terminal line instead of leaving the last
+     * visible progress sample up to 30 seconds stale. */
+    if (!cfg->verbose_q && qgen && !rc && nqdone &&
+        (source_exhausted || count_limit_reached)) {
+        const unsigned long long rels = cfg->cofactor
+            ? Q.nrel : (unsigned long long)acc_rel;
+        char queued[32] = "";
+        if (cfg->cofactor && Q.n)
+            snprintf(queued, sizeof queued, " +%u cand", Q.n);
+        if (count_limit_reached)
+            printf("\n    q=%llu  %u q  %llu rel%s  [--nq %u reached]\033[K\n",
+                   (unsigned long long)last_q.q, nqdone, rels, queued,
+                   cfg->nq_max);
+        else
+            printf("\n    q=%llu  %u q  %llu rel%s  [q range exhausted]\033[K\n",
+                   (unsigned long long)last_q.q, nqdone, rels, queued);
     }
 
     {   /* Steady-state footprint. The per-q buffers (survivor lists, prime
@@ -1270,6 +1337,27 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
             rc = -1;
         cofac_tail = host_ms() - cf0;
     }
+    if (rc == 0 && cfg->target_rels && !target_reached) {
+        const unsigned long long have = cfg->cofactor
+            ? Q.nrel : (unsigned long long)acc_rel;
+        if (have >= cfg->target_rels) {
+            printf("\n  --target-rels %llu reached by the final cofactor flush"
+                   " after %u q (%llu relations)\n",
+                   (unsigned long long)cfg->target_rels, nqdone, have);
+            target_reached = 1;
+        } else if (count_limit_reached) {
+            fprintf(stderr,
+                    "\n  note: --nq %u reached after %u q with %llu relations;"
+                    " --target-rels %llu was not reached\n",
+                    cfg->nq_max, nqdone, have,
+                    (unsigned long long)cfg->target_rels);
+        } else if (source_exhausted) {
+            fprintf(stderr,
+                    "\n  WARNING: special-q source exhausted after %u q with"
+                    " %llu relations; --target-rels %llu was NOT reached\n",
+                    nqdone, have, (unsigned long long)cfg->target_rels);
+        }
+    }
     if (fr) { if (ferror(fr)) rc = -1; if (fclose(fr)) rc = -1; fr = NULL; }
     if (fc) { if (ferror(fc)) rc = -1; if (fclose(fc)) rc = -1; fc = NULL; }
     if (rc == 0) {
@@ -1281,8 +1369,12 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     if (rc) {
         if (cfg->relations) remove(rtmp);
         if (cfg->candidates) remove(ctmp);
-        fprintf(stderr, "  band FAILED after %u of %u q; no output kept\n",
-                nqdone, nq);
+        if (qgen)
+            fprintf(stderr, "  band FAILED after %u generated q; no output kept\n",
+                    nqdone);
+        else
+            fprintf(stderr, "  band FAILED after %u of %u q; no output kept\n",
+                    nqdone, nq);
     }
 
     if (nqdone) {

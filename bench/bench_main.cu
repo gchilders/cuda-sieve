@@ -36,9 +36,9 @@ static void usage(void)
 "                   --relations then holds every relation, not just TD's\n"
 "\n"
 "BAND SELECTION\n"
-"  --qrange MIN:MAX every (q, rho) in that range, taken from the special-q\n"
-"                   side's factor base -- no root-finding, no q-list file.\n"
-"                   MIN: alone runs up to that side's bound\n"
+"  --qrange MIN:MAX generate every prime special-q and every affine root of\n"
+"                   the selected side's polynomial in that inclusive range.\n"
+"                   MIN: generates upward until --target-rels or --nq stops it\n"
 "  --sq-side S      which side carries the special-q: 1 = algebraic (GNFS,\n"
 "                   the default), 0 = rational. An SNFS job whose algebraic\n"
 "                   coefficients are tiny puts the difficulty on the rational\n"
@@ -46,7 +46,7 @@ static void usage(void)
 "  --qlist FILE     band of special-q: `q rho` per line (# comments ok);\n"
 "                   q must be prime, rho is reduced mod q, bad lines are fatal\n"
 "  --q N / --rho N  a single special-q          [120000011]  (las -v prints rho)\n"
-"  --nq N           stop after N special-q from the list\n"
+"  --nq N           stop after N special-q from the list or generated range\n"
 "  --target-rels N  stop once N relations have been collected. Checked at\n"
 "                   flush boundaries, so it overshoots by under a flush.\n"
 "                   Pair with --qrange MIN: to sieve upward until satisfied\n"
@@ -288,6 +288,7 @@ int main(int argc, char **argv)
     int lambda0_set = 0, lambda1_set = 0;  /* asked for CADO's rule at all?    */
     int cof_rounds = 6;
     uint32_t cof_budget = 4096;
+    int qrange_set = 0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--fb") && i + 1 < argc) fbpath = argv[++i];
@@ -423,10 +424,11 @@ int main(int argc, char **argv)
             int got = sscanf(a, "%llu:%llu", &lo, &hi);
             if (got == 1 && strchr(a, ':')) { hi = 0; got = 2; }   /* "MIN:" = open */
             if (got != 2 || (hi && lo > hi)) {
-                fprintf(stderr, "bench: --qrange wants MIN:MAX, or MIN: for"
-                        " everything up to the factor-base bound\n"); return 2;
+                fprintf(stderr, "bench: --qrange wants MIN:MAX, or MIN: to"
+                        " generate upward until --target-rels/--nq\n"); return 2;
             }
-            cfg.qmin = lo; cfg.qmax = hi;   /* 0 = fill in from alim below */
+            cfg.qmin = lo; cfg.qmax = hi;   /* 0 = stream until target/nq */
+            qrange_set = 1;
         }
         else if (!strcmp(argv[i], "--nq") && i + 1 < argc) cfg.nq_max = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--target-rels") && i + 1 < argc)
@@ -787,6 +789,7 @@ int main(int argc, char **argv)
     if (cfg.pipeline) {
         fb_t fb1, fbs1, fb0, fbs0;
         qsel_t *ql = NULL;
+        sqgen_t *qgen = NULL;
         uint32_t nq = 0, capq = 0;
         int prc;
         /* Options that belong to the measurement harness only. The pipeline
@@ -814,7 +817,8 @@ int main(int argc, char **argv)
             fprintf(stderr, "  drop --pipeline to use them, or drop them.\n");
             return 2;
         }
-        /* The pipeline defaults to the FULL special-q-side factor base.
+        /* The pipeline uses the FULL factor base up to each side's lim; the
+         * special-q stream is separate and may continue beyond that lim.
          *
          * This comment used to say that truncating at the special-q "costs
          * relations outright -- 30 of 1,851 cofactors at the parity q differ
@@ -832,20 +836,14 @@ int main(int argc, char **argv)
          * Calibrated against msieve's dedup of the c151: 10,594,292 duplicates
          * in 67,165,877 relations, 15.8%, which back-solves to the same 0.73
          * re-find probability. See task #26. */
-        /* A placeholder scale for the THROWAWAY first parse of the factor
-         * base, which exists only to supply the q list; the real scale is
-         * derived below and the base is reparsed at it. Left at the c183's
-         * value because a plausible magnitude keeps the discarded logp pass
-         * from overflowing, not because it is used for anything measured. */
-        if (!scale_set) cfg.scale = 1.275;
-        if (cfg.qlist && cfg.qmin) {
+        if (cfg.qlist && qrange_set) {
             fprintf(stderr, "bench --pipeline: --qlist and --qrange both give"
                     " the band; pass one\n");
             return 2;
         }
-        if (!cfg.qlist && !cfg.qmin && !rho) {
+        if (!cfg.qlist && !qrange_set && !rho) {
             fprintf(stderr, "bench --pipeline: needs a real root of %s mod q."
-                    " Pass --rho, or --qlist for a band.\n"
+                    " Pass --rho, --qlist, or --qrange for a band.\n"
                     "  A synthetic root is fine for a sieve microbenchmark but"
                     " not for a path that emits relations.\n",
                     cfg.sq_side ? "f" : "G");
@@ -894,9 +892,9 @@ int main(int argc, char **argv)
                  * side, and is emitted as though it were a prime relation
                  * factor -- a wrong relation that reconstructs.
                  *
-                 * --qrange cannot reach either case: it draws q from the factor
-                 * base, prime by construction. A hand-written --qlist is the
-                 * only way in, which is exactly why nothing downstream looks. */
+                 * --qrange cannot reach either case: its generator admits only
+                 * primes. A hand-written --qlist is the only way in, which is
+                 * exactly why nothing downstream looks. */
                 if (qq < 2 || (qq >> 32)) {
                     fprintf(stderr, "%s:%lu: q = %llu is not in [2, 2^32)\n",
                             cfg.qlist, lno, qq);
@@ -929,69 +927,54 @@ int main(int argc, char **argv)
             printf("band: %u special-q from %s\n", nq, cfg.qlist);
         }
 
-        if (cfg.cadofb) {
-            if (fb_load_cado(cfg.cadofb, cfg.scale, &fb1) != 0) return 1;
-        } else if (fb_load(fbpath, &fb1) != 0) return 1;
-        fb_fill_logp(&fb1, cfg.scale);
-        /* --qrange: every special-q in [qmin, qmax] with all of its roots.
-         *
-         * No root-finding is needed and none is done. A special-q below the sq
-         * side's lim is by definition one of that side's factor-base primes,
-         * and the base already lists every root -- so the band is a WINDOW OF
-         * A FACTOR BASE WE ARE BUILDING ANYWAY. Read before fb_restrict
-         * compacts in place.
-         *
-         * On side 1 that base is fbgen/CADO text output, already loaded. On side
-         * 0 it is rfb_build's, which is not built until after the scale is
-         * derived -- and the derivation needs ql[0] to make its lattice. So
-         * for a rational-side q the base is built HERE at the placeholder
-         * scale, walked, and freed; the real one is built later at the derived
-         * scale. That is the same throwaway-then-reparse the algebraic side
-         * already does, and for the same reason.
-         *
-         * Proper prime powers are skipped (a special-q is prime) and so are
-         * projective roots, encoded as root >= p: those are roots at infinity,
-         * which do not give a q-lattice. */
-        {
-            const uint32_t sqlim = cfg.sq_side ? alim : rlim;
-            fb_t fbq; int fbq_temp = 0;
-            if (cfg.qmin && !cfg.qmax) cfg.qmax = sqlim ? sqlim - 1 : 0;
-            if (cfg.qmin) {
-                if (cfg.sq_side) {
-                    fbq = fb1;                    /* borrowed, do not free */
-                } else {
-                    if (rfb_build(&POLY, rlim, maxbits, cfg.scale0, &fbq) != 0) return 1;
-                    fbq_temp = 1;
-                }
-                if (cfg.qmax >= sqlim)
-                    printf("note: --qrange runs past the special-q side's bound"
-                           " %u; q above it have no entry to read a root from\n",
-                           sqlim);
-                for (uint32_t i = 0; i < fbq.n; i++) {
-                    uint32_t pp = fbq.primes[i];
-                    if (pp < cfg.qmin) continue;
-                    if (pp > cfg.qmax) break;
-                    if (FB_ISPOW(&fbq, i) || fbq.roots[i] >= pp) continue;
-                    if (nq == capq) {
-                        capq = capq ? capq * 2 : 1024;
-                        ql = (qsel_t *)realloc(ql, (size_t)capq * sizeof(qsel_t));
-                        if (!ql) { if (fbq_temp) fb_free(&fbq); return 1; }
-                    }
-                    ql[nq].q = pp; ql[nq].rho = fbq.roots[i]; nq++;
-                    if (cfg.nq_max && nq >= cfg.nq_max) break;
-                }
-                if (fbq_temp) fb_free(&fbq);
-                if (!nq) {
-                    fprintf(stderr, "bench: no special-q in [%llu, %llu]\n",
-                            (unsigned long long)cfg.qmin, (unsigned long long)cfg.qmax);
-                    return 1;
-                }
-                printf("band: %u special-q (q, rho) from the %s factor base"
-                       " in [%llu, %llu]\n", nq,
-                       cfg.sq_side ? "algebraic" : "rational",
-                       (unsigned long long)cfg.qmin, (unsigned long long)cfg.qmax);
+        /* --qrange is a stream of prime ideals, independent of the factor
+         * base.  lim bounds the small ideals used by sieve/TD; it is not an
+         * upper bound on q.  Cache only the first generated pair because norm
+         * and byte-scale setup needs its lattice before run_pipeline starts;
+         * the rest are pulled on demand so MIN: can run until the relation
+         * target without allocating a list through 2^32. */
+        if (qrange_set) {
+            int qr;
+            if (!cfg.qmax && !cfg.target_rels && !cfg.nq_max) {
+                fprintf(stderr, "bench: open --qrange MIN: needs --target-rels"
+                                " or --nq as a stopping condition\n");
+                return 2;
             }
+            qgen = sqgen_create(&POLY, cfg.sq_side, cfg.qmin, cfg.qmax,
+                                cfg.nq_max);
+            if (!qgen) return 1;
+            ql = (qsel_t *)malloc(sizeof(*ql));
+            if (!ql) { sqgen_free(qgen); return 1; }
+            qr = sqgen_next(qgen, ql);
+            if (qr < 0) {
+                fprintf(stderr, "bench: special-q generator failed before its"
+                                " first result\n");
+                free(ql); sqgen_free(qgen); return 1;
+            }
+            if (qr == 0) {
+                if (cfg.qmax)
+                    fprintf(stderr, "bench: no affine special-q roots in"
+                            " [%llu, %llu]\n",
+                            (unsigned long long)cfg.qmin,
+                            (unsigned long long)cfg.qmax);
+                else
+                    fprintf(stderr, "bench: no affine special-q roots from"
+                            " %llu through the 32-bit q range\n",
+                            (unsigned long long)cfg.qmin);
+                free(ql); sqgen_free(qgen); return 1;
+            }
+            nq = 1;
+            if (cfg.qmax)
+                printf("band: generated prime special-q roots on side %d in"
+                       " [%llu, %llu]\n", cfg.sq_side,
+                       (unsigned long long)cfg.qmin,
+                       (unsigned long long)cfg.qmax);
+            else
+                printf("band: generating prime special-q roots on side %d from"
+                       " %llu upward\n", cfg.sq_side,
+                       (unsigned long long)cfg.qmin);
         }
+
         /* Derive the byte scale and survivor allowance from the polynomial,
          * as las does. This is UNCONDITIONAL. It used to sit behind
          * --auto-params, whose "off" state was not a mode but a frozen copy of
@@ -1000,15 +983,9 @@ int main(int argc, char **argv)
          * still overrides, which is the override that was actually wanted.
          *
          * The scale depends on the largest norm over the sieve rectangle,
-         * which needs a q-lattice, which for --qrange needs the factor base.
-         * So the base is parsed once to get the q list, the scale is derived
-         * from the first lattice, and the base is reparsed at that scale. One
-         * extra parse per RUN, against bands of thousands of q.
-         *
-         * The alternative -- carrying CADO's per-entry exponents so the logs
-         * could be recomputed in place -- means threading three more arrays
-         * through the loader's merge sort, which is a lot of new surface for a
-         * one-off startup cost. */
+         * which needs a q-lattice. The q list or streaming generator has
+         * already supplied its first pair above. Derive the real scale first,
+         * then load the factor base once with that scale. */
         {
             qlat_t L0; norm_t N1, N0;
             double m1, m0;
@@ -1142,7 +1119,6 @@ int main(int argc, char **argv)
                         cfg.allowance0, cfg.allowance0 - d0, d0, cfg.mfb0);
                 (void)sl1; (void)sl0;
             }
-            fb_free(&fb1);
             if (cfg.cadofb) { if (fb_load_cado(cfg.cadofb, cfg.scale, &fb1) != 0) return 1; }
             else if (fb_load(fbpath, &fb1) != 0) return 1;
             fb_fill_logp(&fb1, cfg.scale);
@@ -1237,8 +1213,10 @@ int main(int argc, char **argv)
                 ql[0].rho = rho ? rho : (uint64_t)(0x9E3779B97F4A7C15ull % q);
                 nq = 1;
             }
-            prc = run_pipeline(&fb1, &fbs1, &fb0, &fbs0, ql, nq, &POLY, &cfg);
+            prc = run_pipeline(&fb1, &fbs1, &fb0, &fbs0, ql, nq, qgen,
+                               &POLY, &cfg);
             free(ql);
+            sqgen_free(qgen);
         }
         fb_free(&fb1); fb_free(&fbs1); fb_free(&fb0); fb_free(&fbs0);
         return prc;

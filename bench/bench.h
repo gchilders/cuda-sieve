@@ -299,7 +299,7 @@ typedef struct {
     int      sq_side;       /* side carrying the special-q  [1 = algebraic]     */
     int      verbose_q;     /* print a line per special-q rather than a summary */
     const char *qlist;      /* file of `q rho` pairs; one special-q per line     */
-    uint64_t qmin, qmax;    /* --qrange: band from the SPECIAL-Q SIDE's FB      */
+    uint64_t qmin, qmax;    /* --qrange: generated prime band; qmax=0 is open   */
     int      cofactor;      /* split the cofactors inline, cross-q queue        */
     int      cof_rounds;    /* rho requeue rounds                               */
     uint32_t cof_budget;    /* rho iterations in the first round                */
@@ -402,13 +402,25 @@ typedef struct {
  * pair; the oracle captures carry it in their `# q = (q, rho, side)` headers. */
 typedef struct { uint64_t q, rho; } qsel_t;
 
+/* Streaming special-q generator.  The factor base and special-q stream are
+ * deliberately independent: lim bounds the ideals used to sieve and trial
+ * divide, while this enumerates prime q and computes roots of the selected
+ * side's polynomial on demand.  qmax == 0 means the uint32 representation
+ * limit; nqmax == 0 means no count limit. */
+typedef struct sqgen sqgen_t;
+sqgen_t *sqgen_create(const poly_t *P, int side, uint64_t qmin, uint64_t qmax,
+                      uint32_t nqmax);
+/* 1 writes the next (q,rho), 0 means exhausted, -1 means failure. */
+int sqgen_next(sqgen_t *G, qsel_t *out);
+void sqgen_free(sqgen_t *G);
+
 /* Both sides in one process, over a band of special-q: sieve, intersect,
  * trial-divide and classify each side against the shared two-sided bitmap,
  * then join. This is the path that becomes the siever; run_bench stays the
  * measurement harness. */
 int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                  const fb_t *fb0, const fb_t *fbs0,
-                 const qsel_t *qlist, uint32_t nq,
+                 const qsel_t *qlist, uint32_t nq, sqgen_t *qgen,
                  const poly_t *P, const bench_cfg_t *cfg);
 
 /* Cofactorise a batch written by --candidates and emit the relations it

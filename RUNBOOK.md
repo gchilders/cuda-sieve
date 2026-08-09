@@ -101,10 +101,11 @@ you either state them or let them derive.
   to `2^(logI-1)`** (CADO's convention), so it no longer needs passing.
 - **`--region`** must be ≤ `--logI`; the default is 14, so only pass it for
   I=13 or smaller (`--region 13`).
-- **`--qrange MIN:`** with the upper end omitted means "up to the factor-base
-  bound". Pair it with **`--target-rels N`** to stop when you have enough
-  rather than guessing a range. Checked at flush boundaries, so it overshoots
-  by well under 1% on any real target.
+- **`--qrange MIN:`** with the upper end omitted generates prime special-q and
+  their polynomial roots upward, independently of `rlim`/`alim`. It requires
+  **`--target-rels N`** or **`--nq N`** as its stopping condition. Relation
+  targets are checked at flush boundaries, so they overshoot by well under 1%
+  on any real target.
 - Side 1 is the algebraic side and carries the special-q. Side 0 is rational.
 
 ### Progress output
@@ -115,10 +116,9 @@ One `\r` line, updated every 30 s, reported against whichever goal is in force:
 q=15020857  1222 q  78251 rel +111390 cand  2608 rel/s  26.1%  ETA 0h 01m
 ```
 
-With `--target-rels` the percentage and ETA track the relation target — which
-is what you want, because `--qrange MIN:` makes the q count meaningless (it is
-the whole factor base, 1,088,865 special-q for the c151). Without a target they
-track the q count instead.
+With `--target-rels` the percentage and ETA track the relation target. Without
+one they track an explicit `--nq`, a finite numeric q range, or the q-list
+length instead.
 
 **`+N cand` is the cofactorisation queue's occupancy, not pending relations.**
 Roughly two thirds of those records become relations on the SNFS job, and the
@@ -142,21 +142,23 @@ side, and the special-q and the 3LP `mfb` go there with it. Pass `--sq-side 0`:
 
 ```sh
 bench --pipeline --cofactor --poly snfs236.job --fb1 snfs236.roots1 \
-      --sq-side 0 --logI 14 --qrange 30000000: --relations msieve.dat
+      --sq-side 0 --logI 14 --qrange 30000000: --target-rels 150000000 \
+      --relations msieve.dat
 ```
 
 `--fb1` is still the **algebraic** base — that side needs prime powers
 regardless of where the q lives. `fbgen --lim` takes `alim` as usual.
 
-Two things that look like errors and are not:
+One thing that looks like an error and is not:
 
 - **"f has no root mod 2"**. That polynomial has `f(0) = 1`, `f(1) = -1` and an
   odd leading coefficient, so 2 can never divide the algebraic norm and fbgen
   correctly emits no `p = 2`. The run says so and continues. The `p = 2` check
   only fires when f *does* have a root mod 2 and the entry is missing anyway.
-- **`--qrange MIN:` resolving to an empty band** when you also lower `--rlim`
-  below `MIN`. The open upper bound follows the *special-q side's* limit, which
-  is `rlim` under `--sq-side 0` and `alim` otherwise.
+
+Special-q generation on the rational side is especially cheap: for every prime
+`q` not dividing `Y1`, the root is simply `-Y0/Y1 (mod q)`. It continues above
+`rlim`; the rational factor base remains bounded by `rlim` for sieve and TD.
 
 ### Lambda: we ignore it, on purpose
 

@@ -450,6 +450,14 @@ static int zpoly_roots(const zpoly_t *F, uint32_t p, uint32_t *roots)
     mpoly_t f = mp_from_z(F, p), x, xp, linear;
     int n;
     if (f.deg <= 0) return 0;
+    /* The rational side is linear, so its one affine root costs one modular
+     * inverse.  Do this before the general x^p-x root finder: special-q
+     * generation calls this once per prime, and making a degree-1 polynomial
+     * take the degree-N path would turn the cheapest side into needless work. */
+    if (f.deg == 1) {
+        roots[0] = mod_mul(p - f.c[0], mod_inv(f.c[1], p), p);
+        return 1;
+    }
     if (p <= BRUTE_ROOT_LIMIT) {
         uint32_t r;
         n = 0;
@@ -464,6 +472,100 @@ static int zpoly_roots(const zpoly_t *F, uint32_t p, uint32_t *roots)
     n = mp_split_linear(&linear, p, roots);
     qsort(roots, (size_t)n, sizeof(*roots), u32_cmp);
     return n;
+}
+
+/* ---- streaming prime special-q generation -------------------------- */
+
+struct sqgen {
+    zpoly_t f;
+    uint64_t candidate;                 /* next integer eligible for testing */
+    uint64_t qmax;                      /* inclusive                         */
+    uint32_t current_q;
+    uint32_t roots[FBGEN_MAX_DEG + 1];
+    uint32_t nroot, iroot;
+    uint32_t emitted, nqmax;
+};
+
+sqgen_t *sqgen_create(const poly_t *P, int side, uint64_t qmin, uint64_t qmax,
+                      uint32_t nqmax)
+{
+    sqgen_t *G;
+    int deg;
+    if (!P || (side != 0 && side != 1) || qmin > UINT32_MAX ||
+        (qmax && qmax > UINT32_MAX) || (qmax && qmin > qmax)) {
+        fprintf(stderr, "sqgen: q range must lie in [2, 2^32)\n");
+        return NULL;
+    }
+    if (!side && (!P->y0s[0] || !P->y1s[0])) {
+        fprintf(stderr, "sqgen: rational special-q generation requires both"
+                        " Y0 and Y1\n");
+        return NULL;
+    }
+    G = (sqgen_t *)calloc(1, sizeof(*G));
+    if (!G) {
+        fprintf(stderr, "sqgen: out of memory\n");
+        return NULL;
+    }
+    deg = side ? P->deg : 1;
+    G->f.deg = deg;
+    for (int k = 0; k <= deg; k++) {
+        const char *s = side ? (P->cs[k][0] ? P->cs[k] : "0")
+                             : (k ? P->y1s : P->y0s);
+        if (!s[0]) s = "0";
+        if (big_parse(&G->f.c[k], s)) {
+            fprintf(stderr, "sqgen: coefficient %d exceeds %d bits\n",
+                    k, BIG_LIMBS * 32);
+            free(G);
+            return NULL;
+        }
+    }
+    if (!side && !G->f.c[1].n) {
+        fprintf(stderr, "sqgen: rational special-q generation requires a"
+                        " nonzero Y1\n");
+        free(G);
+        return NULL;
+    }
+    G->candidate = qmin < 2 ? 2 : qmin;
+    G->qmax = qmax ? qmax : UINT32_MAX;
+    G->nqmax = nqmax;
+    return G;
+}
+
+int sqgen_next(sqgen_t *G, qsel_t *out)
+{
+    if (!G || !out) return -1;
+    if (G->nqmax && G->emitted >= G->nqmax) return 0;
+    for (;;) {
+        if (G->iroot < G->nroot) {
+            out->q = G->current_q;
+            out->rho = G->roots[G->iroot++];
+            G->emitted++;
+            return 1;
+        }
+        G->nroot = G->iroot = 0;
+        while (G->candidate <= G->qmax) {
+            uint32_t p = (uint32_t)G->candidate;
+            if (p == 2)
+                G->candidate = 3;
+            else {
+                if (!(p & 1u)) p++;
+                G->candidate = (uint64_t)p + 2;
+            }
+            if (p > G->qmax) break;
+            if (!bench_is_prime32(p)) continue;
+            G->nroot = (uint32_t)zpoly_roots(&G->f, p, G->roots);
+            if (G->nroot) {
+                G->current_q = p;
+                break;
+            }
+        }
+        if (!G->nroot) return 0;
+    }
+}
+
+void sqgen_free(sqgen_t *G)
+{
+    free(G);
 }
 
 static uint32_t zpoly_eval_mod(const zpoly_t *f, uint32_t x, uint32_t m)
@@ -680,7 +782,13 @@ static void print_poly(FILE *out, const poly_t *P)
     fputc('\n', out);
 }
 
-static int generate(FILE *out, const poly_t *P, uint32_t lim, int maxbits, int nthr)
+#ifdef FBGEN_LIBRARY
+#define FBGEN_MAYBE_UNUSED __attribute__((unused))
+#else
+#define FBGEN_MAYBE_UNUSED
+#endif
+static int FBGEN_MAYBE_UNUSED generate(FILE *out, const poly_t *P, uint32_t lim,
+                                        int maxbits, int nthr)
 {
     zpoly_t f;
     uint32_t *primes;
@@ -741,7 +849,9 @@ cleanup:
                 np, lim, nthr, nthr == 1 ? "" : "s");
     return rc;
 }
+#undef FBGEN_MAYBE_UNUSED
 
+#ifndef FBGEN_LIBRARY
 static void usage(FILE *f)
 {
     fputs("usage: fbgen --poly FILE [--lim N] [--maxbits N] [--threads N] [--out FILE]\n"
@@ -808,3 +918,4 @@ int main(int argc, char **argv)
     }
     return rc ? 1 : 0;
 }
+#endif

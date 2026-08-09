@@ -38,12 +38,12 @@ C_SRCS  = fb_load.c verify_cpu.c poly.c primes.c rfb.c fb_cado.c
 
 CU_OBJS = $(CU_SRCS:.cu=.o)
 C_OBJS  = $(C_SRCS:.c=.o)
-OBJS    = $(CU_OBJS) $(C_OBJS)
+OBJS    = $(CU_OBJS) $(C_OBJS) fbgen_lib.o
 
-all: bench fbtest fbgen dumpcmp mkcofbatch
+all: bench fbtest fbgen sqgentest dumpcmp mkcofbatch
 
 bench: $(OBJS)
-	$(NVCC) $(NVCC_ARCH) -o $@ $^ -lcudart -lm
+	$(NVCC) $(NVCC_ARCH) -Xlinker --gc-sections -o $@ $^ -lcudart -lm
 
 # CPU-only correctness gates. No CUDA, so these run on a busy box and on
 # machines without the card.
@@ -54,6 +54,17 @@ fbtest: fbtest.c $(C_OBJS)
 # CADO/GMP dependencies. It shares the job/poly parser and prime enumerator.
 fbgen: fbgen.c poly.o primes.o
 	$(CC) $(CFLAGS) -o $@ fbgen.c poly.o primes.o -lm -pthread
+
+# The same exact root finder drives on-the-fly special-q generation in bench.
+# Keep it in one source: a copied degree-5 root finder would eventually drift
+# from the factor-base generator whose output is gated against CADO. Function
+# sections let the final links discard fbgen's CLI/thread-pool half, so sharing
+# the implementation does not give bench or sqgentest a pthread dependency.
+fbgen_lib.o: fbgen.c bench.h
+	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -DFBGEN_LIBRARY -c $< -o $@
+
+sqgentest: sqgentest.c fbgen_lib.o poly.o primes.o
+	$(CC) $(CFLAGS) -Wl,--gc-sections -o $@ $^ -lm
 
 dumpcmp: dumpcmp.c
 	$(CC) $(CFLAGS) -o $@ $< -lm
@@ -71,18 +82,21 @@ mkcofbatch: mkcofbatch.c
 -include $(OBJS:.o=.d)
 
 clean:
-	rm -f bench fbtest fbgen dumpcmp mkcofbatch *.o *.d
+	rm -f bench fbtest fbgen sqgentest dumpcmp mkcofbatch *.o *.d
 
-.PHONY: all clean check cofcheck fbgencheck
+.PHONY: all clean check cofcheck fbgencheck sqgencheck
 
 # `check` depended on fbtest alone, so the whole CUDA path -- kernels, the
 # cofactoriser, the pipeline -- could fail to compile while the gates reported
 # "all gates passed". Depend on `all`.
-check: all cofcheck fbgencheck
+check: all cofcheck fbgencheck sqgencheck
 	./fbtest --fb1 ../oracle/c183.fb1
 
 fbgencheck: fbgen
 	./fbgencheck.sh
+
+sqgencheck: sqgentest
+	./sqgentest
 
 # A GPU golden test over the cofactoriser: rho and ECM on the parity special-q,
 # the even-cofactor invariant, the bounds refusals, and a candidate file with no

@@ -257,6 +257,44 @@ else
     printf 'FAIL   %-34s composite NOT detected\n' "primality negative control"; fail=1
 fi
 
+# ---- generated-band control ---------------------------------------------
+# Three ideals exercise all generator handoffs: q0 is cached for norm setup,
+# q1 is the first pull inside run_pipeline, and q2 is another root from the
+# stream. Compare with the exact oracle pairs, then make the count cap compete
+# with an unreachable relation target so its termination message is gated too.
+cat >$TMP/q3 <<EOF
+120000007 30589397
+120000053 112625526
+120000103 21725368
+EOF
+gout=$(./bench --pipeline --cadofb $FB --poly $POLY \
+       --qrange 120000000:120000200 --nq 3 --target-rels 999999 $PIN \
+       --relations $TMP/qgen.txt 2>&1 || true)
+lout=$(./bench --pipeline --cadofb $FB --poly $POLY --qlist $TMP/q3 --nq 10 $PIN \
+       --relations $TMP/qlist.txt 2>&1 || true)
+if printf '%s' "$gout" | grep -q '\[--nq 3 reached\]' &&
+   printf '%s' "$gout" | grep -q 'note: --nq 3 reached.*--target-rels 999999 was not reached' &&
+   printf '%s' "$gout" | grep -q -- '--- band of 3 special-q ---' &&
+   printf '%s' "$lout" | grep -q -- '--- band of 3 special-q ---' &&
+   printf '%s' "$lout" | grep -q '100.0%' &&
+   cmp -s $TMP/qgen.txt $TMP/qlist.txt; then
+    printf 'PASS   %-34s cached + streamed q, byte-identical\n' \
+        "multi-q generated band"
+else
+    printf 'FAIL   %-34s generator/list mismatch or bad terminal status\n' \
+        "multi-q generated band"; fail=1
+fi
+
+# qmin == 0 is a valid spelling that normalises to the first prime. It used to
+# double as the parser's "--qrange absent" sentinel, silently dropping 0:MAX
+# and running the unrelated single-q default instead.
+zero=$(./bench --pipeline --cadofb $FB --poly $POLY --qrange 0:1 $PIN 2>&1 || true)
+if printf '%s' "$zero" | grep -q 'no affine special-q roots in \[0, 1\]'; then
+    printf 'PASS   %-34s parsed as an empty generated band\n' "zero qrange lower bound"
+else
+    printf 'FAIL   %-34s qrange was dropped or misreported\n' "zero qrange lower bound"; fail=1
+fi
+
 # A partial warp has no lane 31 for k_intersect_compact to broadcast its atomic
 # base from. This used to be caught only by the survivor/rank cross-check, i.e.
 # after a full band had run.
