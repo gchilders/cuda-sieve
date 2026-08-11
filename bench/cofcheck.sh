@@ -58,12 +58,16 @@ echo "[cofactor] golden test, q = 120000053"
 expect_rel "trial division only"            7
 expect_rel "rho, inline queue"             37 --cofactor --cof-rounds 2 --cof-budget 65536
 expect_rel "ECM, inline queue"             37 --cofactor --cof-ecm --ecm-b1 2000 --ecm-curves 48
+expect_rel "ECM stage 2 control, disabled" 36 --cofactor --cof-ecm --ecm-b1 1000 --ecm-b2 0 --ecm-curves 16
+expect_rel "ECM stage 2, inline queue"     37 --cofactor --cof-ecm --ecm-b1 1000 --ecm-b2 10000 --ecm-curves 16
 # The method switch must actually REACH the queue. B1 = 2 with one curve can
 # split essentially nothing, so this must fall back to the trial-division count;
 # 37 here would mean rho ran despite --cof-ecm, which is exactly the defect the
 # review found (the queue's ECM fields were left at their memset zero).
 expect_rel "ECM honoured, not silently rho"  7 --cofactor --cof-ecm --ecm-b1 2 --ecm-curves 1
 expect_refused "zero ECM curves"               --cofactor --cof-ecm --ecm-curves 0
+expect_refused "stage 2 without ECM"            --cofactor --ecm-b2 10000
+expect_refused "stage 2 below B1"               --cofactor --cof-ecm --ecm-b1 1000 --ecm-b2 1000
 
 # ---- job-file parameters -------------------------------------------------
 # ../oracle/input.job is the SAME polynomial as c183.poly, plus the sieve keys.

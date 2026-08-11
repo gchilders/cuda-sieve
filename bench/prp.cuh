@@ -1,4 +1,6 @@
-/* Strong probable-prime test, base 2, for moduli up to 128 bits.
+/* SPDX-License-Identifier: LGPL-2.1-or-later
+ *
+ * Strong probable-prime test, base 2, for moduli up to 128 bits.
  *
  * This is the test CADO applies to a leftover norm, and its comment explains
  * why base 2 alone is enough: a composite wrongly called prime loses a

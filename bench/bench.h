@@ -304,8 +304,9 @@ typedef struct {
     int      cof_rounds;    /* rho requeue rounds                               */
     uint32_t cof_budget;    /* rho iterations in the first round                */
     uint64_t target_rels;   /* stop the band once this many relations exist     */
-    int      cof_ecm;       /* use ECM stage 1 instead of rho                   */
+    int      cof_ecm;       /* use ECM instead of rho                           */
     uint32_t ecm_b1;        /* ECM stage-1 bound                                */
+    uint32_t ecm_b2;        /* ECM stage-2 bound (0 disables stage 2)            */
     uint32_t ecm_curves;    /* ECM curves attempted per round                   */
     uint32_t nq_max;        /* stop after this many q (0 = all)                 */
     int      td_verify;     /* run the factors x cofactor == norm reconstruction */
@@ -435,7 +436,7 @@ int check_relations(const char *path, const poly_t *poly, uint32_t lpb0,
 int run_cofac(const char *path, const char *out, uint32_t lim0, uint32_t lpb0,
               uint32_t lim1, uint32_t lpb1, int rounds, uint32_t budget,
               int blocks, int threads, int ecm, uint32_t ecm_b1,
-              uint32_t ecm_curves);
+              uint32_t ecm_b2, uint32_t ecm_curves);
 
 int run_bench(const fb_t *fb, const fb_t *small, const qlat_t *L,
               const poly_t *P, const bench_cfg_t *cfg);

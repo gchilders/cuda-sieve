@@ -76,9 +76,10 @@ static void usage(void)
 "                   [6 for --cofac; 2 for --pipeline --cofactor]\n"
 "  --cof-budget N   rho iterations in the first round\n"
 "                   [4096 for --cofac; 65536 for --pipeline --cofactor]\n"
-"  --cof-ecm        ECM stage 1 instead of Pollard-Brent rho. Built and\n"
-"                   correct, but loses to rho 2.2-2.5x at matched yield\n"
+"  --cof-ecm        ECM instead of Pollard-Brent rho; stage 1 alone loses,\n"
+"                   while tuned stage 2 is near rho at matched yield\n"
 "  --ecm-b1 N       ECM stage-1 bound                              [1000]\n"
+"  --ecm-b2 N       ECM D=30 stage-2 bound; 0 disables stage 2         [0]\n"
 "  --ecm-curves N   ECM curves attempted per round                 [16]\n"
 "  --candidates F   write the cofactorisation batch here\n"
 "  --cofac FILE     cofactorise a batch written by --candidates and emit the\n"
@@ -205,6 +206,9 @@ static int check_cofactor_bounds(const bench_cfg_t *cfg, uint32_t alim,
         bad = 1;
     }
     if (!cfg->cof_ecm) {
+        if (cfg->ecm_b2) {
+            fprintf(stderr, "--ecm-b2 requires --cof-ecm\n"); bad = 1;
+        }
         if (!cof_budget || (uint64_t)cof_budget << (cof_rounds - 1) > 0xFFFFFFFFull) {
             fprintf(stderr, "--cof-budget %u with %d rounds overflows uint32"
                     " (or is zero)\n", cof_budget, cof_rounds);
@@ -222,6 +226,13 @@ static int check_cofactor_bounds(const bench_cfg_t *cfg, uint32_t alim,
         }
         if (cfg->ecm_b1 < 2 || cfg->ecm_b1 > 1000000u) {
             fprintf(stderr, "--ecm-b1 %u: must be 2..1000000\n", cfg->ecm_b1);
+            bad = 1;
+        }
+        if (cfg->ecm_b2 && (cfg->ecm_b1 < 30u ||
+                            cfg->ecm_b2 <= cfg->ecm_b1 ||
+                            cfg->ecm_b2 > 10000000u)) {
+            fprintf(stderr, "--ecm-b2 %u: want 0 (disabled), or B1 < B2 <="
+                    " 10000000 with B1 >= 30\n", cfg->ecm_b2);
             bad = 1;
         }
     }
@@ -271,7 +282,7 @@ int main(int argc, char **argv)
     cfg.qlist = NULL; cfg.nq_max = 0; cfg.verbose_q = 0; cfg.td_verify = 1;
     cfg.qmin = 0; cfg.qmax = 0; cfg.target_rels = 0;
     cfg.cofactor = 0; cfg.cof_rounds = 2; cfg.cof_budget = 65536;
-    cfg.cof_ecm = 0; cfg.ecm_b1 = 1000; cfg.ecm_curves = 16;
+    cfg.cof_ecm = 0; cfg.ecm_b1 = 1000; cfg.ecm_b2 = 0; cfg.ecm_curves = 16;
     int maxbits = 0, maxbits_set = 0;
     int allowance_set = 0, allowance0_set = 0, scale0_set = 0;
     const char *cofac_in = NULL;
@@ -416,6 +427,7 @@ int main(int argc, char **argv)
         #undef LAMBDA_ARG
         else if (!strcmp(argv[i], "--check-relations") && i + 1 < argc) check_rel = argv[++i];
         else if (!strcmp(argv[i], "--ecm-b1") && i + 1 < argc) cfg.ecm_b1 = (uint32_t)strtoul(argv[++i], 0, 10);
+        else if (!strcmp(argv[i], "--ecm-b2") && i + 1 < argc) cfg.ecm_b2 = (uint32_t)strtoul(argv[++i], 0, 10);
         else if (!strcmp(argv[i], "--ecm-curves") && i + 1 < argc) cfg.ecm_curves = (uint32_t)strtoul(argv[++i], 0, 10);
         else if (!strcmp(argv[i], "--qlist") && i + 1 < argc) cfg.qlist = argv[++i];
         else if (!strcmp(argv[i], "--qrange") && i + 1 < argc) {
@@ -764,6 +776,7 @@ int main(int argc, char **argv)
                          cfg.lim, cfg.lpb, cof_rounds, cof_budget,
                          cfg.blocks ? cfg.blocks : 48 * 6, cfg.threads,
                          cfg.cof_ecm, cfg.ecm_b1 ? cfg.ecm_b1 : 1000,
+                         cfg.ecm_b2,
                          cfg.ecm_curves ? cfg.ecm_curves : 16) ? 1 : 0;
     }
 

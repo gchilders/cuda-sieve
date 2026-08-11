@@ -2277,6 +2277,66 @@ then graphs, then the partition.
   Run it on a verified-idle box and check `GPU-accounted / wall` first.
 - Correctness is unaffected: all three runs emit exactly 159,837 relations.
 
+## Finding 54 — RTX 5060 Ti device timings on c147
+
+**Date:** 2026-08-09. Reported externally on native Linux, RTX 5060 Ti
+(36 SM, 32 MB L2), current **1152 x 32** fill geometry. The host was an
+i5-2550K and was fully utilised during the pipeline run, so the device-event
+timings are the portable result here; the pipeline wall clock is deliberately
+not used for a cross-card comparison.
+
+Standalone algebraic side, `--logI 14 --J 8192 --reps 3`, synthetic-root
+`q=120000011`, 2,059,531 bucketed entries and 77,389,658 records:
+
+| stage | ms / special-q |
+|---|---:|
+| transform + plattice | 0.687 |
+| fill | 4.121 |
+| apply | 7.211 |
+| **sieve chain, algebraic side** | **12.019** |
+
+The full pipeline used real algebraic special-q from 15,000,000, both sides,
+and ran 1,340 q. Its event-timed device accounting was:
+
+| stage | ms / special-q |
+|---|---:|
+| transform + plattice, both sides | 1.027 |
+| fill, both sides | 7.980 |
+| apply, both sides | 12.000 |
+| **sieve, both sides** | **21.010** |
+
+TD + classify breakdown (the eight component rows sum to the printed device
+total):
+
+| stage | ms / special-q |
+|---|---:|
+| rank scan | 0.189 |
+| emit `(x,a,b)` in rank order | 0.021 |
+| survivor filter | 0.099 |
+| resieve + scatter, both sides | 2.291 |
+| norms + trial division, both sides | 0.429 |
+| classify, both sides | 0.159 |
+| joint accept + compact | 0.023 |
+| record candidate factorisations | 0.525 |
+| **TD + classify, device total** | **3.736** |
+
+Pipeline device-accounted totals:
+
+| stage | ms / special-q |
+|---|---:|
+| sieve, both sides | 21.010 |
+| intersect + gcd | 0.114 |
+| TD + classify | 3.736 |
+| cofactor queues + relation readback/emit, device-accounted | 1.390 |
+| **device-accounted total excluding cofactorisation** | **24.860** |
+| **device-accounted total including cofactorisation** | **26.250** |
+
+The printed `GPU-accounted / wall (excl cofac)` was **0.743**. That low ratio
+is consistent with finding 53: the CUDA stages remain measurable under host
+contention while wall time grows. The standalone and pipeline sieve totals are
+not a one-side/two-side scaling A/B: they use different q, roots, norm scales,
+and the pipeline adds the rational side.
+
 ## Not addressed in this round
 
 > **This section is a snapshot of one round, not a current status list**, and it

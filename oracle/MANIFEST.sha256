@@ -32,7 +32,7 @@ c7cbab653043048510bc8d5fb05f6da35b1efd907d451b473663273c0d14f2d4  relation_conta
 
 # --- survivor-bound sweep (coarse 2026-08-03, refined to 1-unit 2026-08-04; floor = 128) ---
 4317ace67ed5de624aedd056ad72b9dc7d5e11d2827b399ebc64271a18c5b879  bound_sweep.sh
-267b2f36bf69290279f99d055a27c2e7e683d280a4410c7a571a0cdc37de299f  bound_sweep_fine.sh
+ccf7b57df4fdd5e2697b26d287f83b0dfe8a0dec88976231679f4b5d44f51c49  bound_sweep_fine.sh
 9db65e347161a113c0848f5fe5c870b8ab38b683287839a9236a8009ee08246d  bound_sweep_results.txt
 
 # --- target cofactor population, 2026-08-03 (1,062,811 records over 548 special-q) ---

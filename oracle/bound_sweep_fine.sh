@@ -6,7 +6,7 @@
 set -u
 LAS=~/cado-nfs/build/DESKTOP-3J4UC68/sieve/las
 O=~/code/cuda-sieve/oracle
-OUT=$CLAUDE_JOB_DIR/tmp/sweepfine
+OUT=${1:-$PWD/sweepfine}
 mkdir -p "$OUT"
 for L1 in 3.28 3.25 3.22 3.17 3.15 3.12; do
   f="$OUT/f_${L1}.log"

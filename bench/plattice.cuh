@@ -1,4 +1,6 @@
-/* Franke-Kleinjung p-lattice reduction and walk.
+/* SPDX-License-Identifier: LGPL-2.1-or-later
+ *
+ * Franke-Kleinjung p-lattice reduction and walk.
  *
  * Ported from CADO-NFS sieve/las-plattice.hpp and
  * sieve/las-reduce-plattice-simplistic.hpp so that the benchmark walks the

@@ -905,7 +905,8 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
      * ~2% of records that become relations are read back, and the 295 MB
      * candidate file and its ~3 ms/q of host emission are gone. */
     if (cfg->cofactor && cofq_init(&Q, &QO, CQ_FLUSH, cfg->cof_ecm,
-                                   cfg->ecm_b1, cfg->ecm_curves)) { rc = -1; goto done; }
+                                   cfg->ecm_b1, cfg->ecm_b2,
+                                   cfg->ecm_curves)) { rc = -1; goto done; }
     if (cfg->cofactor) VRAM_MARK("cofactor queue");
 #undef VRAM_MARK
 

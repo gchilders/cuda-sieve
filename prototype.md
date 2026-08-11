@@ -4157,6 +4157,44 @@ The remaining levers are TD's resieve -- walk-dominated with a ~7.1 ms/q floor,
 so it means revisiting the 8 B bucket record this document has twice refused --
 and the sieve itself at 65.7 ms/q, which no work in this session has touched.
 
+### Update, 2026-08-11: stage 2 is built and reopens the lever narrowly
+
+The conclusion immediately above applies to stage 1. A D=30 Montgomery-XZ
+baby-step/giant-step continuation is now implemented behind `--ecm-b2`, with
+four baby residues, a uniform giant-step walk, masked cross-products, and one
+batched gcd on the common path. If that gcd swallows multiple hits by equalling
+the input, the curve is replayed with per-pair gcds. The stage-1 and stage-2
+kernels are separate instantiations, so the larger continuation does not raise
+stage 1's register footprint.
+
+On one production-sized queue of 131,072 real c183 candidates, measured after
+a warmup on an otherwise idle RTX 5070:
+
+| configuration | rational ms | algebraic ms | total ms | relations |
+|---|---:|---:|---:|---:|
+| ECM stage 1, B1=1000, 2 x 16 curves | 924 | 1,927 | 2,851 | 3,090 |
+| ECM stage 2, B2=10000, 2 x 16 curves | 522 | 1,607 | 2,129 | 3,099 |
+| ECM stage 2, B2=15000, 1 x 14 curves | 531 | 1,366 | 1,897 | 3,099 |
+| rho, 3 rounds from budget 65536 | 301 | 1,521 | 1,821 | 3,099 |
+
+The tuned ECM and rho relation files are byte-identical. Stage 2 is 33% faster
+than stage 1 at the displayed settings and comes within 4% of rho at matched
+yield. The side labels are not intrinsic method choices: by cofactorisation
+time these are integers plus `lim`, `lpb`, and the residual-size/factor-count
+class. On this job ECM wins the larger 3LP-shaped queue and loses the smaller
+2LP-shaped queue; another job can assign those shapes to the opposite sides.
+
+A post-review rerun while the GPU was shared moved all three absolute times:
+stage 1 took 5,585 ms, tuned stage 2 4,028 ms, and rho 3,703 ms. Stage 2 and rho
+again emitted the same 3,099 byte-identical relations, putting stage 2 within
+9% of rho under contention. The absolute numbers should not be mixed with the
+idle table, but the matched-yield conclusion survived the noisier condition.
+
+This does not produce a 2x end-to-end result, but it overturns the old
+stage-1-only claim that ECM is categorically closed. It also makes dispatch by
+cofactor class, rather than one method for the entire run, a concrete next
+experiment.
+
 The rho path is **byte-for-byte identical** after the refactor that added the
 method switch, and `make check` passes.
 

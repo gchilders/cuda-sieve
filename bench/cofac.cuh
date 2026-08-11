@@ -74,8 +74,12 @@
 
 #if defined(__CUDACC__)
 #define CF_FN __device__ __forceinline__
+#define CF_NOINLINE __device__ __noinline__
+#define CF_HD static __host__ __device__ __forceinline__
 #else
 #define CF_FN static inline
+#define CF_NOINLINE static
+#define CF_HD static inline
 #endif
 
 /* ---- L-limb arithmetic ------------------------------------------------- *
@@ -441,7 +445,7 @@ found:
     return 1;
 }
 
-/* ---- ECM, stage 1 only -------------------------------------------------- *
+/* ---- ECM, stages 1 and 2 ------------------------------------------------ *
  *
  * Montgomery curves By^2 = x^3 + Ax^2 + x in XZ coordinates, which is the form
  * whose differential addition needs no y and no inversion.
@@ -453,10 +457,42 @@ found:
  * once per curve per record. At tens of curves per record that trade is clearly
  * the right way round, and it keeps a binary extended GCD out of the file.
  *
- * Stage 2 is deliberately absent. It is also where most of ECM's probability
- * per unit cost lives, so the measurement this produces is a floor on ECM, not
- * a verdict on it -- see the write-up.
+ * Stage 2 is the small-table Montgomery-XZ continuation below. It deliberately
+ * uses D=30: the four unsigned baby residues {1,7,11,13} keep one curve's
+ * private table small enough for this first GPU experiment. The host supplies
+ * one four-bit mask per giant step; bit u is set when vD-u or vD+u is prime in
+ * (B1,B2]. Thus every lane follows the same giant-step walk and only the cheap
+ * product-of-differences loop is masked.
  */
+
+#define CF_ECM_D       30u
+#define CF_ECM_NBABY    4u
+#define CF_ECM_MAX_B1   1000000u
+#define CF_ECM_MAX_B2  10000000u
+
+/* One definition supplies both the host mask-bit mapping and the device baby
+ * scalar. A duplicated host/device table can compile and test cleanly while
+ * silently assigning different meanings to the same mask bit. */
+CF_HD uint8_t cf_ecm_baby(uint32_t k)
+{
+    return k == 0 ? 1u : k == 1 ? 7u : k == 2 ? 11u : 13u;
+}
+
+/* Shared composite sieve for both ECM plans. Bounds live here as well as in
+ * the CLI: these helpers are also called by tests and must be safe on their
+ * own. */
+static uint8_t *cf_ecm_sieve(uint32_t limit)
+{
+    uint8_t *composite;
+    if (limit < 2 || limit > CF_ECM_MAX_B2) return NULL;
+    composite = (uint8_t *)calloc((size_t)limit + 1, 1);
+    if (!composite) return NULL;
+    for (uint32_t p = 2; (uint64_t)p * p <= limit; p++)
+        if (!composite[p])
+            for (uint64_t q = (uint64_t)p * p; q <= limit; q += p)
+                composite[q] = 1;
+    return composite;
+}
 
 /* The stage-1 exponent lcm(1..B1), held as its prime powers rather than as one
  * big integer: each is at most B1, so the ladder for it is a dozen bits and the
@@ -465,20 +501,21 @@ found:
 static uint32_t cf_ecm_plan(uint32_t b1, uint32_t **out)
 {
     uint32_t n = 0, cap = 0, *s = NULL;
-    unsigned char *sieve;
-    if (b1 < 2) { *out = NULL; return 0; }
-    sieve = (unsigned char *)calloc(b1 + 1, 1);
+    uint8_t *sieve;
+    if (b1 < 2 || b1 > CF_ECM_MAX_B1) { *out = NULL; return 0; }
+    sieve = cf_ecm_sieve(b1);
     if (!sieve) { *out = NULL; return 0; }
     for (uint32_t p = 2; p <= b1; p++) {
         if (sieve[p]) continue;
-        for (uint64_t q = (uint64_t)p * p; q <= b1; q += p) sieve[q] = 1;
         {   /* the largest power of p that still fits under B1 */
             uint64_t pe = p;
             while (pe * p <= b1) pe *= p;
             if (n == cap) {
+                uint32_t *grown;
                 cap = cap ? cap * 2 : 256;
-                s = (uint32_t *)realloc(s, (size_t)cap * 4);
-                if (!s) { free(sieve); *out = NULL; return 0; }
+                grown = (uint32_t *)realloc(s, (size_t)cap * sizeof(*s));
+                if (!grown) { free(s); free(sieve); *out = NULL; return 0; }
+                s = grown;
             }
             s[n++] = (uint32_t)pe;
         }
@@ -486,6 +523,47 @@ static uint32_t cf_ecm_plan(uint32_t b1, uint32_t **out)
     free(sieve);
     *out = s;
     return n;
+}
+
+/* Build the stage-2 prime-pair schedule. For every prime q in (B1,B2], write
+ * q = vD +/- u with 0 < u < D/2. Since q > B1 >= 30 in the stage-2 path, q is
+ * coprime to D and u is one of the four residues below. One x-coordinate
+ * comparison covers both signs. Empty giant steps remain in the schedule so
+ * the device can advance with one differential addition rather than restart a
+ * scalar multiplication at every populated v. */
+static uint32_t cf_ecm_stage2_plan(uint32_t b1, uint32_t b2, uint32_t *vmin_out,
+                                   uint8_t **mask_out)
+{
+    uint8_t *composite = NULL, *mask = NULL;
+    uint32_t qlo, qhi, vmin, vmax, nv;
+    if (b2 <= b1 || b1 < CF_ECM_D || b1 > CF_ECM_MAX_B1 ||
+        b2 > CF_ECM_MAX_B2) {
+        *vmin_out = 0; *mask_out = NULL; return 0;
+    }
+    composite = cf_ecm_sieve(b2);
+    if (!composite) { *vmin_out = 0; *mask_out = NULL; return 0; }
+    for (qlo = b1 + 1; qlo <= b2 && composite[qlo]; qlo++) {}
+    if (qlo > b2) {
+        free(composite); *vmin_out = 0; *mask_out = NULL; return 0;
+    }
+    for (qhi = b2; qhi > qlo && composite[qhi]; qhi--) {}
+    vmin = (qlo + CF_ECM_D / 2) / CF_ECM_D;
+    vmax = (qhi + CF_ECM_D / 2) / CF_ECM_D;
+    nv = vmax - vmin + 1;
+    mask = (uint8_t *)calloc(nv, 1);
+    if (!mask) { free(composite); *vmin_out = 0; *mask_out = NULL; return 0; }
+    for (uint32_t q = b1 + 1; q <= b2; q++) if (!composite[q]) {
+        const uint32_t v = (q + CF_ECM_D / 2) / CF_ECM_D;
+        const uint32_t vd = v * CF_ECM_D;
+        const uint32_t u = q > vd ? q - vd : vd - q;
+        for (uint32_t k = 0; k < CF_ECM_NBABY; k++)
+            if (u == cf_ecm_baby(k)) {
+                mask[v - vmin] |= (uint8_t)(1u << k); break;
+            }
+    }
+    free(composite);
+    *vmin_out = vmin; *mask_out = mask;
+    return nv;
 }
 
 template <int L> struct mpt { mz<L> X, Z; };
@@ -549,7 +627,7 @@ CF_FN void x_add(mpt<L> *r, const mpt<L> *p, const mpt<L> *q, const mpt<L> *dif,
  * dozen bits at most and the ladder's constant-time shape costs nothing. */
 template <int L>
 CF_FN void x_mul(mpt<L> *p, uint32_t k, const mz<L> *an, const mz<L> *ad,
-                 const mz<L> *n, uint32_t n0inv, uint64_t *bits)
+                 const mz<L> *n, uint32_t n0inv, uint64_t *work)
 {
     mpt<L> r0 = *p, r1, t;
     int b = 31;
@@ -564,16 +642,96 @@ CF_FN void x_mul(mpt<L> *p, uint32_t k, const mz<L> *an, const mz<L> *ad,
             x_add<L>(&t, &r1, &r0, p, n, n0inv); r1 = t;
             x_dbl<L>(&t, &r0, an, ad, n, n0inv);  r0 = t;
         }
-        (*bits)++;
+        (*work)++;
     }
     *p = r0;
 }
 
+/* Keep one copy of the ladder behind a call boundary. Force-inlining x_mul at
+ * every baby/giant setup site makes nvcc expand seven copies of the bigint
+ * arithmetic into this already-large kernel and markedly increases both
+ * compile time and register pressure. */
+template <int L>
+CF_NOINLINE void x_mul_s2(mpt<L> *p, uint32_t k, const mz<L> *an,
+                          const mz<L> *ad, const mz<L> *n, uint32_t n0inv,
+                          uint64_t *work)
+{
+    x_mul<L>(p, k, an, ad, n, n0inv, work);
+}
+
+/* One pass over the D=30 baby-step/giant-step continuation. All selected
+ * cross-products are accumulated and normally only one gcd is paid. If hits
+ * for different prime factors make that gcd equal n, replay the same curve and
+ * gcd each selected difference. The replay is rare, preserves the fast common
+ * path, and prevents a batched product from swallowing every factor it found. */
+template <int L>
+CF_NOINLINE int mz_ecm_stage2_pass(mz<L> *fac, const mpt<L> *Q,
+                                    const mz<L> *an, const mz<L> *ad,
+                                    const mz<L> *one, const mz<L> *n,
+                                    uint32_t n0inv,
+                                    const uint8_t *__restrict masks,
+                                    uint32_t vmin, uint32_t nv,
+                                    uint64_t *work)
+{
+    mpt<L> baby[CF_ECM_NBABY], step, prev, cur, next;
+    mz<L> prod, g;
+
+    for (int replay = 0; replay < 2; replay++) {
+        prod = *one;
+        for (uint32_t k = 0; k < CF_ECM_NBABY; k++) {
+            const uint32_t scalar = cf_ecm_baby(k);
+            baby[k] = *Q;
+            if (scalar != 1)
+                x_mul_s2<L>(&baby[k], scalar, an, ad, n, n0inv, work);
+        }
+        step = *Q; x_mul_s2<L>(&step, CF_ECM_D, an, ad, n, n0inv, work);
+        prev = step; x_mul_s2<L>(&prev, vmin, an, ad, n, n0inv, work);
+        if (nv > 1) {
+            cur = step;
+            x_mul_s2<L>(&cur, vmin + 1, an, ad, n, n0inv, work);
+        }
+
+        for (uint32_t vi = 0; vi < nv; vi++) {
+            const mpt<L> *G = vi ? &cur : &prev;
+            const uint32_t mask = masks[vi];
+            #pragma unroll
+            for (uint32_t k = 0; k < CF_ECM_NBABY; k++)
+                if (mask & (1u << k)) {
+                    mz<L> a, b, d;
+                    mz_mul<L>(&a, &G->X, &baby[k].Z, n, n0inv);
+                    mz_mul<L>(&b, &baby[k].X, &G->Z, n, n0inv);
+                    d = a; mz_sub_mod<L>(&d, &b, n);
+                    (*work)++;                  /* one selected stage-2 pair */
+                    if (replay) {
+                        mz_gcd<L>(&g, d, *n);
+                        if (!mz_is_one<L>(&g) && mz_cmp<L>(&g, n) != 0) {
+                            *fac = g; return 1;
+                        }
+                    } else {
+                        mz_mul<L>(&a, &prod, &d, n, n0inv); prod = a;
+                    }
+                }
+            if (vi + 1 < nv && vi) {
+                x_add<L>(&next, &cur, &step, &prev, n, n0inv);
+                (*work)++;                       /* one stage-2 giant step */
+                prev = cur; cur = next;
+            }
+        }
+        if (replay) return 0;
+        mz_gcd<L>(&g, prod, *n);
+        if (mz_is_one<L>(&g)) return 0;
+        if (mz_cmp<L>(&g, n) != 0) { *fac = g; return 1; }
+    }
+    return 0;
+}
+
 /* One curve of stage 1. `s` holds the prime powers p^e <= B1, ascending.
  * Returns 1 and a nontrivial factor when gcd(Z, n) splits n. */
-template <int L>
+template <int L, int STAGE2>
 CF_FN int mz_ecm(mz<L> *fac, const mz<L> *n, uint32_t sigma,
-                 const uint32_t *__restrict s, uint32_t ns, uint64_t *bits)
+                 const uint32_t *__restrict s, uint32_t ns,
+                 const uint8_t *__restrict s2mask, uint32_t s2vmin,
+                 uint32_t s2nv, uint64_t *work)
 {
     const uint32_t n0inv = mz_n0inv(n->v[0]);
     mz<L> one, sig, u, v, t, w, an, ad, g;
@@ -610,10 +768,17 @@ CF_FN int mz_ecm(mz<L> *fac, const mz<L> *n, uint32_t sigma,
     if (mz_is_zero<L>(&ad)) return 0;
 
     for (uint32_t i = 0; i < ns; i++)
-        x_mul<L>(&P, s[i], &an, &ad, n, n0inv, bits);
+        x_mul<L>(&P, s[i], &an, &ad, n, n0inv, work);
 
     mz_gcd<L>(&g, P.Z, *n);
-    if (mz_is_one<L>(&g) || mz_cmp<L>(&g, n) == 0) return 0;
+    if (mz_is_one<L>(&g)) {
+        if constexpr (STAGE2) {
+            if (mz_ecm_stage2_pass<L>(fac, &P, &an, &ad, &one, n, n0inv,
+                                      s2mask, s2vmin, s2nv, work)) return 1;
+        }
+        return 0;
+    }
+    if (mz_cmp<L>(&g, n) == 0) return 0;
     *fac = g;
     return 1;
 }
@@ -627,13 +792,15 @@ CF_FN int mz_ecm(mz<L> *fac, const mz<L> *n, uint32_t sigma,
  * so only the middle part of a 3LP split is ever tested.
  */
 /* METHOD 0 is Pollard-Brent rho and `budget` is an iteration count; METHOD 1 is
- * ECM stage 1 and `budget` is a CURVE count. Both are bounded per launch and
+ * ECM and `budget` is a CURVE count. Both are bounded per launch and
  * neither turns an exhausted budget into a proof, so the requeue structure
  * around them is unchanged. */
-template <int L, int METHOD>
+template <int L, int METHOD, int STAGE2>
 CF_FN int mz_split(const mz<L> *n0, const mz<L> *lim2, uint32_t lpb,
                    uint32_t c0, uint32_t budget, uint32_t *out, int *nout,
-                   uint64_t *acc, const uint32_t *__restrict s, uint32_t ns)
+                   uint64_t *acc, const uint32_t *__restrict s, uint32_t ns,
+                   const uint8_t *__restrict s2mask, uint32_t s2vmin,
+                   uint32_t s2nv)
 {
     mz<L> st[CF_MAXFAC];
     int sp = 0, nf = 0;
@@ -648,12 +815,13 @@ CF_FN int mz_split(const mz<L> *n0, const mz<L> *lim2, uint32_t lpb,
             continue;
         }
         if (mz_sprp2<L>(&m)) return CF_DEAD;        /* prime, and >= lim2 > 2^lpb */
-        if (METHOD == 0) {
+        if constexpr (METHOD == 0) {
             if (!mz_rho<L>(&g, &m, c0, budget, acc)) return CF_INCOMPLETE;
         } else {
             uint32_t cv = 0;
             for (; cv < budget; cv++)
-                if (mz_ecm<L>(&g, &m, c0 * 1000u + cv + 6u, s, ns, acc)) break;
+                if (mz_ecm<L, STAGE2>(&g, &m, c0 * 1000u + cv + 6u, s, ns,
+                                      s2mask, s2vmin, s2nv, acc)) break;
             if (cv == budget) return CF_INCOMPLETE;
         }
         mz_divexact<L>(&h, &m, &g);
@@ -685,7 +853,7 @@ CF_FN int mz_split(const mz<L> *n0, const mz<L> *lim2, uint32_t lpb,
  *
  * `njp` is read on the device so the grid never has to be sized from a
  * host-visible count, which keeps the round loop free of synchronisation. */
-template <int L, int METHOD>
+template <int L, int METHOD, int STAGE2>
 __global__ void k_cofac(const mz<L> *__restrict n, mz<L> lim2, uint32_t lpb,
                         uint32_t c0, uint32_t budget,
                         const uint32_t *__restrict sel,
@@ -693,7 +861,9 @@ __global__ void k_cofac(const mz<L> *__restrict n, mz<L> lim2, uint32_t lpb,
                         uint8_t *__restrict status,
                         uint32_t *__restrict fac, uint8_t *__restrict nfac,
                         unsigned long long *__restrict iters,
-                        const uint32_t *__restrict s, uint32_t ns)
+                        const uint32_t *__restrict s, uint32_t ns,
+                        const uint8_t *__restrict s2mask, uint32_t s2vmin,
+                        uint32_t s2nv)
 {
     const uint32_t cnt = *njp;
     const uint32_t stride = gridDim.x * blockDim.x;
@@ -705,7 +875,8 @@ __global__ void k_cofac(const mz<L> *__restrict n, mz<L> lim2, uint32_t lpb,
         mz<L> v;
         if (status[t] != CF_INCOMPLETE) continue;
         v = n[t];
-        st = mz_split<L, METHOD>(&v, &lim2, lpb, c0, budget, o, &k, &acc, s, ns);
+        st = mz_split<L, METHOD, STAGE2>(&v, &lim2, lpb, c0, budget, o, &k,
+                                         &acc, s, ns, s2mask, s2vmin, s2nv);
         if (iters) iters[t] += (unsigned long long)acc;   /* summed over rounds */
         status[t] = (uint8_t)st;
         if (st == CF_OK) {
@@ -754,12 +925,14 @@ __global__ void k_cof_selscatter(uint32_t n, const uint32_t *__restrict flag,
  * actually differ between callers: which method, and how much of it.
  */
 typedef struct {
-    int      method;        /* 0 = Pollard-Brent rho, 1 = ECM stage 1        */
+    int      method;        /* 0 = Pollard-Brent rho, 1 = ECM                */
     int      rounds;
     uint32_t budget;        /* rho iterations in round 0; doubles each round */
     uint32_t curves;        /* ECM curves attempted per round                */
     const uint32_t *d_s;    /* ECM stage-1 prime powers, on device           */
     uint32_t ns;
+    const uint8_t *d_s2mask;/* D=30 stage-2 prime-pair mask per giant step   */
+    uint32_t s2vmin, s2nv;
 } cf_sched_t;
 
 /* Scratch for the per-round compaction. The caller owns it because the inline
@@ -792,16 +965,23 @@ static void cf_run_rounds(const mz<L> *d_n, mz<L> lim2, uint32_t lpb, uint32_t n
         k_scan_pass3<<<nb, TD_SCAN_BLK>>>(W->d_off, n, W->d_bsum);
         k_cof_selscatter<<<blocks, threads>>>(n, W->d_flag, W->d_off,
                                               W->d_sel, W->d_nsel);
-        if (S->method)
-            k_cofac<L, 1><<<blocks, threads>>>(d_n, lim2, lpb, (uint32_t)(r + 1),
-                                               S->curves, W->d_sel, W->d_nsel,
-                                               d_status, d_fac, d_nfac, d_iters,
-                                               S->d_s, S->ns);
-        else
-            k_cofac<L, 0><<<blocks, threads>>>(d_n, lim2, lpb, (uint32_t)(r + 1),
-                                               S->budget << r, W->d_sel, W->d_nsel,
-                                               d_status, d_fac, d_nfac, d_iters,
-                                               NULL, 0);
+        if (S->method) {
+            if (S->s2nv)
+                k_cofac<L, 1, 1><<<blocks, threads>>>(
+                    d_n, lim2, lpb, (uint32_t)(r + 1), S->curves,
+                    W->d_sel, W->d_nsel, d_status, d_fac, d_nfac, d_iters,
+                    S->d_s, S->ns, S->d_s2mask, S->s2vmin, S->s2nv);
+            else
+                k_cofac<L, 1, 0><<<blocks, threads>>>(
+                    d_n, lim2, lpb, (uint32_t)(r + 1), S->curves,
+                    W->d_sel, W->d_nsel, d_status, d_fac, d_nfac, d_iters,
+                    S->d_s, S->ns, NULL, 0, 0);
+        } else {
+            k_cofac<L, 0, 0><<<blocks, threads>>>(
+                d_n, lim2, lpb, (uint32_t)(r + 1), S->budget << r,
+                W->d_sel, W->d_nsel, d_status, d_fac, d_nfac, d_iters,
+                NULL, 0, NULL, 0, 0);
+        }
     }
 }
 
@@ -843,6 +1023,7 @@ typedef struct {
     uint32_t *d_flag, *d_off, *d_bsum, *d_idx, *d_nrel;
     uint32_t *d_sel, *d_nsel;             /* compacted job list per round  */
     uint32_t *d_s, ns, ecm_curves; int ecm;   /* ECM stage-1 prime powers  */
+    uint8_t  *d_s2mask; uint32_t s2vmin, s2nv;/* ECM stage-2 schedule      */
     /* pinned mirrors, sized for the relations only */
     int64_t  *h_a, *h_b;
     uint32_t *h_f0, *h_f1, *h_sp0, *h_sp1;
@@ -990,6 +1171,7 @@ static void cofq_free(cofq_t *Q, cofq_out_t *O)
     cudaFree(Q->d_flag); cudaFree(Q->d_off); cudaFree(Q->d_bsum);
     cudaFree(Q->d_idx); cudaFree(Q->d_nrel);
     cudaFree(Q->d_sel); cudaFree(Q->d_nsel); cudaFree(Q->d_s);
+    cudaFree(Q->d_s2mask);
     cudaFree(O->d_a); cudaFree(O->d_b); cudaFree(O->d_f0); cudaFree(O->d_f1);
     cudaFree(O->d_fn0); cudaFree(O->d_fn1); cudaFree(O->d_sp0); cudaFree(O->d_sp1);
     cudaFree(O->d_nsp0); cudaFree(O->d_nsp1);
@@ -1011,7 +1193,8 @@ static void cofq_free(cofq_t *Q, cofq_out_t *O)
  * no matter what the CLI asked for -- the two schedulers had diverged so that
  * only the standalone one could run ECM at all. */
 static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
-                     int ecm, uint32_t ecm_b1, uint32_t ecm_curves)
+                     int ecm, uint32_t ecm_b1, uint32_t ecm_b2,
+                     uint32_t ecm_curves)
 {
     const uint32_t nb = (cap + TD_SCAN_BLK - 1) / TD_SCAN_BLK;
     memset(Q, 0, sizeof(*Q)); memset(O, 0, sizeof(*O));
@@ -1019,13 +1202,28 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
     Q->ecm = ecm; Q->ecm_curves = ecm_curves;
     if (ecm) {
         uint32_t *h_s = NULL;
+        uint8_t *h_s2mask = NULL;
         Q->ns = cf_ecm_plan(ecm_b1, &h_s);
         if (!Q->ns) { fprintf(stderr, "  cofac queue: empty ECM plan for B1=%u\n", ecm_b1); return -1; }
         CK(cudaMalloc(&Q->d_s, (size_t)Q->ns * 4));
         CK(cudaMemcpy(Q->d_s, h_s, (size_t)Q->ns * 4, cudaMemcpyHostToDevice));
         free(h_s);
-        printf("  cofactor queue: ECM stage 1, B1 = %u, %u prime powers,"
-               " %u curves per round\n", ecm_b1, Q->ns, ecm_curves);
+        if (ecm_b2) {
+            Q->s2nv = cf_ecm_stage2_plan(ecm_b1, ecm_b2, &Q->s2vmin, &h_s2mask);
+            if (!Q->s2nv) {
+                fprintf(stderr, "  cofac queue: empty ECM stage-2 plan for"
+                        " B1=%u B2=%u\n", ecm_b1, ecm_b2);
+                free(h_s2mask);
+                cudaFree(Q->d_s); Q->d_s = NULL; Q->ns = 0;
+                return -1;
+            }
+            CK(cudaMalloc(&Q->d_s2mask, Q->s2nv));
+            CK(cudaMemcpy(Q->d_s2mask, h_s2mask, Q->s2nv, cudaMemcpyHostToDevice));
+            free(h_s2mask);
+        }
+        printf("  cofactor queue: ECM B1 = %u, %u prime powers, B2 = %u"
+               " (%u giant steps), %u curves per round\n", ecm_b1, Q->ns,
+               ecm_b2, Q->s2nv, ecm_curves);
     }
     /* Every enqueued record can become a relation, so the readback slots have
      * to allow for that. This was cap/4, sized from c183's ~2% relation rate --
@@ -1120,6 +1318,7 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     W.d_sel = Q->d_sel;   W.d_nsel = Q->d_nsel;
     S.method = Q->ecm; S.rounds = rounds; S.budget = budget;
     S.curves = Q->ecm_curves; S.d_s = Q->d_s; S.ns = Q->ns;
+    S.d_s2mask = Q->d_s2mask; S.s2vmin = Q->s2vmin; S.s2nv = Q->s2nv;
 
     cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventCreate(&e2);
     cudaEventRecord(e0);
@@ -1304,12 +1503,12 @@ static int cf_run_side(mz<L> *h_n, uint32_t nj, uint64_t lim, uint32_t lpb,
     CK(cudaMemcpy(h_nfac, d_nfac, nj, cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(h_fac, d_fac, (size_t)nj * CF_MAXFAC * 4, cudaMemcpyDeviceToHost));
 
-    /* Where do the rho iterations actually go? A CF_DEAD verdict is reached by
-     * a primality test, not by splitting, so it is cheap; a CF_INCOMPLETE one
-     * has burned the whole budget in every round. If the stuck class dominates
-     * the iteration total, the cofactor stage is not paying for the relations
-     * it finds -- it is paying to fail to reject. That is the number that
-     * decides whether ECM is worth building. */
+    /* Where does the bounded splitting work actually go? Rho reports loop
+     * iterations. ECM reports ladder bits plus every stage-2 giant step and
+     * selected pair, including a swallowed-factor replay; gcd work is excluded.
+     * The units are meaningful within a method, while device-event time compares
+     * methods. Keeping stage 1's original counter matters: observability must
+     * not itself increase that kernel's register footprint. */
     h_iters = (unsigned long long *)malloc((size_t)nj * 8);
     if (h_iters) {
         unsigned long long it[6] = {0,0,0,0,0,0}, tot = 0;
@@ -1321,9 +1520,12 @@ static int cf_run_side(mz<L> *h_n, uint32_t nj, uint64_t lim, uint32_t lpb,
         }
         if (verbose && tot) {
             static const char *nm[6] = {"split ok", "dead", "stuck", "overflow", "?", "?"};
-            printf("  %d-limb rho iterations, by outcome (total %.3g):\n", L, (double)tot);
+            printf("  %d-limb %s, by outcome (total %.3g):\n", L,
+                   S->method ? "ECM work units (ladder bits + stage-2 walk)"
+                             : "rho iterations",
+                   (double)tot);
             for (int s = 0; s < 4; s++)
-                if (cnt[s]) printf("    %-9s %8u jobs  %6.2f%% of iters  %9.0f mean\n",
+                if (cnt[s]) printf("    %-9s %8u jobs  %6.2f%% of work   %9.0f mean\n",
                                    nm[s], cnt[s], 100.0 * (double)it[s] / (double)tot,
                                    (double)it[s] / cnt[s]);
         }
@@ -1497,10 +1699,13 @@ static void cf_emit_side(FILE *o, const char *tdfac, const uint32_t *extra,
 extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
                          uint32_t lpb0, uint32_t lim1, uint32_t lpb1,
                          int rounds, uint32_t budget, int blocks, int threads,
-                         int ecm, uint32_t ecm_b1, uint32_t ecm_curves)
+                         int ecm, uint32_t ecm_b1, uint32_t ecm_b2,
+                         uint32_t ecm_curves)
 {
     FILE *f = fopen(path, "rb");
     uint32_t *h_s = NULL, *d_s = NULL, ns = 0;
+    uint8_t *h_s2mask = NULL, *d_s2mask = NULL;
+    uint32_t s2vmin = 0, s2nv = 0;
     cf_sched_t sched;
     char *buf = NULL;
     size_t sz = 0;
@@ -1589,11 +1794,28 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
         CK(cudaMalloc(&d_s, (size_t)ns * 4));
         CK(cudaMemcpy(d_s, h_s, (size_t)ns * 4, cudaMemcpyHostToDevice));
         free(h_s);
-        printf("  ECM stage 1: B1 = %u, %u prime powers, %u curves per round,"
-               " %d rounds\n", ecm_b1, ns, ecm_curves, rounds);
+        if (ecm_b2) {
+            s2nv = cf_ecm_stage2_plan(ecm_b1, ecm_b2, &s2vmin, &h_s2mask);
+            if (!s2nv) {
+                fprintf(stderr, "  cofac: empty ECM stage-2 plan for B1=%u"
+                        " B2=%u\n", ecm_b1, ecm_b2);
+                free(h_s2mask); cudaFree(d_s);
+                free(buf); free(rest); free(j0); free(j1); free(i0); free(i1);
+                free(small0); free(small1); free(side0ok); free(alg_job);
+                free(st0); free(nf0); free(fac0);
+                return -1;
+            }
+            CK(cudaMalloc(&d_s2mask, s2nv));
+            CK(cudaMemcpy(d_s2mask, h_s2mask, s2nv, cudaMemcpyHostToDevice));
+            free(h_s2mask);
+        }
+        printf("  ECM: B1 = %u, %u prime powers, B2 = %u (%u giant steps),"
+               " %u curves per round, %d rounds\n", ecm_b1, ns, ecm_b2,
+               s2nv, ecm_curves, rounds);
     }
     sched.method = ecm; sched.rounds = rounds; sched.budget = budget;
     sched.curves = ecm_curves; sched.d_s = d_s; sched.ns = ns;
+    sched.d_s2mask = d_s2mask; sched.s2vmin = s2vmin; sched.s2nv = s2nv;
     if (cf_run_side<3>(j0, n0, lim0, lpb0, st0, fac0, nf0,
                        blocks, threads, 1, &ms0, &sched, "rational")) return -1;
     for (uint32_t k = 0; k < n0; k++) {
@@ -1699,6 +1921,7 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
     free(buf); free(rest); free(j0); free(j1); free(i0); free(i1);
     free(small0); free(small1); free(side0ok); free(alg_job);
     free(st0); free(st1); free(nf0); free(nf1); free(fac0); free(fac1);
+    cudaFree(d_s); cudaFree(d_s2mask);
     return novf ? -1 : 0;
 }
 
