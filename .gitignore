@@ -4,6 +4,10 @@
 *.dump
 *.afb.0
 *.fb1
+# .roots1 is the CADO-format factor base bench reads via --cadofb. Ignored for
+# the same reason as *.fb1: oracle/c147.roots1 is 29 MB and regenerates exactly
+# from the 543-byte oracle/c147.job, which IS committed.
+*.roots1
 
 # Captured survivor / cofactor populations. Same rule: manifest-pinned, not
 # committed. gzip and tar do not delta-compress, so committing these would add
@@ -19,6 +23,7 @@ bench/fbgen
 bench/sqgentest
 bench/dumpcmp
 bench/mkcofbatch
+bench/.arch.stamp
 *.d
 
 # All per-job working state lives under work/: poly, factor base, relations,

@@ -23,8 +23,23 @@ make -C bench
 ./bench/fbgen --poly oracle/c183.poly --lim 134200000 \
     --maxbits 15 --threads 6 --out oracle/c183.fb1
 
+# Same deal for the C147, which is the workload behind the device timings in
+# bench/RESULTS.md. --maxbits must match the --logI you sieve at; 14 is what
+# the frozen file uses, and --lim defaults to alim from the .job file.
+./bench/fbgen --poly oracle/c147.job --maxbits 14 \
+    --threads 6 --out oracle/c147.roots1
+
 make -C bench check
 ```
+
+Both files are pinned in [`oracle/MANIFEST.sha256`](oracle/MANIFEST.sha256);
+`cd oracle && sha256sum -c MANIFEST.sha256` confirms a regeneration matched.
+
+The default build produces a portable binary covering compute capability 8.0
+through 12.0, which takes a few minutes because `ptxas` is slow on the newest
+target. `make -C bench GPU_ARCH=native` builds only for the card in this machine
+— much faster on an Ampere or Ada host, and the resulting binary will not run
+anywhere else.
 
 For a real job, generate its algebraic factor base and run the complete
 pipeline:

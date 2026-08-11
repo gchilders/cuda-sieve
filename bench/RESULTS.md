@@ -2466,10 +2466,25 @@ comparing anything (finding 49).
 **Cross-GPU profile** — the command all three cards in finding 50 ran:
 
 ```
-./bench --poly c147.job --cadofb c147.roots1 --logI 14 --J 8192 --reps 100
-./bench --pipeline --cofactor --poly c147.job --cadofb c147.roots1 \
+./bench --poly ../oracle/c147.job --cadofb ../oracle/c147.roots1 \
+        --logI 14 --J 8192 --reps 100
+./bench --pipeline --cofactor --poly ../oracle/c147.job \
+        --cadofb ../oracle/c147.roots1 \
         --logI 14 --qrange 15000000: --target-rels 100000 --relations OUT.dat
 ```
+
+**This finding's workload is the C147, not the C183** — as are findings 48 and
+54, the 144×256 vs 1152×32 geometry result, and the host-load experiment. Not
+every timing in this file: findings 43–44 above profile the C183 via `--cadofb
+../oracle/c183.fb1`. The two jobs are not interchangeable, so check which one a
+command names before reusing its numbers.
+
+`../oracle/c147.job` is tracked in git. `../oracle/c147.roots1` is 29 MB and
+git-ignored — regenerate it with the `fbgen` command in `../oracle/README.md`,
+which needs no CADO and reproduces the manifest-pinned file byte for byte.
+**Pass `--maxbits 14`** to match this `--logI 14`; `fbgen` on its own defaults to
+15 and produces a different factor base, and `bench` downgrades the mismatch to a
+`note:` you will scroll past.
 
 The standalone bench (no `--pipeline`) sieves one side at a fixed
 `q=120000011`; the pipeline sieves both sides across a real band. They agree

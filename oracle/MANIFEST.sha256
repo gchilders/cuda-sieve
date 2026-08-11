@@ -37,3 +37,13 @@ ccf7b57df4fdd5e2697b26d287f83b0dfe8a0dec88976231679f4b5d44f51c49  bound_sweep_fi
 
 # --- target cofactor population, 2026-08-03 (1,062,811 records over 548 special-q) ---
 a129d9d8d8ded25316c4d0019dd2cddf27e91cfd0fd351e7d279026376384afe  c183.q120000000-120010000.cofac_candidates.tar.gz
+
+# --- the timing workload, frozen 2026-08-11 ---
+# A different number from the C183 above. Findings 48, 50 and 54 in
+# bench/RESULTS.md, the 144x256 vs 1152x32 geometry result and the host-load
+# experiment were all measured on c147 (findings 43-44 are C183 -- check which
+# job a command names). Without these the numbers cannot be reproduced.
+# c147.roots1 is git-ignored and regenerates byte-identically from c147.job --
+# see oracle/README.md, and note --maxbits 14.
+73f84714da52bd31fd2c068371364f18c37b0a32deebfde165af56515ce0c52f  c147.job
+546a78a12d0310a8e3c221267067d347f338318d9ce01d95170f17a423a9745c  c147.roots1

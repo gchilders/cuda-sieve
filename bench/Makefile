@@ -9,17 +9,91 @@ CC        ?= gcc
 # PTX fallback is compute_80, NOT compute_89: the driver only JITs PTX to a
 # target >= the virtual arch, so a compute_89 fallback cannot load on any
 # Ampere card at all -- the previous default was unrunnable on a 3090.
-# The only sub-sm_80 intrinsic used is __shfl_*_sync (sm_70+).
 # sm_80 is native, not PTX: the A100 is a comparison target (RESULTS.md finding
 # 50), and JIT-ing the whole module from PTX on first load costs seconds on a
 # cold ~/.nv/ComputeCache -- far more than the ~170-220 ms of module load that
 # finding 48's --reps 100 floor is calibrated against, and it recurs every
 # process start if the cache is disabled or evicted.
-NVCC_ARCH ?= -gencode arch=compute_120,code=sm_120 \
-             -gencode arch=compute_89,code=sm_89 \
-             -gencode arch=compute_86,code=sm_86 \
-             -gencode arch=compute_80,code=sm_80 \
-             -gencode arch=compute_80,code=compute_80
+#
+# sm_80 is also the floor, and it is a tuning floor rather than an instruction
+# one. The only warp intrinsics used are __syncwarp and __shfl{,_up}_sync, which
+# long predate Ampere -- but k_fill_l2's __launch_bounds__(512, 3) targets 1536
+# threads/SM and its 3 x 33 KB of shared memory, plus the opt-in shared-memory
+# limit in bench_kernels.cu (grep 101376), are all Ampere-and-later numbers.
+# sm_75 compiles, with ptxas warning that .minnctapersm is out of range on every
+# fill kernel, and then oversubscribes Turing's 64 KB of shared memory at launch.
+# Below that nothing is possible anyway: CUDA 13 dropped Volta, so nvcc 13.2
+# rejects sm_70 outright.
+GPU_ARCH_all := -gencode arch=compute_120,code=sm_120 \
+                -gencode arch=compute_89,code=sm_89 \
+                -gencode arch=compute_86,code=sm_86 \
+                -gencode arch=compute_80,code=sm_80 \
+                -gencode arch=compute_80,code=compute_80
+
+# `make GPU_ARCH=native` builds only for the card in this machine,
+# `make GPU_ARCH=86` cross-builds for a named one (bare compute capability, no
+# "sm_" and no dot), and the default builds the portable fat binary.
+#
+# Named GPU_ARCH, not ARCH: ARCH is exported by kernel-build and cross-compile
+# shells and by some CI images, and make imports the environment, so an inherited
+# ARCH=x86_64 would silently retarget the build to compute_x86_64.
+#
+# Measured on bench_kernels.cu, which is the entire build -- bench_main.cu is
+# 2.5 s and the C files are noise:
+#
+#     all five targets, serial       309 s
+#     all five targets, -t 0         214 s   <- the default
+#     sm_120 alone                   215 s
+#     sm_80 alone                     14 s
+#
+# ptxas on sm_120 is ~16x slower than on sm_80 and swamps everything else, so on
+# a Blackwell host GPU_ARCH=native saves nothing once the passes run
+# concurrently: the one target that cannot be dropped is the expensive one. Keep
+# the fat binary here. GPU_ARCH=native is the real win on an Ampere or Ada host,
+# where it drops sm_120 and takes the build to well under a minute.
+GPU_ARCH ?= all
+
+ifeq ($(GPU_ARCH),all)
+NVCC_ARCH := $(GPU_ARCH_all)
+else
+ifeq ($(GPU_ARCH),native)
+# Detected explicitly rather than via nvcc's -arch=native, which does not fail
+# when it cannot see a GPU: it warns and silently builds for the toolkit default,
+# yielding a binary that will not load on the card you meant to target.
+#
+# The digit check is not paranoia. nvidia-smi prints its errors to STDOUT, not
+# stderr -- an old driver that does not know the compute_cap query field answers
+# `Field "compute_cap" is not a valid field to query.` on fd 1, which sails past
+# 2>/dev/null and past any test for emptiness, and would land inside the gencode
+# flag. Evaluated here rather than at file scope so that `make clean`, `make
+# fbgen` and the default fat build never spawn nvidia-smi at all; probing the
+# driver is not free while a job is running (finding 53).
+GPU_CC := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
+                  | head -1 | tr -d .)
+GPU_CC_VALID := $(shell echo '$(GPU_CC)' | grep -qxE '[0-9]+' && echo yes)
+ifneq ($(GPU_CC_VALID),yes)
+$(error GPU_ARCH=native: no usable compute capability from nvidia-smi (got "$(GPU_CC)"). Pass GPU_ARCH=<cc>, e.g. GPU_ARCH=86, or GPU_ARCH=all)
+endif
+NVCC_ARCH := -gencode arch=compute_$(GPU_CC),code=sm_$(GPU_CC)
+else
+GPU_ARCH_VALID := $(shell echo '$(GPU_ARCH)' | grep -qxE '[0-9]+' && echo yes)
+ifneq ($(GPU_ARCH_VALID),yes)
+$(error GPU_ARCH must be all, native, or a bare compute capability like 86 or 120 -- got "$(GPU_ARCH)". Not sm_86, not 8.6)
+endif
+NVCC_ARCH := -gencode arch=compute_$(GPU_ARCH),code=sm_$(GPU_ARCH)
+endif
+endif
+
+# Objects carry no record of which -gencode built them, so switching GPU_ARCH
+# leaves them "up to date" and the next link silently mixes or mistargets: build
+# once with GPU_ARCH=native on the Ada box, then plain `make` for the portable
+# binary, and you get sm_89-only objects in a binary that dies on the A100 with
+# "no kernel image is available for execution on the device" -- on the machine
+# you cannot debug on, while working fine on the build host. Stamp the arch and
+# depend on it. The $(shell) rewrites the file only when the value changed, so
+# its mtime moves only then and repeat builds stay incremental.
+ARCH_STAMP := .arch.stamp
+$(shell [ "$$(cat $(ARCH_STAMP) 2>/dev/null)" = '$(NVCC_ARCH)' ] || printf '%s' '$(NVCC_ARCH)' > $(ARCH_STAMP))
 
 # Extra -D's for pricing experiments, e.g. make DEFS=-DNORM_CANCEL_TOL=0.0f.
 # Nothing in the default build sets this; it exists so a variant can be timed
@@ -30,7 +104,10 @@ DEFS      ?=
 # listed only bench.h and plattice.cuh, so editing bigint.cuh, prp.cuh or
 # td.cuh left a stale bench_kernels.o and the binary silently did not contain
 # the change under test.
-NVCC_FLAGS = $(NVCC_ARCH) -O3 -std=c++17 -lineinfo -MMD -MP -Xcompiler "-O3 -Wall" $(DEFS)
+# -t 0: run the per-target ptxas passes concurrently, one thread per CPU. The
+# gencode list above is otherwise walked serially, which is where the bulk of a
+# fat build goes; see the timing table. Harmless when GPU_ARCH picks one target.
+NVCC_FLAGS = $(NVCC_ARCH) -t 0 -O3 -std=c++17 -lineinfo -MMD -MP -Xcompiler "-O3 -Wall" $(DEFS)
 CFLAGS     = -O3 -march=native -Wall -Wextra -std=c11 -MMD -MP $(DEFS)
 
 CU_SRCS = bench_main.cu bench_kernels.cu
@@ -42,8 +119,11 @@ OBJS    = $(CU_OBJS) $(C_OBJS) fbgen_lib.o
 
 all: bench fbtest fbgen sqgentest dumpcmp mkcofbatch
 
-bench: $(OBJS)
-	$(NVCC) $(NVCC_ARCH) -Xlinker --gc-sections -o $@ $^ -lcudart -lm
+bench: $(OBJS) $(ARCH_STAMP)
+	$(NVCC) $(NVCC_ARCH) -Xlinker --gc-sections -o $@ $(OBJS) -lcudart -lm
+
+# Only the CUDA objects care about the arch; the C objects are host-only.
+$(CU_OBJS): $(ARCH_STAMP)
 
 # CPU-only correctness gates. No CUDA, so these run on a busy box and on
 # machines without the card.
@@ -82,7 +162,7 @@ mkcofbatch: mkcofbatch.c
 -include $(OBJS:.o=.d)
 
 clean:
-	rm -f bench fbtest fbgen sqgentest dumpcmp mkcofbatch *.o *.d
+	rm -f bench fbtest fbgen sqgentest dumpcmp mkcofbatch *.o *.d $(ARCH_STAMP)
 
 .PHONY: all clean check cofcheck fbgencheck sqgencheck
 
