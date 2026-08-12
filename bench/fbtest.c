@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+
 /* CPU-only correctness gates for the factor-base and transform layer.
  *
  * Deliberately a separate binary from `bench`: everything here runs without a
@@ -8,14 +10,17 @@
  * that compared us against ourselves.
  *
  * Gates, in increasing order of what they can catch:
- *   1. transform vs definition, set equality, synthetic moduli 2..QMAX and
+ *   0. slice-table capacity: all 65,536 record IDs work and the next one is
+ *      rejected before allocation or output writes.
+ *   1. production validation: malformed mixed composites never leave either
+ *      file loader, and structural/root/power-flag errors fail closed.
+ *   2. transform vs definition, set equality, synthetic moduli 2..QMAX and
  *      every root in [0,2q). Primes, prime powers, even moduli, affine and
  *      projective, zero and nonzero reciprocal.
- *   2. the same, driven by the real factor bases, so a loader that mangles the
- *      encoding fails even though the algebra is right.
- *   3. sum(logp/q) over the factor base -- the oracle-free density check. It
- *      cannot see placement (that is what gate 1 is for), but it is the one
- *      number that exercises parse, powers, log deltas and scale at once.
+ *   3. the same, driven by the real factor bases, plus sum(logp/q), the
+ *      oracle-free density check. Placement errors fail the transform check;
+ *      parse, power, log-delta and scale errors fail the density check.
+ *   4. exact-norm width admission around the 256-bit boundary.
  *
  * usage: fbtest [--poly P] [--fb1 F] [--rlim N] [--maxbits N]
  *               [--q N] [--rho N] [--scale S] [--qmax N]
@@ -25,7 +30,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <float.h>
 #include <stdarg.h>
+#include <errno.h>
+#include <unistd.h>
 
 static int fail = 0;
 
@@ -59,6 +67,499 @@ static uint32_t count_proj(const fb_t *fb, uint32_t *nonzero)
             if (fb->roots[i] > fb->primes[i]) (*nonzero)++;
         }
     return n;
+}
+
+/* The bucket record reserves 16 bits for a slice ID. Exercise both sides of
+ * that exact boundary: all 65,536 IDs are usable, while a 65,537th slice must
+ * be rejected before either output allocation is exposed to the caller. */
+static int verify_slice_bounds(void)
+{
+    const uint32_t max_slices = (uint32_t)UINT16_MAX + 1u;
+    fb_t fb;
+    uint8_t *logp = NULL;
+    uint16_t *slice = NULL, *tab = NULL;
+    uint32_t p2 = 0, i;
+    int32_t ns;
+    int good = 0;
+
+    memset(&fb, 0, sizeof(fb));
+    logp = (uint8_t *)malloc((size_t)max_slices + 1u);
+    if (!logp) goto done;
+    for (i = 0; i <= max_slices; i++) logp[i] = (uint8_t)(i & 1u);
+
+    fb.n = max_slices;
+    fb.logp = logp;
+    ns = fb_build_slices(&fb, &slice, &tab, &p2);
+    if (ns != (int32_t)max_slices || p2 != max_slices ||
+        !slice || !tab || slice[max_slices - 1] != UINT16_MAX)
+        goto done;
+
+    free(slice); free(tab);
+    slice = NULL; tab = NULL;
+
+    fb.n = max_slices + 1u;
+    p2 = 123u;
+    errno = 0;
+    ns = fb_build_slices(&fb, &slice, &tab, &p2);
+    good = ns == -1 && errno == EOVERFLOW &&
+           slice == NULL && tab == NULL && p2 == 0;
+
+done:
+    free(slice); free(tab); free(logp);
+    return good;
+}
+
+
+/* CLI numeric values are security-sensitive inputs, not best-effort hints.
+ * Verify that the shared parser consumes one complete finite token and never
+ * overwrites the caller's value on failure. */
+static int verify_finite_double_parser(void)
+{
+    static const char *bad[] = {
+        "", " ", "1.25junk", "nan", "-nan", "inf", "-inf",
+        "1e9999", "1e-9999"
+    };
+    double v = 0.0;
+    size_t i;
+
+    if (bench_parse_finite_double("1.275", &v) != 0 ||
+        fabs(v - 1.275) > 1e-15)
+        return 0;
+    if (bench_parse_finite_double("-2.5", &v) != 0 || v != -2.5)
+        return 0;                       /* sign policy belongs to each option */
+    for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        v = 123.0;
+        errno = 0;
+        if (bench_parse_finite_double(bad[i], &v) == 0 || v != 123.0)
+            return 0;
+    }
+    return 1;
+}
+
+/* The kernel subtracts BOUND from CINIT in unsigned arithmetic. Test both the
+ * intended truncating semantics and every class of value that used to reach
+ * an unchecked floating-to-integer conversion or wrap that subtraction. */
+static int verify_survivor_bound(void)
+{
+    uint32_t b = 0;
+
+    if (sieve_bound_checked(1.275, 112.0, 4096u, &b, NULL) != 0 || b != 143u)
+        return 0;
+    if (sieve_bound_checked(1.0, 0.0, 4096u, &b, NULL) != 0 || b != 1u)
+        return 0;
+    /* The source expression used a truncating cast: 4096.999... is valid and
+     * becomes 4096, but 4097.0 is not. */
+    if (sieve_bound_checked(1.0, 4095.999, 4096u, &b, NULL) != 0 || b != 4096u)
+        return 0;
+    if (sieve_bound_checked(1.0, 254.999, 255u, &b, NULL) != 0 || b != 255u)
+        return 0;
+
+#define MUST_REJECT_BOUND(sc, al, ci)                                      \
+    do {                                                                    \
+        b = UINT32_C(0xdeadbeef);                                           \
+        if (sieve_bound_checked((sc), (al), (ci), &b, NULL) == 0 || b != 0) \
+            return 0;                                                       \
+    } while (0)
+    MUST_REJECT_BOUND(1.0, 4096.0, 4096u);
+    MUST_REJECT_BOUND(0.0, 1.0, 4096u);
+    MUST_REJECT_BOUND(-1.0, 1.0, 4096u);
+    MUST_REJECT_BOUND(DBL_MIN, 1.0, 4096u);  /* underflows norm_t.scale */
+    MUST_REJECT_BOUND(DBL_MAX, 1.0, 4096u);
+    MUST_REJECT_BOUND(1.0, -1.0, 4096u);
+    MUST_REJECT_BOUND(NAN, 1.0, 4096u);
+    MUST_REJECT_BOUND(1.0, NAN, 4096u);
+    MUST_REJECT_BOUND(INFINITY, 1.0, 4096u);
+    MUST_REJECT_BOUND(1.0, INFINITY, 4096u);
+    MUST_REJECT_BOUND(1.0, DBL_MAX, 4096u);
+    MUST_REJECT_BOUND(1.0, 1.0, 0u);
+#undef MUST_REJECT_BOUND
+    return 1;
+}
+
+/* Factor-base logs are byte records. A failed conversion must not publish a
+ * partially initialized array, and the common valid values must retain their
+ * byte-for-byte rounding. */
+static int verify_factor_base_log_bounds(void)
+{
+    uint32_t badq[] = { 2u, UINT32_MAX };
+    uint32_t goodq[] = { 2u, 3u, 251u };
+    fb_t fb;
+    uint8_t lg = 77u;
+
+    if (fb_log_delta_checked(2u, 1, 0, 1.0, &lg) != 0 || lg != 1u)
+        return 0;
+    lg = 77u;
+    if (fb_log_delta_checked(UINT32_MAX, 1, 0, 8.0, &lg) == 0 || lg != 77u)
+        return 0;
+    lg = 77u;
+    if (fb_log_delta_checked(3u, 1, 0, NAN, &lg) == 0 || lg != 77u)
+        return 0;
+
+    memset(&fb, 0, sizeof(fb));
+    fb.n = 2u; fb.primes = badq;
+    if (fb_fill_logp(&fb, 8.0) == 0 || fb.logp != NULL)
+        return 0;
+
+    memset(&fb, 0, sizeof(fb));
+    fb.n = 3u; fb.primes = goodq;
+    if (fb_fill_logp(&fb, 1.0) != 0 || !fb.logp)
+        return 0;
+    if (fb.logp[0] != 1u || fb.logp[1] != 2u || fb.logp[2] != 8u) {
+        free(fb.logp);
+        return 0;
+    }
+    free(fb.logp);
+    return 1;
+}
+
+static int parse_positive_test_double(const char *option, const char *text,
+                                      double *out)
+{
+    double v;
+    if (bench_parse_finite_double(text, &v) != 0 || v <= 0.0) {
+        fprintf(stderr, "%s wants one finite positive number, got '%s'\n",
+                option, text ? text : "");
+        return -1;
+    }
+    *out = v;
+    return 0;
+}
+
+/* Exercise the validator independently of either parser. The most important
+ * negative is an even mixed composite: before this gate, q = 6 reached
+ * pl_invmod_any(), whose even branch computes a 2-adic inverse and is only
+ * valid when q is 2^k. */
+static int verify_validation_core(void)
+{
+    uint32_t q[] = { 2, 4, 8, 9, 17 };
+    uint32_t r[] = { 0, 5, 15, 17, 33 };
+    uint8_t ispow[] = { 0, 1, 1, 1, 0 };
+    uint32_t qp[] = { 2, 3, 5, 7 };
+    uint32_t rp[] = { 0, 1, 9, 7 };
+    uint8_t ppow[] = { 0, 0, 0, 0 };
+    fb_t fb, small;
+
+    memset(&fb, 0, sizeof(fb));
+    fb.n = (uint32_t)(sizeof(q) / sizeof(q[0]));
+    fb.primes = q; fb.roots = r; fb.ispow = ispow;
+    memset(&small, 0, sizeof(small));
+    if (fb_split_small(&fb, 10, &small) == 0 ||
+        fb_is_transform_validated(&small)) {
+        fb_free(&small);
+        return 0;
+    }
+    if (fb_restrict(&fb, 10, UINT32_MAX) == 0)
+        return 0;
+    if (fb_validate(&fb, FB_VALIDATE_EXTERNAL_PRIME_POWERS, NULL) != 0 ||
+        !fb_is_transform_validated(&fb))
+        return 0;
+    if (fb_split_small(&fb, 10, &small) != 0 ||
+        !fb_is_transform_validated(&small)) {
+        fb_free(&small);
+        return 0;
+    }
+    fb_free(&small);
+
+    q[2] = 6;
+    if (fb_validate(&fb, FB_VALIDATE_EXTERNAL_PRIME_POWERS, NULL) == 0 ||
+        fb_is_transform_validated(&fb))
+        return 0;
+    q[2] = 8;
+
+    ispow[2] = 0;
+    if (fb_validate(&fb, FB_VALIDATE_EXTERNAL_PRIME_POWERS, NULL) == 0)
+        return 0;
+    ispow[2] = 1;
+
+    r[3] = 18;                         /* exactly 2*q: outside the encoding */
+    if (fb_validate(&fb, FB_VALIDATE_EXTERNAL_PRIME_POWERS, NULL) == 0)
+        return 0;
+    r[3] = 17;
+
+    q[3] = 7;                          /* no longer non-decreasing */
+    if (fb_validate(&fb, FB_VALIDATE_EXTERNAL_PRIME_POWERS, NULL) == 0)
+        return 0;
+    q[3] = 9;
+
+    memset(&fb, 0, sizeof(fb));
+    fb.n = (uint32_t)(sizeof(qp) / sizeof(qp[0]));
+    fb.primes = qp; fb.roots = rp; fb.ispow = ppow;
+    if (fb_validate(&fb, FB_VALIDATE_EXTERNAL_PRIMES, NULL) != 0 ||
+        !fb_is_transform_validated(&fb))
+        return 0;
+    qp[2] = 4;                          /* valid power, invalid .afb.0 prime */
+    rp[2] = 7;
+    if (fb_validate(&fb, FB_VALIDATE_EXTERNAL_PRIMES, NULL) == 0 ||
+        fb_is_transform_validated(&fb))
+        return 0;
+
+    return 1;
+}
+
+/* Force the validator's dense-factor-base fast path. This is separate from
+ * the tiny malformed cases above, which intentionally use Miller-Rabin. */
+static int verify_validation_sieve_path(void)
+{
+    const uint32_t want = 1u << 16;
+    size_t nprime = 0;
+    fb_t fb;
+    int good = 0;
+
+    memset(&fb, 0, sizeof(fb));
+    fb.primes = prime_list_build(900000u, &nprime);
+    if (!fb.primes || nprime < want) goto done;
+    fb.roots = (uint32_t *)calloc(want, sizeof(*fb.roots));
+    fb.ispow = (uint8_t *)calloc(want, sizeof(*fb.ispow));
+    if (!fb.roots || !fb.ispow) goto done;
+    fb.n = want;
+
+    if (fb_validate(&fb, FB_VALIDATE_EXTERNAL_PRIMES, NULL) != 0 ||
+        !fb_is_transform_validated(&fb))
+        goto done;
+
+    /* Consecutive odd primes have an even composite between them. Keep the
+     * stream ordered while replacing one prime with that composite. */
+    fb.primes[1000] = fb.primes[999] + 1u;
+    if (fb_validate(&fb, FB_VALIDATE_EXTERNAL_PRIMES, NULL) == 0 ||
+        fb_is_transform_validated(&fb))
+        goto done;
+
+    good = 1;
+done:
+    fb_free(&fb);
+    return good;
+}
+
+/* Verify the production integration, not only the helper: both file loaders
+ * must reject malformed moduli before returning a factor base to their caller,
+ * and failure must leave no validated or allocated object behind. */
+static int verify_loader_validation(void)
+{
+    char afb_path[] = "/tmp/cuda-sieve-afb-XXXXXX";
+    char cado_path[] = "/tmp/cuda-sieve-cado-XXXXXX";
+    const uint32_t n = 3;
+    const uint32_t q[3] = { 2, 4, 7 };  /* .afb.0 is base-prime only */
+    const uint32_t r[3] = { 0, 1, 2 };
+    const char cado_bad[] = "6: 1\n";   /* neither prime nor prime power */
+    FILE *f = NULL;
+    fb_t fb;
+    int fd = -1, good = 1;
+
+    fd = mkstemp(afb_path);
+    if (fd < 0) return 0;
+    f = fdopen(fd, "wb");
+    if (!f) { close(fd); unlink(afb_path); return 0; }
+    {
+        int io_bad = 0;
+        if (fwrite(&n, sizeof(n), 1, f) != 1 ||
+            fwrite(q, sizeof(q[0]), n, f) != n ||
+            fwrite(r, sizeof(r[0]), n, f) != n)
+            io_bad = 1;
+        if (fclose(f) != 0) io_bad = 1;
+        f = NULL;
+        if (io_bad) {
+            unlink(afb_path);
+            return 0;
+        }
+    }
+    memset(&fb, 0, sizeof(fb));
+    if (fb_load(afb_path, &fb) == 0) {
+        good = 0;
+        fb_free(&fb);
+    } else if (fb.primes || fb.roots || fb.logp || fb.ispow || fb.n ||
+               fb_is_transform_validated(&fb)) {
+        good = 0;
+        fb_free(&fb);
+    }
+    unlink(afb_path);
+
+    fd = mkstemp(cado_path);
+    if (fd < 0) return 0;
+    f = fdopen(fd, "w");
+    if (!f) { close(fd); unlink(cado_path); return 0; }
+    {
+        int io_bad = 0;
+        if (fwrite(cado_bad, 1, sizeof(cado_bad) - 1, f) !=
+            sizeof(cado_bad) - 1)
+            io_bad = 1;
+        if (fclose(f) != 0) io_bad = 1;
+        f = NULL;
+        if (io_bad) {
+            unlink(cado_path);
+            return 0;
+        }
+    }
+    memset(&fb, 0, sizeof(fb));
+    if (fb_load_cado(cado_path, 1.0, &fb) == 0) {
+        good = 0;
+        fb_free(&fb);
+    } else if (fb.primes || fb.roots || fb.logp || fb.ispow || fb.n ||
+               fb_is_transform_validated(&fb)) {
+        good = 0;
+        fb_free(&fb);
+    }
+    unlink(cado_path);
+    return good;
+}
+
+static int write_text_file(char *path, const char *text)
+{
+    int fd = mkstemp(path);
+    FILE *f;
+    int bad = 0;
+    if (fd < 0) return -1;
+    f = fdopen(fd, "w");
+    if (!f) {
+        close(fd);
+        unlink(path);
+        return -1;
+    }
+    if (fwrite(text, 1, strlen(text), f) != strlen(text)) bad = 1;
+    if (fclose(f)) bad = 1;
+    if (bad) {
+        unlink(path);
+        return -1;
+    }
+    return 0;
+}
+
+static int cado_parse_case(const char *text, int want_ok)
+{
+    char path[] = "/tmp/cuda-sieve-cado-strict-XXXXXX";
+    fb_t fb;
+    int got_ok, clean;
+
+    memset(&fb, 0, sizeof(fb));
+    if (write_text_file(path, text)) return 0;
+    got_ok = fb_load_cado(path, 1.0, &fb) == 0;
+    clean = got_ok || (!fb.n && !fb.primes && !fb.roots && !fb.logp &&
+                       !fb.ispow && !fb_is_transform_validated(&fb));
+    fb_free(&fb);
+    unlink(path);
+    return got_ok == want_ok && clean;
+}
+
+/* The text factor-base parser is a trust boundary. Check strict numeric
+ * conversion, complete-line consumption, exponent metadata, roots, ordering,
+ * and fail-closed cleanup independently of the central validator. */
+static int verify_cado_parser_strict(void)
+{
+    static const char *bad[] = {
+        "4294967296: 1\n",       /* narrowing overflow */
+        "6: 1\n",                /* mixed composite */
+        "4: 1\n",                /* powers need long-form metadata */
+        "4:1,0: 1\n",            /* nexp smaller than v_p(q) */
+        "4:2,2: 1\n",            /* no positive exponent increment */
+        "5:\n",                  /* no roots */
+        "5: 10\n",               /* root == 2*q */
+        "5: 1,\n",               /* missing root after comma */
+        "5: 1 junk\n",           /* trailing junk */
+        "5: 1\n3: 1\n",         /* base stream not sorted */
+        "# maxbits = 99\n5: 1\n",/* malformed recognized header */
+        "# maxbits = 2\n9:2,1: 1\n", /* power exceeds declared bound */
+        "# maxbits = 4\n# maxbits = 5\n5: 1\n",/* conflicting metadata */
+        "5: 1\rjunk\n"          /* junk after a bare carriage return */
+    };
+    const char good[] =
+        "# DEGREE: 2\n"
+        "# maxbits = 2\r\n"
+        "2: 0\n"
+        "3: 1,4\n"
+        "5: 1\n"             /* base primes are limited by lim, not maxbits */
+        "4:2,1: 1,5\n";
+    const char good32[] =
+        "# maxbits = 32\n"
+        "4293001441:2,1: 1\n"; /* 65521^2: full uint32 bit width is legal */
+    size_t i;
+
+    if (!cado_parse_case(good, 1) || !cado_parse_case(good32, 1)) return 0;
+    for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+        if (!cado_parse_case(bad[i], 0)) return 0;
+    return 1;
+}
+
+static int poly_parse_case(const char *text, int want_ok, poly_t *out)
+{
+    char path[] = "/tmp/cuda-sieve-poly-strict-XXXXXX";
+    poly_t P;
+    int got_ok, clean;
+
+    memset(&P, 0x5a, sizeof(P));
+    if (write_text_file(path, text)) return 0;
+    got_ok = poly_load(path, &P) == 0;
+    clean = got_ok || (P.deg == -1 && P.skew == 0.0 && P.y0s[0] == '\0' &&
+                       P.y1s[0] == '\0');
+    unlink(path);
+    if (got_ok && out) *out = P;
+    return got_ok == want_ok && clean;
+}
+
+static int verify_poly_parser_strict(void)
+{
+    static const char good[] =
+        "n: 12345678901234567890\n"
+        "skew: 1.5\n"
+        "c0: -1\n"
+        "c1: 2\n"
+        "Y0: 0\n"
+        "Y1: 1\n"
+        "rlim: 100\n"
+        "rlambda: 2.5 # comment\n";
+    static const char *bad[] = {
+        "c0:-1\nc1:2\nY0:0\nY1:1\n",                    /* no skew */
+        "skew:nan\nc0:-1\nc1:2\nY0:0\nY1:1\n",          /* nonfinite */
+        "skew:1\nc0:-1\nc1:2\nY0:0\n",                  /* no Y1 */
+        "skew:1\nc0:-1\nc1:2\nY0:0\nY1:0\n",            /* zero rational form */
+        "skew:1\nc0:-1\nc1:2junk\nY0:0\nY1:1\n",        /* truncated token */
+        "skew:1\nc0:-1\ncx:2\nc1:2\nY0:0\nY1:1\n",       /* malformed coefficient key */
+        "skew:1\nc0:-1\nc9:2\nY0:0\nY1:1\n",            /* unsupported degree */
+        "skew:1\nc0:-1\nc1:2\nc1:3\nY0:0\nY1:1\n",      /* duplicate */
+        "skew:1\nc0:-1\nc1:2\nY0:0\nY1:1\nrlim:4294967296\n",
+        "skew:1x\nc0:-1\nc1:2\nY0:0\nY1:1\n",
+        "skew:1\rjunk\nc0:-1\nc1:2\nY0:0\nY1:1\n"
+    };
+    char long_coeff[512];
+    poly_t P;
+    size_t i, off;
+
+    if (!poly_parse_case(good, 1, &P) || P.deg != 1 || P.skew != 1.5 ||
+        P.rlim != 100u || P.rlambda != 2.5 || strcmp(P.cs[1], "2"))
+        return 0;
+    for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+        if (!poly_parse_case(bad[i], 0, NULL)) return 0;
+
+    off = (size_t)snprintf(long_coeff, sizeof(long_coeff),
+                           "skew:1\nc0:-1\nc1:");
+    memset(long_coeff + off, '7', 100);
+    off += 100;
+    snprintf(long_coeff + off, sizeof(long_coeff) - off, "\nY0:0\nY1:1\n");
+    if (!poly_parse_case(long_coeff, 0, NULL)) return 0;
+    return 1;
+}
+
+static int verify_qrange_parser(void)
+{
+    static const char *bad[] = {
+        "", ":", "100", "100:abc", "100:200junk", "-1:2", "1:-2",
+        "18446744073709551616:2", "200:100", "100::200",
+        " 2:4", "2: 4", "100:0"
+    };
+    uint64_t lo = 0, hi = 0;
+    size_t i;
+
+    if (bench_parse_qrange("100:200", &lo, &hi) || lo != 100 || hi != 200)
+        return 0;
+    if (bench_parse_qrange("100:", &lo, &hi) || lo != 100 || hi != 0)
+        return 0;
+    for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        lo = UINT64_C(0x1111111111111111);
+        hi = UINT64_C(0x2222222222222222);
+        if (bench_parse_qrange(bad[i], &lo, &hi) == 0 ||
+            lo != UINT64_C(0x1111111111111111) ||
+            hi != UINT64_C(0x2222222222222222))
+            return 0;
+    }
+    return 1;
 }
 
 /* Trace one position: every factor-base ideal that hits (i,j), and the log
@@ -124,9 +625,15 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--maxbits") && i + 1 < argc) maxbits = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--q") && i + 1 < argc) q = strtoull(argv[++i], 0, 10);
         else if (!strcmp(argv[i], "--rho") && i + 1 < argc) rho = strtoull(argv[++i], 0, 10);
-        else if (!strcmp(argv[i], "--scale") && i + 1 < argc) scale = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--scale1") && i + 1 < argc) scale1 = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--scale0") && i + 1 < argc) scale0 = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--scale") && i + 1 < argc) {
+            if (parse_positive_test_double("--scale", argv[++i], &scale)) return 2;
+        }
+        else if (!strcmp(argv[i], "--scale1") && i + 1 < argc) {
+            if (parse_positive_test_double("--scale1", argv[++i], &scale1)) return 2;
+        }
+        else if (!strcmp(argv[i], "--scale0") && i + 1 < argc) {
+            if (parse_positive_test_double("--scale0", argv[++i], &scale0)) return 2;
+        }
         else if (!strcmp(argv[i], "--qmax") && i + 1 < argc) qmax = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--bkthresh") && i + 1 < argc) bkthresh = (uint32_t)strtoul(argv[++i], 0, 10);
         else if (!strcmp(argv[i], "--trace") && i + 1 < argc) {
@@ -150,7 +657,34 @@ int main(int argc, char **argv)
            " %s\n\n", (long long)L.a1, (long long)L.b1,
            L.b1 == 0 ? "i == 0 (mod p) on EVERY row" : "a full lattice");
 
-    printf("[1] transform vs definition, set equality, q <= %d, all roots"
+    printf("[0] bucket slice-table bounds\n");
+    ok("16-bit slice ID boundary", verify_slice_bounds(),
+       "65,536 slices accepted; 65,537 rejected fail-closed");
+    ok("64-bit grid-stride product",
+       bench_grid_product_u64(1u << 24, 256u) == (UINT64_C(1) << 32),
+       "16,777,216 x 256 remains 2^32 rather than wrapping to zero");
+    ok("strict finite decimal parser", verify_finite_double_parser(),
+       "junk, range errors, NaN and infinities rejected without assignment");
+    ok("checked survivor threshold", verify_survivor_bound(),
+       "truncation preserved; invalid values and BOUND > CINIT rejected");
+    ok("8-bit factor-base logs", verify_factor_base_log_bounds(),
+       "out-of-range logs fail without publishing a partial array");
+    ok("strict --qrange parser", verify_qrange_parser(),
+       "open/closed ranges accepted; junk, overflow and reversed bounds rejected");
+
+    printf("\n[1] production factor-base validation\n");
+    ok("validator fail-closed cases", verify_validation_core(),
+       "mixed composites, flags, roots, ordering, .afb.0 powers");
+    ok("validator dense fast path", verify_validation_sieve_path(),
+       "65,536 distinct moduli checked by sieve; injected composite rejected");
+    ok("file loaders invoke validator", verify_loader_validation(),
+       ".afb.0 and text inputs reject malformed moduli and clean up");
+    ok("strict CADO text parser", verify_cado_parser_strict(),
+       "numeric bounds, metadata, roots, ordering and trailing input checked");
+    ok("strict polynomial parser", verify_poly_parser_strict(),
+       "required fields, exact integers, finite values and duplicates checked");
+
+    printf("\n[2] transform vs definition, set equality, q <= %d, all roots"
            " in [0,2q)\n", qmax);
     ok("synthetic moduli", verify_transform(&L, qmax) == 0,
        "primes, prime powers, even moduli, affine + projective");
@@ -182,14 +716,16 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    printf("\n[2] transform vs definition, driven by the real factor bases\n");
+    printf("\n[3] transform vs definition, driven by the real factor bases\n");
 
     if (cadofb) {
         uint32_t np, nzp;
         if (fb_load_cado(cadofb, scale, &fb) != 0) return 1;
         np = count_proj(&fb, &nzp);
         if (fb_split_small(&fb, bkthresh, &fbs) != 0) return 1;
-        fb_fill_logp(&fbs, scale);
+        if (fb_fill_logp(&fbs, scale) != 0) {
+            fb_free(&fbs); fb_free(&fb); return 1;
+        }
         n = verify_fb_transform(&fbs, &L, bkthresh);
         ok("side 1 small part", n > 0, "%d entries checked", n);
         ok("side 1 moduli are prime powers", fb_check_prime_powers(&fb) < 0,
@@ -224,7 +760,9 @@ int main(int argc, char **argv)
         if (rfb_build(&R, rlim, maxbits, scale, &fb) != 0) return 1;
         np = count_proj(&fb, &nzp);
         if (fb_split_small(&fb, bkthresh, &fbs) != 0) return 1;
-        fb_fill_logp(&fbs, scale);
+        if (fb_fill_logp(&fbs, scale) != 0) {
+            fb_free(&fbs); fb_free(&fb); return 1;
+        }
         n = verify_fb_transform(&fbs, &L, bkthresh);
         ok("side 0 small part", n > 0, "%d entries checked", n);
         ok("side 0 moduli are prime powers", fb_check_prime_powers(&fb) < 0,
@@ -247,7 +785,7 @@ int main(int argc, char **argv)
         fb_free(&fbs); fb_free(&fb);
     }
 
-    printf("\n[3] exact-norm width admission\n");
+    printf("\n[4] exact-norm width admission\n");
     {
         norm_t W;
         memset(&W, 0, sizeof(W));

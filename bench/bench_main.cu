@@ -4,6 +4,90 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <errno.h>
+
+static int parse_u64_arg(const char *flag, const char *arg, uint64_t *out)
+{
+    char *end = NULL;
+    unsigned long long v;
+
+    if (!arg || !*arg || *arg == '-') {
+        fprintf(stderr, "%s: not an unsigned integer: %s\n",
+                flag, arg ? arg : "(null)");
+        return -1;
+    }
+    errno = 0;
+    v = strtoull(arg, &end, 10);
+    if (errno == ERANGE || end == arg || *end) {
+        fprintf(stderr, "%s: not an unsigned 64-bit integer: %s\n", flag, arg);
+        return -1;
+    }
+    *out = (uint64_t)v;
+    return 0;
+}
+
+static int parse_int_range_arg(const char *flag, const char *arg,
+                               int lo, int hi, int *out)
+{
+    char *end = NULL;
+    long v;
+
+    if (!arg || !*arg) {
+        fprintf(stderr, "%s: not an integer: %s\n",
+                flag, arg ? arg : "(null)");
+        return -1;
+    }
+    errno = 0;
+    v = strtol(arg, &end, 10);
+    if (errno == ERANGE || end == arg || *end) {
+        fprintf(stderr, "%s: not an integer: %s\n", flag, arg);
+        return -1;
+    }
+    if (v < lo || v > hi) {
+        fprintf(stderr, "%s: must be in [%d,%d], got %ld\n",
+                flag, lo, hi, v);
+        return -1;
+    }
+    *out = (int)v;
+    return 0;
+}
+
+static int parse_finite_double_arg(const char *flag, const char *arg,
+                                   double *out)
+{
+    if (bench_parse_finite_double(arg, out)) {
+        fprintf(stderr, "%s: not a finite decimal number: %s\n",
+                flag, arg ? arg : "(null)");
+        return -1;
+    }
+    return 0;
+}
+
+static int parse_positive_double_arg(const char *flag, const char *arg,
+                                     double *out)
+{
+    double v;
+    if (parse_finite_double_arg(flag, arg, &v)) return -1;
+    if (v <= 0.0) {
+        fprintf(stderr, "%s: must be positive, got %.17g\n", flag, v);
+        return -1;
+    }
+    *out = v;
+    return 0;
+}
+
+static int parse_nonnegative_double_arg(const char *flag, const char *arg,
+                                        double *out)
+{
+    double v;
+    if (parse_finite_double_arg(flag, arg, &v)) return -1;
+    if (v < 0.0) {
+        fprintf(stderr, "%s: must be nonnegative, got %.17g\n", flag, v);
+        return -1;
+    }
+    *out = v;
+    return 0;
+}
 
 static void usage(void)
 {
@@ -131,6 +215,42 @@ static void usage(void)
 "  --probe i,j      read back that cell after apply (gate 5)\n");
 }
 
+static int validate_qsel_or_report(qsel_t *sel, const poly_t *P, int side,
+                                   const char *source, unsigned long line)
+{
+    const qsel_validate_result_t vr = qsel_validate(sel, P, side);
+    if (vr == QSEL_VALID) return 0;
+
+    if (line) fprintf(stderr, "%s:%lu: ", source, line);
+    else      fprintf(stderr, "%s: ", source);
+    switch (vr) {
+    case QSEL_ERR_Q_RANGE:
+        fprintf(stderr, "q = %llu is not in [2, 2^32)\n",
+                (unsigned long long)sel->q);
+        break;
+    case QSEL_ERR_Q_COMPOSITE:
+        fprintf(stderr, "q = %llu is composite\n",
+                (unsigned long long)sel->q);
+        break;
+    case QSEL_ERR_SIDE:
+        fprintf(stderr, "special-q side %d is not 0 or 1\n", side);
+        break;
+    case QSEL_ERR_POLY:
+        fprintf(stderr, "cannot evaluate the exact %s polynomial modulo q\n",
+                side ? "algebraic" : "rational");
+        break;
+    case QSEL_ERR_NOT_ROOT:
+        fprintf(stderr, "rho = %llu is not a root of %s modulo q = %llu\n",
+                (unsigned long long)sel->rho, side ? "f" : "G",
+                (unsigned long long)sel->q);
+        break;
+    default:
+        fprintf(stderr, "invalid special-q selection\n");
+        break;
+    }
+    return -1;
+}
+
 /* Cofactoriser bounds. The representation is narrow ON PURPOSE -- split
  * factors are emitted as a single uint32 limb and both cofactors are mz<3> --
  * so a bound outside that design does not degrade, it silently truncates: a
@@ -247,7 +367,7 @@ int main(int argc, char **argv)
     uint64_t q = 120000011ull;          /* prime, mid-range of [50M,190M] */
     uint32_t bkthresh = 0, fbbound = 0;
     int fbbound_set = 0, scale_set = 0;
-    uint64_t rho = 0;   /* 0 = synthetic; pass the real root of f mod q to match las */
+    uint64_t rho = 0;   /* rho_set distinguishes an explicit zero from omission */
     uint32_t rlim = 67100000;   /* side-0 factor base bound (input.job rlim) */
     uint32_t alim = 134200000;  /* side-1 factor base bound (input.job alim) */
     fb_t fb, fbs; qlat_t L; poly_t POLY;
@@ -299,7 +419,7 @@ int main(int argc, char **argv)
     int lambda0_set = 0, lambda1_set = 0;  /* asked for CADO's rule at all?    */
     int cof_rounds = 6;
     uint32_t cof_budget = 4096;
-    int qrange_set = 0;
+    int qrange_set = 0, rho_set = 0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--fb") && i + 1 < argc) fbpath = argv[++i];
@@ -308,58 +428,94 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--region") && i + 1 < argc) cfg.log_region = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--bkthresh") && i + 1 < argc) bkthresh = (uint32_t)strtoul(argv[++i], 0, 10);
         else if (!strcmp(argv[i], "--fbbound") && i + 1 < argc) { fbbound = (uint32_t)strtoul(argv[++i], 0, 10); fbbound_set = 1; }
-        else if (!strcmp(argv[i], "--q") && i + 1 < argc) q = strtoull(argv[++i], 0, 10);
-        else if (!strcmp(argv[i], "--rho") && i + 1 < argc) rho = strtoull(argv[++i], 0, 10);
+        else if (!strcmp(argv[i], "--q") && i + 1 < argc) {
+            if (parse_u64_arg("--q", argv[++i], &q)) return 1;
+        }
+        else if (!strcmp(argv[i], "--rho") && i + 1 < argc) {
+            if (parse_u64_arg("--rho", argv[++i], &rho)) return 1;
+            rho_set = 1;
+        }
         else if (!strcmp(argv[i], "--record-bytes") && i + 1 < argc) cfg.record_bytes = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) {
             const char *m = argv[++i];
-            cfg.fill_mode = !strcmp(m, "atomic") ? FILL_ATOMIC : FILL_TWOLEVEL;
+            if (!strcmp(m, "atomic")) cfg.fill_mode = FILL_ATOMIC;
+            else if (!strcmp(m, "twolevel")) cfg.fill_mode = FILL_TWOLEVEL;
+            else {
+                fprintf(stderr, "--mode: want atomic or twolevel, got %s\n", m);
+                return 1;
+            }
         }
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) cfg.threads = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--blocks") && i + 1 < argc) cfg.blocks = atoi(argv[++i]);
-        /* strtol, not atoi, for these two ALONE -- not a style preference. Both
-         * treat 0 as "auto", and atoi maps any malformed argument to 0, so
+        else if (!strcmp(argv[i], "--blocks") && i + 1 < argc) {
+            if (parse_int_range_arg("--blocks", argv[++i], 0,
+                                    BENCH_BLOCKS_MAX, &cfg.blocks)) return 1;
+        }
+        /* Strict integer parsing for all three grid controls -- not a style
+         * preference. They treat 0 as "auto", and atoi maps any malformed
+         * argument to 0, so
          * `--fill-threads 64x` would run at the default, print no [--flag] tag,
          * and be indistinguishable from an unswept run. A sweep over a typo'd
          * list then reports N identical timings, which reads as flatness --
          * precisely the shape of the conclusion these flags exist to test. */
         else if (!strcmp(argv[i], "--fill-blocks") && i + 1 < argc) {
-            char *e; long v = strtol(argv[++i], &e, 10);
-            if (*e || e == argv[i]) {
-                fprintf(stderr, "--fill-blocks: not a number: %s\n", argv[i]);
-                return 1;
-            }
-            cfg.fill_blocks = (int)v;
+            if (parse_int_range_arg("--fill-blocks", argv[++i], 0,
+                                    BENCH_BLOCKS_MAX,
+                                    &cfg.fill_blocks)) return 1;
         }
         else if (!strcmp(argv[i], "--fill-threads") && i + 1 < argc) {
-            char *e; long v = strtol(argv[++i], &e, 10);
-            if (*e || e == argv[i]) {
-                fprintf(stderr, "--fill-threads: not a number: %s\n", argv[i]);
-                return 1;
-            }
-            cfg.fill_threads = (int)v;
+            if (parse_int_range_arg("--fill-threads", argv[++i], 0,
+                                    1024, &cfg.fill_threads)) return 1;
         }
         else if (!strcmp(argv[i], "--reps") && i + 1 < argc) cfg.reps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--verify")) cfg.verify = 1;
         else if (!strcmp(argv[i], "--poly") && i + 1 < argc) polypath = argv[++i];
         else if (!strcmp(argv[i], "--stage") && i + 1 < argc) {
             const char *s = argv[++i];
-            cfg.stage = !strcmp(s, "fill") ? STAGE_FILL
-                      : !strcmp(s, "apply") ? STAGE_APPLY : STAGE_BOTH;
+            if (!strcmp(s, "fill")) cfg.stage = STAGE_FILL;
+            else if (!strcmp(s, "apply")) cfg.stage = STAGE_APPLY;
+            else if (!strcmp(s, "both")) cfg.stage = STAGE_BOTH;
+            else {
+                fprintf(stderr, "--stage: want fill, apply, or both, got %s\n", s);
+                return 1;
+            }
         }
         else if (!strcmp(argv[i], "--cells") && i + 1 < argc) cfg.cell_bits = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--norm") && i + 1 < argc)
-            cfg.norm_mode = !strcmp(argv[++i], "const") ? NORM_CONST : NORM_HORNER;
-        else if (!strcmp(argv[i], "--apply-mode") && i + 1 < argc)
-            cfg.apply_atomic = strcmp(argv[++i], "plain") ? 1 : 0;
+        else if (!strcmp(argv[i], "--norm") && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (!strcmp(m, "const")) cfg.norm_mode = NORM_CONST;
+            else if (!strcmp(m, "horner")) cfg.norm_mode = NORM_HORNER;
+            else {
+                fprintf(stderr, "--norm: want const or horner, got %s\n", m);
+                return 1;
+            }
+        }
+        else if (!strcmp(argv[i], "--apply-mode") && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (!strcmp(m, "atomic")) cfg.apply_atomic = 1;
+            else if (!strcmp(m, "plain")) cfg.apply_atomic = 0;
+            else {
+                fprintf(stderr, "--apply-mode: want atomic or plain, got %s\n", m);
+                return 1;
+            }
+        }
         else if (!strcmp(argv[i], "--apply-threads") && i + 1 < argc)
             cfg.apply_threads = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--allowance") && i + 1 < argc)
-            { cfg.allowance = atof(argv[++i]); allowance_set = 1; }
+        else if (!strcmp(argv[i], "--allowance") && i + 1 < argc) {
+            if (parse_nonnegative_double_arg("--allowance", argv[++i],
+                                             &cfg.allowance)) return 1;
+            allowance_set = 1;
+        }
         else if (!strcmp(argv[i], "--no-smallsieve")) cfg.small_sieve = 0;
-        else if (!strcmp(argv[i], "--side") && i + 1 < argc) cfg.side = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--side") && i + 1 < argc) {
+            if (parse_int_range_arg("--side", argv[++i], 0, 1, &cfg.side))
+                return 1;
+        }
         else if (!strcmp(argv[i], "--rlim") && i + 1 < argc) { rlim = (uint32_t)strtoul(argv[++i], 0, 10); rlim_set = 1; }
-        else if (!strcmp(argv[i], "--scale") && i + 1 < argc) { cfg.scale = atof(argv[++i]); scale_set = 1; }
+        else if (!strcmp(argv[i], "--scale") && i + 1 < argc) {
+            if (parse_positive_double_arg("--scale", argv[++i], &cfg.scale))
+                return 1;
+            scale_set = 1;
+        }
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc) cfg.dump = argv[++i];
         else if ((!strcmp(argv[i], "--fb1") || !strcmp(argv[i], "--cadofb")) && i + 1 < argc)
             cfg.cadofb = argv[++i];
@@ -415,7 +571,8 @@ int main(int argc, char **argv)
          * silently giving mfb+1.5 where the script asked for 0.3+mfb/lpb. */
         #define LAMBDA_ARG(flag, var, seen)                                    \
             else if (!strcmp(argv[i], flag) && i + 1 < argc) {                 \
-                var = atof(argv[++i]); seen = 1;                               \
+                if (parse_finite_double_arg(flag, argv[++i], &var)) return 1;   \
+                seen = 1;                                                       \
                 if (var < 0.0 || (var > 0.0 && var < 0.5) || var > 8.0) {      \
                     fprintf(stderr, "%s %g: want 0 (CADO's automatic) or"      \
                             " 0.5..8\n", flag, var);                           \
@@ -431,11 +588,9 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--ecm-curves") && i + 1 < argc) cfg.ecm_curves = (uint32_t)strtoul(argv[++i], 0, 10);
         else if (!strcmp(argv[i], "--qlist") && i + 1 < argc) cfg.qlist = argv[++i];
         else if (!strcmp(argv[i], "--qrange") && i + 1 < argc) {
-            unsigned long long lo, hi;
             const char *a = argv[++i];
-            int got = sscanf(a, "%llu:%llu", &lo, &hi);
-            if (got == 1 && strchr(a, ':')) { hi = 0; got = 2; }   /* "MIN:" = open */
-            if (got != 2 || (hi && lo > hi)) {
+            uint64_t lo, hi;
+            if (bench_parse_qrange(a, &lo, &hi)) {
                 fprintf(stderr, "bench: --qrange wants MIN:MAX, or MIN: to"
                         " generate upward until --target-rels/--nq\n"); return 2;
             }
@@ -447,8 +602,16 @@ int main(int argc, char **argv)
             cfg.target_rels = strtoull(argv[++i], 0, 10);
         else if (!strcmp(argv[i], "--verbose-q")) cfg.verbose_q = 1;
         else if (!strcmp(argv[i], "--alim") && i + 1 < argc) { alim = (uint32_t)strtoul(argv[++i], 0, 10); alim_set = 1; }
-        else if (!strcmp(argv[i], "--scale0") && i + 1 < argc) { cfg.scale0 = atof(argv[++i]); scale0_set = 1; }
-        else if (!strcmp(argv[i], "--allowance0") && i + 1 < argc) { cfg.allowance0 = atof(argv[++i]); allowance0_set = 1; }
+        else if (!strcmp(argv[i], "--scale0") && i + 1 < argc) {
+            if (parse_positive_double_arg("--scale0", argv[++i], &cfg.scale0))
+                return 1;
+            scale0_set = 1;
+        }
+        else if (!strcmp(argv[i], "--allowance0") && i + 1 < argc) {
+            if (parse_nonnegative_double_arg("--allowance0", argv[++i],
+                                             &cfg.allowance0)) return 1;
+            allowance0_set = 1;
+        }
         else if (!strcmp(argv[i], "--relations") && i + 1 < argc) cfg.relations = argv[++i];
         else if (!strcmp(argv[i], "--candidates") && i + 1 < argc) cfg.candidates = argv[++i];
         else if (!strcmp(argv[i], "--lpb") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 32) { fprintf(stderr, "--lpb %ld out of range 1..32\n", v); return 1; } cfg.lpb = (uint32_t)v; lpb_set = 1; }
@@ -525,6 +688,11 @@ int main(int argc, char **argv)
         fprintf(stderr, "--J must be > 0, --reps >= 1, --threads in [32,1024]\n");
         return 1;
     }
+    if (cfg.blocks < 0 || cfg.blocks > BENCH_BLOCKS_MAX) {
+        fprintf(stderr, "--blocks must be in [0, %d] (0 = auto), got %d\n",
+                BENCH_BLOCKS_MAX, cfg.blocks);
+        return 1;
+    }
     /* Same rule --apply-threads has enforced all along, and for the same class
      * of reason -- it was simply never applied to the block width every OTHER
      * kernel launches with. k_intersect_compact runs a warp-wide inclusive scan
@@ -556,18 +724,15 @@ int main(int argc, char **argv)
                 " [32,1024], got %d\n", cfg.fill_threads);
         return 1;
     }
-    /* Bounded ABOVE, and the bound is not cosmetic. k_fill_atomic strides by
-     * `uint32_t stride = gridDim.x * blockDim.x` (bench_kernels.cu:98). CUDA
-     * accepts gridDim.x up to 2^31-1, so --fill-blocks 134217728 at 32 threads
-     * launches fine and computes a stride of 2^32 == 0: the grid-stride loop
-     * never advances and the device hangs until the watchdog fires. Products
-     * that overflow to a nonzero value are worse -- primes get skipped or
-     * walked twice and the run completes with a plausible smaller record count.
-     * 1<<20 blocks is ~900x the measured knee, so nothing legitimate is lost. */
-    if (cfg.fill_blocks < 0 || cfg.fill_blocks > (1 << 20)) {
+    /* Every grid-stride kernel now performs its multiplication in uint64_t, so
+     * an oversized launch cannot wrap its stride to zero. Keep a practical host
+     * ceiling as a second line of defence: 1<<20 blocks is ~900x the measured
+     * fill knee and rejects accidental launches that would spend their time in
+     * scheduling rather than useful work. */
+    if (cfg.fill_blocks < 0 || cfg.fill_blocks > BENCH_BLOCKS_MAX) {
         fprintf(stderr, "--fill-blocks must be in [0, %d] (0 = auto), got %d:"
-                " the fill kernels stride by gridDim.x*blockDim.x in 32 bits\n",
-                1 << 20, cfg.fill_blocks);
+                " larger launches are outside the supported tuning range\n",
+                BENCH_BLOCKS_MAX, cfg.fill_blocks);
         return 1;
     }
     /* The grid-width query used to sit HERE. It now runs after the
@@ -611,16 +776,32 @@ int main(int argc, char **argv)
          * derived; this one runs too early to see either. */
         const double maxnorm = (cfg.side == 1) ? 196.61 : 131.86;
         const double maxlogp = 27.0;           /* log2(alim) */
-        if (cfg.scale * maxnorm > cinit) {
+        const double scaled_norm = cfg.scale * maxnorm;
+        const double scaled_logp = cfg.scale * maxlogp;
+        uint32_t bound_unused;
+        if (!isfinite(cfg.scale) || cfg.scale <= 0.0) {
+            fprintf(stderr, "--scale %.17g must be finite and positive\n",
+                    cfg.scale);
+            return 1;
+        }
+        if (!isfinite(scaled_norm) || scaled_norm > cinit) {
             fprintf(stderr, "--scale %.3f x log2(maxnorm) %.1f exceeds CINIT %.0f\n",
                     cfg.scale, maxnorm, cinit);
             return 1;
         }
-        if (cfg.scale * maxlogp > 255.0) {
+        if (!isfinite(scaled_logp) || scaled_logp > 255.0) {
             fprintf(stderr, "--scale %.3f x log2(p) %.0f exceeds the 8-bit"
                     " per-ideal log\n", cfg.scale, maxlogp);
             return 1;
         }
+        /* In the one-side harness these are already the final parameters. The
+         * pipeline derives both sides later from the first q, so checking its
+         * placeholder defaults here could reject a valid final combination. */
+        if (!cfg.pipeline &&
+            sieve_bound_checked(cfg.scale, cfg.allowance, (uint32_t)cinit,
+                                &bound_unused,
+                                "single-side survivor parameters"))
+            return 1;
     }
 
 
@@ -707,6 +888,19 @@ int main(int argc, char **argv)
         return check_relations(check_rel, &POLY, cfg.lpb0,
                               cfg.lpb ? cfg.lpb : 32) ? 1 : 0;
 
+    /* The production pipeline validates q, primality and the exact root below.
+     * The single-side harness intentionally permits a synthetic/composite q for
+     * microbenchmarks, but q must still fit the transform representation and an
+     * explicit rho must be canonical before qlat_build narrows it to int64_t. */
+    if (!cfg.pipeline) {
+        if (q < 2 || (q >> 32)) {
+            fprintf(stderr, "bench: --q must be in [2, 2^32), got %llu\n",
+                    (unsigned long long)q);
+            return 1;
+        }
+        if (rho_set) rho %= q;
+    }
+
     /* Grid width is 6 resident blocks per SM, so it MUST come from the device.
      * It was hardcoded 48*6 = 288 -- 48 being this box's 5070. On an 82-SM
      * 3090 that is 3.5 blocks/SM, i.e. 58% of the occupancy every tuning
@@ -727,10 +921,35 @@ int main(int argc, char **argv)
     {
         cudaDeviceProp prop;
         int dev = 0;
+        int auto_blocks, effective_fill_blocks;
         if (cudaGetDevice(&dev) != cudaSuccess ||
             cudaGetDeviceProperties(&prop, dev) != cudaSuccess) {
             fprintf(stderr, "bench: cannot query the CUDA device -- refusing to"
                     " fall back to a hardcoded grid width\n");
+            return 1;
+        }
+        {
+            const uint64_t ab = (uint64_t)prop.multiProcessorCount * 6u;
+            if (!ab || ab > BENCH_BLOCKS_MAX ||
+                ab > (uint64_t)prop.maxGridSize[0]) {
+                fprintf(stderr, "bench: automatic grid %llu is outside the"
+                        " supported/device range (max %d, policy max %d)\n",
+                        (unsigned long long)ab, prop.maxGridSize[0],
+                        BENCH_BLOCKS_MAX);
+                return 1;
+            }
+            auto_blocks = (int)ab;
+        }
+        if (cfg.blocks && cfg.blocks > prop.maxGridSize[0]) {
+            fprintf(stderr, "--blocks %d exceeds this device's grid-x limit %d\n",
+                    cfg.blocks, prop.maxGridSize[0]);
+            return 1;
+        }
+        effective_fill_blocks = cfg.fill_blocks ? cfg.fill_blocks
+                                                : FILL_BLOCKS_DEFAULT;
+        if (effective_fill_blocks > prop.maxGridSize[0]) {
+            fprintf(stderr, "fill grid %d exceeds this device's grid-x limit %d\n",
+                    effective_fill_blocks, prop.maxGridSize[0]);
             return 1;
         }
         /* L2 size rides on the card name, on BOTH branches. The fill geometry
@@ -743,7 +962,7 @@ int main(int argc, char **argv)
          * --blocks A/B that wants it -- the defect the paragraph above this
          * block records having already fixed once. */
         if (cfg.blocks == 0) {
-            cfg.blocks = prop.multiProcessorCount * 6;
+            cfg.blocks = auto_blocks;
             printf("grid: %d SMs x 6 = %d blocks (%s, %d MB L2)\n",
                    prop.multiProcessorCount, cfg.blocks, prop.name,
                    prop.l2CacheSize >> 20);
@@ -751,7 +970,7 @@ int main(int argc, char **argv)
             printf("grid: %d blocks on %d SMs (%s, %d MB L2)  [--blocks; auto"
                    " would be %d]\n", cfg.blocks, prop.multiProcessorCount,
                    prop.name, prop.l2CacheSize >> 20,
-                   prop.multiProcessorCount * 6);
+                   auto_blocks);
         }
         /* Reported, NOT resolved. cfg.fill_blocks/fill_threads stay 0 for
          * "auto" all the way to the launch sites, because k_fill_atomic and
@@ -854,7 +1073,7 @@ int main(int argc, char **argv)
                     " the band; pass one\n");
             return 2;
         }
-        if (!cfg.qlist && !qrange_set && !rho) {
+        if (!cfg.qlist && !qrange_set && !rho_set) {
             fprintf(stderr, "bench --pipeline: needs a real root of %s mod q."
                     " Pass --rho, --qlist, or --qrange for a band.\n"
                     "  A synthetic root is fine for a sieve microbenchmark but"
@@ -897,42 +1116,21 @@ int main(int argc, char **argv)
                             cfg.qlist, lno, line);
                     fclose(f); free(ql); return 1;
                 }
-                /* pipe_check_root is NOT a substitute for these two, which is
-                 * why they belong here rather than there. Everything is 0 mod
-                 * 1, so q = 1 passes the root test outright and then reaches a
-                 * full-multiplicity division by 1. A composite q with a genuine
-                 * root mod q also passes, gets divided out of every norm on its
-                 * side, and is emitted as though it were a prime relation
-                 * factor -- a wrong relation that reconstructs.
-                 *
-                 * --qrange cannot reach either case: its generator admits only
-                 * primes. A hand-written --qlist is the only way in, which is
-                 * exactly why nothing downstream looks. */
-                if (qq < 2 || (qq >> 32)) {
-                    fprintf(stderr, "%s:%lu: q = %llu is not in [2, 2^32)\n",
-                            cfg.qlist, lno, qq);
+                /* One validator serves q-lists, generated ranges and the
+                 * single-q path. Besides primality it checks the exact root and
+                 * reduces rho before qlat_build can narrow it to int64_t. */
+                qsel_t ent;
+                ent.q = qq; ent.rho = rr;
+                if (validate_qsel_or_report(&ent, &POLY, cfg.sq_side,
+                                            cfg.qlist, lno)) {
                     fclose(f); free(ql); return 1;
                 }
-                if (!bench_is_prime32((uint32_t)qq)) {
-                    fprintf(stderr, "%s:%lu: q = %llu is composite\n",
-                            cfg.qlist, lno, qq);
-                    fclose(f); free(ql); return 1;
-                }
-                /* Canonicalise. This is NOT about getting a different lattice:
-                 * <(q,0),(rho,1)> and <(q,0),(rho+kq,1)> generate the same one,
-                 * and Gauss reduction converges to the same basis either way --
-                 * measured, an unreduced rho reproduces the golden 37 relations
-                 * exactly. What it is not safe against is SIZE. qlat_build
-                 * casts rho straight to int64_t, so a rho at or above 2^63
-                 * arrives negative, and its reduction is bounded at 200
-                 * iterations. One modulo here removes both. */
-                rr %= qq;
                 if (nq == capq) {
                     capq = capq ? capq * 2 : 256;
                     ql = (qsel_t *)realloc(ql, (size_t)capq * sizeof(qsel_t));
                     if (!ql) { fclose(f); return 1; }
                 }
-                ql[nq].q = qq; ql[nq].rho = rr; nq++;
+                ql[nq++] = ent;
                 if (cfg.nq_max && nq >= cfg.nq_max) break;
             }
             fclose(f);
@@ -976,6 +1174,10 @@ int main(int argc, char **argv)
                             (unsigned long long)cfg.qmin);
                 free(ql); sqgen_free(qgen); return 1;
             }
+            if (validate_qsel_or_report(ql, &POLY, cfg.sq_side,
+                                        "bench: generated special-q", 0)) {
+                free(ql); sqgen_free(qgen); return 1;
+            }
             nq = 1;
             if (cfg.qmax)
                 printf("band: generated prime special-q roots on side %d in"
@@ -986,6 +1188,25 @@ int main(int argc, char **argv)
                 printf("band: generating prime special-q roots on side %d from"
                        " %llu upward\n", cfg.sq_side,
                        (unsigned long long)cfg.qmin);
+        }
+
+        /* Construct and validate the single-q selection BEFORE scale/norm
+         * derivation. The old path waited until after both factor bases were
+         * loaded, so q=0 reached qlat_build and the synthetic-rho expression,
+         * a composite q could become a relation factor, and rho>=2^63 was
+         * narrowed before it was canonicalised. */
+        if (!cfg.qlist && !qrange_set) {
+            ql = (qsel_t *)malloc(sizeof(*ql));
+            if (!ql) return 1;
+            ql[0].q = q;
+            ql[0].rho = rho;
+            if (validate_qsel_or_report(ql, &POLY, cfg.sq_side,
+                                        "bench: --q/--rho", 0)) {
+                free(ql);
+                return 1;
+            }
+            nq = 1;
+            printf("band: one validated special-q on side %d\n", cfg.sq_side);
         }
 
         /* Derive the byte scale and survivor allowance from the polynomial,
@@ -1002,8 +1223,9 @@ int main(int argc, char **argv)
         {
             qlat_t L0; norm_t N1, N0;
             double m1, m0;
-            uint64_t q0  = nq ? ql[0].q   : q;
-            uint64_t rh0 = nq ? ql[0].rho : (rho ? rho : 1);
+            uint32_t bound1 = 0, bound0 = 0;
+            const uint64_t q0 = ql[0].q;
+            const uint64_t rh0 = ql[0].rho;
             poly_t P0 = POLY;      /* side 0's norm is G = Y1*x + Y0, degree 1 */
             P0.deg = 1; P0.c[0] = P0.y0; P0.c[1] = P0.y1;
             for (int z = 2; z < BENCH_NCOEFF; z++) P0.c[z] = 0.0;
@@ -1017,21 +1239,27 @@ int main(int argc, char **argv)
             norm_setup(&N0, &P0,   &L0, cfg.logI, cfg.J, 1.0, cfg.sq_side == 0);
             m1 = (double)(N1.log2M - N1.bias);
             m0 = (double)(N0.log2M - N0.bias);
+            if (!isfinite(m1) || !isfinite(m0)) {
+                fprintf(stderr, "derived scale: nonfinite maxnorm"
+                        " (side1 %.17g, side0 %.17g)\n", m1, m0);
+                return 1;
+            }
             /* An explicit --scale / --allowance is a deliberate override: it
              * is how a swept operating point, or a bound the job file does not
              * express, gets stated. */
             if (!scale_set)  cfg.scale  = las_scale(m1);
             if (!scale0_set) cfg.scale0 = las_scale(m0);
-            if (cfg.scale <= 0.0 || cfg.scale0 <= 0.0) {
+            if (!isfinite(cfg.scale) || cfg.scale <= 0.0 ||
+                !isfinite(cfg.scale0) || cfg.scale0 <= 0.0) {
                 fprintf(stderr, "derived scale: degenerate maxnorm"
                         " (side1 %.2f, side0 %.2f)\n", m1, m0);
                 return 1;
             }
             /* The startup guards on --scale ran long before this point and
              * against the c183's norm sizes, so a DERIVED scale never met
-             * them. fb_load's logp is a uint8 that saturates silently at 255,
-             * which is exactly what those guards exist to prevent. Recheck
-             * here, on both sides, against the real bounds. */
+             * them. Factor-base logs are uint8 values and are now rejected if
+             * they do not fit; recheck here, on both sides, against the real
+             * bounds so failure precedes the expensive factor-base load. */
             {
                 const double cinit = (cfg.cell_bits == 16) ? 4096.0 : 255.0;
                 const struct { double sc, mx; uint32_t lim; const char *nm; } chk[2] = {
@@ -1041,13 +1269,15 @@ int main(int argc, char **argv)
                 for (int z = 0; z < 2; z++) {
                     const double lg = chk[z].lim > 1
                         ? log((double)chk[z].lim) / log(2.0) : 0.0;
-                    if (chk[z].sc * chk[z].mx > cinit) {
+                    const double sn = chk[z].sc * chk[z].mx;
+                    const double sp = chk[z].sc * lg;
+                    if (!isfinite(sn) || sn > cinit) {
                         fprintf(stderr, "%s: scale %.3f x log2(maxnorm) %.1f"
                                 " exceeds CINIT %.0f\n",
                                 chk[z].nm, chk[z].sc, chk[z].mx, cinit);
                         return 1;
                     }
-                    if (chk[z].sc * lg > 255.0) {
+                    if (!isfinite(sp) || sp > 255.0) {
                         fprintf(stderr, "%s: scale %.3f x log2(lim) %.1f exceeds"
                                 " the 8-bit per-ideal log\n",
                                 chk[z].nm, chk[z].sc, lg);
@@ -1068,17 +1298,21 @@ int main(int argc, char **argv)
                 cfg.allowance0 = lambda0_set
                     ? las_allowance(m0, cfg.scale0, lambda0, cfg.lpb0, cfg.mfb0)
                     : sieve_allowance(m0, cfg.scale0, cfg.mfb0);
+            if (sieve_bound_checked(cfg.scale, cfg.allowance, 4096u, &bound1,
+                                    "side 1 survivor parameters") ||
+                sieve_bound_checked(cfg.scale0, cfg.allowance0, 4096u, &bound0,
+                                    "side 0 survivor parameters"))
+                return 1;
             /* uint32_t, matching pipe_side_init. The (unsigned char) this used
              * to print through wrapped any bound above 255 -- legal against a
              * 16-bit cell with CINIT 4096 -- so the banner disagreed with the
              * bound the sieve actually ran. */
             printf("params from q=%llu: side 1 log2(maxnorm)=%.2f scale=%.3f"
                    " allowance=%.2f bound=%u\n", (unsigned long long)q0, m1,
-                   cfg.scale, cfg.allowance,
-                   (uint32_t)(cfg.allowance * cfg.scale + 1.0));
+                   cfg.scale, cfg.allowance, bound1);
             printf("                    side 0 log2(maxnorm)=%.2f scale=%.3f"
                    " allowance=%.2f bound=%u\n", m0, cfg.scale0, cfg.allowance0,
-                   (uint32_t)(cfg.allowance0 * cfg.scale0 + 1.0));
+                   bound0);
             /* An allowance far above mfb admits survivors that classify will
              * then reject: the sieve keeps a position whose cofactor is bigger
              * than the cofactoriser is willing to touch, and the whole resieve
@@ -1134,7 +1368,7 @@ int main(int argc, char **argv)
             }
             if (cfg.cadofb) { if (fb_load_cado(cfg.cadofb, cfg.scale, &fb1) != 0) return 1; }
             else if (fb_load(fbpath, &fb1) != 0) return 1;
-            fb_fill_logp(&fb1, cfg.scale);
+            if (fb_fill_logp(&fb1, cfg.scale) != 0) return 1;
         }
         if (cfg.cadofb && fb1.maxbits > 0 && fb1.maxbits != maxbits)
             fprintf(stderr,
@@ -1204,12 +1438,12 @@ int main(int argc, char **argv)
                 if (producing) return 1;
             }
         }
-        fb_restrict(&fb1, bkthresh, fbbound);
+        if (fb_restrict(&fb1, bkthresh, fbbound) != 0) return 1;
 
         if (rfb_build(&POLY, rlim, maxbits, cfg.scale0, &fb0) != 0) return 1;
-        fb_fill_logp(&fb0, cfg.scale0);
+        if (fb_fill_logp(&fb0, cfg.scale0) != 0) return 1;
         if (fb_split_small(&fb0, bkthresh, &fbs0) != 0) return 1;
-        fb_restrict(&fb0, bkthresh, rlim);
+        if (fb_restrict(&fb0, bkthresh, rlim) != 0) return 1;
 
         printf("\nside 1 (algebraic): bucketed %u <= p < %u : %u entries,"
                " line-sieved %u\n", bkthresh, fbbound, fb1.n, fbs1.n);
@@ -1217,15 +1451,6 @@ int main(int argc, char **argv)
                " line-sieved %u\n", bkthresh, rlim, fb0.n, fbs0.n);
 
         {
-            /* Neither --qlist nor --qrange: the single-q path, read above and
-             * at the --qrange block respectively. */
-            if (!nq) {
-                ql = (qsel_t *)malloc(sizeof(qsel_t));
-                if (!ql) return 1;
-                ql[0].q = q;
-                ql[0].rho = rho ? rho : (uint64_t)(0x9E3779B97F4A7C15ull % q);
-                nq = 1;
-            }
             prc = run_pipeline(&fb1, &fbs1, &fb0, &fbs0, ql, nq, qgen,
                                &POLY, &cfg);
             free(ql);
@@ -1259,9 +1484,9 @@ int main(int argc, char **argv)
         for (int z = 2; z < BENCH_NCOEFF; z++) POLY.c[z] = 0.0;
         printf("\nside 0 (rational): degree 1, G(x) = Y1*x + Y0\n");
     }
-    fb_fill_logp(&fb, cfg.scale);
+    if (fb_fill_logp(&fb, cfg.scale) != 0) return 1;
     if (fb_split_small(&fb, bkthresh, &fbs) != 0) return 1;
-    fb_restrict(&fb, bkthresh, fbbound);
+    if (fb_restrict(&fb, bkthresh, fbbound) != 0) return 1;
     printf("  bucketed  %u <= p < %u : %u entries\n", bkthresh, fbbound, fb.n);
 
     /* Cofactor-classification parameters, from oracle/input.job. `lim` is the
@@ -1283,11 +1508,13 @@ int main(int argc, char **argv)
            bkthresh, fbs.n);
     if (!fb.n) { fprintf(stderr, "empty factor base after restriction\n"); return 1; }
 
-    qlat_build(&L, q, rho ? rho : (uint64_t)(0x9E3779B97F4A7C15ull % q), POLY.skew);
+    qlat_build(&L, q, rho_set ? rho
+                              : (uint64_t)(0x9E3779B97F4A7C15ull % q),
+               POLY.skew);
     printf("q-lattice q=%llu basis (a0,a1,b0,b1) = (%lld,%lld,%lld,%lld), det=%lld\n",
            (unsigned long long)q, (long long)L.a0, (long long)L.a1,
            (long long)L.b0, (long long)L.b1, (long long)(L.a0 * L.b1 - L.a1 * L.b0));
-    if (!rho)
+    if (!rho_set)
         printf("  NOTE: rho is synthetic (no root of f mod q computed here). The basis is\n"
                "  a genuine reduced q-lattice basis of the right shape, and transformed\n"
                "  roots are uniform mod p either way, so fill volume and distribution are\n"

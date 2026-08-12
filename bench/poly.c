@@ -20,54 +20,433 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <float.h>
+#include <limits.h>
+#include <errno.h>
+#include <stdarg.h>
+
+int bench_parse_finite_double(const char *text, double *out)
+{
+    char *end = NULL;
+    double v;
+
+    if (!text || !*text || !out) {
+        errno = EINVAL;
+        return -1;
+    }
+    errno = 0;
+    v = strtod(text, &end);
+    if (errno == ERANGE || end == text || *end || !isfinite(v)) {
+        errno = (errno == ERANGE) ? ERANGE : EINVAL;
+        return -1;
+    }
+    *out = v;
+    return 0;
+}
+
+static int sieve_bound_error(const char *source, int err, const char *fmt, ...)
+{
+    va_list ap;
+    errno = err;
+    if (!source) return -1;
+    fprintf(stderr, "%s: ", source);
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+    return -1;
+}
+
+int sieve_bound_checked(double scale, double allowance, uint32_t CINIT,
+                        uint32_t *bound_out, const char *source)
+{
+    double raw;
+    uint64_t bound;
+
+    if (!bound_out)
+        return sieve_bound_error(source, EINVAL,
+                                 "null survivor-bound output");
+    *bound_out = 0;
+    if (!CINIT)
+        return sieve_bound_error(source, EINVAL,
+                                 "CINIT must be positive");
+    /* norm_t stores the scale as float. A positive double that underflows to
+     * zero there is not a positive scale in the code that actually runs. */
+    if (!isfinite(scale) || scale < (double)FLT_TRUE_MIN ||
+        scale > (double)FLT_MAX)
+        return sieve_bound_error(source, EINVAL,
+            "scale %.17g must be finite, positive, and representable as float",
+            scale);
+    if (!isfinite(allowance) || allowance < 0.0)
+        return sieve_bound_error(source, EINVAL,
+            "allowance %.17g must be finite and nonnegative", allowance);
+
+    raw = scale * allowance + 1.0;
+    /* For nonnegative raw values, the C cast truncates exactly as floor().
+     * raw < CINIT + 1 is the pre-cast proof that the integer result fits both
+     * uint32_t and the subtraction CINIT - bound. */
+    if (!isfinite(raw) || raw < 0.0 || raw >= (double)CINIT + 1.0)
+        return sieve_bound_error(source, ERANGE,
+            "scale * allowance + 1 = %.17g yields a survivor bound above CINIT %u",
+            raw, CINIT);
+    bound = (uint64_t)raw;
+    if (bound > CINIT)
+        return sieve_bound_error(source, ERANGE,
+            "survivor bound %llu exceeds CINIT %u",
+            (unsigned long long)bound, CINIT);
+    *bound_out = (uint32_t)bound;
+    return 0;
+}
+
+static const char *skip_hspace(const char *s)
+{
+    while (*s == ' ' || *s == '\t') s++;
+    return s;
+}
+
+static int value_ended(const char *s)
+{
+    s = skip_hspace(s);
+    if (*s == '\0' || *s == '#') return 1;
+    if (*s == '\n') return s[1] == '\0';
+    if (*s == '\r') return s[1] == '\0' ||
+                            (s[1] == '\n' && s[2] == '\0');
+    return 0;
+}
+
+int bench_parse_qrange(const char *text, uint64_t *qmin, uint64_t *qmax)
+{
+    char *end = NULL;
+    unsigned long long lo, hi = 0;
+
+    if (!text || !qmin || !qmax || *text < '0' || *text > '9') {
+        errno = EINVAL;
+        return -1;
+    }
+    errno = 0;
+    lo = strtoull(text, &end, 10);
+    if (errno == ERANGE || end == text || *end != ':') {
+        errno = (errno == ERANGE) ? ERANGE : EINVAL;
+        return -1;
+    }
+    text = end + 1;
+    if (*text) {
+        if (*text < '0' || *text > '9') {
+            errno = EINVAL;
+            return -1;
+        }
+        errno = 0;
+        hi = strtoull(text, &end, 10);
+        if (errno == ERANGE || end == text || *end || hi == 0 || lo > hi) {
+            errno = (errno == ERANGE) ? ERANGE : EINVAL;
+            return -1;
+        }
+    }
+    *qmin = (uint64_t)lo;
+    *qmax = (uint64_t)hi;
+    return 0;
+}
+
+static int poly_diag(const char *path, unsigned long linenr,
+                     const char *fmt, ...)
+{
+    va_list ap;
+    fprintf(stderr, "poly_load: %s", path ? path : "(null)");
+    if (linenr) fprintf(stderr, ":%lu", linenr);
+    fputs(": ", stderr);
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+    return -1;
+}
+
+static int token_span(const char *value, const char **begin, size_t *len)
+{
+    const char *s = skip_hspace(value), *e;
+    if (!*s || *s == '\n' || *s == '\r' || *s == '#') return -1;
+    e = s;
+    while (*e && *e != ' ' && *e != '\t' && *e != '\n' &&
+           *e != '\r' && *e != '#')
+        e++;
+    if (!value_ended(e)) return -1;
+    *begin = s;
+    *len = (size_t)(e - s);
+    return 0;
+}
+
+static int parse_finite_value(const char *value, double *out)
+{
+    const char *s;
+    size_t n;
+    char buf[128];
+    double v;
+
+    if (token_span(value, &s, &n) || n >= sizeof(buf)) return -1;
+    memcpy(buf, s, n);
+    buf[n] = '\0';
+    if (bench_parse_finite_double(buf, &v)) return -1;
+    *out = v;
+    return 0;
+}
+
+static int parse_u32_value(const char *value, uint32_t *out)
+{
+    const char *s;
+    size_t n;
+    uint64_t v = 0;
+    size_t i;
+
+    if (token_span(value, &s, &n) || !n || s[0] == '+' || s[0] == '-')
+        return -1;
+    for (i = 0; i < n; i++) {
+        unsigned d;
+        if (s[i] < '0' || s[i] > '9') return -1;
+        d = (unsigned)(s[i] - '0');
+        if (v > (UINT32_MAX - d) / 10u) return -1;
+        v = v * 10u + d;
+    }
+    *out = (uint32_t)v;
+    return 0;
+}
+
+static int exact_decimal_is_zero(const char *s)
+{
+    if (*s == '+' || *s == '-') s++;
+    while (*s == '0') s++;
+    return *s == '\0';
+}
+
+static int parse_exact_integer(const char *value, char *exact, size_t exact_cap,
+                               double *approx)
+{
+    const char *s;
+    size_t n, i = 0;
+    char *end = NULL;
+    double v;
+
+    if (token_span(value, &s, &n) || !n || n >= exact_cap) return -1;
+    if (s[i] == '+' || s[i] == '-') i++;
+    if (i == n) return -1;
+    for (; i < n; i++)
+        if (s[i] < '0' || s[i] > '9') return -1;
+
+    memcpy(exact, s, n);
+    exact[n] = '\0';
+    errno = 0;
+    v = strtod(exact, &end);
+    if (errno == ERANGE || end == exact || *end || !isfinite(v)) return -1;
+    *approx = v;
+    return 0;
+}
 
 int poly_load(const char *path, poly_t *P)
 {
-    FILE *f = fopen(path, "r");
+    FILE *f = NULL;
     char line[4096];
-    if (!f) { fprintf(stderr, "poly_load: cannot open %s\n", path); return -1; }
+    unsigned long linenr = 0;
+    unsigned seen_c = 0;
+    unsigned seen_skew = 0, seen_y0 = 0, seen_y1 = 0;
+    unsigned seen_rlim = 0, seen_alim = 0, seen_lpbr = 0, seen_lpba = 0;
+    unsigned seen_mfbr = 0, seen_mfba = 0, seen_rlambda = 0, seen_alambda = 0;
+    int rc = -1;
+
+    if (!P || !path) {
+        errno = EINVAL;
+        return poly_diag(path, 0, "null input");
+    }
     memset(P, 0, sizeof(*P));
     P->deg = -1;
-    while (fgets(line, sizeof line, f)) {
-        if (line[0] == 'c' && line[1] >= '0' && line[1] <= '9' && line[2] == ':') {
-            int k = line[1] - '0';
-            if (k > BENCH_MAX_DEGREE) {
-                fprintf(stderr, "poly_load: degree %d exceeds supported maximum %d\n",
-                        k, BENCH_MAX_DEGREE);
-                fclose(f);
-                return -1;
-            }
-            P->c[k] = strtod(line + 3, NULL);
-            /* Keep the exact decimal too. The double is what the norm-init
-             * needs (it is taking a logarithm); trial division needs the
-             * integer, and c0 here is 147 bits. */
-            sscanf(line + 3, " %79s", P->cs[k]);
-            if (P->c[k] != 0.0 && k > P->deg) P->deg = k;
-        } else if (!strncmp(line, "skew:", 5)) {
-            P->skew = strtod(line + 5, NULL);
-        } else if (!strncmp(line, "Y0:", 3)) {
-            P->y0 = strtod(line + 3, NULL);
-            sscanf(line + 3, " %79s", P->y0s);
-        } else if (!strncmp(line, "Y1:", 3)) {
-            P->y1 = strtod(line + 3, NULL);
-            sscanf(line + 3, " %79s", P->y1s);
+    f = fopen(path, "r");
+    if (!f) return poly_diag(path, 0, "cannot open file");
+
+    while (fgets(line, sizeof(line), f)) {
+        char *s, *colon, *key_end;
+        const char *value;
+        size_t key_len;
+        linenr++;
+
+        if (!strchr(line, '\n') && !feof(f)) {
+            int ch;
+            while ((ch = fgetc(f)) != '\n' && ch != EOF) {}
+            poly_diag(path, linenr, "line exceeds %zu bytes", sizeof(line) - 1u);
+            goto done;
         }
-        /* Sieve parameters. A GGNFS .job file carries all of these; a CADO
-         * .poly carries none, and every one stays 0 so the caller can tell
-         * "absent" from "zero". Both loaders used to stop at Y1 and the human
-         * retyped the rest onto the command line. */
-        else if (!strncmp(line, "rlim:", 5))    P->rlim    = strtoul(line + 5, NULL, 10);
-        else if (!strncmp(line, "alim:", 5))    P->alim    = strtoul(line + 5, NULL, 10);
-        else if (!strncmp(line, "lpbr:", 5))    P->lpbr    = strtoul(line + 5, NULL, 10);
-        else if (!strncmp(line, "lpba:", 5))    P->lpba    = strtoul(line + 5, NULL, 10);
-        else if (!strncmp(line, "mfbr:", 5))    P->mfbr    = strtoul(line + 5, NULL, 10);
-        else if (!strncmp(line, "mfba:", 5))    P->mfba    = strtoul(line + 5, NULL, 10);
-        else if (!strncmp(line, "rlambda:", 8)) P->rlambda = strtod(line + 8, NULL);
-        else if (!strncmp(line, "alambda:", 8)) P->alambda = strtod(line + 8, NULL);
+        s = (char *)skip_hspace(line);
+        if (!*s || *s == '#' ||
+            ((*s == '\n' || *s == '\r') && value_ended(s)))
+            continue;
+        colon = strchr(s, ':');
+        if (!colon) {
+            poly_diag(path, linenr, "non-comment line has no ':' separator");
+            goto done;
+        }
+        key_end = colon;
+        while (key_end > s && (key_end[-1] == ' ' || key_end[-1] == '\t'))
+            key_end--;
+        key_len = (size_t)(key_end - s);
+        value = colon + 1;
+        if (!key_len) {
+            poly_diag(path, linenr, "empty field name");
+            goto done;
+        }
+
+#define KEY_IS(k) (key_len == sizeof(k) - 1u && !memcmp(s, (k), sizeof(k) - 1u))
+#define DUP_GUARD(flag, name)                                                \
+        do {                                                                 \
+            if (flag) {                                                      \
+                poly_diag(path, linenr, "duplicate %s field", (name));       \
+                goto done;                                                   \
+            }                                                                \
+            (flag) = 1;                                                      \
+        } while (0)
+
+        if (s[0] == 'c') {
+            unsigned k = 0;
+            size_t z;
+            if (key_len < 2u || s[1] < '0' || s[1] > '9') {
+                poly_diag(path, linenr, "malformed coefficient name");
+                goto done;
+            }
+            for (z = 1; z < key_len; z++) {
+                unsigned d;
+                if (s[z] < '0' || s[z] > '9') {
+                    poly_diag(path, linenr, "malformed coefficient name");
+                    goto done;
+                }
+                d = (unsigned)(s[z] - '0');
+                if (k > (UINT_MAX - d) / 10u) {
+                    poly_diag(path, linenr, "coefficient index overflow");
+                    goto done;
+                }
+                k = k * 10u + d;
+            }
+            if (k > BENCH_MAX_DEGREE) {
+                poly_diag(path, linenr,
+                          "degree %u exceeds supported maximum %d",
+                          k, BENCH_MAX_DEGREE);
+                goto done;
+            }
+            if (seen_c & (1u << k)) {
+                poly_diag(path, linenr, "duplicate c%u coefficient", k);
+                goto done;
+            }
+            if (parse_exact_integer(value, P->cs[k], sizeof(P->cs[k]),
+                                    &P->c[k])) {
+                poly_diag(path, linenr,
+                          "c%u must be a complete finite integer shorter than %zu bytes",
+                          k, sizeof(P->cs[k]));
+                goto done;
+            }
+            seen_c |= 1u << k;
+        } else if (KEY_IS("skew")) {
+            DUP_GUARD(seen_skew, "skew");
+            if (parse_finite_value(value, &P->skew) || P->skew <= 0.0) {
+                poly_diag(path, linenr, "skew must be finite and positive");
+                goto done;
+            }
+        } else if (KEY_IS("Y0")) {
+            DUP_GUARD(seen_y0, "Y0");
+            if (parse_exact_integer(value, P->y0s, sizeof(P->y0s), &P->y0)) {
+                poly_diag(path, linenr,
+                          "Y0 must be a complete finite integer shorter than %zu bytes",
+                          sizeof(P->y0s));
+                goto done;
+            }
+        } else if (KEY_IS("Y1")) {
+            DUP_GUARD(seen_y1, "Y1");
+            if (parse_exact_integer(value, P->y1s, sizeof(P->y1s), &P->y1)) {
+                poly_diag(path, linenr,
+                          "Y1 must be a complete finite integer shorter than %zu bytes",
+                          sizeof(P->y1s));
+                goto done;
+            }
+        } else if (KEY_IS("rlim")) {
+            DUP_GUARD(seen_rlim, "rlim");
+            if (parse_u32_value(value, &P->rlim)) goto bad_u32;
+        } else if (KEY_IS("alim")) {
+            DUP_GUARD(seen_alim, "alim");
+            if (parse_u32_value(value, &P->alim)) goto bad_u32;
+        } else if (KEY_IS("lpbr")) {
+            DUP_GUARD(seen_lpbr, "lpbr");
+            if (parse_u32_value(value, &P->lpbr)) goto bad_u32;
+        } else if (KEY_IS("lpba")) {
+            DUP_GUARD(seen_lpba, "lpba");
+            if (parse_u32_value(value, &P->lpba)) goto bad_u32;
+        } else if (KEY_IS("mfbr")) {
+            DUP_GUARD(seen_mfbr, "mfbr");
+            if (parse_u32_value(value, &P->mfbr)) goto bad_u32;
+        } else if (KEY_IS("mfba")) {
+            DUP_GUARD(seen_mfba, "mfba");
+            if (parse_u32_value(value, &P->mfba)) goto bad_u32;
+        } else if (KEY_IS("rlambda")) {
+            DUP_GUARD(seen_rlambda, "rlambda");
+            if (parse_finite_value(value, &P->rlambda) || P->rlambda < 0.0) {
+                poly_diag(path, linenr, "rlambda must be finite and nonnegative");
+                goto done;
+            }
+        } else if (KEY_IS("alambda")) {
+            DUP_GUARD(seen_alambda, "alambda");
+            if (parse_finite_value(value, &P->alambda) || P->alambda < 0.0) {
+                poly_diag(path, linenr, "alambda must be finite and nonnegative");
+                goto done;
+            }
+        } else {
+            /* CADO/GGNFS files carry metadata such as n:. Unknown fields are
+             * deliberately ignored, but every recognized field above is
+             * parsed strictly and cannot fall through after a partial match. */
+        }
+        continue;
+
+bad_u32:
+        poly_diag(path, linenr,
+                  "%.*s must be a complete unsigned 32-bit integer",
+                  (int)key_len, s);
+        goto done;
+#undef DUP_GUARD
+#undef KEY_IS
     }
-    fclose(f);
-    if (P->deg < 1) { fprintf(stderr, "poly_load: no algebraic coefficients\n"); return -1; }
-    return 0;
+    if (ferror(f)) {
+        poly_diag(path, linenr, "read error");
+        goto done;
+    }
+
+    if (!seen_skew) {
+        poly_diag(path, 0, "missing skew field");
+        goto done;
+    }
+    if (!seen_y0 || !seen_y1) {
+        poly_diag(path, 0, "both Y0 and Y1 are required");
+        goto done;
+    }
+    if (exact_decimal_is_zero(P->y0s) && exact_decimal_is_zero(P->y1s)) {
+        poly_diag(path, 0, "Y0 and Y1 cannot both be zero");
+        goto done;
+    }
+    for (int k = BENCH_MAX_DEGREE; k >= 0; k--)
+        if ((seen_c & (1u << k)) && !exact_decimal_is_zero(P->cs[k])) {
+            P->deg = k;
+            break;
+        }
+    if (P->deg < 1) {
+        poly_diag(path, 0, "algebraic polynomial must have degree at least 1");
+        goto done;
+    }
+    if (fclose(f)) {
+        f = NULL;
+        poly_diag(path, 0, "close error");
+        goto done;
+    }
+    f = NULL;
+    rc = 0;
+
+done:
+    if (f) fclose(f);
+    if (rc) {
+        memset(P, 0, sizeof(*P));
+        P->deg = -1;
+    }
+    return rc;
 }
 
 /* Does f have a root mod 2 -- affine (x = 0 or 1) or projective (2 | c_deg)?
@@ -100,9 +479,72 @@ int poly_has_root_mod2(const poly_t *P)
     return 0;
 }
 
+/* Exact decimal coefficient modulo q. The polynomial loader retains decimal
+ * strings precisely because the doubles do not carry enough bits for roots or
+ * trial division. Keep this small evaluator independent of the fixed-width
+ * norm integer: modular reduction never needs to materialise the coefficient. */
+static int qsel_dec_mod(const char *s, uint32_t q, uint32_t *out)
+{
+    uint64_t r = 0;
+    int neg = 0, ndigit = 0;
+
+    if (!s || !out || !q) return -1;
+    while (*s == ' ' || *s == '\t') s++;
+    if (*s == '-' || *s == '+') { neg = (*s == '-'); s++; }
+    while (*s >= '0' && *s <= '9') {
+        r = (r * 10u + (uint32_t)(*s - '0')) % q;
+        s++;
+        ndigit = 1;
+    }
+    while (*s == ' ' || *s == '\t') s++;
+    if (!ndigit || *s) return -1;
+    if (neg && r) r = q - r;
+    *out = (uint32_t)r;
+    return 0;
+}
+
+qsel_validate_result_t qsel_validate(qsel_t *sel, const poly_t *P, int side)
+{
+    uint32_t q;
+    uint32_t rho;
+    uint64_t acc = 0;
+    int deg;
+
+    if (!sel || !P) return QSEL_ERR_POLY;
+    if (sel->q < 2 || (sel->q >> 32)) return QSEL_ERR_Q_RANGE;
+    q = (uint32_t)sel->q;
+    if (!bench_is_prime32(q)) return QSEL_ERR_Q_COMPOSITE;
+    if (side != 0 && side != 1) return QSEL_ERR_SIDE;
+
+    /* q is now known nonzero. Work with a canonical local value and publish it
+     * only after the complete gate succeeds, so a rejected selection is not
+     * partially modified. qlat_build() stores rho in int64_t, which is why the
+     * reduction must happen before a valid selection reaches it. */
+    rho = (uint32_t)(sel->rho % q);
+    deg = side ? P->deg : 1;
+    if (deg < 1 || deg > BENCH_MAX_DEGREE) return QSEL_ERR_POLY;
+
+    for (int k = deg; k >= 0; k--) {
+        const char *s;
+        uint32_t cm = 0;
+        if (side) {
+            s = P->cs[k];
+            if (s[0] && qsel_dec_mod(s, q, &cm)) return QSEL_ERR_POLY;
+            /* An absent algebraic coefficient is exactly zero. */
+        } else {
+            s = k ? P->y1s : P->y0s;
+            if (!s[0] || qsel_dec_mod(s, q, &cm)) return QSEL_ERR_POLY;
+        }
+        acc = (acc * rho + cm) % q;
+    }
+    if (acc != 0) return QSEL_ERR_NOT_ROOT;
+    sel->rho = rho;
+    return QSEL_VALID;
+}
+
 double job_allowance_bits(double lambda, uint32_t lim)
 {
-    if (lambda <= 0.0 || lim < 2) return 0.0;
+    if (!isfinite(lambda) || lambda <= 0.0 || lim < 2) return 0.0;
     return lambda * (log((double)lim) / log(2.0));
 }
 
@@ -117,8 +559,9 @@ int norm_verbose = 1;
 double las_scale(double maxlog2)
 {
     double s;
-    if (maxlog2 <= 0.0) return 0.0;
+    if (!isfinite(maxlog2) || maxlog2 <= 0.0) return 0.0;
     s = (255.0 - 1.0) / maxlog2;          /* UCHAR_MAX - LOGNORM_GUARD_BITS */
+    if (!isfinite(s) || s <= 0.0 || s > (double)INT32_MAX / 40.0) return 0.0;
     return (double)(int)(s * 40.0) * 0.025;
 }
 
@@ -126,7 +569,9 @@ double las_allowance(double maxlog2, double scale, double lambda,
                      unsigned lpb, unsigned mfb)
 {
     double r;
-    if (scale <= 0.0) return 0.0;
+    if (!isfinite(maxlog2) || !isfinite(scale) || scale <= 0.0 ||
+        !isfinite(lambda) || !lpb)
+        return 0.0;
     /* CADO's automatic lambda when none is given. */
     if (lambda <= 0.0) lambda = 0.3 + (double)mfb / (double)lpb;
     r = maxlog2 - 1.0 / scale;            /* LOGNORM_GUARD_BITS / scale */
@@ -170,7 +615,7 @@ double las_allowance(double maxlog2, double scale, double lambda,
 double sieve_allowance(double maxlog2, double scale, unsigned mfb)
 {
     double slack, r;
-    if (scale <= 0.0) return 0.0;
+    if (!isfinite(maxlog2) || !isfinite(scale) || scale <= 0.0) return 0.0;
     slack = 2.0 / scale;
     if (slack < 1.5) slack = 1.5;
     r = (double)mfb + slack;
