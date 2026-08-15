@@ -5,6 +5,7 @@
 #include <string.h>
 #include <math.h>
 #include <errno.h>
+#include <limits.h>
 
 static int parse_u64_arg(const char *flag, const char *arg, uint64_t *out)
 {
@@ -177,6 +178,7 @@ static void usage(void)
 "  --verbose-q      print a line per special-q instead of a band summary\n"
 "\n"
 "RUNTIME\n"
+"  --device N       select CUDA device N (also accepted from the BOINC client)\n"
 "  --threads N      threads per block, multiple of 32  [256]\n"
 "  --blocks N       0 = auto (6 per SM)        [0]\n"
 "  --fill-blocks N  fill only; 0 = auto (1152, absolute -- NOT per SM) [0]\n"
@@ -359,7 +361,7 @@ static int check_cofactor_bounds(const bench_cfg_t *cfg, uint32_t alim,
     return bad;
 }
 
-int main(int argc, char **argv)
+static int bench_main_impl(int argc, char **argv)
 {
     const char *fbpath = "../oracle/input.job.afb.0";
     const char *polypath = "../oracle/c183.poly";
@@ -408,6 +410,7 @@ int main(int argc, char **argv)
     const char *cofac_in = NULL;
     const char *check_rel = NULL;
     int blocking_sync = 0;
+    int cuda_device = -1;       /* BOINC passes --device N to CUDA apps */
     /* Which values the COMMAND LINE supplied. Precedence is
      *      explicit flag  >  job file  >  derived  >  refuse
      * and these are what distinguishes the first level from the rest. A
@@ -422,7 +425,9 @@ int main(int argc, char **argv)
     int qrange_set = 0, rho_set = 0;
 
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--fb") && i + 1 < argc) fbpath = argv[++i];
+        if (!strcmp(argv[i], "--fb") && i + 1 < argc) {
+            if (bench_boinc_resolve_path("--fb", argv[++i], &fbpath)) return 1;
+        }
         else if (!strcmp(argv[i], "--logI") && i + 1 < argc) cfg.logI = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--J") && i + 1 < argc) { cfg.J = (uint32_t)strtoul(argv[++i], 0, 10); J_set = 1; }
         else if (!strcmp(argv[i], "--region") && i + 1 < argc) cfg.log_region = atoi(argv[++i]);
@@ -444,6 +449,10 @@ int main(int argc, char **argv)
                 fprintf(stderr, "--mode: want atomic or twolevel, got %s\n", m);
                 return 1;
             }
+        }
+        else if (!strcmp(argv[i], "--device") && i + 1 < argc) {
+            if (parse_int_range_arg("--device", argv[++i], 0, INT_MAX,
+                                    &cuda_device)) return 1;
         }
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) cfg.threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--blocks") && i + 1 < argc) {
@@ -468,7 +477,9 @@ int main(int argc, char **argv)
         }
         else if (!strcmp(argv[i], "--reps") && i + 1 < argc) cfg.reps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--verify")) cfg.verify = 1;
-        else if (!strcmp(argv[i], "--poly") && i + 1 < argc) polypath = argv[++i];
+        else if (!strcmp(argv[i], "--poly") && i + 1 < argc) {
+            if (bench_boinc_resolve_path("--poly", argv[++i], &polypath)) return 1;
+        }
         else if (!strcmp(argv[i], "--stage") && i + 1 < argc) {
             const char *s = argv[++i];
             if (!strcmp(s, "fill")) cfg.stage = STAGE_FILL;
@@ -516,12 +527,23 @@ int main(int argc, char **argv)
                 return 1;
             scale_set = 1;
         }
-        else if (!strcmp(argv[i], "--dump") && i + 1 < argc) cfg.dump = argv[++i];
-        else if ((!strcmp(argv[i], "--fb1") || !strcmp(argv[i], "--cadofb")) && i + 1 < argc)
-            cfg.cadofb = argv[++i];
-        else if (!strcmp(argv[i], "--survbits") && i + 1 < argc) cfg.survbits = argv[++i];
-        else if (!strcmp(argv[i], "--other-bits") && i + 1 < argc) cfg.other_bits = argv[++i];
-        else if (!strcmp(argv[i], "--emit") && i + 1 < argc) cfg.emit = argv[++i];
+        else if (!strcmp(argv[i], "--dump") && i + 1 < argc) {
+            if (bench_boinc_resolve_path("--dump", argv[++i], &cfg.dump)) return 1;
+        }
+        else if ((!strcmp(argv[i], "--fb1") || !strcmp(argv[i], "--cadofb")) && i + 1 < argc) {
+            const char *option = argv[i];
+            if (bench_boinc_resolve_path(option, argv[++i], &cfg.cadofb))
+                return 1;
+        }
+        else if (!strcmp(argv[i], "--survbits") && i + 1 < argc) {
+            if (bench_boinc_resolve_path("--survbits", argv[++i], &cfg.survbits)) return 1;
+        }
+        else if (!strcmp(argv[i], "--other-bits") && i + 1 < argc) {
+            if (bench_boinc_resolve_path("--other-bits", argv[++i], &cfg.other_bits)) return 1;
+        }
+        else if (!strcmp(argv[i], "--emit") && i + 1 < argc) {
+            if (bench_boinc_resolve_path("--emit", argv[++i], &cfg.emit)) return 1;
+        }
         else if (!strcmp(argv[i], "--td")) cfg.td = 1;
         else if (!strcmp(argv[i], "--ab-resieve")) cfg.ab_resieve = 1;
         else if (!strcmp(argv[i], "--resieve-sweep")) cfg.resieve_sweep = 1;
@@ -540,7 +562,9 @@ int main(int argc, char **argv)
             }
             cfg.sq_side = (int)v;
         }
-        else if (!strcmp(argv[i], "--cofac") && i + 1 < argc) cofac_in = argv[++i];
+        else if (!strcmp(argv[i], "--cofac") && i + 1 < argc) {
+            if (bench_boinc_resolve_path("--cofac", argv[++i], &cofac_in)) return 1;
+        }
         else if (!strcmp(argv[i], "--cofactor")) cfg.cofactor = 1;
         else if (!strcmp(argv[i], "--cof-rounds") && i + 1 < argc) { cof_rounds = atoi(argv[++i]); cfg.cof_rounds = cof_rounds; }
         else if (!strcmp(argv[i], "--cof-budget") && i + 1 < argc) { cof_budget = (uint32_t)strtoul(argv[++i], 0, 10); cfg.cof_budget = cof_budget; }
@@ -582,11 +606,15 @@ int main(int argc, char **argv)
         LAMBDA_ARG("--lambda0", lambda0, lambda0_set)
         LAMBDA_ARG("--lambda1", lambda1, lambda1_set)
         #undef LAMBDA_ARG
-        else if (!strcmp(argv[i], "--check-relations") && i + 1 < argc) check_rel = argv[++i];
+        else if (!strcmp(argv[i], "--check-relations") && i + 1 < argc) {
+            if (bench_boinc_resolve_path("--check-relations", argv[++i], &check_rel)) return 1;
+        }
         else if (!strcmp(argv[i], "--ecm-b1") && i + 1 < argc) cfg.ecm_b1 = (uint32_t)strtoul(argv[++i], 0, 10);
         else if (!strcmp(argv[i], "--ecm-b2") && i + 1 < argc) cfg.ecm_b2 = (uint32_t)strtoul(argv[++i], 0, 10);
         else if (!strcmp(argv[i], "--ecm-curves") && i + 1 < argc) cfg.ecm_curves = (uint32_t)strtoul(argv[++i], 0, 10);
-        else if (!strcmp(argv[i], "--qlist") && i + 1 < argc) cfg.qlist = argv[++i];
+        else if (!strcmp(argv[i], "--qlist") && i + 1 < argc) {
+            if (bench_boinc_resolve_path("--qlist", argv[++i], &cfg.qlist)) return 1;
+        }
         else if (!strcmp(argv[i], "--qrange") && i + 1 < argc) {
             const char *a = argv[++i];
             uint64_t lo, hi;
@@ -612,12 +640,20 @@ int main(int argc, char **argv)
                                              &cfg.allowance0)) return 1;
             allowance0_set = 1;
         }
-        else if (!strcmp(argv[i], "--relations") && i + 1 < argc) cfg.relations = argv[++i];
-        else if (!strcmp(argv[i], "--candidates") && i + 1 < argc) cfg.candidates = argv[++i];
+        else if (!strcmp(argv[i], "--relations") && i + 1 < argc) {
+            if (bench_boinc_resolve_path("--relations", argv[++i], &cfg.relations)) return 1;
+        }
+        else if (!strcmp(argv[i], "--candidates") && i + 1 < argc) {
+            if (bench_boinc_resolve_path("--candidates", argv[++i], &cfg.candidates)) return 1;
+        }
         else if (!strcmp(argv[i], "--lpb") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 32) { fprintf(stderr, "--lpb %ld out of range 1..32\n", v); return 1; } cfg.lpb = (uint32_t)v; lpb_set = 1; }
         else if (!strcmp(argv[i], "--mfb") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 96) { fprintf(stderr, "--mfb %ld out of range 1..96\n", v); return 1; } cfg.mfb = (uint32_t)v; mfb_set = 1; }
-        else if (!strcmp(argv[i], "--cofgate") && i + 1 < argc) cfg.cofgate = argv[++i];
-        else if (!strcmp(argv[i], "--emit-cof") && i + 1 < argc) cfg.emit_cof = argv[++i];
+        else if (!strcmp(argv[i], "--cofgate") && i + 1 < argc) {
+            if (bench_boinc_resolve_path("--cofgate", argv[++i], &cfg.cofgate)) return 1;
+        }
+        else if (!strcmp(argv[i], "--emit-cof") && i + 1 < argc) {
+            if (bench_boinc_resolve_path("--emit-cof", argv[++i], &cfg.emit_cof)) return 1;
+        }
         else if (!strcmp(argv[i], "--not-both-even")) cfg.not_both_even = 1;
         else if (!strcmp(argv[i], "--maxbits") && i + 1 < argc) {
             maxbits = atoi(argv[++i]); maxbits_set = 1;
@@ -805,14 +841,7 @@ int main(int argc, char **argv)
     }
 
 
-    /* Must precede any call that creates the CUDA context. */
-    if (blocking_sync && cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync) != cudaSuccess) {
-        fprintf(stderr, "warning: could not set blocking sync\n");
-    }
-
     printf("=== cuda-sieve bucket-fill benchmark ===\n");
-
-
 
     if (poly_load(polypath, &POLY) != 0) return 1;
     printf("polynomial %s: algebraic degree %d, skew %.4g\n",
@@ -901,6 +930,26 @@ int main(int argc, char **argv)
         if (rho_set) rho %= q;
     }
 
+    /* BOINC's CUDA application convention appends --device N. Select it before
+     * the first device query, allocation, or kernel launch. */
+    if (cuda_device >= 0) {
+        const cudaError_t err = cudaSetDevice(cuda_device);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "bench: cannot select CUDA device %d: %s\n",
+                    cuda_device, cudaGetErrorString(err));
+            return 1;
+        }
+    }
+    /* Set the scheduling flags after device selection so they apply to the
+     * BOINC-assigned device rather than implicitly initialising device 0. */
+    if (blocking_sync) {
+        const cudaError_t err =
+            cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
+        if (err != cudaSuccess)
+            fprintf(stderr, "warning: could not set blocking sync: %s\n",
+                    cudaGetErrorString(err));
+    }
+
     /* Grid width is 6 resident blocks per SM, so it MUST come from the device.
      * It was hardcoded 48*6 = 288 -- 48 being this box's 5070. On an 82-SM
      * 3090 that is 3.5 blocks/SM, i.e. 58% of the occupancy every tuning
@@ -916,8 +965,8 @@ int main(int argc, char **argv)
      * diagnostic. There is no useful run on a device we cannot query, so a
      * failure here is fatal rather than a default.
      *
-     * Device 0 always. There is no cudaSetDevice and no --device flag; select
-     * another GPU with CUDA_VISIBLE_DEVICES and confirm it on this line. */
+     * The current device is the one selected by --device, or CUDA's default
+     * when that option is absent. The line below prints the actual selection. */
     {
         cudaDeviceProp prop;
         int dev = 0;
@@ -1551,4 +1600,12 @@ int main(int argc, char **argv)
     int rc = run_bench(&fb, &fbs, &L, &POLY, &cfg);
     fb_free(&fb);
     return rc;
+}
+
+int main(int argc, char **argv)
+{
+    int rc = bench_boinc_init();
+    if (rc) return rc;
+    rc = bench_main_impl(argc, argv);
+    return bench_boinc_finish(rc);
 }

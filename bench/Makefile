@@ -4,6 +4,7 @@
 
 NVCC      ?= nvcc
 CC        ?= gcc
+CXX       ?= g++
 
 # sm_120 native (RTX 5070, Blackwell consumer), sm_86 native (RTX 3090/A10).
 # PTX fallback is compute_80, NOT compute_89: the driver only JITs PTX to a
@@ -100,6 +101,25 @@ $(shell [ "$$(cat $(ARCH_STAMP) 2>/dev/null)" = '$(NVCC_ARCH)' ] || printf '%s' 
 # without editing a header and forgetting to put it back.
 DEFS      ?=
 
+# Optional BOINC application build.  Keep BOINC dependencies out of the default
+# executable; HAVE_BOINC=1 adds the compile-time API gate and the libraries.
+# BOINC_CPPFLAGS should point at directories containing boinc_api.h and its
+# companion headers (usually .../include/boinc, or BOINC's api and lib trees).
+HAVE_BOINC     ?= 0
+BOINC_CPPFLAGS ?=
+BOINC_LIBS     ?= -lboinc_api -lboinc -lpthread
+ifeq ($(HAVE_BOINC),1)
+BOINC_DEFS := -DHAVE_BOINC
+BENCH_LIBS := $(BOINC_LIBS)
+# A BOINC application binary is distributed to CPUs other than the build host.
+# Do not bake the build machine's ISA into the host-only C/C++ objects.
+HOST_TUNE ?=
+else
+BOINC_DEFS :=
+BENCH_LIBS :=
+HOST_TUNE ?= -march=native
+endif
+
 # -MMD -MP: generate header dependencies. Without them the pattern rules below
 # listed only bench.h and plattice.cuh, so editing bigint.cuh, prp.cuh or
 # td.cuh left a stale bench_kernels.o and the binary silently did not contain
@@ -107,23 +127,40 @@ DEFS      ?=
 # -t 0: run the per-target ptxas passes concurrently, one thread per CPU. The
 # gencode list above is otherwise walked serially, which is where the bulk of a
 # fat build goes; see the timing table. Harmless when GPU_ARCH picks one target.
-NVCC_FLAGS = $(NVCC_ARCH) -t 0 -O3 -std=c++17 -lineinfo -MMD -MP -Xcompiler "-O3 -Wall" $(DEFS)
-CFLAGS     = -O3 -march=native -Wall -Wextra -std=c11 -MMD -MP $(DEFS)
+NVCC_FLAGS = $(NVCC_ARCH) -t 0 -O3 -std=c++17 -lineinfo -MMD -MP \
+             -Xcompiler "-O3 -Wall" $(DEFS) $(BOINC_DEFS) $(BOINC_CPPFLAGS)
+CFLAGS     = -O3 $(HOST_TUNE) -Wall -Wextra -std=c11 -MMD -MP \
+             $(DEFS) $(BOINC_DEFS)
+CXXFLAGS   = -O3 $(HOST_TUNE) -Wall -Wextra -std=c++17 -MMD -MP \
+             $(DEFS) $(BOINC_DEFS) $(BOINC_CPPFLAGS)
 
-CU_SRCS = bench_main.cu bench_kernels.cu
-C_SRCS  = fb_load.c verify_cpu.c poly.c primes.c rfb.c fb_cado.c
+CU_SRCS  = bench_main.cu bench_kernels.cu
+C_SRCS   = fb_load.c verify_cpu.c poly.c primes.c rfb.c fb_cado.c
+CPP_SRCS = boinc_support.cpp
 
-CU_OBJS = $(CU_SRCS:.cu=.o)
-C_OBJS  = $(C_SRCS:.c=.o)
-OBJS    = $(CU_OBJS) $(C_OBJS) fbgen_lib.o
+CU_OBJS  = $(CU_SRCS:.cu=.o)
+C_OBJS   = $(C_SRCS:.c=.o)
+CPP_OBJS = $(CPP_SRCS:.cpp=.o)
+OBJS     = $(CU_OBJS) $(C_OBJS) $(CPP_OBJS) fbgen_lib.o
+
+# Switching HAVE_BOINC on an existing tree must rebuild boinc_support.o; make
+# otherwise sees the same source timestamp and quietly reuses the no-op object.
+# Include the BOINC include/link settings and host tuning in the signature so a
+# changed deployment build cannot reuse objects produced for another one.
+BOINC_STAMP := .boinc.stamp
+BOINC_SIGNATURE := HAVE_BOINC=$(HAVE_BOINC)|BOINC_CPPFLAGS=$(BOINC_CPPFLAGS)|BOINC_LIBS=$(BOINC_LIBS)|HOST_TUNE=$(HOST_TUNE)
+$(shell [ "$$(cat $(BOINC_STAMP) 2>/dev/null)" = '$(BOINC_SIGNATURE)' ] || printf '%s' '$(BOINC_SIGNATURE)' > $(BOINC_STAMP))
 
 all: bench fbtest fbgen sqgentest dumpcmp mkcofbatch
 
-bench: $(OBJS) $(ARCH_STAMP)
-	$(NVCC) $(NVCC_ARCH) -Xlinker --gc-sections -o $@ $(OBJS) -lcudart -lm
+bench: $(OBJS) $(ARCH_STAMP) $(BOINC_STAMP)
+	$(NVCC) $(NVCC_ARCH) -Xlinker --gc-sections -o $@ $(OBJS) \
+		-lcudart $(BENCH_LIBS) -lm
 
 # Only the CUDA objects care about the arch; the C objects are host-only.
 $(CU_OBJS): $(ARCH_STAMP)
+# HAVE_BOINC changes boinc_support.cpp and may change host-code portability.
+$(OBJS): $(BOINC_STAMP)
 
 # CPU-only correctness gates. No CUDA, so these run on a busy box and on
 # machines without the card.
@@ -159,10 +196,13 @@ mkcofbatch: mkcofbatch.c
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+%.o: %.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
 -include $(OBJS:.o=.d)
 
 clean:
-	rm -f bench fbtest fbgen sqgentest dumpcmp mkcofbatch *.o *.d $(ARCH_STAMP)
+	rm -f bench fbtest fbgen sqgentest dumpcmp mkcofbatch *.o *.d $(ARCH_STAMP) $(BOINC_STAMP)
 
 .PHONY: all clean check cofcheck fbgencheck sqgencheck
 

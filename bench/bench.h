@@ -335,6 +335,19 @@ uint64_t verify_count_updates(const fb_t *fb, const qlat_t *L,
                               int logI, uint32_t J,
                               int log_region, uint32_t *per_region);
 
+/* ---- optional BOINC integration -------------------------------------- */
+
+/* These wrappers are no-ops in the normal build.  When HAVE_BOINC is set,
+ * bench_boinc_init() configures the BOINC runtime for a GPU application,
+ * filename arguments are resolved from BOINC logical names, progress is
+ * reported monotonically, and bench_boinc_finish() terminates through the
+ * BOINC API. */
+int  bench_boinc_init(void);
+int  bench_boinc_resolve_path(const char *option, const char *logical_name,
+                              const char **resolved_name);
+void bench_boinc_fraction_done(double fraction_done);
+int  bench_boinc_finish(int status);
+
 /* ---- GPU entry points ------------------------------------------------- */
 
 typedef struct {

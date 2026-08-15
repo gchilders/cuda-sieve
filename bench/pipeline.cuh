@@ -56,6 +56,34 @@ static uint64_t pipe_est_records(const fb_t *fb, uint32_t xmax)
     return (uint64_t)(acc * 1.15) + 4096;
 }
 
+/* One progress estimator shared by the terminal reporter and BOINC.  Its
+ * priority matches the user-visible progress line: a relation target is the
+ * goal when present; otherwise use a bounded q count/range.  Open-ended work
+ * is required by bench_main to have either --target-rels or --nq, so every
+ * production band has a denominator. */
+static double pipe_progress_fraction(const bench_cfg_t *cfg, int streaming,
+                                     uint32_t nq, uint32_t nqdone,
+                                     uint64_t current_q,
+                                     unsigned long long relations)
+{
+    double fraction = 0.0;
+
+    if (cfg->target_rels) {
+        fraction = (double)relations / (double)cfg->target_rels;
+    } else if (streaming && cfg->nq_max) {
+        fraction = (double)nqdone / (double)cfg->nq_max;
+    } else if (streaming && cfg->qmax && cfg->qmax >= cfg->qmin &&
+               current_q >= cfg->qmin) {
+        const double span = (double)(cfg->qmax - cfg->qmin) + 1.0;
+        fraction = ((double)(current_q - cfg->qmin) + 1.0) / span;
+    } else if (nq) {
+        fraction = (double)nqdone / (double)nq;
+    }
+
+    if (!isfinite(fraction) || fraction < 0.0) return 0.0;
+    return fraction > 1.0 ? 1.0 : fraction;
+}
+
 /* Everything that does NOT depend on the special-q: the factor base upload,
  * the slice tables, and the pinned staging. Hoisted out of the per-q path so a
  * band of q measures sieving rather than allocation churn. */
@@ -1038,6 +1066,9 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     {
     const double t_band = host_ms();
     double t_report = t_band;
+#ifdef HAVE_BOINC
+    double t_boinc_report = t_band - 1000.0; /* report after the first q */
+#endif
     for (uint32_t qi = 0;; qi++) {
         qsel_t generated, checked;
         const qsel_t *cur;
@@ -1259,6 +1290,27 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         acc_surv += hn; acc_cand += ncand; acc_rel += nrel;   /* host path only */
         nqdone++;
         norm_verbose = 0;      /* the first q's setup is printed; the rest are not */
+#ifdef HAVE_BOINC
+        {
+            const unsigned long long progress_rels = cfg->cofactor
+                ? Q.nrel : (unsigned long long)acc_rel;
+            const double now = host_ms();
+            const int terminal_known =
+                (!qgen && nqdone == nq) ||
+                (cfg->target_rels && progress_rels >= cfg->target_rels);
+            if (now - t_boinc_report >= 1000.0 || terminal_known) {
+                double fraction = pipe_progress_fraction(
+                    cfg, qgen != NULL, nq, nqdone, cur->q, progress_rels);
+                /* Leave the final one percent for the after-band cofactor flush,
+                 * output close/rename, cleanup, and bench_boinc_finish(). A
+                 * successful workunit reports exactly 1.0 only after main has
+                 * completed successfully. */
+                if (fraction > 0.99) fraction = 0.99;
+                bench_boinc_fraction_done(fraction);
+                t_boinc_report = now;
+            }
+        }
+#endif
         /* --target-rels: stop once enough relations exist. Under inline
          * cofactorisation the only running total the host has without a per-q
          * readback is Q.nrel, which advances at FLUSH boundaries -- so this
@@ -1324,21 +1376,12 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
             const double rps = el > 0 ? rels / el : 0.0;
             double frac, eta;
             t_report = host_ms();
-            if (cfg->target_rels) {
-                frac = (double)rels / (double)cfg->target_rels;
-                eta  = rps > 0 ? ((double)cfg->target_rels - rels) / rps : 0.0;
-            } else if (qgen && cfg->nq_max) {
-                frac = (double)(qi + 1) / cfg->nq_max;
-                eta  = frac > 0 ? el * (1.0 / frac - 1.0) : 0.0;
-            } else if (qgen && cfg->qmax) {
-                const double span = (double)(cfg->qmax - cfg->qmin) + 1.0;
-                frac = ((double)(cur->q - cfg->qmin) + 1.0) / span;
-                eta  = frac > 0 ? el * (1.0 / frac - 1.0) : 0.0;
-            } else {
-                frac = (double)(qi + 1) / nq;
-                eta  = frac > 0 ? el * (1.0 / frac - 1.0) : 0.0;
-            }
-            if (frac > 1.0) frac = 1.0;
+            frac = pipe_progress_fraction(cfg, qgen != NULL, nq, nqdone,
+                                             cur->q, rels);
+            if (cfg->target_rels)
+                eta = rps > 0 ? ((double)cfg->target_rels - rels) / rps : 0.0;
+            else
+                eta = frac > 0 ? el * (1.0 / frac - 1.0) : 0.0;
             if (eta < 0.0) eta = 0.0;
             {   /* Q.n counts queued CANDIDATE records, not relations -- only
                  * ~2/3 of them survive splitting on this job, and the band
@@ -1406,6 +1449,17 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
             printf("\n    q=%llu  %u q  %llu rel%s  [q range exhausted]\033[K\n",
                    (unsigned long long)last_q.q, nqdone, rels, queued);
     }
+
+#ifdef HAVE_BOINC
+    if (!rc && nqdone) {
+        const unsigned long long rels = cfg->cofactor
+            ? Q.nrel : (unsigned long long)acc_rel;
+        double fraction = pipe_progress_fraction(
+            cfg, qgen != NULL, nq, nqdone, last_q.q, rels);
+        if (fraction > 0.99) fraction = 0.99;
+        bench_boinc_fraction_done(fraction);
+    }
+#endif
 
     {   /* Steady-state footprint. The per-q buffers (survivor lists, prime
          * lists, candidate records) grow on demand as q vary, so the band's
@@ -1481,6 +1535,9 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
             perror("rename"); rc = -1;
         }
     }
+#ifdef HAVE_BOINC
+    if (rc == 0) bench_boinc_fraction_done(0.99);
+#endif
     if (rc) {
         if (cfg->relations) remove(rtmp);
         if (cfg->candidates) remove(ctmp);

@@ -12,8 +12,9 @@ are part of its release status.
 
 ## Build and test
 
-You need a Linux build environment, GNU Make, a C11 compiler, and an NVIDIA
-CUDA toolkit. The supplied Makefile targets compute capability 8.0 and newer.
+You need a Linux build environment, GNU Make, a C11 compiler, a C++17
+compiler, and an NVIDIA CUDA toolkit. The supplied Makefile targets compute
+capability 8.0 and newer.
 
 ```sh
 make -C bench
@@ -57,6 +58,56 @@ The job's `rlim`, `alim`, large-prime bounds, cofactor bounds, and polynomial
 are read from the `.job` file. See [`RUNBOOK.md`](RUNBOOK.md) before starting
 a long run; it documents supported inputs, output handling, parameter
 precedence, verification, and msieve handoff.
+
+## Optional BOINC application build
+
+BOINC integration is compiled only when `HAVE_BOINC=1`. The normal build has no
+BOINC header or library dependency; its wrappers compile to no-ops and the
+recurring per-q progress path is omitted. With distribution-provided BOINC
+development files, a typical build is:
+
+```sh
+make -C bench bench HAVE_BOINC=1 GPU_ARCH=all \
+    BOINC_CPPFLAGS="-I/usr/include/boinc"
+```
+
+When building against a BOINC source tree instead, point the compiler and
+linker at that tree explicitly:
+
+```sh
+make -C bench bench HAVE_BOINC=1 GPU_ARCH=all \
+    BOINC_CPPFLAGS="-I/path/to/boinc/api -I/path/to/boinc/lib" \
+    BOINC_LIBS="-L/path/to/boinc/api -L/path/to/boinc/lib -lboinc_api -lboinc -lpthread"
+```
+
+The BOINC build:
+
+- initialises and finishes through the BOINC API;
+- requests normal host-thread priority for the CUDA feeder thread;
+- accepts BOINC's `--device N` CUDA-device argument;
+- resolves every explicitly supplied input or output filename through
+  `boinc_resolve_filename_s()` and follows native BOINC output links before
+  staging and renaming result files; and
+- reports a nondecreasing fraction done at special-q boundaries, normally no
+  more than once per second, with an immediate end-of-band update. The
+  denominator is, in priority order, `--target-rels`, `--nq`, a bounded
+  generated q range, or the length of `--qlist`.
+
+The sieve reserves the final one percent for final cofactor flushing, output
+close/rename, and cleanup. A successful BOINC workunit reports 100 percent just
+before `boinc_finish(0)`.
+
+A BOINC workunit command line should therefore name all files using the logical
+names declared in its workunit template, for example:
+
+```text
+--pipeline --cofactor --poly job_file --fb1 roots_file --logI 14 \
+--qrange 15000000:16000000 --relations result_file --device 0
+```
+
+This integration does not yet add checkpoint files. BOINC can suspend and
+resume a live process, but a process that exits and is restarted begins the
+current band again.
 
 ## Repository map
 
