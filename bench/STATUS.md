@@ -4,7 +4,7 @@
 the order they were discovered, including the ones later refuted, because the
 refutations are the most useful part. That makes them bad at answering "what
 does this thing do today". This file answers only that, and holds nothing that
-is not current. **Last updated 2026-08-06.**
+is not current. **Last updated 2026-08-14.**
 
 ## Architecture
 
@@ -26,6 +26,169 @@ per special-q:
 Two sides run **sequentially through one shared bucket allocation**. There is
 no stream concurrency and no second workspace. Every timing in `RESULTS.md` is
 one-q-at-a-time.
+
+## Current size limits, and what lifting them entails
+
+This is a design assessment, not implemented work. The production path still
+refuses inputs outside the limits below; there is no unsafe override.
+
+| quantity | current limit | immediate reason |
+|---|---:|---|
+| sieve area `I*J` | `2^31` positions | the exclusive end `xmax` and the hot plattice walks use `uint32_t` |
+| `lpb` | 32 | each split large prime and unsplit small residual is stored in one `uint32_t` |
+| `mfb` | 96 | the production cofactor queue narrows residuals to `mz<3>`, three 32-bit limbs |
+| large primes per side | 3 | `ceil(mfb/lpb) <= 3` is checked before the run |
+
+The area and cofactor limits are independent even though an A=32 job such as
+AS276 needs both lifted (`I=2^16`, `J=2^16`, `lpba=35`, `mfba=101`).
+
+### A=32: representation is the first blocker, memory is the second
+
+Every valid position in a `2^32`-position rectangle still fits in a
+`uint32_t`; the value that does not fit is the exclusive endpoint `xmax =
+2^32`. The current fill and resieve loops compare a 32-bit walk position with
+that endpoint, and their next-position arithmetic wraps at the top of the
+range. Merely deleting the front-end check therefore makes an empty or
+incorrect sieve.
+
+Two implementation levels are plausible:
+
+1. **Whole-area, large-memory path.** Keep stored positions and bucket-local
+   offsets 32-bit, add an explicit full-range/end-of-walk representation, and
+   avoid promoting every operation in the hot walk to 64 bits. This is the
+   smaller change, but the complete allocation is only comfortable on a card
+   with substantially more than 16 GB.
+2. **Slabbed path.** Process A=32 as two or more A<=31 slabs, reusing the
+   bucket array and survivor bitmaps. A correct version needs persistent
+   per-prime walk positions, global row offsets in norm and small-sieve
+   calculations, slab-local rank/resieve state, and global coordinates in the
+   candidate queue. This is the portable solution for a 12 GB card and the
+   more invasive pipeline change.
+
+The measured memory model is linear in area for the two large allocations:
+
+| area | bucket array | three survivor bitmaps | subtotal |
+|---:|---:|---:|---:|
+| `2^31` | 5.53 GB | 0.81 GB | 6.34 GB |
+| `2^32` | 11.06 GB | 1.61 GB | 12.67 GB |
+
+Fixed allocations plus the CUDA/driver footprint put the full A=32 projection
+at roughly **14–16 GB**. Work that touches positions or bucket records is
+also approximately linear in area: A=32 is about 2x A=31, and 8x the A=29
+C183 rectangle, per special-q. Relations per q rise too, so q/s alone is not
+a useful comparison. A stateful slab implementation should add only launch
+and boundary bookkeeping beyond that intrinsic work; this has not been built
+or measured.
+
+### LPB and MFB are separate widths
+
+`lpb` bounds an *individual resulting prime*. `mfb` bounds the *composite
+residual sent to cofactorisation*. Raising one does not inherently require
+raising the other:
+
+- Raising `lpb` above 32 requires a two-word or `uint64_t` representation for
+  split primes, unsplit prime residuals, sorting, emission, primality checking,
+  and relation reconstruction. It does **not** require four-limb rho/ECM when
+  `mfb <= 96`.
+- Raising `mfb` above 96 requires `mz<4>` arithmetic even when the actual
+  maximum is only 101 bits. Rho, ECM, probable-prime testing, GCD, and exact
+  division all pay the wider modular-arithmetic cost.
+
+The useful dispatch is fixed-width kernels selected on the host, independently
+for each side:
+
+| side's `mfb` | cofactor type |
+|---:|---|
+| `<= 64` | `mz<2>` |
+| `<= 96` | `mz<3>` |
+| `<= 128` | `mz<4>` |
+
+The underlying `mz<L>` arithmetic is already templated. What is hardcoded
+today is the production queue/storage and its launches at `mz<3>`. Runtime
+variable-length loops inside a kernel are not the intended design: they would
+lose compile-time unrolling and likely increase register pressure. Per-side
+host dispatch captures the obvious win because current jobs do not use 3LP on
+both sides. The criterion is nevertheless the bit bound, not the label: a 2LP
+side with `mfb=65` still needs three limbs.
+
+This makes `lpb=33` with `mfb=64/95` a materially smaller extension than
+`lpb=35` with `mfb=64/101`: the former needs 64-bit factor outputs but retains
+two- and three-limb cofactor kernels; the latter needs a four-limb kernel on
+the 101-bit side. Both ratios still ask for at most three large primes, so
+`CF_MAXFAC` is not the blocker.
+
+The output-width change itself should be cheap. The TD factor lists remain
+32-bit because factor-base primes remain 32-bit; only the much smaller residual
+and split-prime arrays need widening. The expensive part is any extra limb in
+the repeatedly executed modular arithmetic.
+
+There is one direct measurement of the per-side dispatch opportunity. Widening
+the formerly two-limb rational queue to three limbs changed that queue from
+2.15 to 3.94 ms/q (**+83%**) while changing the then-current whole pipeline
+from 172.65 to 173.75 ms/q (**+0.64%**). Narrow arithmetic matters greatly to
+the stage that uses it, but the easy side was only about 1% of wall time. That
+makes per-side dispatch sensible work while the queue is already being changed,
+not a high-value standalone optimisation.
+
+### Performance accounting
+
+Three-to-four-limb Montgomery multiplication expands the CIOS inner product
+from `3*3 = 9` to `4*4 = 16` limb multiply-adds. That suggests roughly a
+1.8–2x cofactor-stage cost from width alone, subject to register pressure. A
+quoted **5x** is not a four-limb estimate: it combines the width cost with a
+pessimistic rho workload in which the factor being sought is three bits larger
+and therefore takes about `sqrt(8) = 2.8x` as many expected iterations. ECM
+also pays for four-limb operations, but does not have rho's square-root scaling;
+the rho/ECM crossover for the new cofactor population is unmeasured.
+
+On the current measured profile, cofactorisation is 14.37 of 98.26 ms/q
+(14.6%). If the *entire* stage changed and everything else remained fixed:
+
+| cofactor-stage multiplier | total ms/q | whole-pipeline slowdown |
+|---:|---:|---:|
+| 1.8x | 109.8 | 11.7% |
+| 2x | 112.6 | 14.6% |
+| 3x | 127.0 | 29.3% |
+| 5x | 155.7 | 58.5% |
+
+That table is an Amdahl illustration, not a projection for AS276. The larger
+job has a different area, cofactor distribution, stage mix, and yield. The 5x
+case would normally apply only to its hard four-limb subset, not every queued
+record.
+
+The final metric is **time to a filterable matrix**, not raw relations/s:
+
+```
+new time / old time
+  = (new ms/q / old ms/q)
+  * (new required usable relations / old required usable relations)
+  / (new usable relations/q / old usable relations/q)
+```
+
+LPB directly expands the possible large-prime ideal universe and therefore the
+column and singleton burden during filtering. As a scale indication only,
+`pi(2^(b+d))/pi(2^b) ~= 2^d*b/(b+d)`: 32 -> 33 is about 1.94x and 32 -> 35
+about 7.31x. Those are **not** required-relation multipliers—a run does not
+sample the entire prime universe—but they show why extra raw yield cannot be
+credited without filtering. MFB does not directly enlarge the ideal universe
+at fixed LPB, but admitting more and larger 3LP products can still raise the
+required surplus.
+
+### Work status and rough scope
+
+| item | status | rough engineering scope, including GPU validation |
+|---|---|---:|
+| A=32 whole-area endpoint/walk support | not started | about 1 week |
+| A=32 stateful slabbing for 12 GB | not started | about 2–3 weeks |
+| 64-bit large-prime outputs and gates | not started | part of the LPB/MFB work |
+| per-side `mz<2>` / `mz<3>` / `mz<4>` dispatch | arithmetic templates exist; queue/launch work not started | about 1--2 weeks with LPB widening |
+| target cofactor corpus, rho/ECM crossover, and filter test | not captured or measured | required before a performance claim |
+
+Together, a robust slabbed and width-dispatched implementation is roughly a
+**3–5 focused engineering-week** change, not counting delays obtaining the
+target workload or GPU access. A whole-area path restricted to >=24 GB cards
+would be appreciably smaller. These are source-review estimates, not measured
+schedules.
 
 ## Validated
 
@@ -528,13 +691,13 @@ absent from every document in the repo.
    than the report threshold. **Do not "fix" it by tightening the default** —
    the current gate finds every relation GGNFS finds (verified, zero misses
    over 2,531), so any trade of yield for speed must be made deliberately.
-8. **A = 32 sieve areas** (`2^16 × 2^16`), for jobs like AS276. Three
-   independent blockers, all still present: `xmax` is `uint32_t`
-   (`pipeline.cuh:90`, `:146`) and `(1u << 16) * 65536` is exactly 2^32, so it
-   wraps to zero; VRAM at that area projects to ~14–16 GB against 11.9 GB
-   usable on the 5070; and such jobs carry `lpba 35 > 32` and `mfba 101 > 96`,
-   both refused by `check_cofactor_bounds` because the limb widths cannot hold
-   them.
+8. **A = 32 sieve areas and LPB/MFB widening**, for jobs like AS276. All three
+   independent blockers remain: the `2^32` exclusive position endpoint, the
+   14–16 GB whole-area footprint, and the `lpb 35 / mfb 101` factor/cofactor
+   widths. The current design assessment, performance accounting, alternatives,
+   and work status are consolidated in **"Current size limits, and what lifting
+   them entails"** above; that section is canonical rather than duplicating a
+   moving design here.
 9. **Dead factor-base parses under `--sq-side 0`.** `fb1` is loaded and
    `fb_fill_logp`'d purely as the throwaway first parse that used to supply the
    q list, but under `sq_side 0` the band comes from the rational base instead

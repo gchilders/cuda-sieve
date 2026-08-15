@@ -108,6 +108,33 @@ you either state them or let them derive.
   on any real target.
 - Side 1 is the algebraic side and carries the special-q. Side 0 is rational.
 
+### Current hard size limits
+
+The production binary currently refuses:
+
+- a sieve rectangle with more than `2^31` positions;
+- `lpbr` or `lpba` above 32;
+- `mfbr` or `mfba` above 96; or
+- a ratio `ceil(mfb/lpb)` above 3 on either side.
+
+These are representation limits, not tuning advice, and there is no supported
+override. In particular, an A=32 job (`--logI 16 --J 65536`) would wrap the
+current 32-bit exclusive position endpoint and is therefore refused; an
+`lpb 35 / mfb 101` side needs both 64-bit large-prime outputs and a four-limb
+cofactor kernel.
+
+LPB and MFB should not be conflated. LPB is the bound on each resulting prime;
+raising it above 32 requires widening the split-prime, emission, and validation
+paths. MFB is the maximum composite residual sent to cofactorisation and sets
+the arithmetic width: up to 64 bits can use two 32-bit limbs, up to 96 three,
+and up to 128 four. Thus `lpb 33` with `mfb 64/95` would not itself require
+four-limb rho or ECM, although that configuration is not implemented today.
+
+For the current status, proposed per-side fixed-width kernel dispatch, A=32
+memory/slabbing options, and why the end metric is time to a filterable matrix
+rather than raw relations/s, see [Current size limits, and what lifting them
+entails](bench/STATUS.md#current-size-limits-and-what-lifting-them-entails).
+
 ### Progress output
 
 One `\r` line, updated every 30 s, reported against whichever goal is in force:

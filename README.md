@@ -10,6 +10,12 @@ GPUs. It is research software: the correctness gates pass, but the current
 limitations and unfinished experiments in [`bench/STATUS.md`](bench/STATUS.md)
 are part of its release status.
 
+The current production path is limited to a `2^31`-position sieve area,
+`lpb <= 32`, `mfb <= 96`, and at most three large primes per side. These are
+checked limits, not suggested settings. The separate representation, memory,
+cofactor-performance, and filtering implications of lifting them are laid out
+in [Current size limits, and what lifting them entails](bench/STATUS.md#current-size-limits-and-what-lifting-them-entails).
+
 ## Build and test
 
 You need a Linux build environment, GNU Make, a C11 compiler, and an NVIDIA
@@ -75,4 +81,3 @@ Original material in this repository is dedicated to the public domain under
 [CC0 1.0 Universal](LICENSE), including its as-is warranty and liability
 disclaimers. A few files derived from CADO-NFS remain under
 LGPL-2.1-or-later; see [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
-
