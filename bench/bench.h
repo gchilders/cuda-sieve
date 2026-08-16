@@ -319,6 +319,22 @@ typedef struct {
     uint32_t mfb;           /* max cofactor bits carried into cofactorisation   */
     const char *cofgate;    /* CADO cofactor file to gate trial division against */
     const char *emit_cof;   /* write (a, b, cofactor) for every survivor here    */
+    /* ---- checkpoint / resume / clean stop; see ckpt.h and STATUS.md 12a ---- */
+    /* The factor-base convention, carried here purely so the resume
+     * fingerprint can see it: dropping --maxbits under-divides every norm for
+     * the rest of a run, which startup refuses outright but a resume could
+     * not otherwise detect. */
+    int      fb_maxbits;
+    int      resume;        /* continue an existing NAME.part from its sidecar  */
+    int      restart;       /* --restart: discard that .part instead of resuming */
+    const char *stopfile;   /* --stop-file: stop cleanly once this path exists  */
+    /* Loaded from the sidecar when resume is set. The scale/allowance the band
+     * was originally derived with travel in cfg.scale/scale0/allowance*, which
+     * bench_main.cu overwrites from the checkpoint before deriving its own --
+     * re-deriving them from a later q would move the survivor gate mid-run. */
+    uint64_t resume_q, resume_rho;
+    unsigned long long resume_rel_bytes, resume_cand_bytes;
+    unsigned long long resume_nrel, resume_nq;
 } bench_cfg_t;
 
 #define FILL_ATOMIC   0     /* (a) direct global atomicAdd per record   */
@@ -432,6 +448,17 @@ int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
  * Gates what the cofactoriser EMITTED, which the pre-split gate cannot see. */
 int check_relations(const char *path, const poly_t *poly, uint32_t lpb0,
                     uint32_t lpb1);
+
+/* The same gate over the first and last `n` relations only, for resume: a
+ * multi-gigabyte .part cannot be rescanned at every restart. Proves the
+ * polynomial and nothing else -- the checkpoint fingerprint covers the sieve
+ * parameters, which a valid-looking line cannot. Returns bad lines, or -1. */
+/* `limit` bounds the sample to the checkpointed prefix, since a torn final line
+ * past it is normal after a crash and is about to be truncated away; 0 means
+ * the whole file. */
+int check_relations_sample(const char *path, const poly_t *poly, uint32_t lpb0,
+                           uint32_t lpb1, uint32_t n, unsigned long long limit,
+                           uint32_t *checked);
 
 int run_cofac(const char *path, const char *out, uint32_t lim0, uint32_t lpb0,
               uint32_t lim1, uint32_t lpb1, int rounds, uint32_t budget,

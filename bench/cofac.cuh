@@ -1575,39 +1575,32 @@ static int cf_norm_exact(bn_t *out, const tdpoly_t *P, int64_t a, int64_t b)
 }
 
 /* Returns 0 if every relation reconstructs, else the number that did not. */
-static int cf_check_relations(const char *path, const poly_t *poly,
-                              uint32_t lpb0, uint32_t lpb1)
+/* One line, verified in place (the parse writes NULs over the separators).
+ * Returns 1 if it rebuilds both norms exactly, 0 if it does not, and -1 for a
+ * comment or blank that is not a relation at all.
+ *
+ * Split out of cf_check_relations so resume can spot-check a handful of lines
+ * from the head and tail of a multi-gigabyte .part instead of rescanning it. */
+static int cf_check_one(char *line, tdpoly_t *tp, uint32_t lpb0, uint32_t lpb1,
+                        uint32_t *nprime, uint32_t *ncomp)
 {
-    tdpoly_t tp[2];
-    FILE *f = fopen(path, "rb");
-    char *line = NULL;
-    size_t cap = 0;
-    long nl = 0;
-    uint32_t nok = 0, nbad = 0, nprime = 0, ncomp = 0;
-    if (!f) { perror(path); return -1; }
-    if (td_build_poly(&tp[1], poly, 1) || td_build_poly(&tp[0], poly, 0)) {
-        fprintf(stderr, "check-relations: polynomial does not fit\n");
-        fclose(f); return -1;
-    }
-    while (getline(&line, &cap, f) > 0) {
-        int64_t a, b;
-        char *p = line, *e;
-        nl++;
-        if (*p == '#' || *p == '\n') continue;
-        a = strtoll(p, &e, 10); if (*e != ',') { nbad++; continue; }
-        b = strtoll(e + 1, &e, 10); if (*e != ':') { nbad++; continue; }
-        {
+    int64_t a, b;
+    char *p = line, *e;
+    if (*p == '#' || *p == '\n' || !*p) return -1;
+    a = strtoll(p, &e, 10); if (*e != ',') return 0;
+    b = strtoll(e + 1, &e, 10); if (*e != ':') return 0;
+    {
             bn_t N[2];
             char *fld[2];
             int side, bad = 0;
             /* fields: "a,b" ":" side-0 primes ":" side-1 primes */
             fld[0] = e + 1;
             fld[1] = strchr(fld[0], ':');
-            if (!fld[1]) { nbad++; continue; }
+            if (!fld[1]) return 0;
             *fld[1]++ = 0;
             { char *nlp = strchr(fld[1], '\n'); if (nlp) *nlp = 0; }
             if (cf_norm_exact(&N[1], &tp[1], a, b) ||
-                cf_norm_exact(&N[0], &tp[0], a, b)) { nbad++; continue; }
+                cf_norm_exact(&N[0], &tp[0], a, b)) return 0;
             for (side = 0; side < 2 && !bad; side++) {
                 const uint32_t lpb = side ? lpb1 : lpb0;
                 char *q = fld[side];
@@ -1621,7 +1614,7 @@ static int cf_check_relations(const char *path, const poly_t *poly,
                      * not to divide. `v > 0xffffffff` now rejects it directly,
                      * which also makes `1ull << 32` safe to evaluate. */
                     if (!v || v > 0xffffffffull || v >= (1ull << lpb)) {
-                        nprime++; bad = 1; break;
+                        (*nprime)++; bad = 1; break;
                     }
                     /* THE GATE'S BLIND SPOT UNTIL NOW. Exact division cannot
                      * see a composite: replace a relation's `p,q` with the
@@ -1631,7 +1624,7 @@ static int cf_check_relations(const char *path, const poly_t *poly,
                      * likely real defect in the ECM/rho path, and the one
                      * failure this gate exists to catch. */
                     if (!bench_is_prime32((uint32_t)v)) {
-                        ncomp++; bad = 1; break;
+                        (*ncomp)++; bad = 1; break;
                     }
                     {   /* exact division: a factor that does not divide is a
                          * reconstruction failure, not a rounding question */
@@ -1647,9 +1640,26 @@ static int cf_check_relations(const char *path, const poly_t *poly,
                     if (*q == ',') q++; else break;
                 }
             }
-            if (!bad && bn_is_one(&N[0]) && bn_is_one(&N[1])) nok++;
-            else nbad++;
-        }
+        return (!bad && bn_is_one(&N[0]) && bn_is_one(&N[1])) ? 1 : 0;
+    }
+}
+
+static int cf_check_relations(const char *path, const poly_t *poly,
+                              uint32_t lpb0, uint32_t lpb1)
+{
+    tdpoly_t tp[2];
+    FILE *f = fopen(path, "rb");
+    char *line = NULL;
+    size_t cap = 0;
+    uint32_t nok = 0, nbad = 0, nprime = 0, ncomp = 0;
+    if (!f) { perror(path); return -1; }
+    if (td_build_poly(&tp[1], poly, 1) || td_build_poly(&tp[0], poly, 0)) {
+        fprintf(stderr, "check-relations: polynomial does not fit\n");
+        fclose(f); return -1;
+    }
+    while (getline(&line, &cap, f) > 0) {
+        const int r = cf_check_one(line, tp, lpb0, lpb1, &nprime, &ncomp);
+        if (r > 0) nok++; else if (r == 0) nbad++;
     }
     free(line); fclose(f);
     printf("  relation reconstruction gate: %u of %u rebuild both norms exactly",
@@ -1657,7 +1667,6 @@ static int cf_check_relations(const char *path, const poly_t *poly,
     if (nprime) printf(", %u carried a factor outside [2, 2^lpb)", nprime);
     if (ncomp)  printf(", %u carried a COMPOSITE factor", ncomp);
     printf("  %s\n", nbad ? "<-- FAIL" : "PASS");
-    (void)nl;
     return (int)nbad;
 }
 
@@ -1665,6 +1674,102 @@ extern "C" int check_relations(const char *path, const poly_t *poly,
                                uint32_t lpb0, uint32_t lpb1)
 {
     return cf_check_relations(path, poly, lpb0, lpb1);
+}
+
+/* Spot-check a relation file without reading all of it: the first `n` relation
+ * lines and the last `n` that fall inside the final 64 KiB. Resume uses this to
+ * refuse a .part that does not belong to the job being run.
+ *
+ * It proves the POLYNOMIAL, and nothing else. logI, J, lambda, mfb, lpb,
+ * sq-side and the factor-base convention can all differ while every line still
+ * reconstructs exactly -- that is what the checkpoint fingerprint is for.
+ * Returns the number of bad lines, or -1 if the file could not be read. */
+extern "C" int check_relations_sample(const char *path, const poly_t *poly,
+                                      uint32_t lpb0, uint32_t lpb1,
+                                      uint32_t n, unsigned long long limit,
+                                      uint32_t *checked)
+{
+    enum { TAILWIN = 65536 };
+    tdpoly_t tp[2];
+    FILE *f = fopen(path, "rb");
+    char *line = NULL, **keep = NULL;
+    size_t cap = 0;
+    uint32_t nok = 0, nbad = 0, nprime = 0, ncomp = 0, seen = 0, nkeep = 0;
+    long long size, end, head_end = 0;
+    if (checked) *checked = 0;
+    if (!f) { perror(path); return -1; }
+    if (td_build_poly(&tp[1], poly, 1) || td_build_poly(&tp[0], poly, 0)) {
+        fprintf(stderr, "resume: polynomial does not fit\n");
+        fclose(f); return -1;
+    }
+    if (fseek(f, 0, SEEK_END) != 0 || (size = ftell(f)) <= 0) goto done;
+    /* `limit` is the checkpointed prefix, and everything past it is about to be
+     * truncated away. Stopping here is not an optimisation: a kill -9 leaves a
+     * torn final line beyond the checkpoint, and sampling it would report a
+     * corrupt file and refuse a resume that is in fact perfectly sound. */
+    end = (limit && (long long)limit < size) ? (long long)limit : size;
+    rewind(f);
+    while (seen < n && getline(&line, &cap, f) > 0) {
+        int r;
+        if (ftell(f) > end) break;      /* the line crosses the prefix end */
+        r = cf_check_one(line, tp, lpb0, lpb1, &nprime, &ncomp);
+        if (r < 0) continue;
+        seen++;
+        if (r) nok++; else nbad++;
+        head_end = ftell(f);
+    }
+    /* The tail matters more than the head: a truncated or mis-joined write
+     * lands there, and the head of a resumed file was already checked by
+     * whatever session wrote it. */
+    {
+        /* Never re-read what the head pass already covered. On a prefix under
+         * 64 KiB the window would otherwise start at 0, so the same lines get
+         * checked twice and `seen`, `nok` and `nbad` all double -- a 6-relation
+         * file reporting "spot-checked 12 relations", and one bad line
+         * reported as two. */
+        long long off = end > TAILWIN ? end - TAILWIN : 0;
+        if (off < head_end) off = head_end;
+        if (off < end && fseek(f, (long)off, SEEK_SET) == 0) {
+            /* Only resync to a line boundary when the window was cut mid-file;
+             * head_end is already one. */
+            if (off && off != head_end) {
+                if (getline(&line, &cap, f) <= 0) goto done;
+            }
+            keep = (char **)calloc(n, sizeof *keep);
+            if (!keep) goto done;
+            while (getline(&line, &cap, f) > 0) {
+                if (ftell(f) > end) break;
+                if (line[0] == '#' || line[0] == '\n') continue;
+                free(keep[nkeep % n]);
+                keep[nkeep % n] = strdup(line);
+                nkeep++;
+            }
+            {   /* replay in file order; the ring holds the last min(n, nkeep) */
+                const uint32_t have = nkeep < n ? nkeep : n;
+                const uint32_t first = nkeep < n ? 0 : nkeep % n;
+                for (uint32_t i = 0; i < have; i++) {
+                    char *s = keep[(first + i) % n];
+                    int r;
+                    if (!s) continue;
+                    r = cf_check_one(s, tp, lpb0, lpb1, &nprime, &ncomp);
+                    if (r < 0) continue;
+                    seen++;
+                    if (r) nok++; else nbad++;
+                }
+            }
+            for (uint32_t i = 0; i < n; i++) free(keep[i]);
+            free(keep);
+        }
+    }
+done:
+    free(line); fclose(f);
+    if (checked) *checked = seen;
+    printf("  resume: spot-checked %u relations from %s -- %u rebuild both"
+           " norms exactly", seen, path, nok);
+    if (nprime) printf(", %u out of lpb range", nprime);
+    if (ncomp)  printf(", %u composite", ncomp);
+    printf("  %s\n", nbad ? "<-- FAIL" : "PASS");
+    return (int)nbad;
 }
 
 typedef struct { char *ab, *f0, *f1; } cf_rest_t;

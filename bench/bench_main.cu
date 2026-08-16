@@ -1,9 +1,11 @@
 /* CLI for the standalone bucket-fill benchmark. */
 #include "bench.h"
+#include "ckpt.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <sys/stat.h>
 
 static void usage(void)
 {
@@ -49,7 +51,22 @@ static void usage(void)
 "  --nq N           stop after N special-q from the list or generated range\n"
 "  --target-rels N  stop once N relations have been collected. Checked at\n"
 "                   flush boundaries, so it overshoots by under a flush.\n"
-"                   Pair with --qrange MIN: to sieve upward until satisfied\n"
+"                   Pair with --qrange MIN: to sieve upward until satisfied.\n"
+"                   Counts relations already on disk when resuming\n"
+"\n"
+"STOPPING AND RESUMING  (--relations runs only)\n"
+"  Relations stage to NAME.part and are renamed to NAME when the band finishes.\n"
+"  After every cofactor flush -- the one instant the file holds a whole number\n"
+"  of special-q -- the .part is fsynced and NAME.part.ckpt records the next\n"
+"  (q, rho), the byte offset and the derived scale. Rerunning the SAME command\n"
+"  resumes there: the .part is truncated to that offset, discarding any torn\n"
+"  final line, and sieving continues. A .part with no checkpoint, or one whose\n"
+"  job fingerprint differs, is refused rather than appended to or overwritten.\n"
+"  SIGINT or SIGTERM stops cleanly at the next special-q, draining the queue\n"
+"  first, so a planned stop loses no work; a second signal exits at once and\n"
+"  falls back to the previous checkpoint.\n"
+"  --restart        discard an existing .part and its checkpoint, start over\n"
+"  --stop-file P    stop cleanly once path P exists (for unattended runs)\n"
 "\n"
 "PARAMETERS  (precedence: this flag > .job file > derived from the poly)\n"
 "  The byte scale and survivor allowance are ALWAYS derived, as las does, from\n"
@@ -283,6 +300,11 @@ int main(int argc, char **argv)
     cfg.qmin = 0; cfg.qmax = 0; cfg.target_rels = 0;
     cfg.cofactor = 0; cfg.cof_rounds = 2; cfg.cof_budget = 65536;
     cfg.cof_ecm = 0; cfg.ecm_b1 = 1000; cfg.ecm_b2 = 0; cfg.ecm_curves = 16;
+    cfg.fb_maxbits = 0;
+    cfg.resume = 0; cfg.restart = 0; cfg.stopfile = NULL;
+    cfg.resume_q = 0; cfg.resume_rho = 0;
+    cfg.resume_rel_bytes = 0; cfg.resume_cand_bytes = 0;
+    cfg.resume_nrel = 0; cfg.resume_nq = 0;
     int maxbits = 0, maxbits_set = 0;
     int allowance_set = 0, allowance0_set = 0, scale0_set = 0;
     const char *cofac_in = NULL;
@@ -451,6 +473,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--allowance0") && i + 1 < argc) { cfg.allowance0 = atof(argv[++i]); allowance0_set = 1; }
         else if (!strcmp(argv[i], "--relations") && i + 1 < argc) cfg.relations = argv[++i];
         else if (!strcmp(argv[i], "--candidates") && i + 1 < argc) cfg.candidates = argv[++i];
+        else if (!strcmp(argv[i], "--restart")) cfg.restart = 1;
+        else if (!strcmp(argv[i], "--stop-file") && i + 1 < argc) cfg.stopfile = argv[++i];
         else if (!strcmp(argv[i], "--lpb") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 32) { fprintf(stderr, "--lpb %ld out of range 1..32\n", v); return 1; } cfg.lpb = (uint32_t)v; lpb_set = 1; }
         else if (!strcmp(argv[i], "--mfb") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 96) { fprintf(stderr, "--mfb %ld out of range 1..96\n", v); return 1; } cfg.mfb = (uint32_t)v; mfb_set = 1; }
         else if (!strcmp(argv[i], "--cofgate") && i + 1 < argc) cfg.cofgate = argv[++i];
@@ -473,6 +497,7 @@ int main(int argc, char **argv)
      * check, the probe range), and an out-of-range shift is undefined. */
     if (cfg.logI < 2 || cfg.logI > 20) { usage(); return 1; }
     if (!maxbits_set) maxbits = cfg.logI;
+    cfg.fb_maxbits = maxbits;      /* the resume fingerprint reads it from cfg */
     if (maxbits < 1 || maxbits > 31) {
         fprintf(stderr, "--maxbits must be in [1,31]\n");
         return 1;
@@ -786,7 +811,8 @@ int main(int argc, char **argv)
      * neither is the same defect either way. */
     if (!cfg.pipeline) {
         static const char *pipeline_only[] = {
-            "--target-rels", "--lambda0", "--lambda1", "--sq-side", NULL
+            "--target-rels", "--lambda0", "--lambda1", "--sq-side",
+            "--restart", "--stop-file", NULL
         };
         int nbad = 0;
         for (int i = 1; i < argc; i++)
@@ -868,6 +894,227 @@ int main(int argc, char **argv)
         if (!cfg.lpb)  cfg.lpb  = 32;
         if (!cfg.mfb)  cfg.mfb  = 92;
 
+        /* A stop file that is still present would be honoured at the very
+         * first q, so the run would drain nothing, rewrite the same
+         * checkpoint and exit 0 -- telling a job queue the work succeeded
+         * while making no progress, forever. Refuse to start instead, rather
+         * than deleting a path the operator created. */
+        if (cfg.stopfile && access(cfg.stopfile, F_OK) == 0) {
+            fprintf(stderr, "bench: --stop-file %s already exists; remove it"
+                    " before starting.\n", cfg.stopfile);
+            return 1;
+        }
+        if (cfg.stopfile && !cfg.relations) {
+            fprintf(stderr, "bench: --stop-file needs --relations: there is no"
+                    " checkpoint to stop against.\n");
+            return 2;
+        }
+
+        /* ---- resume, before anything reads qmin (STATUS.md item 12a) ----
+         *
+         * Everything the fingerprint covers is settled by this point, which is
+         * why the check lives here: it has to run before sqgen_create fixes the
+         * band start and before the scale derivation below, whose result the
+         * checkpoint overrides.
+         *
+         * THE LOCK COMES FIRST, ahead of --restart's unlink and ahead of the
+         * factor-base parse. Taking it later meant --restart could delete a
+         * running siever's .part and only then discover the lock -- reporting
+         * the conflict after doing the damage, with the victim still writing
+         * to an unlinked inode and its final rename doomed to ENOENT. */
+        if (cfg.relations) {
+            if (ckpt_lock(cfg.relations, ckpt_lock_held,
+                          sizeof ckpt_lock_held)) {
+                ckpt_lock_held[0] = 0;
+                return 1;
+            }
+            atexit(ckpt_unlock_atexit);
+        }
+        if (cfg.relations) {
+            char part[2048], cpath[2048];
+            char fp[17];
+            struct stat st;
+            ckpt_t ck;
+            ckpt_part_path(cfg.relations, part, sizeof part);
+            ckpt_ckpt_path(cfg.relations, cpath, sizeof cpath);
+            ckpt_fingerprint(&POLY, &cfg, fp);
+            if (cfg.restart) {
+                if (stat(part, &st) == 0)
+                    printf("resume: --restart, discarding %s (%lld bytes)\n",
+                           part, (long long)st.st_size);
+                remove(part); remove(cpath);
+                if (cfg.candidates) {
+                    char cp2[2048];
+                    ckpt_part_path(cfg.candidates, cp2, sizeof cp2);
+                    remove(cp2);
+                }
+            } else if (stat(part, &st) == 0) {
+                const int r = ckpt_read(cfg.relations, &ck);
+                /* Every branch here refuses rather than guesses. An existing
+                 * .part is either resumable work or somebody else's data; the
+                 * one thing this must never do is silently truncate it. */
+                if (r == -1) {
+                    fprintf(stderr,
+                        "bench: %s exists but %s does not.\n"
+                        "  That file cannot be resumed automatically -- the"
+                        " special-q that produced a relation\n"
+                        "  cannot be recovered from the relation itself under"
+                        " the full factor base (a line\n"
+                        "  carries ~1.8 in-band primes and none of them is"
+                        " marked). Move it aside, or pass\n"
+                        "  --restart to discard it.\n", part, cpath);
+                    return 1;
+                }
+                if (r == -2) return 1;      /* ckpt_read explained why */
+                if (strcmp(ck.fp, fp)) {
+                    fprintf(stderr,
+                        "bench: %s belongs to a different job.\n"
+                        "  checkpoint fingerprint %s, this run %s.\n"
+                        "  Appending would produce a file whose lines all"
+                        " verify and whose yield means\n"
+                        "  nothing. Check the polynomial, lim/lpb/mfb, logI/J"
+                        " and --sq-side, or --restart.\n",
+                        cpath, ck.fp, fp);
+                    return 1;
+                }
+                if (ck.rel_bytes > (unsigned long long)st.st_size) {
+                    fprintf(stderr,
+                        "bench: %s is %lld bytes but %s claims %llu.\n"
+                        "  The relation file has been truncated or replaced"
+                        " since the checkpoint.\n",
+                        part, (long long)st.st_size, cpath, ck.rel_bytes);
+                    return 1;
+                }
+                /* The candidates .part is truncated to a recorded offset just
+                 * like the relations one, so it needs the same guard. Two ways
+                 * it goes wrong unguarded: a short file is EXTENDED by
+                 * ftruncate and the gap is a run of NULs no parser survives;
+                 * and because --candidates is not part of the fingerprint, a
+                 * resume that omitted it records cand_bytes = 0, so the next
+                 * resume that supplies it again truncates the whole file away. */
+                {
+                    struct stat cst;
+                    char cpart[2048] = "";
+                    if (cfg.candidates)
+                        ckpt_part_path(cfg.candidates, cpart, sizeof cpart);
+                    if (cfg.candidates && !ck.cand_bytes &&
+                        stat(cpart, &cst) == 0 && cst.st_size > 0) {
+                        fprintf(stderr,
+                            "bench: %s holds %lld bytes but the checkpoint"
+                            " records none.\n"
+                            "  It was written by a session run without"
+                            " --candidates. Resuming would\n"
+                            "  discard it; drop --candidates, or move the file"
+                            " aside.\n", cpart, (long long)cst.st_size);
+                        return 1;
+                    }
+                    if (cfg.candidates && ck.cand_bytes &&
+                        (stat(cpart, &cst) || (unsigned long long)cst.st_size
+                                              < ck.cand_bytes)) {
+                        fprintf(stderr,
+                            "bench: %s is missing or shorter than the %llu"
+                            " bytes the checkpoint records.\n", cpart,
+                            ck.cand_bytes);
+                        return 1;
+                    }
+                    if (!cfg.candidates && ck.cand_bytes) {
+                        fprintf(stderr,
+                            "bench: the checkpoint records %llu bytes of"
+                            " candidates but --candidates was not given.\n"
+                            "  Resuming would strand them. Pass the same"
+                            " --candidates path, or --restart.\n",
+                            ck.cand_bytes);
+                        return 1;
+                    }
+                }
+                {   /* Cheap, host-only, and it catches the case the
+                     * fingerprint cannot: a .part that was hand-edited, or
+                     * concatenated from another job, under a checkpoint that
+                     * still matches. Proves the polynomial only. */
+                    uint32_t nchecked = 0;
+                    const int bad = check_relations_sample(part, &POLY,
+                                                           cfg.lpb0, cfg.lpb,
+                                                           8, ck.rel_bytes,
+                                                           &nchecked);
+                    if (bad < 0) return 1;
+                    if (bad > 0) {
+                        fprintf(stderr,
+                            "bench: %d of %u sampled relations in %s do not"
+                            " reconstruct.\n"
+                            "  Refusing to append to it.\n", bad, nchecked,
+                            part);
+                        return 1;
+                    }
+                }
+                /* The single-q fallback builds ql[0] from --q/--rho and never
+                 * consults the checkpoint, so resuming into it would truncate
+                 * the .part, sieve one unrelated q, decide the band finished
+                 * normally, rename over the final name and delete the sidecar
+                 * -- presenting a multi-day partial band as complete. The band
+                 * source is not in the fingerprint, so only this check stops
+                 * it. */
+                if (!cfg.qlist && !qrange_set) {
+                    fprintf(stderr,
+                        "bench: %s is a resumable band, but neither --qlist nor"
+                        " --qrange was given.\n"
+                        "  The single-q path cannot continue it. Supply the"
+                        " original band, or --restart.\n", part);
+                    return 1;
+                }
+                cfg.resume = 1;
+                cfg.resume_q = ck.next_q;
+                cfg.resume_rho = ck.next_rho;
+                cfg.resume_rel_bytes = ck.rel_bytes;
+                cfg.resume_cand_bytes = ck.cand_bytes;
+                cfg.resume_nrel = ck.nrel;
+                cfg.resume_nq = ck.nqdone;
+                /* The gate must not move mid-run. scale/allowance are derived
+                 * once from the band's FIRST q and held band-wide; re-deriving
+                 * them here from the resume q would sieve the rest of the job
+                 * against a different survivor bound than the part already on
+                 * disk. Carried in the checkpoint, restored here, and marked
+                 * as explicit so the derivation below leaves them alone. */
+                cfg.scale = ck.scale;   scale_set = 1;
+                cfg.scale0 = ck.scale0; scale0_set = 1;
+                cfg.allowance = ck.allowance;   allowance_set = 1;
+                cfg.allowance0 = ck.allowance0; allowance0_set = 1;
+                if (qrange_set && cfg.qmin > ck.next_q) {
+                    fprintf(stderr,
+                        "bench: --qrange starts at %llu but the checkpoint"
+                        " resumes at %llu.\n"
+                        "  The gap would never be sieved.\n",
+                        (unsigned long long)cfg.qmin,
+                        (unsigned long long)ck.next_q);
+                    return 1;
+                }
+                if (qrange_set) cfg.qmin = ck.next_q;
+                /* --nq counts this session's q, so a resumed run must not be
+                 * handed the whole original budget again. */
+                if (cfg.nq_max) {
+                    cfg.nq_max = ck.nqdone >= cfg.nq_max
+                        ? 0 : (uint32_t)(cfg.nq_max - ck.nqdone);
+                    if (!cfg.nq_max) {
+                        printf("resume: --nq already satisfied by %llu"
+                               " completed q; nothing to do\n", ck.nqdone);
+                        return 0;
+                    }
+                }
+                printf("resume: %s at q=%llu rho=%llu -- %llu relations,"
+                       " %llu q done, %llu bytes kept\n",
+                       part, (unsigned long long)ck.next_q,
+                       (unsigned long long)ck.next_rho,
+                       ck.nrel, ck.nqdone, ck.rel_bytes);
+                printf("        scale %.4f/%.4f allowance %.2f/%.2f restored"
+                       " from the checkpoint\n",
+                       cfg.scale, cfg.scale0, cfg.allowance, cfg.allowance0);
+            } else if (access(cpath, F_OK) == 0) {
+                fprintf(stderr,
+                    "bench: %s exists but %s does not. Remove the checkpoint"
+                    " to start fresh.\n", cpath, part);
+                return 1;
+            }
+        }
+
         /* --qlist is read HERE, before the factor base, for two reasons. It
          * needs nothing from the base, so a missing or malformed list should
          * fail before a 29 MB parse rather than after it. And the scale
@@ -933,11 +1180,42 @@ int main(int argc, char **argv)
                     if (!ql) { fclose(f); return 1; }
                 }
                 ql[nq].q = qq; ql[nq].rho = rr; nq++;
-                if (cfg.nq_max && nq >= cfg.nq_max) break;
+                /* When resuming, --nq is a budget for THIS session and the
+                 * resume point may be past this many entries, so the list
+                 * cannot be truncated until after the skip below. */
+                if (!cfg.resume && cfg.nq_max && nq >= cfg.nq_max) break;
             }
             fclose(f);
             if (!nq) { fprintf(stderr, "%s: no `q rho` pairs\n", cfg.qlist); return 1; }
             printf("band: %u special-q from %s\n", nq, cfg.qlist);
+            /* A list is resumed by POSITION, not by q: the checkpoint names the
+             * exact (q, rho) pair that was next, and the list may legitimately
+             * repeat a q with different roots. An entry that is not in this
+             * list means the list changed under the checkpoint, which is the
+             * same class of error as a fingerprint mismatch. */
+            if (cfg.resume) {
+                uint32_t at = 0;
+                while (at < nq && !(ql[at].q == cfg.resume_q &&
+                                    ql[at].rho == cfg.resume_rho)) at++;
+                if (at == nq) {
+                    fprintf(stderr,
+                        "bench: the checkpoint resumes at q=%llu rho=%llu,"
+                        " which is not in %s.\n",
+                        (unsigned long long)cfg.resume_q,
+                        (unsigned long long)cfg.resume_rho, cfg.qlist);
+                    free(ql); return 1;
+                }
+                printf("resume: skipping the first %u entries of %s\n",
+                       at, cfg.qlist);
+                memmove(ql, ql + at, (size_t)(nq - at) * sizeof(qsel_t));
+                nq -= at;
+                if (cfg.nq_max && nq > cfg.nq_max) nq = cfg.nq_max;
+                if (!nq) {
+                    printf("resume: %s is exhausted; nothing to do\n",
+                           cfg.qlist);
+                    free(ql); return 0;
+                }
+            }
         }
 
         /* --qrange is a stream of prime ideals, independent of the factor
@@ -953,8 +1231,14 @@ int main(int argc, char **argv)
                                 " or --nq as a stopping condition\n");
                 return 2;
             }
+            /* sqgen counts every pair it EMITS against its nqmax, and the
+             * resume wind-forward below discards up to deg-1 of them to reach
+             * the exact root. Charging those to the budget makes the generator
+             * stop early and report "q range exhausted" on a range that is
+             * nowhere near it, so when resuming the count limit is enforced by
+             * run_pipeline's own nqdone check instead. */
             qgen = sqgen_create(&POLY, cfg.sq_side, cfg.qmin, cfg.qmax,
-                                cfg.nq_max);
+                                cfg.resume ? 0 : cfg.nq_max);
             if (!qgen) return 1;
             ql = (qsel_t *)malloc(sizeof(*ql));
             if (!ql) { sqgen_free(qgen); return 1; }
@@ -977,6 +1261,29 @@ int main(int argc, char **argv)
                 free(ql); sqgen_free(qgen); return 1;
             }
             nq = 1;
+            /* cfg.qmin is already the checkpoint's q, but a prime carries one
+             * (q, rho) entry per affine root and the stop may have landed on
+             * the second or third of them. Wind forward to the exact pair --
+             * restarting at the first root of that q would re-sieve roots
+             * whose relations are already in the file. */
+            if (cfg.resume) {
+                int guard = 0;
+                while ((ql->q != cfg.resume_q || ql->rho != cfg.resume_rho) &&
+                       ++guard <= BENCH_NCOEFF) {
+                    qr = sqgen_next(qgen, ql);
+                    if (qr <= 0) break;
+                }
+                if (ql->q != cfg.resume_q || ql->rho != cfg.resume_rho) {
+                    fprintf(stderr,
+                        "bench: the generator does not produce q=%llu rho=%llu"
+                        " at the checkpoint.\n"
+                        "  --sq-side or the polynomial has changed since it was"
+                        " written.\n",
+                        (unsigned long long)cfg.resume_q,
+                        (unsigned long long)cfg.resume_rho);
+                    free(ql); sqgen_free(qgen); return 1;
+                }
+            }
             if (cfg.qmax)
                 printf("band: generated prime special-q roots on side %d in"
                        " [%llu, %llu]\n", cfg.sq_side,
@@ -1226,6 +1533,8 @@ int main(int argc, char **argv)
                 ql[0].rho = rho ? rho : (uint64_t)(0x9E3779B97F4A7C15ull % q);
                 nq = 1;
             }
+            /* The .part lock was taken before the resume check, far above --
+             * see the comment there. It is released by atexit. */
             prc = run_pipeline(&fb1, &fbs1, &fb0, &fbs0, ql, nq, qgen,
                                &POLY, &cfg);
             free(ql);

@@ -27,6 +27,15 @@ Two sides run **sequentially through one shared bucket allocation**. There is
 no stream concurrency and no second workspace. Every timing in `RESULTS.md` is
 one-q-at-a-time.
 
+`--relations NAME` stages to `NAME.part` and renames to `NAME` only when the
+band completes. The `.part` is the **durable artifact**, not scratch: after
+every cofactor flush it is fsynced and `NAME.part.ckpt` records the next
+`(q, rho)`, the byte offset, the relation count, the derived scale/allowance
+and a job fingerprint. Rerunning the same command resumes there; `--restart`
+discards; SIGINT/SIGTERM and `--stop-file` stop cleanly at the next special-q;
+`NAME.lock` refuses a second writer. See item 12a, including what has not yet
+been exercised on a GPU.
+
 ## Current size limits, and what lifting them entails
 
 This is a design assessment, not implemented work. The production path still
@@ -747,19 +756,154 @@ absent from every document in the repo.
     "Measured" narrows this**: fill is not at an L2 bandwidth ceiling (52% of
     max) and wastes ~7× on store sectors, so the prior-art warning may not
     transfer. Take the same profile of `k_apply` before assuming it does.
-12. **Unattended operation — a job queue** *(added 2026-08-07, owner-stated
-    requirement; design not yet scoped)*. The GPU should not idle waiting on
-    a human any more than it should idle waiting on the host thread; item 4 is
-    the within-job half of this and this is the between-job half. Known
-    concrete pieces, pending a decision on what the queue should actually be:
+12. **Unattended operation — checkpoint, resume, clean stop, logging**
+    *(added 2026-08-07, owner-stated requirement; scoped 2026-08-11)*. The GPU
+    should not idle waiting on a human any more than it should idle waiting on
+    the host thread; item 4 is the within-job half of this and this is the
+    between-job half. Split into three pieces, in dependency order.
 
-    - A job list consumed without intervention, so finishing one job starts
-      the next rather than leaving the card idle overnight.
-    - **Resume.** The snfs236 restart was hand-built — the current process was
-      launched with `--qrange 36965783:` derived by hand from where
-      `msieve.dat.1` stopped. That step has to become automatic before a queue
-      means anything, and it is the piece most likely to silently lose or
-      duplicate relations if it is got wrong.
-    - **Item 9 stops being cosmetic.** Its ~15–20 s of redundant startup is
-      noise in a multi-day run and real overhead in anything that restarts the
-      process per job — which is exactly what a queue does.
+    **12a. Checkpoint / resume / clean stop — BUILT 2026-08-11**, in
+    `bench/ckpt.h` plus changes to `pipeline.cuh`, `bench_main.cu` and
+    `cofac.cuh`. **Compiles clean and the host-side half is tested; none of the
+    write path has run on a GPU.** What is unverified: that checkpoints are
+    actually emitted during a band, that the signal drain works, and that a
+    resumed run produces correct continued output. `make check` has not been
+    run against it either. Verify with a short c147 band — run, `^C` mid-band,
+    rerun the same command, `--check-relations` the joined file — before
+    trusting it with a long job.
+
+    The mechanism rests on one property of the existing code:
+    `pipeline.cuh:1228` flushes the cofactor queue *before* enqueuing the
+    current q rather than splitting it, so `cofq_flush` never straddles a
+    special-q. At every flush the `.part` file therefore holds exactly the
+    complete relation set for every q processed so far and nothing partial — a
+    checkpoint the run already produced and simply did not record.
+
+    So: after each flush, `fflush` + `fsync` the `.part`, then write a sidecar
+    `NAME.part.ckpt` recording the next `(q, rho)`, the byte offset, the
+    relation count, and a job fingerprint. Resume truncates the `.part` to that
+    offset (which also removes any torn final line) and restarts at that
+    `(q, rho)`. Exact, and independent of the factor-base convention.
+    `--restart` discards; `--stop-file PATH` stops cleanly for unattended runs;
+    a `NAME.lock` refuses a second writer and clears itself if the recorded pid
+    is gone.
+
+    **Rejected: inferring the resume point from the primes in the relation
+    lines.** It is the obvious approach and it is ambiguous under the
+    convention the pipeline actually runs. The full factor base is in force —
+    item 3's per-q truncation is not built, all three kernels still take the
+    full `fb->n` — so a relation is re-found at *every* band q dividing its
+    sq-side norm: measured P(re-found) 70.2%/72.3%, mean 1.82 sq-side primes
+    per relation. A line typically carries ~2 in-band primes and nothing
+    distinguishes the one that produced it. The failure is asymmetric —
+    guessing high skips q and loses relations silently, guessing low only
+    re-sieves an overlap that msieve deduplicates — so a guess is survivable
+    but not auditable. Note it becomes exact *under* truncation, where the
+    producing q is the largest sq-side FB prime; that it depends on an open
+    experiment (item 3) is itself the reason not to build resume on it. Keep
+    prime-scanning as a separate human-read diagnostic for files with no
+    sidecar, reporting a conservative (minimum) resume point.
+
+    Constraints the implementation had to meet, each of which is a way to lose
+    or corrupt relations. They are listed because they are the review checklist
+    for anything that touches this code again, not because any is outstanding:
+
+    - **The `.part` used to be destroyed.** `pipeline.cuh:1588` removed it on
+      any failure and `:1030` opens it `"w"`, which would truncate the file
+      being resumed from. The reframe is that `.part` is the durable artifact
+      and the rename to the final name is only the "band completed" marker.
+      It is now kept on failure **iff a sidecar was actually written** — not
+      merely because a relation file was opened. Under `--cofactor` the file is
+      empty until the first flush and that flush is what writes the first
+      checkpoint, so an unresumable `.part` holds nothing; keeping one would
+      strand every rerun on the startup refusal, which is the one wedge an
+      unattended queue cannot recover from.
+    - **A failed checkpoint write must not fail the band.** A missed checkpoint
+      costs at most one flush of re-sieving; aborting costs everything since
+      the last good one. It warns once and continues.
+    - **Never checkpoint between flushes under `--cofactor`.** At the top of an
+      arbitrary q the queue holds up to a flush of candidates that are not in
+      the file; recording that position as the resume point drops them.
+    - **A clean stop must drain.** SIGINT/SIGTERM sets a flag, checked at the
+      top of the q loop after the next `(q, rho)` is pulled: flush the queue,
+      fsync, checkpoint that pair, exit 0. A planned stop then loses nothing,
+      against up to one flush of re-sieving after a crash (~67 q on the c183,
+      but **686 q on the SNFS job**, which enqueues 191 records/q instead of
+      1,956 — `pipeline.cuh:1385`). Second signal exits immediately; the
+      previous checkpoint stays valid.
+    - **The derived scale and allowance must be carried in the checkpoint.**
+      They are derived once from the *first* q of the band
+      (`bench_main.cu:1312`, `q0 = ql[0].q`) and held band-wide — that is the
+      fixed-scale approximation under "Known defects". Re-deriving them from
+      the resume q would silently change the survivor gate partway through a
+      run, which is exactly the kind of inconsistency an item-0 verdict cannot
+      absorb. Measured on the c147: the carried gate is scale 0.900/1.100,
+      bound 56/65, against a fresh derivation at the resume q of 1.250/2.925,
+      bound 76/169. Not a rounding difference — a different sieve.
+    - **A relation that verifies proves the polynomial, not the parameters.**
+      `--check-relations` (`bench_main.cu:732`) is host-only and cheap, so
+      spot-checking a few lines of the `.part` is worth doing — but logI, J,
+      lambda, mfb, lpb, sq-side and the FB convention can all differ while
+      every line still reconstructs. Hence the fingerprint; refuse a mismatch
+      rather than appending incoherent yield to a valid-looking file. The
+      fingerprint therefore covers the polynomial, lim/lpb/mfb on both sides,
+      logI/J, sq-side, **`--maxbits`** and **the whole cofactor configuration**
+      — dropping `--cofactor` on a resume switches the file from queue-emitted
+      to trial-division-only *and* the checkpoint discipline from
+      flush-anchored to a timer, and the ECM/rho bounds decide which cofactors
+      split at all.
+    - **Sample only the checkpointed prefix.** A torn final line past the
+      offset is the normal shape of a `kill -9` and is about to be truncated
+      away; scanning to EOF would refuse a sound file.
+    - **Take the lock before anything destructive.** `--restart` unlinks the
+      `.part`, so acquiring the lock after that (or after the factor-base
+      parse) lets it delete a running siever's output and report the conflict
+      afterwards, with the victim still writing to an unlinked inode and its
+      final rename doomed to ENOENT.
+    - **Resume needs the original band.** The single-q fallback builds `ql[0]`
+      from `--q`/`--rho` and never consults the checkpoint, so resuming into it
+      would truncate the `.part`, sieve one unrelated q, call the band complete,
+      rename over the final name and delete the sidecar. The band source is not
+      in the fingerprint, so this is checked separately.
+    - **`--target-rels` counts what is already on disk**, or a resumed run
+      overshoots by the whole prior amount.
+    - **`--candidates` has its own `.part`** and must be truncated to a
+      consistent point in the same checkpoint — with the same length guard the
+      relation file gets. Unguarded, a short file is *extended* by `ftruncate`
+      and the gap is a run of NULs no parser survives; and because
+      `--candidates` is not in the fingerprint, a resume that omitted it would
+      record `cand_bytes = 0` and the next resume that supplied it again would
+      truncate the whole file away.
+    - **A lockfile**, because two processes appending to one `.part` is silent
+      corruption and a job queue makes that a realistic accident. It must clear
+      itself when the recorded pid is gone: `SIGKILL`, OOM, power loss and the
+      second-signal `_exit` all skip the unlink, and a lock needing a human
+      defeats unattended operation more thoroughly than the race it prevents.
+    - **`--nq` is a per-session budget** once a run can resume. It is reduced by
+      the completed count, so the messages that echo it must add that count back
+      or they print a number nobody typed. The wind-forward to the exact `(q,
+      rho)` also must not be charged against the generator's own limit, or the
+      band stops early and reports a range exhausted that is nowhere near it.
+
+    **12b. Logging.** Console today, nothing on disk. A tee is the obvious
+    version and is worth less than it looks: finding 53 is that host contention
+    costs up to 29% of wall while every GPU counter reads normal, and that any
+    cross-box wall or ETA comparison is invalid without knowing host load on
+    both. So the heartbeat should carry `GPU-accounted / wall`, GPU
+    utilisation, board watts and host load average — which makes an unattended
+    run *auditable after the fact* rather than something that had to be
+    watched, and that is a prerequisite for item 0 rather than a convenience.
+    Log a header once (git commit, full argv, fingerprint, card and driver,
+    geometry, FB convention, resume point) — RESULTS.md has already had to grow
+    a warning that findings 48/54 are c147 while 43/44 are c183; a logged
+    header ends that class of confusion. The existing reporter is a 30 s `\r`
+    line (`pipeline.cuh:1401`): split on `isatty(1)`, console keeps `\r`, the
+    file gets timestamped newline records every 5 min (~864 lines over three
+    days, so **no rotation**). Route the mid-band stderr warnings — bucket
+    overflow, norm overflow, candidate cap, target-not-reached — into it too.
+
+    **12c. The queue itself.** A job list consumed without intervention, so
+    finishing one job starts the next rather than leaving the card idle
+    overnight. Depends on 12a; unscoped beyond that. **Item 9 stops being
+    cosmetic here**: its ~15–20 s of redundant startup is noise in a multi-day
+    run and real overhead in anything that restarts the process per job.

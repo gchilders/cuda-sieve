@@ -18,6 +18,88 @@
 #ifndef CUDA_SIEVE_PIPELINE_CUH
 #define CUDA_SIEVE_PIPELINE_CUH
 
+#include "ckpt.h"
+#include <signal.h>
+
+/* ---- clean stop -------------------------------------------------------- *
+ *
+ * A band runs for days and gets interrupted. Without a handler the process
+ * dies inside a q with the stdio buffer unwritten and the last line possibly
+ * torn, so the first signal only sets a flag: the band loop notices it at the
+ * top of the next q -- after the next (q, rho) has been pulled but before any
+ * work is done for it -- drains the cofactor queue, fsyncs, and records that
+ * pair as the resume point. A planned stop then loses nothing at all.
+ *
+ * The second signal is the escape hatch for a drain that is itself stuck. It
+ * skips the checkpoint, which is safe: the previous one is still a valid, just
+ * older, resume point. _exit is used because it is async-signal-safe and
+ * flushing stdio from a handler is not. */
+static volatile sig_atomic_t g_pipe_stop = 0;
+
+static void pipe_on_signal(int sig)
+{
+    (void)sig;
+    if (++g_pipe_stop >= 2) _exit(130);
+}
+
+/* Record a resume point.
+ *
+ * THE PRECONDITION IS THE WHOLE DESIGN: the caller must guarantee that the
+ * relation file holds a whole number of special-q. Under --cofactor that is
+ * true at exactly one place -- immediately after cofq_flush -- because between
+ * flushes the queue holds up to CQ_FLUSH candidates that are not in the file,
+ * and recording that position as the resume point would drop every relation
+ * they were going to yield, with no symptom until filtering came up short.
+ * Without --cofactor the host join loop writes each q as it finishes, so any q
+ * boundary will do. */
+static int pipe_checkpoint(const poly_t *P, const bench_cfg_t *cfg, ckpt_t *ck,
+                           FILE *fr, FILE *fc, const qsel_t *next,
+                           unsigned long long nrel, unsigned long long nqdone)
+{
+    off_t ro, co = 0;
+    if (!fr || !cfg->relations) return 0;
+    /* fsync before the sidecar, never after: the checkpoint asserts these
+     * bytes are on the platter, and a sidecar naming bytes that are still in
+     * the page cache is worse than no sidecar at all. */
+    if (fflush(fr) || fsync(fileno(fr))) { perror("relations"); return -1; }
+    if (fc && (fflush(fc) || fsync(fileno(fc)))) {
+        perror("candidates"); return -1;
+    }
+    if ((ro = ftello(fr)) < 0) { perror("relations"); return -1; }
+    if (fc && (co = ftello(fc)) < 0) { perror("candidates"); return -1; }
+    ck->next_q   = next->q;
+    ck->next_rho = next->rho;
+    ck->rel_bytes  = (unsigned long long)ro;
+    ck->cand_bytes = (unsigned long long)co;
+    ck->nrel   = nrel;
+    ck->nqdone = nqdone;
+    return ckpt_write(cfg->relations, P, cfg, ck);
+}
+
+/* A missed checkpoint costs at most one flush of re-sieving on the next
+ * resume. Aborting the band costs everything produced since the last
+ * successful one, so a full disk, a read-only remount or an fsync EIO warns
+ * and the sieve keeps going. Only the FIRST failure is reported: a persistent
+ * one would otherwise print on every flush for days. */
+static void pipe_try_checkpoint(const poly_t *P, const bench_cfg_t *cfg,
+                                ckpt_t *ck, FILE *fr, FILE *fc,
+                                const qsel_t *next, unsigned long long nrel,
+                                unsigned long long nqdone,
+                                int *written, int *warned)
+{
+    if (pipe_checkpoint(P, cfg, ck, fr, fc, next, nrel, nqdone) == 0) {
+        *written = 1;
+        return;
+    }
+    if (!(*warned)++)
+        fprintf(stderr,
+                "\n  WARNING: cannot write the resume checkpoint for %s.\n"
+                "  Sieving continues, but a crash will resume from an older"
+                " point, or leave an\n"
+                "  unresumable .part if none has been written yet.\n",
+                cfg->relations);
+}
+
 typedef struct {
     uint32_t *primes, *roots;
     plat_t   *plat;
@@ -824,6 +906,19 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     int target_reached = 0;
     qsel_t last_q = {0, 0};
     cudaEvent_t ea, eb;
+    /* Resume state. base_rel/base_nq are what earlier sessions already put on
+     * disk: they are added to the goal tests and the progress line, and kept
+     * OUT of the band summary, whose per-q figures describe this session. */
+    ckpt_t ck;
+    const unsigned long long base_rel = cfg->resume ? cfg->resume_nrel : 0;
+    const unsigned long long base_nq  = cfg->resume ? cfg->resume_nq  : 0;
+    /* ckpt_armed: a relation file is open, so checkpointing and the signal
+     * handlers are active. ckpt_written: a sidecar has actually been written,
+     * which is the ONLY thing that makes the .part resumable. Conflating the
+     * two keeps a .part that no rerun can consume and that the startup check
+     * then refuses, wedging an unattended queue. */
+    int stopped = 0, ckpt_armed = 0, ckpt_written = 0, ckpt_warned = 0;
+    void (*old_int)(int) = SIG_ERR, (*old_term)(int) = SIG_ERR;
 
     memset(&S1, 0, sizeof S1); memset(&S0, 0, sizeof S0);
     memset(&C, 0, sizeof C); memset(&tm, 0, sizeof tm);
@@ -916,20 +1011,54 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         rc = -1; goto done;
     }
     /* Written through temporaries and renamed only on success: a band that
-     * fails at q 20 must not leave files that look like a complete run. */
+     * fails at q 20 must not leave files that look like a complete run.
+     *
+     * The .part is nonetheless the DURABLE artifact, not scratch. The rename is
+     * only the "band completed" marker; an interrupted run leaves the .part and
+     * its sidecar in place to be resumed, and this used to delete both. */
     if (cfg->relations) {
-        snprintf(rtmp, sizeof rtmp, "%s.part", cfg->relations);
-        if (!(fr = fopen(rtmp, "w"))) { perror(rtmp); rc = -1; goto done; }
+        ckpt_part_path(cfg->relations, rtmp, sizeof rtmp);
+        if (cfg->resume) {
+            /* Truncate to the checkpointed prefix before appending. This is
+             * what makes a torn final line from a kill -9 a non-problem: the
+             * partial write is discarded rather than parsed. */
+            if (!(fr = fopen(rtmp, "r+"))) { perror(rtmp); rc = -1; goto done; }
+            if (ftruncate(fileno(fr), (off_t)cfg->resume_rel_bytes) ||
+                fseeko(fr, (off_t)cfg->resume_rel_bytes, SEEK_SET)) {
+                perror(rtmp); rc = -1; goto done;
+            }
+        } else if (!(fr = fopen(rtmp, "w"))) {
+            perror(rtmp); rc = -1; goto done;
+        }
     }
     if (cfg->candidates) {
-        snprintf(ctmp, sizeof ctmp, "%s.part", cfg->candidates);
-        if (!(fc = fopen(ctmp, "w"))) { perror(ctmp); rc = -1; goto done; }
+        ckpt_part_path(cfg->candidates, ctmp, sizeof ctmp);
+        if (cfg->resume) {
+            if (!(fc = fopen(ctmp, "r+"))) { perror(ctmp); rc = -1; goto done; }
+            if (ftruncate(fileno(fc), (off_t)cfg->resume_cand_bytes) ||
+                fseeko(fc, (off_t)cfg->resume_cand_bytes, SEEK_SET)) {
+                perror(ctmp); rc = -1; goto done;
+            }
+        } else if (!(fc = fopen(ctmp, "w"))) {
+            perror(ctmp); rc = -1; goto done;
+        }
+    }
+    /* Only meaningful once there is a relation file to point at. */
+    if (fr) {
+        memset(&ck, 0, sizeof ck);
+        ckpt_fingerprint(POLY, cfg, ck.fp);
+        ck.scale = cfg->scale; ck.scale0 = cfg->scale0;
+        ck.allowance = cfg->allowance; ck.allowance0 = cfg->allowance0;
+        ckpt_armed = 1;
+        old_int  = signal(SIGINT,  pipe_on_signal);
+        old_term = signal(SIGTERM, pipe_on_signal);
+        g_pipe_stop = 0;
     }
 
     /* ---- the band ---- */
     {
     const double t_band = host_ms();
-    double t_report = t_band;
+    double t_report = t_band, t_ckpt = t_band;
     /* The polynomial the special-q is a root of. Built once: for a q on the
      * rational side that is G = Y1*x + Y0, not f, and checking against f would
      * reject every legitimate root. */
@@ -961,7 +1090,15 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         if (qi < nq) {
             cur = &qlist[qi];
         } else if (qgen) {
-            const int qr = sqgen_next(qgen, &generated);
+            int qr;
+            /* Enforced here as well as in the generator, because a resumed run
+             * hands sqgen no limit at all -- see the sqgen_create comment in
+             * bench_main.cu. Without this the budget would not exist. */
+            if (cfg->nq_max && nqdone >= cfg->nq_max) {
+                count_limit_reached = 1;
+                break;
+            }
+            qr = sqgen_next(qgen, &generated);
             if (qr < 0) {
                 fprintf(stderr, "  special-q generator failed after %u q\n",
                         nqdone);
@@ -983,6 +1120,46 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
             break;
         }
         last_q = *cur;
+
+        /* ---- clean stop ----
+         *
+         * Checked here, with the next (q, rho) in hand but no work done for it,
+         * because that pair is exactly the resume point: drain the queue so
+         * every q already sieved reaches the file, checkpoint, and leave this
+         * one for the next session. A planned stop loses nothing.
+         *
+         * The stop file is for unattended runs, where there is no terminal to
+         * press ^C in and a job queue needs a way to ask for the card back. */
+        if (fr && !g_pipe_stop && cfg->stopfile && (qi & 63) == 0 &&
+            access(cfg->stopfile, F_OK) == 0) {
+            printf("\n  stop file %s exists\n", cfg->stopfile);
+            g_pipe_stop = 1;
+        }
+        if (fr && g_pipe_stop) {
+            printf("\n  stopping cleanly at q=%llu; draining the cofactor"
+                   " queue\n", (unsigned long long)cur->q);
+            if (cfg->cofactor && Q.n &&
+                cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
+                           cfg->cof_rounds, cfg->cof_budget, blocks,
+                           cfg->threads, fr)) { rc = -1; break; }
+            pipe_try_checkpoint(POLY, cfg, &ck, fr, fc, cur,
+                                base_rel + (cfg->cofactor ? Q.nrel
+                                                          : (unsigned long long)acc_rel),
+                                base_nq + nqdone, &ckpt_written, &ckpt_warned);
+            stopped = 1;
+            break;
+        }
+        /* Without --cofactor the host join loop writes each q's relations as it
+         * finishes, so every q boundary is a valid resume point and the only
+         * question is how often to pay the fsync. Under --cofactor this is
+         * handled at the flush instead, and doing it here as well would record
+         * a point the queue's contents are not in the file for. */
+        if (fr && !cfg->cofactor && qi && host_ms() - t_ckpt > 30000.0) {
+            t_ckpt = host_ms();
+            pipe_try_checkpoint(POLY, cfg, &ck, fr, fc, cur,
+                                base_rel + (unsigned long long)acc_rel,
+                                base_nq + nqdone, &ckpt_written, &ckpt_warned);
+        }
 
         if (!pipe_check_root(&SQP, cur->q, cur->rho)) {
             fprintf(stderr, "  q=%llu: rho=%llu is not a root of %s mod q\n",
@@ -1048,10 +1225,21 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
              * whole q after the flush, which counts its first rows twice. A
              * special-q is ~1,956 records against a 131,072 slot queue, so
              * never splitting one costs at most 1.5% of a flush's occupancy. */
-            if (Q.n + nacc > Q.cap &&
-                cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
-                           cfg->cof_rounds, cfg->cof_budget, blocks,
-                           cfg->threads, fr)) { rc = -1; break; }
+            if (Q.n + nacc > Q.cap) {
+                if (cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
+                               cfg->cof_rounds, cfg->cof_budget, blocks,
+                               cfg->threads, fr)) { rc = -1; break; }
+                /* THE resume point. The queue is now empty and this q's
+                 * candidates have not been enqueued yet, so the file holds
+                 * every completed q and nothing partial -- see
+                 * pipe_checkpoint. This is the only such instant in the loop,
+                 * which is why the checkpoint is written here and not on a
+                 * timer. */
+                if (fr)
+                    pipe_try_checkpoint(POLY, cfg, &ck, fr, fc, cur,
+                                        base_rel + Q.nrel, base_nq + nqdone,
+                                        &ckpt_written, &ckpt_warned);
+            }
             if (nacc > Q.cap) {
                 fprintf(stderr, "  q=%llu: %u candidates exceeds the %u-slot"
                         " cofactor queue\n", (unsigned long long)cur->q,
@@ -1156,11 +1344,16 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
          * per q falls as q grows and guessing the range wastes either time or
          * relations. */
         if (cfg->target_rels) {
-            unsigned long long have = cfg->cofactor ? Q.nrel
-                                                    : (unsigned long long)acc_rel;
+            /* base_rel is what earlier sessions already wrote. Counting only
+             * this session's would make a resumed run sieve the whole target
+             * again from scratch. */
+            unsigned long long have = base_rel + (cfg->cofactor
+                                                  ? Q.nrel
+                                                  : (unsigned long long)acc_rel);
             if (have >= cfg->target_rels) {
-                printf("\n  --target-rels %llu reached after %u q (%llu relations)\n",
-                       (unsigned long long)cfg->target_rels, nqdone, have);
+                printf("\n  --target-rels %llu reached after %llu q (%llu relations)\n",
+                       (unsigned long long)cfg->target_rels,
+                       base_nq + nqdone, have);
                 target_reached = 1;
                 break;
             }
@@ -1206,10 +1399,15 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
          */
         if (!cfg->verbose_q &&
             (host_ms() - t_report > 30000.0 || (!qgen && qi + 1 == nq))) {
-            const unsigned long long rels = cfg->cofactor
+            /* Two different numbers, and mixing them is how a resumed run
+             * reports a nonsense rate: the goal is measured against everything
+             * on disk, the RATE only against what this session produced in the
+             * time this session has been running. */
+            const unsigned long long mine = cfg->cofactor
                 ? Q.nrel : (unsigned long long)acc_rel;
+            const unsigned long long rels = base_rel + mine;
             const double el = (host_ms() - t_band) / 1000.0;
-            const double rps = el > 0 ? rels / el : 0.0;
+            const double rps = el > 0 ? mine / el : 0.0;
             double frac, eta;
             t_report = host_ms();
             if (cfg->target_rels) {
@@ -1281,18 +1479,22 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
      * visible progress sample up to 30 seconds stale. */
     if (!cfg->verbose_q && qgen && !rc && nqdone &&
         (source_exhausted || count_limit_reached)) {
-        const unsigned long long rels = cfg->cofactor
-            ? Q.nrel : (unsigned long long)acc_rel;
+        const unsigned long long rels = base_rel + (cfg->cofactor
+            ? Q.nrel : (unsigned long long)acc_rel);
         char queued[32] = "";
         if (cfg->cofactor && Q.n)
             snprintf(queued, sizeof queued, " +%u cand", Q.n);
         if (count_limit_reached)
-            printf("\n    q=%llu  %u q  %llu rel%s  [--nq %u reached]\033[K\n",
-                   (unsigned long long)last_q.q, nqdone, rels, queued,
-                   cfg->nq_max);
+            /* base_nq + nq_max reconstructs what the operator actually typed:
+             * a resumed run holds only the REMAINING budget in cfg->nq_max, so
+             * echoing it raw prints a number nobody passed, next to a q count
+             * that then disagrees with it. */
+            printf("\n    q=%llu  %llu q  %llu rel%s  [--nq %llu reached]\033[K\n",
+                   (unsigned long long)last_q.q, base_nq + nqdone, rels, queued,
+                   base_nq + cfg->nq_max);
         else
-            printf("\n    q=%llu  %u q  %llu rel%s  [q range exhausted]\033[K\n",
-                   (unsigned long long)last_q.q, nqdone, rels, queued);
+            printf("\n    q=%llu  %llu q  %llu rel%s  [q range exhausted]\033[K\n",
+                   (unsigned long long)last_q.q, base_nq + nqdone, rels, queued);
     }
 
     {   /* Steady-state footprint. The per-q buffers (survivor lists, prime
@@ -1338,45 +1540,76 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
             rc = -1;
         cofac_tail = host_ms() - cf0;
     }
-    if (rc == 0 && cfg->target_rels && !target_reached) {
-        const unsigned long long have = cfg->cofactor
-            ? Q.nrel : (unsigned long long)acc_rel;
+    if (rc == 0 && !stopped && cfg->target_rels && !target_reached) {
+        const unsigned long long have = base_rel + (cfg->cofactor
+            ? Q.nrel : (unsigned long long)acc_rel);
         if (have >= cfg->target_rels) {
             printf("\n  --target-rels %llu reached by the final cofactor flush"
-                   " after %u q (%llu relations)\n",
-                   (unsigned long long)cfg->target_rels, nqdone, have);
+                   " after %llu q (%llu relations)\n",
+                   (unsigned long long)cfg->target_rels, base_nq + nqdone, have);
             target_reached = 1;
         } else if (count_limit_reached) {
             fprintf(stderr,
-                    "\n  note: --nq %u reached after %u q with %llu relations;"
+                    "\n  note: --nq %llu reached after %llu q with %llu relations;"
                     " --target-rels %llu was not reached\n",
-                    cfg->nq_max, nqdone, have,
+                    base_nq + cfg->nq_max, base_nq + nqdone, have,
                     (unsigned long long)cfg->target_rels);
         } else if (source_exhausted) {
             fprintf(stderr,
-                    "\n  WARNING: special-q source exhausted after %u q with"
+                    "\n  WARNING: special-q source exhausted after %llu q with"
                     " %llu relations; --target-rels %llu was NOT reached\n",
-                    nqdone, have, (unsigned long long)cfg->target_rels);
+                    base_nq + nqdone, have,
+                    (unsigned long long)cfg->target_rels);
         }
     }
     if (fr) { if (ferror(fr)) rc = -1; if (fclose(fr)) rc = -1; fr = NULL; }
     if (fc) { if (ferror(fc)) rc = -1; if (fclose(fc)) rc = -1; fc = NULL; }
-    if (rc == 0) {
+    /* A clean stop is not a completed band: the .part and its sidecar stay,
+     * and the final name is not claimed. Renaming here would present a partial
+     * band as a finished one and strand the rest of the q range. */
+    if (rc == 0 && !stopped) {
         if ((cfg->relations && rename(rtmp, cfg->relations)) ||
             (cfg->candidates && rename(ctmp, cfg->candidates))) {
             perror("rename"); rc = -1;
+        } else if (ckpt_armed) {
+            char cp[1200];
+            ckpt_ckpt_path(cfg->relations, cp, sizeof cp);
+            remove(cp);          /* nothing left to resume */
         }
     }
     if (rc) {
-        if (cfg->relations) remove(rtmp);
-        if (cfg->candidates) remove(ctmp);
-        if (qgen)
-            fprintf(stderr, "  band FAILED after %u generated q; no output kept\n",
-                    nqdone);
-        else
-            fprintf(stderr, "  band FAILED after %u of %u q; no output kept\n",
-                    nqdone, nq);
+        /* A .part is resumable work only if a sidecar was actually written --
+         * NOT merely because a relation file was opened. Under --cofactor the
+         * file is empty until the first flush, and that flush is what writes
+         * the first checkpoint, so an unresumable .part here holds nothing.
+         * Keeping one would strand every rerun on the startup refusal, which
+         * is precisely the wedge an unattended queue cannot recover from. */
+        if (!ckpt_written) {
+            if (cfg->relations) remove(rtmp);
+            if (cfg->candidates) remove(ctmp);
+        }
+        {
+            const char *fate = ckpt_written
+                ? "the .part is kept; rerun the same command to resume"
+                : "nothing was checkpointed, so no output is kept";
+            if (qgen)
+                fprintf(stderr, "  band FAILED after %u generated q; %s\n",
+                        nqdone, fate);
+            else
+                fprintf(stderr, "  band FAILED after %u of %u q; %s\n",
+                        nqdone, nq, fate);
+        }
     }
+    if (stopped && ckpt_written)
+        printf("\n  stopped after %u q this session (%llu total, %llu"
+               " relations). Rerun the same command to resume at q=%llu.\n",
+               nqdone, base_nq + nqdone, ck.nrel,
+               (unsigned long long)ck.next_q);
+    else if (stopped)
+        fprintf(stderr,
+                "\n  stopped after %u q, but NO checkpoint could be written."
+                " %s cannot be\n  resumed automatically; move it aside or pass"
+                " --restart.\n", nqdone, rtmp);
 
     if (nqdone) {
         const double N = nqdone;
@@ -1509,6 +1742,8 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     }
 
 done:
+    if (old_int  != SIG_ERR) signal(SIGINT,  old_int);
+    if (old_term != SIG_ERR) signal(SIGTERM, old_term);
     if (fr) fclose(fr);
     if (fc) fclose(fc);
     pipe_td_free(&C);
