@@ -9,21 +9,26 @@
 
 static int parse_u64_arg(const char *flag, const char *arg, uint64_t *out)
 {
-    char *end = NULL;
-    unsigned long long v;
-
-    if (!arg || !*arg || *arg == '-') {
-        fprintf(stderr, "%s: not an unsigned integer: %s\n",
+    if (bench_parse_u64_decimal(arg, out)) {
+        fprintf(stderr, "%s: not an unsigned 64-bit decimal integer: %s\n",
                 flag, arg ? arg : "(null)");
         return -1;
     }
-    errno = 0;
-    v = strtoull(arg, &end, 10);
-    if (errno == ERANGE || end == arg || *end) {
-        fprintf(stderr, "%s: not an unsigned 64-bit integer: %s\n", flag, arg);
+    return 0;
+}
+
+static int parse_u32_range_arg(const char *flag, const char *arg,
+                               uint32_t lo, uint32_t hi, uint32_t *out)
+{
+    uint64_t v;
+
+    if (parse_u64_arg(flag, arg, &v)) return -1;
+    if (v < lo || v > hi) {
+        fprintf(stderr, "%s: must be in [%u,%u], got %llu\n",
+                flag, lo, hi, (unsigned long long)v);
         return -1;
     }
-    *out = (uint64_t)v;
+    *out = (uint32_t)v;
     return 0;
 }
 
@@ -625,9 +630,19 @@ static int bench_main_impl(int argc, char **argv)
             cfg.qmin = lo; cfg.qmax = hi;   /* 0 = stream until target/nq */
             qrange_set = 1;
         }
-        else if (!strcmp(argv[i], "--nq") && i + 1 < argc) cfg.nq_max = (uint32_t)atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--target-rels") && i + 1 < argc)
-            cfg.target_rels = strtoull(argv[++i], 0, 10);
+        else if (!strcmp(argv[i], "--nq") && i + 1 < argc) {
+            if (parse_u32_range_arg("--nq", argv[++i], 1u, UINT32_MAX,
+                                    &cfg.nq_max))
+                return 1;
+        }
+        else if (!strcmp(argv[i], "--target-rels") && i + 1 < argc) {
+            if (parse_u64_arg("--target-rels", argv[++i], &cfg.target_rels))
+                return 1;
+            if (!cfg.target_rels) {
+                fprintf(stderr, "--target-rels: must be greater than zero\n");
+                return 1;
+            }
+        }
         else if (!strcmp(argv[i], "--verbose-q")) cfg.verbose_q = 1;
         else if (!strcmp(argv[i], "--alim") && i + 1 < argc) { alim = (uint32_t)strtoul(argv[++i], 0, 10); alim_set = 1; }
         else if (!strcmp(argv[i], "--scale0") && i + 1 < argc) {
@@ -724,11 +739,6 @@ static int bench_main_impl(int argc, char **argv)
         fprintf(stderr, "--J must be > 0, --reps >= 1, --threads in [32,1024]\n");
         return 1;
     }
-    if (cfg.blocks < 0 || cfg.blocks > BENCH_BLOCKS_MAX) {
-        fprintf(stderr, "--blocks must be in [0, %d] (0 = auto), got %d\n",
-                BENCH_BLOCKS_MAX, cfg.blocks);
-        return 1;
-    }
     /* Same rule --apply-threads has enforced all along, and for the same class
      * of reason -- it was simply never applied to the block width every OTHER
      * kernel launches with. k_intersect_compact runs a warp-wide inclusive scan
@@ -758,17 +768,6 @@ static int bench_main_impl(int argc, char **argv)
          || (cfg.fill_threads & 31))) {
         fprintf(stderr, "--fill-threads must be 0 (auto) or a multiple of 32 in"
                 " [32,1024], got %d\n", cfg.fill_threads);
-        return 1;
-    }
-    /* Every grid-stride kernel now performs its multiplication in uint64_t, so
-     * an oversized launch cannot wrap its stride to zero. Keep a practical host
-     * ceiling as a second line of defence: 1<<20 blocks is ~900x the measured
-     * fill knee and rejects accidental launches that would spend their time in
-     * scheduling rather than useful work. */
-    if (cfg.fill_blocks < 0 || cfg.fill_blocks > BENCH_BLOCKS_MAX) {
-        fprintf(stderr, "--fill-blocks must be in [0, %d] (0 = auto), got %d:"
-                " larger launches are outside the supported tuning range\n",
-                BENCH_BLOCKS_MAX, cfg.fill_blocks);
         return 1;
     }
     /* The grid-width query used to sit HERE. It now runs after the
@@ -930,24 +929,83 @@ static int bench_main_impl(int argc, char **argv)
         if (rho_set) rho %= q;
     }
 
-    /* BOINC's CUDA application convention appends --device N. Select it before
-     * the first device query, allocation, or kernel launch. */
-    if (cuda_device >= 0) {
-        const cudaError_t err = cudaSetDevice(cuda_device);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "bench: cannot select CUDA device %d: %s\n",
-                    cuda_device, cudaGetErrorString(err));
-            return 1;
+    /* BOINC's CUDA application convention appends --device N. CUDA 12 and
+     * later initialise a device's primary context in cudaSetDevice(), so a
+     * scheduling policy must be attached before that call. cudaInitDevice()
+     * does exactly that for the selected device without accidentally creating
+     * a context on device 0. Older runtimes lack that API; there the legacy
+     * cudaSetDeviceFlags() ordering is safe only for CUDA's default device, so
+     * select first for a nonzero assignment and verify the effective flags. */
+    {
+        const int selected_device = cuda_device >= 0 ? cuda_device : 0;
+        cudaError_t err;
+
+        if (blocking_sync) {
+#if CUDART_VERSION >= 12000
+            err = cudaInitDevice(selected_device,
+                                 cudaDeviceScheduleBlockingSync,
+                                 cudaInitDeviceFlagsAreValid);
+            if (err != cudaSuccess) {
+                fprintf(stderr,
+                        "bench: cannot initialise CUDA device %d with blocking"
+                        " synchronization: %s\n",
+                        selected_device, cudaGetErrorString(err));
+                return 1;
+            }
+#else
+            if (selected_device == 0) {
+                err = cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
+                if (err != cudaSuccess) {
+                    fprintf(stderr,
+                            "bench: cannot configure CUDA device 0 for blocking"
+                            " synchronization: %s\n",
+                            cudaGetErrorString(err));
+                    return 1;
+                }
+            }
+#endif
         }
-    }
-    /* Set the scheduling flags after device selection so they apply to the
-     * BOINC-assigned device rather than implicitly initialising device 0. */
-    if (blocking_sync) {
-        const cudaError_t err =
-            cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
-        if (err != cudaSuccess)
-            fprintf(stderr, "warning: could not set blocking sync: %s\n",
-                    cudaGetErrorString(err));
+
+        if (cuda_device >= 0 || blocking_sync) {
+            err = cudaSetDevice(selected_device);
+            if (err != cudaSuccess) {
+                fprintf(stderr, "bench: cannot select CUDA device %d: %s\n",
+                        selected_device, cudaGetErrorString(err));
+                return 1;
+            }
+        }
+
+#if CUDART_VERSION < 12000
+        if (blocking_sync && selected_device != 0) {
+            err = cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
+            if (err != cudaSuccess) {
+                fprintf(stderr,
+                        "bench: cannot configure CUDA device %d for blocking"
+                        " synchronization: %s\n",
+                        selected_device, cudaGetErrorString(err));
+                return 1;
+            }
+        }
+#endif
+        if (blocking_sync) {
+            unsigned int flags = 0;
+            err = cudaGetDeviceFlags(&flags);
+            if (err != cudaSuccess) {
+                fprintf(stderr,
+                        "bench: cannot verify CUDA scheduling flags for device"
+                        " %d: %s\n",
+                        selected_device, cudaGetErrorString(err));
+                return 1;
+            }
+            if ((flags & cudaDeviceScheduleMask) !=
+                cudaDeviceScheduleBlockingSync) {
+                fprintf(stderr,
+                        "bench: CUDA device %d did not retain blocking"
+                        " synchronization flags (effective flags 0x%x)\n",
+                        selected_device, flags);
+                return 1;
+            }
+        }
     }
 
     /* Grid width is 6 resident blocks per SM, so it MUST come from the device.
@@ -1605,7 +1663,7 @@ static int bench_main_impl(int argc, char **argv)
 int main(int argc, char **argv)
 {
     int rc = bench_boinc_init();
-    if (rc) return rc;
+    if (rc) return bench_boinc_finish(rc);
     rc = bench_main_impl(argc, argv);
     return bench_boinc_finish(rc);
 }

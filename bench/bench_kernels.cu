@@ -746,8 +746,7 @@ __global__ void k_purge(const uint32_t *__restrict recs,
 {
     const uint32_t offmask = (1u << log_region) - 1;
     unsigned long long rd = 0;
-    for (uint64_t bb = blockIdx.x; bb < nregion; bb += (uint64_t)gridDim.x) {
-        const uint32_t b = (uint32_t)bb;
+    for (uint32_t b = blockIdx.x; b < nregion; b += gridDim.x) {
         uint32_t nrec = cursor[b];
         if (nrec > cap) nrec = cap;
         rd += (threadIdx.x == 0) ? nrec : 0;
@@ -857,8 +856,7 @@ __global__ void k_purge_prime(const uint32_t *__restrict recs,
                               uint32_t cap_out, uint32_t *__restrict nout)
 {
     const uint32_t offmask = (1u << log_region) - 1;
-    for (uint64_t bb = blockIdx.x; bb < nregion; bb += (uint64_t)gridDim.x) {
-        const uint32_t b = (uint32_t)bb;
+    for (uint32_t b = blockIdx.x; b < nregion; b += gridDim.x) {
         uint32_t nrec = cursor[b];
         if (nrec > cap) nrec = cap;
         const uint32_t *row = bounds + (size_t)b * nslice;

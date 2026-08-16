@@ -44,6 +44,32 @@ int bench_parse_finite_double(const char *text, double *out)
     return 0;
 }
 
+int bench_parse_u64_decimal(const char *text, uint64_t *out)
+{
+    const unsigned char *p;
+    char *end = NULL;
+    unsigned long long v;
+
+    if (!text || !*text || !out) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (p = (const unsigned char *)text; *p; p++) {
+        if (*p < (unsigned char)'0' || *p > (unsigned char)'9') {
+            errno = EINVAL;
+            return -1;
+        }
+    }
+    errno = 0;
+    v = strtoull(text, &end, 10);
+    if (errno == ERANGE || end == text || *end) {
+        errno = (errno == ERANGE) ? ERANGE : EINVAL;
+        return -1;
+    }
+    *out = (uint64_t)v;
+    return 0;
+}
+
 static int sieve_bound_error(const char *source, int err, const char *fmt, ...)
 {
     va_list ap;
@@ -301,13 +327,12 @@ int poly_load(const char *path, poly_t *P)
             (flag) = 1;                                                      \
         } while (0)
 
-        if (s[0] == 'c') {
+        /* Claim only the coefficient namespace, c<digits>:. Unknown metadata
+         * such as CADO's cost: field must fall through like qintsize: and
+         * type:, rather than becoming a fatal malformed-coefficient error. */
+        if (key_len >= 2u && s[0] == 'c' && s[1] >= '0' && s[1] <= '9') {
             unsigned k = 0;
             size_t z;
-            if (key_len < 2u || s[1] < '0' || s[1] > '9') {
-                poly_diag(path, linenr, "malformed coefficient name");
-                goto done;
-            }
             for (z = 1; z < key_len; z++) {
                 unsigned d;
                 if (s[z] < '0' || s[z] > '9') {

@@ -117,11 +117,16 @@ int32_t fb_check_prime_powers(const fb_t *fb);
  * GENERATED_PRIME_POWERS is only for in-process builders whose prime entries
  * come directly from prime_list_build(); it still checks structure, roots,
  * ordering, flags, and every proper-power entry without re-sieving the full
- * generated prime range a second time. Never use it for file input. */
+ * generated prime range a second time. Never use it for file input.
+ * PRECLASSIFIED_PRIME_POWERS is reserved for the strict CADO text loader. That
+ * loader has already classified every distinct modulus while parsing it, so
+ * the central validator rechecks structure, ordering, roots, flags, and every
+ * flagged proper power without repeating millions of primality tests. */
 typedef enum {
     FB_VALIDATE_EXTERNAL_PRIMES = 0,
     FB_VALIDATE_EXTERNAL_PRIME_POWERS = 1,
-    FB_VALIDATE_GENERATED_PRIME_POWERS = 2
+    FB_VALIDATE_GENERATED_PRIME_POWERS = 2,
+    FB_VALIDATE_PRECLASSIFIED_PRIME_POWERS = 3
 } fb_validate_policy_t;
 
 /* Validate all invariants needed before a factor base reaches the lattice
@@ -198,6 +203,11 @@ double sieve_allowance(double maxlog2, double scale, unsigned mfb);
  * characters, under/overflow, NaN and infinities. The output is unchanged on
  * failure. */
 int bench_parse_finite_double(const char *text, double *out);
+
+/* Strict unsigned decimal parser shared by command-line options and tests.
+ * Only ASCII digits are accepted: signs, whitespace, prefixes and trailing
+ * characters are rejected. The output is unchanged on failure. */
+int bench_parse_u64_decimal(const char *text, uint64_t *out);
 
 /* Strict parser for --qrange. Accepts MIN:MAX and the open-ended MIN: form,
  * consumes the complete token, rejects signs/overflow/junk, and requires

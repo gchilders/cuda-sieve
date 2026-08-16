@@ -29,7 +29,12 @@ struct resolved_path_node {
 };
 
 static struct resolved_path_node *resolved_paths;
-static int boinc_initialised;
+enum boinc_runtime_state {
+    BOINC_NOT_STARTED = 0,
+    BOINC_INIT_ATTEMPTED,
+    BOINC_READY
+};
+static enum boinc_runtime_state boinc_state;
 static double last_fraction_done;
 static int fraction_warning_printed;
 
@@ -123,12 +128,13 @@ extern "C" int bench_boinc_init(void)
      * completion handling are not starved while the CPUs are busy. */
     options.normal_thread_priority = 1;
 
+    boinc_state = BOINC_INIT_ATTEMPTED;
     rc = boinc_init_options(&options);
     if (rc) {
         fprintf(stderr, "BOINC: boinc_init_options failed with status %d\n", rc);
         return rc;
     }
-    boinc_initialised = 1;
+    boinc_state = BOINC_READY;
     last_fraction_done = 0.0;
     fraction_warning_printed = 0;
     rc = boinc_fraction_done(0.0);
@@ -159,7 +165,7 @@ extern "C" int bench_boinc_resolve_path(const char *option,
     char *copy;
     int rc;
 
-    if (!boinc_initialised) {
+    if (boinc_state != BOINC_READY) {
         fprintf(stderr,
                 "%s: BOINC filename resolution requested before initialisation\n",
                 option ? option : "filename");
@@ -210,7 +216,7 @@ extern "C" void bench_boinc_fraction_done(double fraction_done)
 #ifdef HAVE_BOINC
     int rc;
 
-    if (!boinc_initialised || !std::isfinite(fraction_done)) return;
+    if (boinc_state != BOINC_READY || !std::isfinite(fraction_done)) return;
     if (fraction_done < 0.0) fraction_done = 0.0;
     if (fraction_done > 1.0) fraction_done = 1.0;
     /* BOINC requires successive values to be nondecreasing. Keep that
@@ -241,12 +247,16 @@ extern "C" int bench_boinc_finish(int status)
 #ifdef HAVE_BOINC
     int rc;
 
-    if (boinc_initialised && status == 0)
+    if (boinc_state == BOINC_READY && status == 0)
         bench_boinc_fraction_done(1.0);
     free_resolved_paths();
-    if (!boinc_initialised) return status;
+    if (boinc_state == BOINC_NOT_STARTED) return status;
 
-    boinc_initialised = 0;
+    /* Even a failed boinc_init_options() attempt must terminate through the
+     * BOINC API. The client classifies boinc_finish(nonzero) as an application
+     * error; returning directly looks like a crash and follows different retry
+     * and host-reliability policy. */
+    boinc_state = BOINC_NOT_STARTED;
     rc = boinc_finish(status);
     /* BOINC normally terminates the application here. Preserve a useful
      * process status if a test double or an unusual runtime returns anyway. */

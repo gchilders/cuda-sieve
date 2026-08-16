@@ -108,15 +108,20 @@ DEFS      ?=
 HAVE_BOINC     ?= 0
 BOINC_CPPFLAGS ?=
 BOINC_LIBS     ?= -lboinc_api -lboinc -lpthread
+# Distribution binaries carry their C++ and GCC support runtimes. These flags
+# apply only to the BOINC link; set BOINC_HOST_STATIC= to opt out explicitly.
+BOINC_HOST_STATIC ?= -static-libstdc++ -static-libgcc
 ifeq ($(HAVE_BOINC),1)
 BOINC_DEFS := -DHAVE_BOINC
 BENCH_LIBS := $(BOINC_LIBS)
+BENCH_LINKFLAGS := $(foreach flag,$(BOINC_HOST_STATIC),-Xcompiler=$(flag))
 # A BOINC application binary is distributed to CPUs other than the build host.
 # Do not bake the build machine's ISA into the host-only C/C++ objects.
 HOST_TUNE ?=
 else
 BOINC_DEFS :=
 BENCH_LIBS :=
+BENCH_LINKFLAGS :=
 HOST_TUNE ?= -march=native
 endif
 
@@ -148,14 +153,14 @@ OBJS     = $(CU_OBJS) $(C_OBJS) $(CPP_OBJS) fbgen_lib.o
 # Include the BOINC include/link settings and host tuning in the signature so a
 # changed deployment build cannot reuse objects produced for another one.
 BOINC_STAMP := .boinc.stamp
-BOINC_SIGNATURE := HAVE_BOINC=$(HAVE_BOINC)|BOINC_CPPFLAGS=$(BOINC_CPPFLAGS)|BOINC_LIBS=$(BOINC_LIBS)|HOST_TUNE=$(HOST_TUNE)
+BOINC_SIGNATURE := HAVE_BOINC=$(HAVE_BOINC)|BOINC_CPPFLAGS=$(BOINC_CPPFLAGS)|BOINC_LIBS=$(BOINC_LIBS)|BOINC_HOST_STATIC=$(BOINC_HOST_STATIC)|HOST_TUNE=$(HOST_TUNE)
 $(shell [ "$$(cat $(BOINC_STAMP) 2>/dev/null)" = '$(BOINC_SIGNATURE)' ] || printf '%s' '$(BOINC_SIGNATURE)' > $(BOINC_STAMP))
 
 all: bench fbtest fbgen sqgentest dumpcmp mkcofbatch
 
 bench: $(OBJS) $(ARCH_STAMP) $(BOINC_STAMP)
-	$(NVCC) $(NVCC_ARCH) -Xlinker --gc-sections -o $@ $(OBJS) \
-		-lcudart $(BENCH_LIBS) -lm
+	$(NVCC) $(NVCC_ARCH) --cudart static -Xlinker --gc-sections \
+		$(BENCH_LINKFLAGS) -o $@ $(OBJS) $(BENCH_LIBS) -lm
 
 # Only the CUDA objects care about the arch; the C objects are host-only.
 $(CU_OBJS): $(ARCH_STAMP)

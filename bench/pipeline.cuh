@@ -891,6 +891,58 @@ static int pipe_td_perq(pipe_td_t *C, const fb_t *fb1, const fb_t *fbs1,
     return 0;
 }
 
+/* Memory reports are telemetry, not part of the scientific result. A failed
+ * query must never discard a completed band or bypass the final cofactor queue
+ * flush. Admission-control queries remain fatal at their call site. */
+static int pipe_mem_info_optional(const char *where,
+                                  size_t *free_bytes, size_t *total_bytes)
+{
+    const cudaError_t err = cudaMemGetInfo(free_bytes, total_bytes);
+    if (err == cudaSuccess) return 0;
+    fprintf(stderr, "warning: CUDA memory diagnostic '%s' unavailable: %s\n",
+            where, cudaGetErrorString(err));
+    return -1;
+}
+
+/* Close the two staged outputs exactly once. `commit` is true only after the
+ * whole band and final cofactor flush succeed. Any close or rename failure
+ * converts the operation to discard mode and removes whatever temporary files
+ * remain. */
+static int pipe_finalize_outputs(FILE **frp, FILE **fcp,
+                                 const bench_cfg_t *cfg,
+                                 const char *rtmp, const char *ctmp,
+                                 int commit)
+{
+    int bad = 0;
+
+    if (frp && *frp) {
+        const int io_bad = ferror(*frp);
+        if (fclose(*frp) || io_bad) bad = 1;
+        *frp = NULL;
+    }
+    if (fcp && *fcp) {
+        const int io_bad = ferror(*fcp);
+        if (fclose(*fcp) || io_bad) bad = 1;
+        *fcp = NULL;
+    }
+
+    if (commit && !bad) {
+        if (cfg->relations && rename(rtmp, cfg->relations)) {
+            perror("rename relations");
+            bad = 1;
+        }
+        if (!bad && cfg->candidates && rename(ctmp, cfg->candidates)) {
+            perror("rename candidates");
+            bad = 1;
+        }
+    }
+    if (!commit || bad) {
+        if (rtmp && rtmp[0]) remove(rtmp);
+        if (ctmp && ctmp[0]) remove(ctmp);
+    }
+    return bad ? -1 : 0;
+}
+
 /* ---- the whole per-q pipeline ------------------------------------------ */
 
 extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
@@ -931,6 +983,7 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     FILE *fr = NULL, *fc = NULL;
     char rtmp[2048] = "", ctmp[2048] = "";
     int rc = 0, source_exhausted = 0, count_limit_reached = 0;
+    int outputs_finalized = 0, vram_reporting = 1;
     int target_reached = 0;
     qsel_t last_q = {0, 0};
     cudaEvent_t ea = NULL, eb = NULL;
@@ -996,19 +1049,28 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
      * Print the actual split rather than inviting anyone to model it. */
 #define VRAM_MARK(label)                                                        \
     do {                                                                        \
-        size_t fb_ = 0, tb_ = 0;                                                \
-        PIPE_CK(cudaMemGetInfo(&fb_, &tb_));                                    \
-        printf("    %-28s %6.2f GB   (%.2f GB free)\n", label,                  \
-               (vram_prev - (double)fb_) / 1073741824.0, fb_ / 1073741824.0);   \
-        vram_prev = (double)fb_;                                                \
+        if (vram_reporting) {                                                   \
+            size_t fb_ = 0, tb_ = 0;                                            \
+            if (pipe_mem_info_optional((label), &fb_, &tb_) == 0) {            \
+                printf("    %-28s %6.2f GB   (%.2f GB free)\n", label,          \
+                       (vram_prev - (double)fb_) / 1073741824.0,                \
+                       fb_ / 1073741824.0);                                     \
+                vram_prev = (double)fb_;                                        \
+            } else {                                                            \
+                vram_reporting = 0;                                             \
+            }                                                                   \
+        }                                                                       \
     } while (0)
     {
         size_t fb_ = 0, tb_ = 0;
-        PIPE_CK(cudaMemGetInfo(&fb_, &tb_));
-        vram_prev = (double)fb_;
-        printf("  device memory by stage:\n");
-        vram_prev += (double)need;   /* the bucket array is already allocated */
-        VRAM_MARK("bucket array");
+        if (pipe_mem_info_optional("stage-report baseline", &fb_, &tb_) == 0) {
+            vram_prev = (double)fb_;
+            printf("  device memory by stage:\n");
+            vram_prev += (double)need; /* bucket is already allocated */
+            VRAM_MARK("bucket array");
+        } else {
+            vram_reporting = 0;
+        }
     }
     if (pipe_side_init(fb1, fbs1, cfg, bound1, &S1) ||
         pipe_side_init(fb0, fbs0, cfg, bound0, &S0)) { rc = -1; goto done; }
@@ -1461,17 +1523,6 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     }
 #endif
 
-    {   /* Steady-state footprint. The per-q buffers (survivor lists, prime
-         * lists, candidate records) grow on demand as q vary, so the band's
-         * high-water mark is not knowable from the init sizes -- it is the
-         * larger part of the total on a small-area job. */
-        size_t fb_ = 0, tb_ = 0;
-        PIPE_CK(cudaMemGetInfo(&fb_, &tb_));
-        printf("\n  device memory, steady state: %.2f GB in use of %.2f GB"
-               " (%.2f GB free)\n",
-               (tb_ - fb_) / 1073741824.0, tb_ / 1073741824.0,
-               fb_ / 1073741824.0);
-    }
     }   /* t_band scope */
 
     /* Fold in the device-side candidate counters. Under inline cofactorisation
@@ -1527,20 +1578,24 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                     nqdone, have, (unsigned long long)cfg->target_rels);
         }
     }
-    if (fr) { if (ferror(fr)) rc = -1; if (fclose(fr)) rc = -1; fr = NULL; }
-    if (fc) { if (ferror(fc)) rc = -1; if (fclose(fc)) rc = -1; fc = NULL; }
-    if (rc == 0) {
-        if ((cfg->relations && rename(rtmp, cfg->relations)) ||
-            (cfg->candidates && rename(ctmp, cfg->candidates))) {
-            perror("rename"); rc = -1;
-        }
-    }
+    if (pipe_finalize_outputs(&fr, &fc, cfg, rtmp, ctmp, rc == 0)) rc = -1;
+    outputs_finalized = 1;
 #ifdef HAVE_BOINC
     if (rc == 0) bench_boinc_fraction_done(0.99);
 #endif
+    if (rc == 0) {
+        /* Query only after the scientific output is committed. Per-q buffers
+         * grow on demand, so this remains useful telemetry, but its failure is
+         * never allowed to change a completed workunit into an error. */
+        size_t fb_ = 0, tb_ = 0;
+        if (pipe_mem_info_optional("steady-state report", &fb_, &tb_) == 0) {
+            printf("\n  device memory, steady state: %.2f GB in use of %.2f GB"
+                   " (%.2f GB free)\n",
+                   (tb_ - fb_) / 1073741824.0, tb_ / 1073741824.0,
+                   fb_ / 1073741824.0);
+        }
+    }
     if (rc) {
-        if (cfg->relations) remove(rtmp);
-        if (cfg->candidates) remove(ctmp);
         if (qgen)
             fprintf(stderr, "  band FAILED after %u generated q; no output kept\n",
                     nqdone);
@@ -1681,22 +1736,11 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
 
 #undef PIPE_CK
 done:
-    if (fr) {
-        const int io_bad = ferror(fr);
-        if (fclose(fr) || io_bad) rc = -1;
-        fr = NULL;
-    }
-    if (fc) {
-        const int io_bad = ferror(fc);
-        if (fclose(fc) || io_bad) rc = -1;
-        fc = NULL;
-    }
-    /* CUDA failures can jump here from any stage. Remove incomplete outputs
-     * here as well as in the normal band-finalisation path so no early error
-     * leaves a plausible-looking .part file behind. */
-    if (rc) {
-        if (rtmp[0]) remove(rtmp);
-        if (ctmp[0]) remove(ctmp);
+    /* CUDA failures can jump here from any stage. Normal completion already
+     * finalized exactly once above; an early jump closes and discards here. */
+    if (!outputs_finalized) {
+        if (pipe_finalize_outputs(&fr, &fc, cfg, rtmp, ctmp, 0)) rc = -1;
+        outputs_finalized = 1;
     }
     pipe_td_free(&C);
     cofq_free(&Q, &QO);

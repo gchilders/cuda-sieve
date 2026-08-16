@@ -59,7 +59,6 @@ static uint32_t is_power(uint32_t q, int *kk)
 }
 
 typedef struct {
-    unsigned char *mem;
     uint32_t *q, *r;
     uint8_t *logp;
     uint32_t n, cap;
@@ -68,15 +67,15 @@ typedef struct {
 static void fbvec_free(fbvec_t *v)
 {
     if (!v) return;
-    free(v->mem);
+    free(v->q);
+    free(v->r);
+    free(v->logp);
     memset(v, 0, sizeof(*v));
 }
 
 static int fbvec_reserve(fbvec_t *v, uint32_t need)
 {
     uint32_t cap;
-    size_t bytes;
-    unsigned char *mem;
     uint32_t *q, *r;
     uint8_t *logp;
 
@@ -91,26 +90,27 @@ static int fbvec_reserve(fbvec_t *v, uint32_t need)
         return -1;
     }
 #if SIZE_MAX <= UINT32_MAX
-    if ((size_t)cap > SIZE_MAX / 9u) {
+    if ((size_t)cap > SIZE_MAX / sizeof(*v->q) ||
+        (size_t)cap > SIZE_MAX / sizeof(*v->r) ||
+        (size_t)cap > SIZE_MAX / sizeof(*v->logp)) {
         errno = EOVERFLOW;
         return -1;
     }
 #endif
-    bytes = (size_t)cap * 9u;
-    mem = (unsigned char *)malloc(bytes);
-    if (!mem) return -1;
-    q = (uint32_t *)(void *)mem;
-    r = (uint32_t *)(void *)(mem + (size_t)cap * 4u);
-    logp = mem + (size_t)cap * 8u;
-    if (v->n) {
-        memcpy(q, v->q, (size_t)v->n * sizeof(*q));
-        memcpy(r, v->r, (size_t)v->n * sizeof(*r));
-        memcpy(logp, v->logp, (size_t)v->n * sizeof(*logp));
-    }
-    free(v->mem);
-    v->mem = mem;
+
+    /* Grow each array in place when possible. If a later realloc fails, the
+     * arrays already grown remain valid and v->cap deliberately stays at the
+     * old common capacity. A later retry can finish the growth safely, while
+     * peak RSS never includes a complete old and complete new three-array
+     * vector at the same time. */
+    q = (uint32_t *)realloc(v->q, (size_t)cap * sizeof(*v->q));
+    if (!q) return -1;
     v->q = q;
+    r = (uint32_t *)realloc(v->r, (size_t)cap * sizeof(*v->r));
+    if (!r) return -1;
     v->r = r;
+    logp = (uint8_t *)realloc(v->logp, (size_t)cap * sizeof(*v->logp));
+    if (!logp) return -1;
     v->logp = logp;
     v->cap = cap;
     return 0;
@@ -216,7 +216,10 @@ static int cado_maxbits_comment(char *line, int *maxbits)
         (s[7] && s[7] != ' ' && s[7] != '\t' && s[7] != '='))
         return 0;
     s = cado_skip_space(s + 7);
-    if (*s++ != '=') return -1;
+    /* Only the assignment form is metadata. Other prose comments beginning
+     * with "maxbits" are ordinary comments and must not abort the load. */
+    if (*s != '=') return 0;
+    s++;
     if (cado_u32(&s, &v) || !cado_at_end(s) || v < 1u || v > 32u)
         return -1;
     *maxbits = (int)v;
@@ -455,7 +458,7 @@ int fb_load_cado(const char *path, double scale, fb_t *fb)
             j++;
         }
     }
-    if (fb_validate(fb, FB_VALIDATE_EXTERNAL_PRIME_POWERS, path) != 0)
+    if (fb_validate(fb, FB_VALIDATE_PRECLASSIFIED_PRIME_POWERS, path) != 0)
         goto done;
 
     printf("text factor base %s: %u ideals (%u prime, %u prime-power)"

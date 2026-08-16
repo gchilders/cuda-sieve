@@ -136,6 +136,29 @@ static int verify_finite_double_parser(void)
     return 1;
 }
 
+static int verify_u64_decimal_parser(void)
+{
+    static const char *bad[] = {
+        "", " ", " -1", "-1", "+1", "1 ", "1x", "0x10",
+        "18446744073709551616"
+    };
+    uint64_t v = 0;
+    size_t i;
+
+    if (bench_parse_u64_decimal("0", &v) != 0 || v != 0) return 0;
+    if (bench_parse_u64_decimal("18446744073709551615", &v) != 0 ||
+        v != UINT64_MAX)
+        return 0;
+    for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        v = UINT64_C(0x1122334455667788);
+        errno = 0;
+        if (bench_parse_u64_decimal(bad[i], &v) == 0 ||
+            v != UINT64_C(0x1122334455667788))
+            return 0;
+    }
+    return 1;
+}
+
 /* The kernel subtracts BOUND from CINIT in unsigned arithmetic. Test both the
  * intended truncating semantics and every class of value that used to reach
  * an unchecked floating-to-integer conversion or wrap that subtraction. */
@@ -251,6 +274,9 @@ static int verify_validation_core(void)
     if (fb_restrict(&fb, 10, UINT32_MAX) == 0)
         return 0;
     if (fb_validate(&fb, FB_VALIDATE_EXTERNAL_PRIME_POWERS, NULL) != 0 ||
+        !fb_is_transform_validated(&fb))
+        return 0;
+    if (fb_validate(&fb, FB_VALIDATE_PRECLASSIFIED_PRIME_POWERS, NULL) != 0 ||
         !fb_is_transform_validated(&fb))
         return 0;
     if (fb_split_small(&fb, 10, &small) != 0 ||
@@ -462,6 +488,7 @@ static int verify_cado_parser_strict(void)
     };
     const char good[] =
         "# DEGREE: 2\n"
+        "# maxbits is 15\n"
         "# maxbits = 2\r\n"
         "2: 0\n"
         "3: 1,4\n"
@@ -498,6 +525,7 @@ static int verify_poly_parser_strict(void)
 {
     static const char good[] =
         "n: 12345678901234567890\n"
+        "cost: 2.7e18\n"
         "skew: 1.5\n"
         "c0: -1\n"
         "c1: 2\n"
@@ -511,7 +539,7 @@ static int verify_poly_parser_strict(void)
         "skew:1\nc0:-1\nc1:2\nY0:0\n",                  /* no Y1 */
         "skew:1\nc0:-1\nc1:2\nY0:0\nY1:0\n",            /* zero rational form */
         "skew:1\nc0:-1\nc1:2junk\nY0:0\nY1:1\n",        /* truncated token */
-        "skew:1\nc0:-1\ncx:2\nc1:2\nY0:0\nY1:1\n",       /* malformed coefficient key */
+        "skew:1\nc0:-1\nc1x:2\nc1:2\nY0:0\nY1:1\n",      /* malformed claimed coefficient key */
         "skew:1\nc0:-1\nc9:2\nY0:0\nY1:1\n",            /* unsupported degree */
         "skew:1\nc0:-1\nc1:2\nc1:3\nY0:0\nY1:1\n",      /* duplicate */
         "skew:1\nc0:-1\nc1:2\nY0:0\nY1:1\nrlim:4294967296\n",
@@ -665,6 +693,8 @@ int main(int argc, char **argv)
        "16,777,216 x 256 remains 2^32 rather than wrapping to zero");
     ok("strict finite decimal parser", verify_finite_double_parser(),
        "junk, range errors, NaN and infinities rejected without assignment");
+    ok("strict unsigned decimal parser", verify_u64_decimal_parser(),
+       "signs, whitespace, junk and overflow rejected without assignment");
     ok("checked survivor threshold", verify_survivor_bound(),
        "truncation preserved; invalid values and BOUND > CINIT rejected");
     ok("8-bit factor-base logs", verify_factor_base_log_bounds(),

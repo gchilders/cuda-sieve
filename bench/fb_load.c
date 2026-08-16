@@ -182,7 +182,8 @@ int fb_validate(fb_t *fb, fb_validate_policy_t policy, const char *source)
 
     if (policy != FB_VALIDATE_EXTERNAL_PRIMES &&
         policy != FB_VALIDATE_EXTERNAL_PRIME_POWERS &&
-        policy != FB_VALIDATE_GENERATED_PRIME_POWERS)
+        policy != FB_VALIDATE_GENERATED_PRIME_POWERS &&
+        policy != FB_VALIDATE_PRECLASSIFIED_PRIME_POWERS)
         return fb_validation_error(fb, source, UINT32_MAX,
                                    "unknown validation policy %d", (int)policy);
     if (fb->n == 0)
@@ -191,9 +192,10 @@ int fb_validate(fb_t *fb, fb_validate_policy_t policy, const char *source)
     if (!fb->primes || !fb->roots)
         return fb_validation_error(fb, source, UINT32_MAX,
                                    "missing modulus or root array");
-    if (policy == FB_VALIDATE_GENERATED_PRIME_POWERS && !fb->ispow)
+    if ((policy == FB_VALIDATE_GENERATED_PRIME_POWERS ||
+         policy == FB_VALIDATE_PRECLASSIFIED_PRIME_POWERS) && !fb->ispow)
         return fb_validation_error(fb, source, UINT32_MAX,
-                                   "generated factor base has no ispow array");
+                                   "generated or preclassified factor base has no ispow array");
 
     /* Structural pass. It is deliberately separate from classification so we
      * know whether the fast sieve is appropriate before spending any primality
@@ -224,6 +226,7 @@ int fb_validate(fb_t *fb, fb_validate_policy_t policy, const char *source)
     }
 
     if (policy != FB_VALIDATE_GENERATED_PRIME_POWERS &&
+        policy != FB_VALIDATE_PRECLASSIFIED_PRIME_POWERS &&
         nunique >= sieve_unique_min && maxq <= sieve_q_limit &&
         (uint64_t)maxq <= (uint64_t)nunique * sieve_max_span_per_modulus) {
         prime_list = prime_list_build(maxq, &nprime);
@@ -239,11 +242,15 @@ int fb_validate(fb_t *fb, fb_validate_policy_t policy, const char *source)
         if (!have_classified || q != classified_q) {
             fb_modulus_kind_t kind;
 
-            if (policy == FB_VALIDATE_GENERATED_PRIME_POWERS) {
-                /* The zero-flag entries came directly from prime_list_build()
-                 * in the in-process generator. Rechecking that entire stream
-                 * would build the same sieve twice. Proper powers are few and
-                 * are still independently verified here. */
+            if (policy == FB_VALIDATE_GENERATED_PRIME_POWERS ||
+                policy == FB_VALIDATE_PRECLASSIFIED_PRIME_POWERS) {
+                /* The zero-flag entries were already proven prime: either by
+                 * prime_list_build() in an in-process generator or by the
+                 * strict CADO loader while it parsed each distinct modulus.
+                 * Reclassifying that stream here duplicates the dominant load
+                 * cost. Proper powers are few and remain independently checked
+                 * so a bad flag cannot route a mixed composite to the lattice
+                 * transform. */
                 kind = flagged_power
                     ? (composite_is_prime_power(q)
                        ? FB_MODULUS_PROPER_POWER : FB_MODULUS_INVALID)
@@ -500,9 +507,9 @@ int fb_split_small(const fb_t *fb, uint32_t bkthresh, fb_t *small)
         k++;
     }
     small->n = k;
-    /* A subsequence cannot introduce a bad modulus, root, order, or power
-     * flag. Preserve the proof carried by the source; an unvalidated source
-     * deliberately leaves the subset unvalidated too. */
+    /* fb_split_small() rejects an unvalidated source above. Taking an ordered
+     * subsequence cannot invalidate its modulus, root, ordering, or power
+     * classification, so the subset inherits the source's validation proof. */
     small->validation_cookie = fb->validation_cookie;
     return 0;
 
