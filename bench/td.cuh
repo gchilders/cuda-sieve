@@ -146,8 +146,9 @@ __global__ void k_cand_stats(uint32_t n,
                              uint32_t lpb0, uint32_t lpb1, uint32_t fmax,
                              uint32_t *__restrict out)
 {
-    const uint32_t stride = gridDim.x * blockDim.x;
-    for (uint32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < n; t += stride) {
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t tt = bench_grid_thread_x(); tt < n; tt += stride) {
+        const uint32_t t = (uint32_t)tt;
         if (fn0[t] > fmax || fn1[t] > fmax) { atomicAdd(&out[2], 1u); continue; }
         if ((uint32_t)bits0[t] <= lpb0 && (uint32_t)bits1[t] <= lpb1)
             atomicAdd(&out[0], 1u);
@@ -184,8 +185,9 @@ __device__ __forceinline__ uint32_t td_rank(const uint32_t *__restrict bits,
 __global__ void k_group_counts(const uint32_t *__restrict bits,
                                uint32_t ngroup, uint32_t *__restrict cnt)
 {
-    uint32_t stride = gridDim.x * blockDim.x;
-    for (uint32_t g = blockIdx.x * blockDim.x + threadIdx.x; g < ngroup; g += stride) {
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t gg = bench_grid_thread_x(); gg < ngroup; gg += stride) {
+        const uint32_t g = (uint32_t)gg;
         uint32_t s = 0;
         for (uint32_t k = 0; k < TD_GROUP_W; k++) s += __popc(bits[g * TD_GROUP_W + k]);
         cnt[g] = s;
@@ -203,8 +205,9 @@ __global__ void k_scan_pass1(const uint32_t *__restrict in, uint32_t n,
                              uint32_t *__restrict out, uint32_t *__restrict bsum)
 {
     __shared__ uint32_t s[TD_SCAN_BLK];
-    uint32_t i = blockIdx.x * TD_SCAN_BLK + threadIdx.x;
-    s[threadIdx.x] = (i < n) ? in[i] : 0u;
+    const uint64_t ii = (uint64_t)blockIdx.x * TD_SCAN_BLK + threadIdx.x;
+    const uint32_t i = (uint32_t)ii;
+    s[threadIdx.x] = (ii < n) ? in[i] : 0u;
     __syncthreads();
     for (uint32_t off = 1; off < TD_SCAN_BLK; off <<= 1) {
         uint32_t v = (threadIdx.x >= off) ? s[threadIdx.x - off] : 0u;
@@ -212,7 +215,7 @@ __global__ void k_scan_pass1(const uint32_t *__restrict in, uint32_t n,
         s[threadIdx.x] += v;
         __syncthreads();
     }
-    if (i < n) out[i] = s[threadIdx.x] - ((i < n) ? in[i] : 0u);   /* exclusive */
+    if (ii < n) out[i] = s[threadIdx.x] - in[i];   /* exclusive */
     if (threadIdx.x == TD_SCAN_BLK - 1) bsum[blockIdx.x] = s[threadIdx.x];
 }
 
@@ -244,8 +247,8 @@ __global__ void k_scan_pass2(uint32_t *__restrict bsum, uint32_t nb)
 __global__ void k_scan_pass3(uint32_t *__restrict out, uint32_t n,
                              const uint32_t *__restrict bsum)
 {
-    uint32_t i = blockIdx.x * TD_SCAN_BLK + threadIdx.x;
-    if (i < n) out[i] += bsum[blockIdx.x];
+    const uint64_t ii = (uint64_t)blockIdx.x * TD_SCAN_BLK + threadIdx.x;
+    if (ii < n) out[(uint32_t)ii] += bsum[blockIdx.x];
 }
 
 /* ---- rank-ordered compaction ------------------------------------------- */
@@ -266,9 +269,10 @@ __global__ void k_emit_ranked(const uint32_t *__restrict bits,
 {
     const uint32_t Imask = (1u << logI) - 1;
     const int32_t  Ihalf = (int32_t)(1u << (logI - 1));
-    const uint32_t stride = gridDim.x * blockDim.x;
+    const uint64_t stride = bench_grid_stride_x();
 
-    for (uint32_t w = blockIdx.x * blockDim.x + threadIdx.x; w < nword; w += stride) {
+    for (uint64_t ww = bench_grid_thread_x(); ww < nword; ww += stride) {
+        const uint32_t w = (uint32_t)ww;
         uint32_t m = bits[w];
         if (!m) continue;
         /* rank of this word's first position: the group base plus the words
@@ -340,10 +344,11 @@ __global__ void k_resieve_scatter(const plat_t *__restrict plat,
 {
     const uint32_t Imask = (1u << logI) - 1;
     const uint32_t NONE = 0xFFFFFFFFu;      /* x < 2^29, so this cannot collide */
-    uint32_t stride = gridDim.x * blockDim.x;
+    const uint64_t stride = bench_grid_stride_x();
     unsigned long long ovf = 0;
 
-    for (uint32_t k = blockIdx.x * blockDim.x + threadIdx.x; k < n; k += stride) {
+    for (uint64_t kk = bench_grid_thread_x(); kk < n; kk += stride) {
+        const uint32_t k = (uint32_t)kk;
         plat_t P = plat[k];
         if (P.inc_warp == 0xFFFFFFFFu) continue;
         if (ispow && ispow[k]) continue;
@@ -439,14 +444,15 @@ __global__ void k_td(const int64_t *__restrict A, const int64_t *__restrict B,
 
     const uint32_t Imask = (1u << logI) - 1;
     const int32_t  Ihalf = (int32_t)(1u << (logI - 1));
-    const uint32_t nthread = gridDim.x * blockDim.x;
-    const uint32_t iters = (n + nthread - 1) / nthread;
+    const uint64_t nthread = bench_grid_stride_x();
+    const uint64_t iters = ((uint64_t)n + nthread - 1) / nthread;
     const int deg = P->deg;
     unsigned long long hits = 0;
 
-    for (uint32_t it = 0; it < iters; it++) {
-        const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x + it * nthread;
-        const bool active = (t < n);
+    for (uint64_t it = 0; it < iters; it++) {
+        const uint64_t tt = bench_grid_thread_x() + it * nthread;
+        const bool active = (tt < n);
+        const uint32_t t = (uint32_t)tt;
         const uint32_t s = (SELECT && active) ? sel[t] : t;
         const int64_t a = active ? A[s] : 0;
         const int64_t b = active ? B[s] : 0;
@@ -574,8 +580,9 @@ __global__ void k_classify(const bn_t *__restrict cof,
                            uint32_t lpb, uint32_t mfb, double lim,
                            uint8_t *__restrict status)
 {
-    const uint32_t stride = gridDim.x * blockDim.x;
-    for (uint32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < n; t += stride) {
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t tt = bench_grid_thread_x(); tt < n; tt += stride) {
+        const uint32_t t = (uint32_t)tt;
         bn_t c = cof[t];
         /* b == 0 is the lattice point (i,j) = (0,1): a = q, b = 0. It passes
          * gcd(i,j) == 1 and both norm bounds, and its cofactors classify
@@ -603,8 +610,9 @@ __global__ void k_accept_flags(const uint8_t *__restrict st0,
                                const uint8_t *__restrict st1,
                                uint32_t n, uint32_t *__restrict flag)
 {
-    const uint32_t stride = gridDim.x * blockDim.x;
-    for (uint32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < n; t += stride) {
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t tt = bench_grid_thread_x(); tt < n; tt += stride) {
+        const uint32_t t = (uint32_t)tt;
         uint32_t a = (st0[t] == COF_ACCEPT || st0[t] == COF_SPLIT);
         uint32_t b = (st1[t] == COF_ACCEPT || st1[t] == COF_SPLIT);
         flag[t] = a & b;
@@ -616,8 +624,9 @@ __global__ void k_scatter_sel(const uint32_t *__restrict flag,
                               uint32_t n, uint32_t *__restrict sel,
                               uint32_t cap, uint32_t *__restrict nacc)
 {
-    const uint32_t stride = gridDim.x * blockDim.x;
-    for (uint32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < n; t += stride) {
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t tt = bench_grid_thread_x(); tt < n; tt += stride) {
+        const uint32_t t = (uint32_t)tt;
         if (flag[t] && off[t] < cap) sel[off[t]] = t;
         if (t == n - 1) *nacc = off[t] + flag[t];
     }
@@ -628,8 +637,9 @@ __global__ void k_gather_ab(const int64_t *__restrict A,
                             const uint32_t *__restrict sel, uint32_t n,
                             int64_t *__restrict oa, int64_t *__restrict ob)
 {
-    const uint32_t stride = gridDim.x * blockDim.x;
-    for (uint32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < n; t += stride) {
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t tt = bench_grid_thread_x(); tt < n; tt += stride) {
+        const uint32_t t = (uint32_t)tt;
         oa[t] = A[sel[t]]; ob[t] = B[sel[t]];
     }
 }

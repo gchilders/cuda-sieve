@@ -22,6 +22,7 @@
 #include <math.h>
 #include <algorithm>
 #include <time.h>
+#include <errno.h>
 
 /* Host-side wall clock, for the per-q work that runs off the GPU and so is
  * invisible to cudaEvent timing. Goal 1 is about host demand, so this has to
@@ -33,9 +34,28 @@ static double host_ms(void)
     return t.tv_sec * 1e3 + t.tv_nsec * 1e-6;
 }
 
-#define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
-    fprintf(stderr, "CUDA %s at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); \
-    return -1; } } while (0)
+static void report_slice_build_error(void)
+{
+    if (errno == EOVERFLOW)
+        fprintf(stderr, "fb_build_slices: factor base requires more than"
+                " 65,536 slices; bucket records carry only a 16-bit slice ID\n");
+    else if (errno == EINVAL)
+        fprintf(stderr, "fb_build_slices: empty factor base or missing log table\n");
+    else
+        perror("fb_build_slices");
+}
+
+static int cuda_check_impl(cudaError_t err, const char *expr,
+                           const char *file, int line)
+{
+    if (err == cudaSuccess) return 0;
+    fprintf(stderr, "CUDA %s: %s at %s:%d\n",
+            expr, cudaGetErrorString(err), file, line);
+    return -1;
+}
+
+#define CUDA_CHECKED(x) cuda_check_impl((x), #x, __FILE__, __LINE__)
+#define CK(x) do { if (CUDA_CHECKED(x)) return -1; } while (0)
 
 /* ---- stage T: root transform + plattice reduction --------------------- */
 
@@ -64,8 +84,9 @@ __global__ void k_transform(const uint32_t *__restrict primes,
                             uint32_t *__restrict nproj,
                             unsigned long long *__restrict nlost)
 {
-    uint32_t stride = gridDim.x * blockDim.x;
-    for (uint32_t k = blockIdx.x * blockDim.x + threadIdx.x; k < n; k += stride) {
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t kk = bench_grid_thread_x(); kk < n; kk += stride) {
+        const uint32_t k = (uint32_t)kk;
         const uint32_t q = primes[k];
         uint32_t rt, g, m = pl_transform_enc(q, roots[k], a0, a1, b0, b1, &rt, &g);
         if (g > 1) {                         /* rows only: emit an empty walk */
@@ -95,9 +116,10 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
 {
     const uint32_t Imask = (1u << logI) - 1;
     const uint32_t offmask = (1u << log_region) - 1;
-    uint32_t stride = gridDim.x * blockDim.x;
+    const uint64_t stride = bench_grid_stride_x();
 
-    for (uint32_t k = blockIdx.x * blockDim.x + threadIdx.x; k < n; k += stride) {
+    for (uint64_t kk = bench_grid_thread_x(); kk < n; kk += stride) {
+        const uint32_t k = (uint32_t)kk;
         plat_t P = plat[k];
         if (P.inc_warp == 0xFFFFFFFFu) continue;
         /* one read per prime, not per record: the slice hint is what the apply
@@ -423,8 +445,8 @@ void k_fill_l1(const plat_t *__restrict plat,
     for (uint32_t i = tid; i < L1_NBUF; i += nth) cnt[i] = 0;
     __syncthreads();
 
-    const uint32_t stride = gridDim.x * nth;
-    uint32_t k = blockIdx.x * nth + tid;
+    const uint64_t stride = bench_grid_product_u64(gridDim.x, nth);
+    uint64_t k = bench_grid_product_u64(blockIdx.x, nth) + tid;
     plat_t P; P.inc_warp = 0xFFFFFFFFu;
     uint32_t x = 0;
     int active = 0;
@@ -432,7 +454,7 @@ void k_fill_l1(const plat_t *__restrict plat,
     for (;;) {
         if (!active) {                       /* pick up the next prime */
             while (k < n) {
-                P = plat[k];
+                P = plat[(uint32_t)k];
                 if (P.inc_warp != 0xFFFFFFFFu) { x = pl_first(&P, logI); active = (x < xmax); }
                 k += stride;
                 if (active) break;
@@ -655,8 +677,9 @@ __global__ void k_build_summary_g(const uint32_t *__restrict bits,
                                   uint32_t *__restrict summary)
 {
     const uint32_t nsw = nword / (wper * 32);
-    const uint32_t stride = gridDim.x * blockDim.x;
-    for (uint32_t w = blockIdx.x * blockDim.x + threadIdx.x; w < nsw; w += stride) {
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t ww = bench_grid_thread_x(); ww < nsw; ww += stride) {
+        const uint32_t w = (uint32_t)ww;
         uint32_t out = 0;
         for (uint32_t b = 0; b < 32; b++) {
             uint32_t o = 0;
@@ -672,8 +695,9 @@ __global__ void k_build_summary(const uint32_t *__restrict bits,
                                 uint32_t nword, uint32_t *__restrict summary)
 {
     /* one summary bit per 64 positions == per 2 words of the full bitmap */
-    uint32_t stride = gridDim.x * blockDim.x;
-    for (uint32_t s = blockIdx.x * blockDim.x + threadIdx.x; s < nword / 2; s += stride) {
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t ss = bench_grid_thread_x(); ss < nword / 2; ss += stride) {
+        const uint32_t s = (uint32_t)ss;
         uint32_t occupied = (bits[2 * s] | bits[2 * s + 1]) != 0u;
         if (occupied) atomicOr(&summary[s >> 5], 1u << (s & 31u));
     }
@@ -691,9 +715,10 @@ __global__ void k_resieve_rewalk(const plat_t *__restrict plat,
                                  unsigned long long *__restrict npass1)
 {
     const uint32_t Imask = (1u << logI) - 1;
-    uint32_t stride = gridDim.x * blockDim.x;
+    const uint64_t stride = bench_grid_stride_x();
     unsigned long long probes = 0, pass1 = 0;
-    for (uint32_t k = blockIdx.x * blockDim.x + threadIdx.x; k < n; k += stride) {
+    for (uint64_t kk = bench_grid_thread_x(); kk < n; kk += stride) {
+        const uint32_t k = (uint32_t)kk;
         plat_t P = plat[k];
         if (P.inc_warp == 0xFFFFFFFFu) continue;
         uint32_t p = primes[k];
@@ -737,7 +762,7 @@ __global__ void k_purge(const uint32_t *__restrict recs,
 }
 
 
-/* Slice cut for LAYOUT B. Two differences from build_slices() above, and both
+/* Slice cut for LAYOUT B. Two differences from fb_build_slices(), and both
  * are forced by the record format rather than chosen:
  *
  *  - the cap is 65536, not 262144, because the record's high 16 bits hold the
@@ -782,8 +807,10 @@ __global__ void k_fill_segmented(const plat_t *__restrict plat,
 {
     const uint32_t Imask = (1u << logI) - 1;
     const uint32_t offmask = (1u << log_region) - 1;
-    uint32_t stride = gridDim.x * blockDim.x;
-    for (uint32_t k = kbeg + blockIdx.x * blockDim.x + threadIdx.x; k < kend; k += stride) {
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t kk = (uint64_t)kbeg + bench_grid_thread_x();
+         kk < kend; kk += stride) {
+        const uint32_t k = (uint32_t)kk;
         plat_t P = plat[k];
         if (P.inc_warp == 0xFFFFFFFFu) continue;
         const uint32_t soff = k - kbeg;          /* < 65536 by construction */
@@ -804,9 +831,11 @@ __global__ void k_snapshot_bounds(const uint32_t *__restrict cursor,
                                   uint32_t *__restrict bounds,
                                   uint32_t nregion, uint32_t nslice, uint32_t sl)
 {
-    uint32_t stride = gridDim.x * blockDim.x;
-    for (uint32_t b = blockIdx.x * blockDim.x + threadIdx.x; b < nregion; b += stride)
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t bb = bench_grid_thread_x(); bb < nregion; bb += stride) {
+        const uint32_t b = (uint32_t)bb;
         bounds[(size_t)b * nslice + sl] = cursor[b];
+    }
 }
 
 /* Purge, layout B: stream the retained records, keep the ones on a survivor,
@@ -861,19 +890,20 @@ __global__ void k_intersect_compact(const uint32_t *__restrict A,
 {
     const uint32_t Imask = (1u << logI) - 1;
     const int32_t  Ihalf = (int32_t)(1u << (logI - 1));
-    const uint32_t stride = gridDim.x * blockDim.x;
+    const uint64_t stride = bench_grid_stride_x();
     const uint32_t lane = threadIdx.x & 31u;
     unsigned long long pre = 0;
 
     /* Round the trip count up so every lane of a warp runs the same number of
      * iterations: the warp-aggregated atomic below needs a converged warp, and
      * lanes past the end simply contribute nothing. */
-    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t iters = (nword + stride - 1) / stride;
+    const uint64_t tid = bench_grid_thread_x();
+    const uint64_t iters = ((uint64_t)nword + stride - 1) / stride;
 
-    for (uint32_t it = 0; it < iters; it++) {
-        uint32_t w = tid + it * stride;
-        uint32_t m = (w < nword) ? (A[w] & B[w]) : 0u;
+    for (uint64_t it = 0; it < iters; it++) {
+        const uint64_t ww = tid + it * stride;
+        const uint32_t w = (uint32_t)ww;
+        uint32_t m = (ww < nword) ? (A[w] & B[w]) : 0u;
         uint32_t keep = 0;
         pre += __popc(m);
         while (m) {
@@ -894,7 +924,7 @@ __global__ void k_intersect_compact(const uint32_t *__restrict A,
         /* Each thread owns a whole 32-position word, so the primitive
          * two-sided bitmap can be stored outright -- no atomics needed. This
          * is what the resieve filters against. */
-        if (twosided && w < nword) twosided[w] = keep;
+        if (twosided && ww < nword) twosided[w] = keep;
 
         uint32_t slot;
         if (AGG) {
@@ -931,29 +961,6 @@ __global__ void k_intersect_compact(const uint32_t *__restrict A,
     }
     /* one atomic per thread, not one per survivor */
     if (pre) atomicAdd(npre, pre);
-}
-
-/* Cut the (sorted) factor base into slices of constant log p. This is CADO's
- * scheme: the bucket record carries a slice index, and log p is a property of
- * the slice, so the apply kernel needs only a tiny shared-memory table. Slices
- * are capped so the count stays a power of two we can mask with. */
-static uint32_t build_slices(const fb_t *fb, uint16_t *slice,
-                             uint16_t **logp_tab, uint32_t *nslice_pow2)
-{
-    uint32_t ns = 0, k;
-    uint16_t *tab = (uint16_t *)malloc(65536 * 2);
-    int cur = -1;
-    for (k = 0; k < fb->n; k++) {
-        int lp = fb->logp[k];        /* las's per-ideal increment, already scaled */
-        if (lp != cur || (ns && (k % 262144u) == 0)) {
-            cur = lp; tab[ns++] = (uint16_t)lp;
-        }
-        slice[k] = (uint16_t)(ns - 1);
-    }
-    { uint32_t p2 = 1; while (p2 < ns) p2 <<= 1; *nslice_pow2 = p2;
-      for (uint32_t i = ns; i < p2; i++) tab[i] = 0; }
-    *logp_tab = tab;
-    return ns;
 }
 
 /* ======================= trial division, host side ======================= */
@@ -1613,7 +1620,25 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     const uint32_t nbitword = xmax >> 5;   /* survivor bitmap, 1 bit/position */
     const int log_super = log_region + 7;             /* 128 regions/super */
     const uint32_t nsuper = xmax >> log_super;
+    const uint32_t CINIT = (cfg->cell_bits == 16) ? 4096u : 255u;
+    uint32_t BOUND = 0;
     norm_t N;
+
+    if (!fb_is_transform_validated(fb) ||
+        (fbs && fbs->n && !fb_is_transform_validated(fbs))) {
+        fprintf(stderr,
+                "run_bench: refusing an unvalidated factor base;"
+                " call fb_validate() before splitting or uploading it\n");
+        return -1;
+    }
+    /* Validate the threshold before norm_setup(), allocations, or launches.
+     * run_bench is an exported consumer boundary and must remain safe even
+     * when called directly instead of through bench_main's CLI parser. */
+    if (sieve_bound_checked(cfg->scale, cfg->allowance, CINIT, &BOUND,
+                            cfg->side == 1
+                                ? "run_bench side 1 survivor parameters"
+                                : "run_bench side 0 survivor parameters"))
+        return -1;
 
     /* Exact trial division constructs the full homogeneous norm. Reject a
      * shape that cannot fit before allocating or launching anything on the
@@ -1646,9 +1671,16 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     CK(cudaMemcpy(D.roots,  fb->roots,  (size_t)fb->n * 4, cudaMemcpyHostToDevice));
 
     /* ---- slices: bucket record hint -> log p ---- */
-    uint16_t *hslice = (uint16_t *)malloc((size_t)fb->n * 2), *hlogp = NULL;
+    uint16_t *hslice = NULL, *hlogp = NULL;
     uint32_t nslice_pow2 = 1;
-    uint32_t nslice = build_slices(fb, hslice, &hlogp, &nslice_pow2);
+    int32_t nslice_rc = fb_build_slices(fb, &hslice, &hlogp, &nslice_pow2);
+    if (nslice_rc < 0) {
+        report_slice_build_error();
+        cudaFree(D.primes); cudaFree(D.roots); cudaFree(D.plat);
+        cudaFree(D.overflow); cudaFree(D.nproj); cudaFree(D.nlost);
+        return -1;
+    }
+    uint32_t nslice = (uint32_t)nslice_rc;
     printf("  factor base cut into %u slices (padded to %u), log p in [%u,%u] bits\n",
            nslice, nslice_pow2, hlogp[0], hlogp[nslice - 1]);
     CK(cudaMalloc(&D.slice, (size_t)fb->n * 2));
@@ -1756,7 +1788,6 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     }
 
     /* ---- norm initialisation constants ---- */
-    const uint32_t CINIT = (cfg->cell_bits == 16) ? 4096u : 255u;
     /* las's survivor test is S = max(T - sum, 0) <= bound with
      * bound = round(scale * lambda * lpb). Ours holds CINIT - T + sum, so
      * S = CINIT - cell and the test becomes cell >= CINIT - bound. */
@@ -1766,7 +1797,6 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
      * this reproduces both of las's bounds exactly: 143 and 141. The old
      * round(scale*allowance) matched only because the rounded scales happened
      * to compensate. */
-    const uint32_t BOUND = (uint32_t)(cfg->scale * cfg->allowance + 1.0);
     uint32_t tconst;
     {
         float t = norm_target_host(&N, 0, cfg->J / 2);

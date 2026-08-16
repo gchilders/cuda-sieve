@@ -4,6 +4,52 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <errno.h>
+#include <stdarg.h>
+
+#define FB_VALIDATION_COOKIE 0x46425631u  /* "FBV1" */
+
+typedef enum {
+    FB_MODULUS_INVALID = 0,
+    FB_MODULUS_PRIME = 1,
+    FB_MODULUS_PROPER_POWER = 2
+} fb_modulus_kind_t;
+
+static int fb_validation_error(fb_t *fb, const char *source, uint32_t index,
+                               const char *fmt, ...)
+{
+    va_list ap;
+    if (fb) fb->validation_cookie = 0;
+    errno = EINVAL;
+    if (!source) return -1;
+    fprintf(stderr, "fb_validate(%s): ", source);
+    if (index != UINT32_MAX) fprintf(stderr, "entry %u: ", index);
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+    return -1;
+}
+
+/* q is already known to be composite. Return whether it is p^k for one prime
+ * p and k >= 2. The first divisor found by ascending trial division is prime,
+ * so removing it completely is sufficient. This path is rare in a valid
+ * factor base: only the explicitly marked power entries pay for it. */
+static int composite_is_prime_power(uint32_t q)
+{
+    uint32_t d;
+    if (q < 4) return 0;
+    if ((q & 1u) == 0) {
+        do q >>= 1; while ((q & 1u) == 0);
+        return q == 1;
+    }
+    for (d = 3; (uint64_t)d * d <= (uint64_t)q; d += 2) {
+        if (q % d) continue;
+        do q /= d; while (q % d == 0);
+        return q == 1;
+    }
+    return 0;
+}
 
 int fb_load(const char *path, fb_t *fb)
 {
@@ -32,20 +78,36 @@ int fb_load(const char *path, fb_t *fb)
      * per entry, which cost 7.8 s on this file and applied to the DEFAULT
      * invocation, the one path not exercised while fixing finding 29. */
     fb->ispow  = (uint8_t *)calloc((size_t)n, 1);
-    if (!fb->primes || !fb->roots || !fb->ispow) { fclose(f); return -1; }
+    if (!fb->primes || !fb->roots || !fb->ispow) {
+        fclose(f);
+        fb_free(fb);
+        return -1;
+    }
 
     got  = fread(fb->primes, 4, n, f);
     got += fread(fb->roots,  4, n, f);
     fclose(f);
-    if (got != 2ull * n) { fprintf(stderr, "fb_load: short read\n"); return -1; }
+    if (got != 2ull * n) {
+        fprintf(stderr, "fb_load: short read\n");
+        fb_free(fb);
+        return -1;
+    }
+    /* .afb.0 has no way to mark prime powers. Requiring actual primes here is
+     * therefore stricter than the transform's prime-power rule on purpose: a
+     * power accepted as a base prime would retain ispow == 0 and be routed to
+     * the bucket walk even when its transformed solutions are row-confined. */
+    if (fb_validate(fb, FB_VALIDATE_EXTERNAL_PRIMES, path) != 0) {
+        fb_free(fb);
+        return -1;
+    }
     return 0;
 }
 
 void fb_free(fb_t *fb)
 {
+    if (!fb) return;
     free(fb->primes); free(fb->roots); free(fb->logp); free(fb->ispow);
-    fb->primes = fb->roots = NULL; fb->logp = NULL; fb->ispow = NULL; fb->n = 0;
-    fb->maxbits = 0;
+    memset(fb, 0, sizeof(*fb));
 }
 
 /* Is q a prime power (including a prime)?
@@ -56,22 +118,16 @@ void fb_free(fb_t *fb)
  * prime is at most sqrt(q), so the search is short. */
 int fb_is_prime_power(uint32_t q)
 {
-    uint32_t d;
     if (q < 2) return 0;
     if (bench_is_prime32(q)) return 1;
-    for (d = 2; (uint64_t)d * d <= (uint64_t)q; d++) {
-        if (q % d) continue;
-        while (q % d == 0) q /= d;
-        return q == 1;
-    }
-    return 0;                    /* composite with no factor <= sqrt: impossible */
+    return composite_is_prime_power(q);
 }
 
 /* p^k with k >= 2. These are the entries whose transform can come out
  * row-confined (g > 1), which the bucket walk cannot express. */
 int fb_is_proper_power(uint32_t q)
 {
-    return q >= 4 && !bench_is_prime32(q) && fb_is_prime_power(q);
+    return q >= 4 && !bench_is_prime32(q) && composite_is_prime_power(q);
 }
 
 /* Every modulus in a factor base must be a prime power: the root transform's
@@ -88,16 +144,270 @@ int32_t fb_check_prime_powers(const fb_t *fb)
     return -1;
 }
 
-void fb_fill_logp(fb_t *fb, double scale)
+int fb_is_transform_validated(const fb_t *fb)
+{
+    return fb && fb->validation_cookie == FB_VALIDATION_COOKIE;
+}
+
+/* Validate the host representation before any entry can reach
+ * pl_transform_enc(). External factor bases are checked independently of the
+ * loader's interpretation: this is what catches a malformed even composite
+ * such as 6 or 12 before pl_invmod_any() mistakes it for a power of two.
+ *
+ * A deterministic Miller-Rabin test per ideal is needlessly expensive because
+ * a polynomial may have several roots for one modulus. We classify each
+ * DISTINCT q once. For normal, dense factor bases below 2^28, building one
+ * Eratosthenes prime list is substantially faster than millions of modular
+ * exponentiations; sparse or unusually high-q inputs use Miller-Rabin instead
+ * so a tiny malicious file cannot force a sieve over almost 2^32 integers. */
+int fb_validate(fb_t *fb, fb_validate_policy_t policy, const char *source)
+{
+    const uint32_t sieve_q_limit = 1u << 28;
+    const size_t sieve_unique_min = 1u << 16;
+    const uint32_t sieve_max_span_per_modulus = 256u;
+    uint32_t i, prev = 0, maxq = 0;
+    size_t nunique = 0;
+    uint32_t *prime_list = NULL;
+    size_t nprime = 0, prime_pos = 0;
+    uint32_t classified_q = 0;
+    fb_modulus_kind_t classified_kind = FB_MODULUS_INVALID;
+    int have_classified = 0;
+
+    if (!fb) {
+        errno = EINVAL;
+        if (source) fprintf(stderr, "fb_validate(%s): null factor base\n", source);
+        return -1;
+    }
+    fb->validation_cookie = 0;
+
+    if (policy != FB_VALIDATE_EXTERNAL_PRIMES &&
+        policy != FB_VALIDATE_EXTERNAL_PRIME_POWERS &&
+        policy != FB_VALIDATE_GENERATED_PRIME_POWERS &&
+        policy != FB_VALIDATE_PRECLASSIFIED_PRIME_POWERS)
+        return fb_validation_error(fb, source, UINT32_MAX,
+                                   "unknown validation policy %d", (int)policy);
+    if (fb->n == 0)
+        return fb_validation_error(fb, source, UINT32_MAX,
+                                   "empty factor base");
+    if (!fb->primes || !fb->roots)
+        return fb_validation_error(fb, source, UINT32_MAX,
+                                   "missing modulus or root array");
+    if ((policy == FB_VALIDATE_GENERATED_PRIME_POWERS ||
+         policy == FB_VALIDATE_PRECLASSIFIED_PRIME_POWERS) && !fb->ispow)
+        return fb_validation_error(fb, source, UINT32_MAX,
+                                   "generated or preclassified factor base has no ispow array");
+
+    /* Structural pass. It is deliberately separate from classification so we
+     * know whether the fast sieve is appropriate before spending any primality
+     * work, and so malformed ordering/root encodings fail immediately. */
+    for (i = 0; i < fb->n; i++) {
+        const uint32_t q = fb->primes[i];
+        const uint32_t r = fb->roots[i];
+        if (q < 2)
+            return fb_validation_error(fb, source, i,
+                                       "modulus %u is below 2", q);
+        if (i && q < prev)
+            return fb_validation_error(fb, source, i,
+                                       "modulus %u is below previous modulus %u",
+                                       q, prev);
+        if ((uint64_t)r >= 2ull * (uint64_t)q)
+            return fb_validation_error(fb, source, i,
+                                       "root encoding %u is outside [0, 2*q) for q=%u",
+                                       r, q);
+        if (fb->ispow && fb->ispow[i] > 1)
+            return fb_validation_error(fb, source, i,
+                                       "ispow value %u is not boolean",
+                                       (unsigned)fb->ispow[i]);
+        if (!i || q != prev) {
+            nunique++;
+            maxq = q;
+        }
+        prev = q;
+    }
+
+    if (policy != FB_VALIDATE_GENERATED_PRIME_POWERS &&
+        policy != FB_VALIDATE_PRECLASSIFIED_PRIME_POWERS &&
+        nunique >= sieve_unique_min && maxq <= sieve_q_limit &&
+        (uint64_t)maxq <= (uint64_t)nunique * sieve_max_span_per_modulus) {
+        prime_list = prime_list_build(maxq, &nprime);
+        /* Allocation failure is not a validation failure: deterministic
+         * Miller-Rabin remains a bounded-memory fallback. */
+    }
+
+    for (i = 0; i < fb->n; i++) {
+        const uint32_t q = fb->primes[i];
+        const int flagged_power = fb->ispow ? !!fb->ispow[i] : 0;
+        int expected_power;
+
+        if (!have_classified || q != classified_q) {
+            fb_modulus_kind_t kind;
+
+            if (policy == FB_VALIDATE_GENERATED_PRIME_POWERS ||
+                policy == FB_VALIDATE_PRECLASSIFIED_PRIME_POWERS) {
+                /* The zero-flag entries were already proven prime: either by
+                 * prime_list_build() in an in-process generator or by the
+                 * strict CADO loader while it parsed each distinct modulus.
+                 * Reclassifying that stream here duplicates the dominant load
+                 * cost. Proper powers are few and remain independently checked
+                 * so a bad flag cannot route a mixed composite to the lattice
+                 * transform. */
+                kind = flagged_power
+                    ? (composite_is_prime_power(q)
+                       ? FB_MODULUS_PROPER_POWER : FB_MODULUS_INVALID)
+                    : FB_MODULUS_PRIME;
+            } else {
+                int isprime;
+                if (prime_list) {
+                    while (prime_pos < nprime && prime_list[prime_pos] < q)
+                        prime_pos++;
+                    isprime = prime_pos < nprime && prime_list[prime_pos] == q;
+                } else {
+                    isprime = bench_is_prime32(q);
+                }
+                if (isprime) kind = FB_MODULUS_PRIME;
+                else if (composite_is_prime_power(q))
+                    kind = FB_MODULUS_PROPER_POWER;
+                else
+                    kind = FB_MODULUS_INVALID;
+            }
+
+            if (kind == FB_MODULUS_INVALID) {
+                free(prime_list);
+                return fb_validation_error(fb, source, i,
+                    "modulus %u is neither prime nor a power of one prime", q);
+            }
+            if (policy == FB_VALIDATE_EXTERNAL_PRIMES &&
+                kind != FB_MODULUS_PRIME) {
+                free(prime_list);
+                return fb_validation_error(fb, source, i,
+                    ".afb.0 modulus %u is a proper prime power, not a base prime", q);
+            }
+            classified_q = q;
+            classified_kind = kind;
+            have_classified = 1;
+        }
+
+        expected_power = classified_kind == FB_MODULUS_PROPER_POWER;
+        if (fb->ispow && flagged_power != expected_power) {
+            free(prime_list);
+            return fb_validation_error(fb, source, i,
+                "ispow=%d disagrees with modulus %u (%s)",
+                flagged_power, q, expected_power ? "proper prime power" : "prime");
+        }
+    }
+
+    free(prime_list);
+    fb->validation_cookie = FB_VALIDATION_COOKIE;
+    return 0;
+}
+
+int fb_fill_logp(fb_t *fb, double scale)
 {
     uint32_t i;
-    if (fb->logp) return;
-    fb->logp = (uint8_t *)malloc(fb->n ? fb->n : 1);
-    if (!fb->logp) return;
-    for (i = 0; i < fb->n; i++) {
-        long l = (long)floor(log2((double)fb->primes[i]) * scale + 0.5);
-        fb->logp[i] = (uint8_t)(l < 0 ? 0 : (l > 255 ? 255 : l));
+    uint8_t *logp;
+
+    if (!fb || (fb->n && !fb->primes) ||
+        !isfinite(scale) || scale <= 0.0) {
+        errno = EINVAL;
+        return -1;
     }
+    if (fb->logp) return 0;
+    logp = (uint8_t *)malloc(fb->n ? fb->n : 1);
+    if (!logp) return -1;
+    for (i = 0; i < fb->n; i++) {
+        if (fb_log_delta_checked(fb->primes[i], 1, 0, scale, &logp[i])) {
+            fprintf(stderr,
+                    "fb_fill_logp: modulus %u at entry %u has no finite"
+                    " 8-bit log at scale %.17g\n",
+                    fb->primes[i], i, scale);
+            free(logp);
+            errno = ERANGE;
+            return -1;
+        }
+    }
+    fb->logp = logp;
+    return 0;
+}
+
+/* Cut a factor base into constant-log slices. Bucket records encode the slice
+ * ID in 16 bits, so 65,536 slices is the hard format limit. Count first: this
+ * both permits an exactly-sized allocation and guarantees that malformed or
+ * unsorted input cannot write past either the slice-ID range or the log table.
+ *
+ * The forced cut at each 262,144-entry boundary preserves the original layout
+ * used by the CUDA path. The second pass is deliberately identical to the
+ * counting pass; output handles stay fail-closed until every size check and
+ * allocation has succeeded. */
+int32_t fb_build_slices(const fb_t *fb, uint16_t **slice_out,
+                        uint16_t **logp_tab_out, uint32_t *nslice_pow2)
+{
+    const uint32_t max_slices = (uint32_t)UINT16_MAX + 1u;
+    const uint32_t forced_cut = 262144u;
+    uint16_t *slice = NULL, *tab = NULL;
+    uint32_t k, ns = 0, counted, p2 = 1;
+    int cur = -1;
+
+    if (!slice_out || !logp_tab_out || !nslice_pow2) {
+        errno = EINVAL;
+        return -1;
+    }
+    *slice_out = NULL;
+    *logp_tab_out = NULL;
+    *nslice_pow2 = 0;
+
+    if (!fb || !fb->logp || fb->n == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    for (k = 0; k < fb->n; k++) {
+        const int lp = fb->logp[k];
+        if (lp != cur || (ns && (k % forced_cut) == 0)) {
+            if (ns == max_slices) {
+                errno = EOVERFLOW;
+                return -1;
+            }
+            cur = lp;
+            ns++;
+        }
+    }
+    counted = ns;
+
+    while (p2 < counted) p2 <<= 1;
+    {
+        const size_t slice_bytes = (size_t)fb->n * sizeof(*slice);
+        const size_t tab_bytes = (size_t)p2 * sizeof(*tab);
+        if (slice_bytes / sizeof(*slice) != fb->n ||
+            tab_bytes / sizeof(*tab) != p2) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+    }
+
+    slice = (uint16_t *)malloc((size_t)fb->n * sizeof(*slice));
+    tab = (uint16_t *)calloc((size_t)p2, sizeof(*tab));
+    if (!slice || !tab) {
+        free(slice);
+        free(tab);
+        errno = ENOMEM;
+        return -1;
+    }
+
+    ns = 0;
+    cur = -1;
+    for (k = 0; k < fb->n; k++) {
+        const int lp = fb->logp[k];
+        if (lp != cur || (ns && (k % forced_cut) == 0)) {
+            cur = lp;
+            tab[ns++] = (uint16_t)lp;
+        }
+        slice[k] = (uint16_t)(ns - 1);
+    }
+
+    *slice_out = slice;
+    *logp_tab_out = tab;
+    *nslice_pow2 = p2;
+    return (int32_t)counted;
 }
 
 /* Keep the bucketed window [bkthresh, fb_bound).
@@ -121,9 +431,14 @@ void fb_fill_logp(fb_t *fb, double scale)
  * moment anyone raises --maxbits and creates powers well above bkthresh. It
  * costs ~200 extra entries in the small tier, each with a large modulus and so
  * at most one hit per region. */
-void fb_restrict(fb_t *fb, uint32_t bkthresh, uint32_t fb_bound)
+int fb_restrict(fb_t *fb, uint32_t bkthresh, uint32_t fb_bound)
 {
     uint32_t i, k = 0;
+    if (!fb_is_transform_validated(fb)) {
+        fprintf(stderr, "fb_restrict: refusing an unvalidated factor base\n");
+        errno = EINVAL;
+        return -1;
+    }
     for (i = 0; i < fb->n; i++) {
         uint32_t p = fb->primes[i], r = fb->roots[i];
         if (p < bkthresh || p >= fb_bound) continue;
@@ -134,6 +449,7 @@ void fb_restrict(fb_t *fb, uint32_t bkthresh, uint32_t fb_bound)
         k++;
     }
     fb->n = k;
+    return 0;
 }
 
 /* Copy out the entries the bucket path does not take: everything below
@@ -147,7 +463,16 @@ void fb_restrict(fb_t *fb, uint32_t bkthresh, uint32_t fb_bound)
 int fb_split_small(const fb_t *fb, uint32_t bkthresh, fb_t *small)
 {
     uint32_t i, k = 0, cap = 0;
+    if (!small || small == fb) {
+        errno = EINVAL;
+        return -1;
+    }
     memset(small, 0, sizeof(*small));
+    if (!fb_is_transform_validated(fb)) {
+        fprintf(stderr, "fb_split_small: refusing an unvalidated factor base\n");
+        errno = EINVAL;
+        return -1;
+    }
     small->maxbits = fb->maxbits;
     if (getenv("TD_DUMP_SMALL")) {
         uint32_t n2 = 0, np = 0;
@@ -164,14 +489,14 @@ int fb_split_small(const fb_t *fb, uint32_t bkthresh, fb_t *small)
         if (fb->primes[i] < bkthresh || FB_ISPOW(fb, i)) cap++;
     small->primes = (uint32_t *)malloc((size_t)(cap ? cap : 1) * 4);
     small->roots  = (uint32_t *)malloc((size_t)(cap ? cap : 1) * 4);
-    if (!small->primes || !small->roots) return -1;
+    if (!small->primes || !small->roots) goto nomem;
     if (fb->logp) {
         small->logp = (uint8_t *)malloc((size_t)(cap ? cap : 1));
-        if (!small->logp) return -1;
+        if (!small->logp) goto nomem;
     }
     if (fb->ispow) {
         small->ispow = (uint8_t *)malloc((size_t)(cap ? cap : 1));
-        if (!small->ispow) return -1;
+        if (!small->ispow) goto nomem;
     }
     for (i = 0; i < fb->n; i++) {
         if (fb->primes[i] >= bkthresh && !FB_ISPOW(fb, i)) continue;
@@ -182,5 +507,14 @@ int fb_split_small(const fb_t *fb, uint32_t bkthresh, fb_t *small)
         k++;
     }
     small->n = k;
+    /* fb_split_small() rejects an unvalidated source above. Taking an ordered
+     * subsequence cannot invalidate its modulus, root, ordering, or power
+     * classification, so the subset inherits the source's validation proof. */
+    small->validation_cookie = fb->validation_cookie;
     return 0;
+
+nomem:
+    fb_free(small);
+    errno = ENOMEM;
+    return -1;
 }

@@ -4,6 +4,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <math.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -35,6 +36,11 @@ typedef struct {
     uint8_t  *logp;     /* las's log increment for this ideal, at a given scale */
     uint8_t  *ispow;    /* 1 if the modulus is p^k with k >= 2; may be NULL */
     int       maxbits;  /* source power bound; 0 if the input did not say */
+    /* Set only by fb_validate(). The CUDA entry points reject a factor base
+     * without this cookie, so a future loader cannot accidentally bypass the
+     * prime-power precondition of pl_transform_enc(). Subsets produced by
+     * fb_split_small()/fb_restrict() retain it. */
+    uint32_t  validation_cookie;
 } fb_t;
 
 /* Is entry i a proper prime power? Uses the flag the loader already set --
@@ -48,14 +54,87 @@ int  fb_load(const char *path, fb_t *fb);          /* 0 on success */
  * per-ideal log increment, neither of which GGNFS's .afb.0 has. */
 int  fb_load_cado(const char *path, double scale, fb_t *fb);
 /* Fill logp with floor(log2(p)*scale + 0.5) for factor bases that did not come
- * with one (i.e. .afb.0). No-op if logp is already set. */
-void fb_fill_logp(fb_t *fb, double scale);
+ * with one (i.e. .afb.0). No-op if logp is already set. Returns 0 on success;
+ * invalid/nonfinite scales, an unrepresentable 8-bit log, and allocation
+ * failures return -1 without exposing a partially filled array. */
+int fb_fill_logp(fb_t *fb, double scale);
+
+/* Checked form of las's marginal factor-base log:
+ *
+ *   round(nexp   * log2(p) * scale)
+ * - round(oldexp * log2(p) * scale)
+ *
+ * The output record is only eight bits. Keep the floating-point operations in
+ * double until the complete range check has succeeded; converting NaN, an
+ * infinity, or an out-of-range value to an integer is undefined or
+ * implementation-dependent. Header-inline because rational factor-base
+ * generation calls it once per ideal and should not pay a non-inline function
+ * call on top of log2(). */
+static inline int fb_log_delta_checked(uint32_t p, int nexp, int oldexp,
+                                       double scale, uint8_t *out)
+{
+    double x, a, b, d;
+    if (!out || p < 2 || nexp < 1 || oldexp < 0 || oldexp >= nexp ||
+        !isfinite(scale) || scale <= 0.0)
+        return -1;
+
+    x = log2((double)p) * scale;
+    /* For x >= 256, even one exponent step has an integer rounded delta of at
+     * least 256. Reject before forming large nearly equal rounded values, which
+     * would otherwise lose the low bits and could make an absurd scale appear
+     * to have a small delta through cancellation. */
+    if (!isfinite(x) || x < 0.0 || x >= 256.0) return -1;
+    a = floor((double)nexp   * x + 0.5);
+    b = floor((double)oldexp * x + 0.5);
+    d = a - b;
+    if (!isfinite(d) || d < 0.0 || d > 255.0) return -1;
+    *out = (uint8_t)d;
+    return 0;
+}
+
+/* Build the bucket-record slice map. Each record carries a 16-bit slice ID,
+ * so at most 65,536 slices can be represented. On success, returns the actual
+ * slice count and allocates both output arrays for the caller to free. The log
+ * table is zero-padded to a power of two for the device-side mask. With valid
+ * output arguments, failure returns -1, leaves both pointers NULL and
+ * nslice_pow2 zero, and sets errno. */
+int32_t fb_build_slices(const fb_t *fb, uint16_t **slice_out,
+                        uint16_t **logp_tab_out, uint32_t *nslice_pow2);
 
 /* The root transform is only valid for prime-power moduli; these keep that
  * assumption honest. fb_check_prime_powers returns the first bad index, or -1. */
 int     fb_is_prime_power(uint32_t q);
 int     fb_is_proper_power(uint32_t q);   /* p^k, k >= 2 */
 int32_t fb_check_prime_powers(const fb_t *fb);
+
+/* Validation policy for the modulus stream.
+ *
+ * EXTERNAL_PRIMES is the strict policy for GGNFS .afb.0: every modulus must
+ * be prime, because that format has no prime-power metadata.
+ * EXTERNAL_PRIME_POWERS accepts primes and proper powers, but verifies every
+ * distinct modulus and checks ispow against the result. This is the policy for
+ * text factor bases.
+ * GENERATED_PRIME_POWERS is only for in-process builders whose prime entries
+ * come directly from prime_list_build(); it still checks structure, roots,
+ * ordering, flags, and every proper-power entry without re-sieving the full
+ * generated prime range a second time. Never use it for file input.
+ * PRECLASSIFIED_PRIME_POWERS is reserved for the strict CADO text loader. That
+ * loader has already classified every distinct modulus while parsing it, so
+ * the central validator rechecks structure, ordering, roots, flags, and every
+ * flagged proper power without repeating millions of primality tests. */
+typedef enum {
+    FB_VALIDATE_EXTERNAL_PRIMES = 0,
+    FB_VALIDATE_EXTERNAL_PRIME_POWERS = 1,
+    FB_VALIDATE_GENERATED_PRIME_POWERS = 2,
+    FB_VALIDATE_PRECLASSIFIED_PRIME_POWERS = 3
+} fb_validate_policy_t;
+
+/* Validate all invariants needed before a factor base reaches the lattice
+ * transform. On success, records a validation cookie in fb and returns 0. On
+ * failure, clears the cookie and returns -1. `source == NULL` suppresses the
+ * diagnostic, which is useful for negative regression tests. */
+int fb_validate(fb_t *fb, fb_validate_policy_t policy, const char *source);
+int fb_is_transform_validated(const fb_t *fb);
 void fb_free(fb_t *fb);
 
 /* Deterministic primality over the WHOLE 32-bit range -- not probabilistic and
@@ -118,9 +197,37 @@ double las_allowance(double maxlog2, double scale, double lambda,
  * Neither GGNFS's lambda nor CADO's transfers to this tool's survivor gate --
  * see the comment on the definition for the measurements. */
 double sieve_allowance(double maxlog2, double scale, unsigned mfb);
+
+/* Strict decimal parser shared by the production CLI and CPU tests. It
+ * accepts the complete strtod grammar, but rejects empty strings, trailing
+ * characters, under/overflow, NaN and infinities. The output is unchanged on
+ * failure. */
+int bench_parse_finite_double(const char *text, double *out);
+
+/* Strict unsigned decimal parser shared by command-line options and tests.
+ * Only ASCII digits are accepted: signs, whitespace, prefixes and trailing
+ * characters are rejected. The output is unchanged on failure. */
+int bench_parse_u64_decimal(const char *text, uint64_t *out);
+
+/* Strict parser for --qrange. Accepts MIN:MAX and the open-ended MIN: form,
+ * consumes the complete token, rejects signs/overflow/junk, and requires
+ * MIN <= MAX when MAX is present. Outputs are unchanged on failure. */
+int bench_parse_qrange(const char *text, uint64_t *qmin, uint64_t *qmax);
+
+/* Build the exact integer survivor bound used by the kernels:
+ *
+ *     bound = trunc(scale * allowance + 1)
+ *
+ * Both operands must be finite, scale must be positive and representable by
+ * norm_t's float field, allowance must be nonnegative, and the truncated value
+ * must not exceed CINIT. On failure, *bound_out is zeroed. `source == NULL`
+ * suppresses diagnostics for negative tests. */
+int sieve_bound_checked(double scale, double allowance, uint32_t CINIT,
+                        uint32_t *bound_out, const char *source);
 /* Restrict to bkthresh <= p < fb_bound, compacting in place. GGNFS truncates
- * the algebraic FB at the special-q; pass fb_bound = q to match it. */
-void fb_restrict(fb_t *fb, uint32_t bkthresh, uint32_t fb_bound);
+ * the algebraic FB at the special-q; pass fb_bound = q to match it. Returns 0,
+ * or -1 if the caller bypassed factor-base validation. */
+int  fb_restrict(fb_t *fb, uint32_t bkthresh, uint32_t fb_bound);
 /* Copy out the entries with p < bkthresh (line-sieved, not bucketed).
  * Call BEFORE fb_restrict, which compacts fb in place. */
 int  fb_split_small(const fb_t *fb, uint32_t bkthresh, fb_t *small);
@@ -237,6 +344,19 @@ int  verify_walk(int logI, uint32_t J, int nprimes);
 uint64_t verify_count_updates(const fb_t *fb, const qlat_t *L,
                               int logI, uint32_t J,
                               int log_region, uint32_t *per_region);
+
+/* ---- optional BOINC integration -------------------------------------- */
+
+/* These wrappers are no-ops in the normal build.  When HAVE_BOINC is set,
+ * bench_boinc_init() configures the BOINC runtime for a GPU application,
+ * filename arguments are resolved from BOINC logical names, progress is
+ * reported monotonically, and bench_boinc_finish() terminates through the
+ * BOINC API. */
+int  bench_boinc_init(void);
+int  bench_boinc_resolve_path(const char *option, const char *logical_name,
+                              const char **resolved_name);
+void bench_boinc_fraction_done(double fraction_done);
+int  bench_boinc_finish(int status);
 
 /* ---- GPU entry points ------------------------------------------------- */
 
@@ -406,6 +526,40 @@ typedef struct {
 /* k_fill_l1's grid, frozen at what it has always run. See the launch site. */
 #define FILL_L1_BLOCKS 144
 
+/* A practical ceiling for user-selected grids. The device kernels use 64-bit
+ * grid indices and strides, so this is no longer an arithmetic requirement;
+ * it rejects accidental billion-block launches and keeps every accepted value
+ * comfortably inside the launch range of the supported devices. */
+#define BENCH_BLOCKS_MAX (1 << 20)
+
+/* Keep the widening operation available to CPU-only correctness gates too.
+ * Casting either operand after the multiplication would be too late: the
+ * 32-bit product may already have wrapped to zero. */
+#if defined(__CUDACC__)
+static __host__ __device__ __forceinline__ uint64_t
+bench_grid_product_u64(uint32_t a, uint32_t b)
+#else
+static inline uint64_t bench_grid_product_u64(uint32_t a, uint32_t b)
+#endif
+{
+    return (uint64_t)a * (uint64_t)b;
+}
+
+#if defined(__CUDACC__)
+/* CUDA's grid dimensions are 32-bit, but their product need not fit in 32
+ * bits. Keep the cast BEFORE multiplication in one shared helper so a future
+ * grid-stride kernel cannot reintroduce a zero or wrapped stride. */
+static __device__ __forceinline__ uint64_t bench_grid_thread_x(void)
+{
+    return bench_grid_product_u64(blockIdx.x, blockDim.x) + threadIdx.x;
+}
+
+static __device__ __forceinline__ uint64_t bench_grid_stride_x(void)
+{
+    return bench_grid_product_u64(gridDim.x, blockDim.x);
+}
+#endif
+
 #define STAGE_FILL    0
 #define STAGE_BOTH    1
 #define STAGE_APPLY   2     /* fill still runs; only apply is reported */
@@ -418,6 +572,21 @@ typedef struct {
 /* One special-q of the band: the prime and a root of f mod it. las prints the
  * pair; the oracle captures carry it in their `# q = (q, rho, side)` headers. */
 typedef struct { uint64_t q, rho; } qsel_t;
+
+/* Validate and canonicalise one special-q selection before it is allowed to
+ * build a q-lattice. Success reduces rho modulo q. The root is checked against
+ * f on side 1 and against G = Y1*x + Y0 on side 0, using the exact decimal
+ * coefficients rather than their double approximations. */
+typedef enum {
+    QSEL_VALID = 0,
+    QSEL_ERR_Q_RANGE,
+    QSEL_ERR_Q_COMPOSITE,
+    QSEL_ERR_SIDE,
+    QSEL_ERR_POLY,
+    QSEL_ERR_NOT_ROOT
+} qsel_validate_result_t;
+
+qsel_validate_result_t qsel_validate(qsel_t *sel, const poly_t *P, int side);
 
 /* Streaming special-q generator.  The factor base and special-q stream are
  * deliberately independent: lim bounds the ideals used to sieve and trial
