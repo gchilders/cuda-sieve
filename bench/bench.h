@@ -118,15 +118,16 @@ int32_t fb_check_prime_powers(const fb_t *fb);
  * come directly from prime_list_build(); it still checks structure, roots,
  * ordering, flags, and every proper-power entry without re-sieving the full
  * generated prime range a second time. Never use it for file input.
- * PRECLASSIFIED_PRIME_POWERS is reserved for the strict CADO text loader. That
- * loader has already classified every distinct modulus while parsing it, so
- * the central validator rechecks structure, ordering, roots, flags, and every
- * flagged proper power without repeating millions of primality tests. */
+ *
+ * There is deliberately no "the loader already classified these" policy for
+ * file input. One existed briefly for the CADO loader; it cost a Miller-Rabin
+ * per line to save a single sieve, and left the file with no witness but the
+ * parser that read it. For a text factor base that parser's reading IS the
+ * thing under test, so EXTERNAL_PRIME_POWERS is the only correct choice. */
 typedef enum {
     FB_VALIDATE_EXTERNAL_PRIMES = 0,
     FB_VALIDATE_EXTERNAL_PRIME_POWERS = 1,
-    FB_VALIDATE_GENERATED_PRIME_POWERS = 2,
-    FB_VALIDATE_PRECLASSIFIED_PRIME_POWERS = 3
+    FB_VALIDATE_GENERATED_PRIME_POWERS = 2
 } fb_validate_policy_t;
 
 /* Validate all invariants needed before a factor base reaches the lattice

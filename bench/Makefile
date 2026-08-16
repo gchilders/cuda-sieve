@@ -125,6 +125,14 @@ BENCH_LINKFLAGS :=
 HOST_TUNE ?= -march=native
 endif
 
+# The CUDA runtime is linked statically in EVERY build, not only BOINC ones. A
+# distributed binary cannot rely on a matching libcudart on the volunteer's
+# host, and a local build that links it dynamically fails to start wherever the
+# toolkit's lib directory is not on the loader path -- a plain `make && ./bench`
+# on a stock CUDA install. It costs ~1 MB against a binary the fat gencode
+# already dominates. Pass CUDART_LINK=shared to opt out.
+CUDART_LINK ?= static
+
 # -MMD -MP: generate header dependencies. Without them the pattern rules below
 # listed only bench.h and plattice.cuh, so editing bigint.cuh, prp.cuh or
 # td.cuh left a stale bench_kernels.o and the binary silently did not contain
@@ -156,10 +164,18 @@ BOINC_STAMP := .boinc.stamp
 BOINC_SIGNATURE := HAVE_BOINC=$(HAVE_BOINC)|BOINC_CPPFLAGS=$(BOINC_CPPFLAGS)|BOINC_LIBS=$(BOINC_LIBS)|BOINC_HOST_STATIC=$(BOINC_HOST_STATIC)|HOST_TUNE=$(HOST_TUNE)
 $(shell [ "$$(cat $(BOINC_STAMP) 2>/dev/null)" = '$(BOINC_SIGNATURE)' ] || printf '%s' '$(BOINC_SIGNATURE)' > $(BOINC_STAMP))
 
+# CUDART_LINK changes the link line and nothing else, so it gets its own stamp.
+# Folding it into BOINC_SIGNATURE would make every object depend on it, and
+# `make CUDART_LINK=shared` would recompile the whole fat CUDA build (214-309 s
+# by the table above) to change one linker argument.
+LINK_STAMP := .link.stamp
+LINK_SIGNATURE := CUDART_LINK=$(CUDART_LINK)
+$(shell [ "$$(cat $(LINK_STAMP) 2>/dev/null)" = '$(LINK_SIGNATURE)' ] || printf '%s' '$(LINK_SIGNATURE)' > $(LINK_STAMP))
+
 all: bench fbtest fbgen sqgentest dumpcmp mkcofbatch
 
-bench: $(OBJS) $(ARCH_STAMP) $(BOINC_STAMP)
-	$(NVCC) $(NVCC_ARCH) --cudart static -Xlinker --gc-sections \
+bench: $(OBJS) $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP)
+	$(NVCC) $(NVCC_ARCH) --cudart $(CUDART_LINK) -Xlinker --gc-sections \
 		$(BENCH_LINKFLAGS) -o $@ $(OBJS) $(BENCH_LIBS) -lm
 
 # Only the CUDA objects care about the arch; the C objects are host-only.
@@ -207,7 +223,7 @@ mkcofbatch: mkcofbatch.c
 -include $(OBJS:.o=.d)
 
 clean:
-	rm -f bench fbtest fbgen sqgentest dumpcmp mkcofbatch *.o *.d $(ARCH_STAMP) $(BOINC_STAMP)
+	rm -f bench fbtest fbgen sqgentest dumpcmp mkcofbatch *.o *.d $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP)
 
 .PHONY: all clean check cofcheck fbgencheck sqgencheck
 

@@ -276,7 +276,7 @@ static int verify_validation_core(void)
     if (fb_validate(&fb, FB_VALIDATE_EXTERNAL_PRIME_POWERS, NULL) != 0 ||
         !fb_is_transform_validated(&fb))
         return 0;
-    if (fb_validate(&fb, FB_VALIDATE_PRECLASSIFIED_PRIME_POWERS, NULL) != 0 ||
+    if (fb_validate(&fb, FB_VALIDATE_GENERATED_PRIME_POWERS, NULL) != 0 ||
         !fb_is_transform_validated(&fb))
         return 0;
     if (fb_split_small(&fb, 10, &small) != 0 ||

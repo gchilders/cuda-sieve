@@ -1085,7 +1085,7 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     double acc_td = 0, t_verify = 0, td0 = 0, jn0 = 0, cf0 = 0, cofac_tail = 0;
     unsigned long long acc_surv = 0, acc_cand = 0, acc_rel = 0;
     FILE *fr = NULL, *fc = NULL;
-    char rtmp[2048] = "", ctmp[2048] = "";
+    char rtmp[CKPT_PATH_MAX] = "", ctmp[CKPT_PATH_MAX] = "";
     int rc = 0, source_exhausted = 0, count_limit_reached = 0;
     int outputs_finalized = 0, vram_reporting = 1;
     int target_reached = 0;
@@ -1238,8 +1238,19 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
      * The .part is nonetheless the DURABLE artifact, not scratch. The rename is
      * only the "band completed" marker; an interrupted run leaves the .part and
      * its sidecar in place to be resumed, and this used to delete both. */
+    /* Build BOTH staging names before opening either file. Failing on the
+     * candidates name after fr is open would, on a resume, already have
+     * ftruncated the relation .part to the checkpointed prefix -- and the
+     * jump to done: discards with keep_partial = ckpt_written = 0, deleting
+     * a .part that holds every earlier session's work. bench_main gates both
+     * paths on ckpt_path_usable() before this, so these cannot fire; they
+     * keep run_pipeline safe as the public entry point it is. */
+    if ((cfg->relations && ckpt_part_path(cfg->relations, rtmp, sizeof rtmp)) ||
+        (cfg->candidates && ckpt_part_path(cfg->candidates, ctmp, sizeof ctmp))) {
+        fprintf(stderr, "run_pipeline: output path too long for its .part name\n");
+        rc = -1; goto done;
+    }
     if (cfg->relations) {
-        ckpt_part_path(cfg->relations, rtmp, sizeof rtmp);
         if (cfg->resume) {
             /* Truncate to the checkpointed prefix before appending. This is
              * what makes a torn final line from a kill -9 a non-problem: the
@@ -1254,7 +1265,6 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         }
     }
     if (cfg->candidates) {
-        ckpt_part_path(cfg->candidates, ctmp, sizeof ctmp);
         if (cfg->resume) {
             if (!(fc = fopen(ctmp, "r+"))) { perror(ctmp); rc = -1; goto done; }
             if (ftruncate(fileno(fc), (off_t)cfg->resume_cand_bytes) ||
@@ -1823,9 +1833,13 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
             rc = -1;
         outputs_finalized = 1;
         if (commit && rc == 0 && ckpt_armed) {
-            char cp[1200];
-            ckpt_ckpt_path(cfg->relations, cp, sizeof cp);
-            remove(cp);          /* nothing left to resume */
+            char cp[CKPT_PATH_MAX];
+            /* Cannot fail here: the same name was built for every checkpoint
+             * this band wrote, into a buffer of the same size. Checked anyway
+             * because the band is already committed -- a stale sidecar is a
+             * better outcome than an ignored return value. */
+            if (ckpt_ckpt_path(cfg->relations, cp, sizeof cp) == 0)
+                remove(cp);      /* nothing left to resume */
         }
     }
 #ifdef HAVE_BOINC
@@ -2006,7 +2020,6 @@ done:
     if (!outputs_finalized) {
         if (pipe_finalize_outputs(&fr, &fc, cfg, rtmp, ctmp, 0, ckpt_written))
             rc = -1;
-        outputs_finalized = 1;
     }
     pipe_td_free(&C);
     cofq_free(&Q, &QO);

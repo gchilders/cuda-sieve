@@ -59,19 +59,64 @@ typedef struct {
 
 /* ---- paths ------------------------------------------------------------- */
 
-static inline void ckpt_part_path(const char *relations, char *out, size_t n)
+/* ONE limit governs every derived name. Sizing the buffers differently at
+ * different call sites is worse than not checking at all: a path that fits the
+ * 2048-byte staging buffers but not a 1200-byte sidecar buffer passes the
+ * startup checks, takes the lock, sieves -- and then fails at every checkpoint,
+ * so ckpt_written never becomes 1 and a clean stop discards the .part holding
+ * the whole session. */
+#define CKPT_PATH_MAX 2048
+/* Longest suffix appended below: ".part.ckpt.tmp" is 14 bytes. */
+#define CKPT_SUFFIX_MAX 16
+
+/* Check ONCE, where the path enters the program, that every name derived from
+ * it will fit. Callers that pass this may then build .part, .part.ckpt,
+ * .part.ckpt.tmp and .lock without any of them being able to truncate, which
+ * is what makes the four names consistent with each other. The names are
+ * derived, not typed: under BOINC `relations` is a resolved absolute
+ * slot/project path, so the margin is not the one the command line suggests. */
+static inline int ckpt_path_usable(const char *relations, const char *what)
 {
-    snprintf(out, n, "%s.part", relations);
+    const size_t n = relations ? strlen(relations) : 0;
+    if (n + CKPT_SUFFIX_MAX >= (size_t)CKPT_PATH_MAX) {
+        fprintf(stderr,
+                "%s: path is %zu bytes; the .part, .part.ckpt and .lock names"
+                " derived from it must fit in %d\n",
+                what, n, CKPT_PATH_MAX);
+        return -1;
+    }
+    return 0;
 }
 
-static inline void ckpt_ckpt_path(const char *relations, char *out, size_t n)
+/* Silent: a caller that skipped ckpt_path_usable() gets a return code, not a
+ * message. ckpt_write() runs this on every flush of a multi-day band, so a
+ * diagnostic here would repeat until it buried the log. Argument order matches
+ * the wrappers below so a misremembered call cannot silently swap the two
+ * const char * parameters. */
+static inline int ckpt_path_fmt(const char *relations, char *out, size_t n,
+                                const char *suffix)
 {
-    snprintf(out, n, "%s.part.ckpt", relations);
+    const int k = snprintf(out, n, "%s%s", relations, suffix);
+    if (k < 0 || (size_t)k >= n) {
+        if (n) out[0] = '\0';
+        return -1;
+    }
+    return 0;
 }
 
-static inline void ckpt_lock_path(const char *relations, char *out, size_t n)
+static inline int ckpt_part_path(const char *relations, char *out, size_t n)
 {
-    snprintf(out, n, "%s.lock", relations);
+    return ckpt_path_fmt(relations, out, n, ".part");
+}
+
+static inline int ckpt_ckpt_path(const char *relations, char *out, size_t n)
+{
+    return ckpt_path_fmt(relations, out, n, ".part.ckpt");
+}
+
+static inline int ckpt_lock_path(const char *relations, char *out, size_t n)
+{
+    return ckpt_path_fmt(relations, out, n, ".lock");
 }
 
 /* ---- fingerprint ------------------------------------------------------- */
@@ -163,10 +208,12 @@ static inline void ckpt_fingerprint(const poly_t *P, const bench_cfg_t *cfg,
 static inline int ckpt_write(const char *relations, const poly_t *P,
                              const bench_cfg_t *cfg, const ckpt_t *ck)
 {
-    char path[1200], tmp[1216], text[2048];
+    char path[CKPT_PATH_MAX], tmp[CKPT_PATH_MAX], text[2048];
     FILE *f;
-    ckpt_ckpt_path(relations, path, sizeof path);
-    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    /* Both go through the same guard, so ".tmp" cannot be the one suffix that
+     * overflows; CKPT_SUFFIX_MAX already reserves room for it. */
+    if (ckpt_ckpt_path(relations, path, sizeof path) ||
+        ckpt_path_fmt(path, tmp, sizeof tmp, ".tmp")) return -1;
     if (!(f = fopen(tmp, "w"))) { perror(tmp); return -1; }
     ckpt_job_text(P, cfg, text, sizeof text);
     fprintf(f, "# cuda-sieve resume checkpoint. Delete this file to force a"
@@ -198,10 +245,14 @@ static inline int ckpt_write(const char *relations, const poly_t *P,
  * discard a file the operator believes is being resumed. */
 static inline int ckpt_read(const char *relations, ckpt_t *ck)
 {
-    char path[1200], line[1024];
+    char path[CKPT_PATH_MAX], line[1024];
     FILE *f;
     int version = 0, got = 0;
-    ckpt_ckpt_path(relations, path, sizeof path);
+    /* -2, not -1: -1 is "no sidecar", which makes the caller report that the
+     * file does not exist and advise --restart. A name we could not build says
+     * nothing about what is on disk, and telling an operator to discard a
+     * resumable .part on that basis is the one answer that loses work. */
+    if (ckpt_ckpt_path(relations, path, sizeof path)) return -2;
     if (!(f = fopen(path, "r"))) return -1;
     memset(ck, 0, sizeof *ck);
     while (fgets(line, sizeof line, f)) {
@@ -265,7 +316,7 @@ static inline int ckpt_lock(const char *relations, char *path, size_t n)
 {
     int fd, retried = 0;
     char buf[64];
-    ckpt_lock_path(relations, path, n);
+    if (ckpt_lock_path(relations, path, n)) return -1;
 again:
     fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
     if (fd < 0) {
@@ -298,7 +349,7 @@ again:
 /* Held for the process lifetime and released via atexit, so every early
  * `return 1` between acquisition and the band drops it. _exit and fatal
  * signals still skip it -- that is what the staleness check above is for. */
-static char ckpt_lock_held[2048];
+static char ckpt_lock_held[CKPT_PATH_MAX];
 
 static inline void ckpt_unlock_atexit(void)
 {
