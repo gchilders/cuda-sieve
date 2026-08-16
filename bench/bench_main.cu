@@ -1266,8 +1266,9 @@ static int bench_main_impl(int argc, char **argv)
             char fp[17];
             struct stat st;
             ckpt_t ck;
-            ckpt_part_path(cfg.relations, part, sizeof part);
-            ckpt_ckpt_path(cfg.relations, cpath, sizeof cpath);
+            if (ckpt_part_path(cfg.relations, part, sizeof part) ||
+                ckpt_ckpt_path(cfg.relations, cpath, sizeof cpath))
+                return 1;
             ckpt_fingerprint(&POLY, &cfg, fp);
             if (cfg.restart) {
                 if (stat(part, &st) == 0)
@@ -1276,7 +1277,8 @@ static int bench_main_impl(int argc, char **argv)
                 remove(part); remove(cpath);
                 if (cfg.candidates) {
                     char cp2[2048];
-                    ckpt_part_path(cfg.candidates, cp2, sizeof cp2);
+                    if (ckpt_part_path(cfg.candidates, cp2, sizeof cp2))
+                        return 1;
                     remove(cp2);
                 }
             } else if (stat(part, &st) == 0) {
@@ -1326,8 +1328,9 @@ static int bench_main_impl(int argc, char **argv)
                 {
                     struct stat cst;
                     char cpart[2048] = "";
-                    if (cfg.candidates)
-                        ckpt_part_path(cfg.candidates, cpart, sizeof cpart);
+                    if (cfg.candidates &&
+                        ckpt_part_path(cfg.candidates, cpart, sizeof cpart))
+                        return 1;
                     if (cfg.candidates && !ck.cand_bytes &&
                         stat(cpart, &cst) == 0 && cst.st_size > 0) {
                         fprintf(stderr,

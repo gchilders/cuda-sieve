@@ -312,21 +312,23 @@ int fb_load_cado(const char *path, double scale, fb_t *fb)
         for (scan = s; *scan && *scan != '\n' && *scan != '\r' && *scan != '#'; scan++)
             if (*scan == ':') { long_form = 1; break; }
 
-        if (bench_is_prime32(q)) {
-            p = q;
-            kk = 1;
-        } else {
-            p = is_power(q, &kk);
-            if (!p) {
-                cado_line_error(path, linenr,
-                                "modulus is neither prime nor a prime power");
-                goto done;
-            }
-        }
-        if (!long_form && kk != 1) {
-            cado_line_error(path, linenr,
-                            "prime-power modulus requires q:nexp,oldexp: form");
-            goto done;
+        /* Classifying every modulus here costs one deterministic Miller-Rabin
+         * per line -- 4.8M of them on a c183 base -- to answer a question
+         * fb_validate() answers again below from a single Eratosthenes list
+         * over the whole file. The parser therefore does not classify at all;
+         * the format is what makes that safe, because a prime-power modulus
+         * must use the long form. A short-form line asserts primality, is
+         * taken at its word here, and is checked there.
+         *
+         * Nothing is lost from the diagnostics: a composite smuggled onto a
+         * short-form line comes back as "modulus %u is neither prime nor a
+         * power of one prime", and a prime power written in the short form as
+         * an ispow disagreement -- both naming this file as the source. */
+        p = q;
+        if (long_form) {
+            int pk = 1;
+            const uint32_t base_p = is_power(q, &pk);
+            if (base_p) { p = base_p; kk = pk; }
         }
         if (kk > 1 && q > max_power_q) max_power_q = q;
 
@@ -458,7 +460,10 @@ int fb_load_cado(const char *path, double scale, fb_t *fb)
             j++;
         }
     }
-    if (fb_validate(fb, FB_VALIDATE_PRECLASSIFIED_PRIME_POWERS, path) != 0)
+    /* EXTERNAL, not PRECLASSIFIED: this is the trust boundary for a text file
+     * the parser above has only read, never verified. The sieve fast path in
+     * fb_validate() is the single authority on what is prime here. */
+    if (fb_validate(fb, FB_VALIDATE_EXTERNAL_PRIME_POWERS, path) != 0)
         goto done;
 
     printf("text factor base %s: %u ideals (%u prime, %u prime-power)"

@@ -86,10 +86,13 @@ make -C bench bench HAVE_BOINC=1 GPU_ARCH=all \
     BOINC_LIBS="-L/path/to/boinc/api -L/path/to/boinc/lib -lboinc_api -lboinc -lpthread"
 ```
 
-For distribution builds, this path links the CUDA runtime statically and passes
-`-static-libstdc++ -static-libgcc` to the host linker by default. Override
-`BOINC_HOST_STATIC` only when a toolchain cannot provide those static runtime
-archives. This does not by itself make a completely static Linux executable:
+For distribution builds, this path links the CUDA runtime statically
+(`CUDART_LINK=static`) and passes `-static-libstdc++ -static-libgcc` to the host
+linker by default. A build without `HAVE_BOINC=1` defaults to `CUDART_LINK=shared`
+instead; pass `CUDART_LINK=static` explicitly to get a relocatable binary without
+turning the BOINC path on. Override `BOINC_HOST_STATIC` only when a toolchain
+cannot provide those static runtime archives. This does not by itself make a
+completely static Linux executable:
 BOINC libraries and system libraries follow the archives and linker policy
 provided by the build environment.
 

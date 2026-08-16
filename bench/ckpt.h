@@ -59,19 +59,40 @@ typedef struct {
 
 /* ---- paths ------------------------------------------------------------- */
 
-static inline void ckpt_part_path(const char *relations, char *out, size_t n)
+/* These return -1 on truncation rather than quietly producing a short name.
+ * The names are derived, not typed: under BOINC `relations` is a resolved
+ * absolute slot/project path rather than the operator's relative filename, so
+ * the margin against the buffer is not the one the command line suggests. A
+ * truncated .part usually fails to open with a confusing ENOENT, but a
+ * truncation that still names an openable file is worse -- the rename at the
+ * end of the band would commit the wrong one -- and a .part that truncates
+ * where its .ckpt does not leaves a sidecar describing a different file. */
+static inline int ckpt_path_fmt(char *out, size_t n, const char *suffix,
+                                const char *relations)
 {
-    snprintf(out, n, "%s.part", relations);
+    const int k = snprintf(out, n, "%s%s", relations, suffix);
+    if (k < 0 || (size_t)k >= n) {
+        if (n) out[0] = '\0';
+        fprintf(stderr, "ckpt: path for %s%s exceeds %zu bytes\n",
+                relations, suffix, n);
+        return -1;
+    }
+    return 0;
 }
 
-static inline void ckpt_ckpt_path(const char *relations, char *out, size_t n)
+static inline int ckpt_part_path(const char *relations, char *out, size_t n)
 {
-    snprintf(out, n, "%s.part.ckpt", relations);
+    return ckpt_path_fmt(out, n, ".part", relations);
 }
 
-static inline void ckpt_lock_path(const char *relations, char *out, size_t n)
+static inline int ckpt_ckpt_path(const char *relations, char *out, size_t n)
 {
-    snprintf(out, n, "%s.lock", relations);
+    return ckpt_path_fmt(out, n, ".part.ckpt", relations);
+}
+
+static inline int ckpt_lock_path(const char *relations, char *out, size_t n)
+{
+    return ckpt_path_fmt(out, n, ".lock", relations);
 }
 
 /* ---- fingerprint ------------------------------------------------------- */
@@ -165,8 +186,11 @@ static inline int ckpt_write(const char *relations, const poly_t *P,
 {
     char path[1200], tmp[1216], text[2048];
     FILE *f;
-    ckpt_ckpt_path(relations, path, sizeof path);
-    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    if (ckpt_ckpt_path(relations, path, sizeof path)) return -1;
+    if (snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp) {
+        fprintf(stderr, "ckpt: staging path for %s is too long\n", path);
+        return -1;
+    }
     if (!(f = fopen(tmp, "w"))) { perror(tmp); return -1; }
     ckpt_job_text(P, cfg, text, sizeof text);
     fprintf(f, "# cuda-sieve resume checkpoint. Delete this file to force a"
@@ -201,7 +225,7 @@ static inline int ckpt_read(const char *relations, ckpt_t *ck)
     char path[1200], line[1024];
     FILE *f;
     int version = 0, got = 0;
-    ckpt_ckpt_path(relations, path, sizeof path);
+    if (ckpt_ckpt_path(relations, path, sizeof path)) return -1;
     if (!(f = fopen(path, "r"))) return -1;
     memset(ck, 0, sizeof *ck);
     while (fgets(line, sizeof line, f)) {
@@ -265,7 +289,7 @@ static inline int ckpt_lock(const char *relations, char *path, size_t n)
 {
     int fd, retried = 0;
     char buf[64];
-    ckpt_lock_path(relations, path, n);
+    if (ckpt_lock_path(relations, path, n)) return -1;
 again:
     fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
     if (fd < 0) {

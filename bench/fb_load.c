@@ -244,13 +244,14 @@ int fb_validate(fb_t *fb, fb_validate_policy_t policy, const char *source)
 
             if (policy == FB_VALIDATE_GENERATED_PRIME_POWERS ||
                 policy == FB_VALIDATE_PRECLASSIFIED_PRIME_POWERS) {
-                /* The zero-flag entries were already proven prime: either by
-                 * prime_list_build() in an in-process generator or by the
-                 * strict CADO loader while it parsed each distinct modulus.
-                 * Reclassifying that stream here duplicates the dominant load
-                 * cost. Proper powers are few and remain independently checked
-                 * so a bad flag cannot route a mixed composite to the lattice
-                 * transform. */
+                /* The zero-flag entries were already proven prime by
+                 * prime_list_build() inside an in-process generator, so
+                 * reclassifying that stream here would re-sieve a range this
+                 * process just sieved. Proper powers are few and remain
+                 * independently checked so a bad flag cannot route a mixed
+                 * composite to the lattice transform. This shortcut is only
+                 * ever valid when the primes came from THIS process; file
+                 * input goes through the sieve below. */
                 kind = flagged_power
                     ? (composite_is_prime_power(q)
                        ? FB_MODULUS_PROPER_POWER : FB_MODULUS_INVALID)

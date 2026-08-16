@@ -118,11 +118,18 @@ BENCH_LINKFLAGS := $(foreach flag,$(BOINC_HOST_STATIC),-Xcompiler=$(flag))
 # A BOINC application binary is distributed to CPUs other than the build host.
 # Do not bake the build machine's ISA into the host-only C/C++ objects.
 HOST_TUNE ?=
+# A distributed binary cannot rely on a matching libcudart being present on
+# the volunteer's host, so it carries its own.
+CUDART_LINK ?= static
 else
 BOINC_DEFS :=
 BENCH_LIBS :=
 BENCH_LINKFLAGS :=
 HOST_TUNE ?= -march=native
+# A local build links the CUDA runtime dynamically: it costs ~1 MB less, and a
+# toolkit upgrade is picked up without relinking. Pass CUDART_LINK=static to
+# build a relocatable binary without turning the whole BOINC path on.
+CUDART_LINK ?= shared
 endif
 
 # -MMD -MP: generate header dependencies. Without them the pattern rules below
@@ -153,13 +160,13 @@ OBJS     = $(CU_OBJS) $(C_OBJS) $(CPP_OBJS) fbgen_lib.o
 # Include the BOINC include/link settings and host tuning in the signature so a
 # changed deployment build cannot reuse objects produced for another one.
 BOINC_STAMP := .boinc.stamp
-BOINC_SIGNATURE := HAVE_BOINC=$(HAVE_BOINC)|BOINC_CPPFLAGS=$(BOINC_CPPFLAGS)|BOINC_LIBS=$(BOINC_LIBS)|BOINC_HOST_STATIC=$(BOINC_HOST_STATIC)|HOST_TUNE=$(HOST_TUNE)
+BOINC_SIGNATURE := HAVE_BOINC=$(HAVE_BOINC)|BOINC_CPPFLAGS=$(BOINC_CPPFLAGS)|BOINC_LIBS=$(BOINC_LIBS)|BOINC_HOST_STATIC=$(BOINC_HOST_STATIC)|HOST_TUNE=$(HOST_TUNE)|CUDART_LINK=$(CUDART_LINK)
 $(shell [ "$$(cat $(BOINC_STAMP) 2>/dev/null)" = '$(BOINC_SIGNATURE)' ] || printf '%s' '$(BOINC_SIGNATURE)' > $(BOINC_STAMP))
 
 all: bench fbtest fbgen sqgentest dumpcmp mkcofbatch
 
 bench: $(OBJS) $(ARCH_STAMP) $(BOINC_STAMP)
-	$(NVCC) $(NVCC_ARCH) --cudart static -Xlinker --gc-sections \
+	$(NVCC) $(NVCC_ARCH) --cudart $(CUDART_LINK) -Xlinker --gc-sections \
 		$(BENCH_LINKFLAGS) -o $@ $(OBJS) $(BENCH_LIBS) -lm
 
 # Only the CUDA objects care about the arch; the C objects are host-only.

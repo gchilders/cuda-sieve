@@ -1239,7 +1239,7 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
      * only the "band completed" marker; an interrupted run leaves the .part and
      * its sidecar in place to be resumed, and this used to delete both. */
     if (cfg->relations) {
-        ckpt_part_path(cfg->relations, rtmp, sizeof rtmp);
+        if (ckpt_part_path(cfg->relations, rtmp, sizeof rtmp)) { rc = -1; goto done; }
         if (cfg->resume) {
             /* Truncate to the checkpointed prefix before appending. This is
              * what makes a torn final line from a kill -9 a non-problem: the
@@ -1254,7 +1254,7 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         }
     }
     if (cfg->candidates) {
-        ckpt_part_path(cfg->candidates, ctmp, sizeof ctmp);
+        if (ckpt_part_path(cfg->candidates, ctmp, sizeof ctmp)) { rc = -1; goto done; }
         if (cfg->resume) {
             if (!(fc = fopen(ctmp, "r+"))) { perror(ctmp); rc = -1; goto done; }
             if (ftruncate(fileno(fc), (off_t)cfg->resume_cand_bytes) ||
@@ -1824,8 +1824,10 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         outputs_finalized = 1;
         if (commit && rc == 0 && ckpt_armed) {
             char cp[1200];
-            ckpt_ckpt_path(cfg->relations, cp, sizeof cp);
-            remove(cp);          /* nothing left to resume */
+            /* Best-effort: the band is already committed, so a name too long
+             * to rebuild leaves a stale sidecar rather than failing the run. */
+            if (ckpt_ckpt_path(cfg->relations, cp, sizeof cp) == 0)
+                remove(cp);      /* nothing left to resume */
         }
     }
 #ifdef HAVE_BOINC
@@ -2006,7 +2008,6 @@ done:
     if (!outputs_finalized) {
         if (pipe_finalize_outputs(&fr, &fc, cfg, rtmp, ctmp, 0, ckpt_written))
             rc = -1;
-        outputs_finalized = 1;
     }
     pipe_td_free(&C);
     cofq_free(&Q, &QO);
