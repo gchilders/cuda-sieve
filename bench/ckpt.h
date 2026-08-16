@@ -59,22 +59,46 @@ typedef struct {
 
 /* ---- paths ------------------------------------------------------------- */
 
-/* These return -1 on truncation rather than quietly producing a short name.
- * The names are derived, not typed: under BOINC `relations` is a resolved
- * absolute slot/project path rather than the operator's relative filename, so
- * the margin against the buffer is not the one the command line suggests. A
- * truncated .part usually fails to open with a confusing ENOENT, but a
- * truncation that still names an openable file is worse -- the rename at the
- * end of the band would commit the wrong one -- and a .part that truncates
- * where its .ckpt does not leaves a sidecar describing a different file. */
-static inline int ckpt_path_fmt(char *out, size_t n, const char *suffix,
-                                const char *relations)
+/* ONE limit governs every derived name. Sizing the buffers differently at
+ * different call sites is worse than not checking at all: a path that fits the
+ * 2048-byte staging buffers but not a 1200-byte sidecar buffer passes the
+ * startup checks, takes the lock, sieves -- and then fails at every checkpoint,
+ * so ckpt_written never becomes 1 and a clean stop discards the .part holding
+ * the whole session. */
+#define CKPT_PATH_MAX 2048
+/* Longest suffix appended below: ".part.ckpt.tmp" is 14 bytes. */
+#define CKPT_SUFFIX_MAX 16
+
+/* Check ONCE, where the path enters the program, that every name derived from
+ * it will fit. Callers that pass this may then build .part, .part.ckpt,
+ * .part.ckpt.tmp and .lock without any of them being able to truncate, which
+ * is what makes the four names consistent with each other. The names are
+ * derived, not typed: under BOINC `relations` is a resolved absolute
+ * slot/project path, so the margin is not the one the command line suggests. */
+static inline int ckpt_path_usable(const char *relations, const char *what)
+{
+    const size_t n = relations ? strlen(relations) : 0;
+    if (n + CKPT_SUFFIX_MAX >= (size_t)CKPT_PATH_MAX) {
+        fprintf(stderr,
+                "%s: path is %zu bytes; the .part, .part.ckpt and .lock names"
+                " derived from it must fit in %d\n",
+                what, n, CKPT_PATH_MAX);
+        return -1;
+    }
+    return 0;
+}
+
+/* Silent: a caller that skipped ckpt_path_usable() gets a return code, not a
+ * message. ckpt_write() runs this on every flush of a multi-day band, so a
+ * diagnostic here would repeat until it buried the log. Argument order matches
+ * the wrappers below so a misremembered call cannot silently swap the two
+ * const char * parameters. */
+static inline int ckpt_path_fmt(const char *relations, char *out, size_t n,
+                                const char *suffix)
 {
     const int k = snprintf(out, n, "%s%s", relations, suffix);
     if (k < 0 || (size_t)k >= n) {
         if (n) out[0] = '\0';
-        fprintf(stderr, "ckpt: path for %s%s exceeds %zu bytes\n",
-                relations, suffix, n);
         return -1;
     }
     return 0;
@@ -82,17 +106,17 @@ static inline int ckpt_path_fmt(char *out, size_t n, const char *suffix,
 
 static inline int ckpt_part_path(const char *relations, char *out, size_t n)
 {
-    return ckpt_path_fmt(out, n, ".part", relations);
+    return ckpt_path_fmt(relations, out, n, ".part");
 }
 
 static inline int ckpt_ckpt_path(const char *relations, char *out, size_t n)
 {
-    return ckpt_path_fmt(out, n, ".part.ckpt", relations);
+    return ckpt_path_fmt(relations, out, n, ".part.ckpt");
 }
 
 static inline int ckpt_lock_path(const char *relations, char *out, size_t n)
 {
-    return ckpt_path_fmt(out, n, ".lock", relations);
+    return ckpt_path_fmt(relations, out, n, ".lock");
 }
 
 /* ---- fingerprint ------------------------------------------------------- */
@@ -184,13 +208,12 @@ static inline void ckpt_fingerprint(const poly_t *P, const bench_cfg_t *cfg,
 static inline int ckpt_write(const char *relations, const poly_t *P,
                              const bench_cfg_t *cfg, const ckpt_t *ck)
 {
-    char path[1200], tmp[1216], text[2048];
+    char path[CKPT_PATH_MAX], tmp[CKPT_PATH_MAX], text[2048];
     FILE *f;
-    if (ckpt_ckpt_path(relations, path, sizeof path)) return -1;
-    if (snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp) {
-        fprintf(stderr, "ckpt: staging path for %s is too long\n", path);
-        return -1;
-    }
+    /* Both go through the same guard, so ".tmp" cannot be the one suffix that
+     * overflows; CKPT_SUFFIX_MAX already reserves room for it. */
+    if (ckpt_ckpt_path(relations, path, sizeof path) ||
+        ckpt_path_fmt(path, tmp, sizeof tmp, ".tmp")) return -1;
     if (!(f = fopen(tmp, "w"))) { perror(tmp); return -1; }
     ckpt_job_text(P, cfg, text, sizeof text);
     fprintf(f, "# cuda-sieve resume checkpoint. Delete this file to force a"
@@ -222,10 +245,14 @@ static inline int ckpt_write(const char *relations, const poly_t *P,
  * discard a file the operator believes is being resumed. */
 static inline int ckpt_read(const char *relations, ckpt_t *ck)
 {
-    char path[1200], line[1024];
+    char path[CKPT_PATH_MAX], line[1024];
     FILE *f;
     int version = 0, got = 0;
-    if (ckpt_ckpt_path(relations, path, sizeof path)) return -1;
+    /* -2, not -1: -1 is "no sidecar", which makes the caller report that the
+     * file does not exist and advise --restart. A name we could not build says
+     * nothing about what is on disk, and telling an operator to discard a
+     * resumable .part on that basis is the one answer that loses work. */
+    if (ckpt_ckpt_path(relations, path, sizeof path)) return -2;
     if (!(f = fopen(path, "r"))) return -1;
     memset(ck, 0, sizeof *ck);
     while (fgets(line, sizeof line, f)) {
@@ -322,7 +349,7 @@ again:
 /* Held for the process lifetime and released via atexit, so every early
  * `return 1` between acquisition and the band drops it. _exit and fatal
  * signals still skip it -- that is what the staleness check above is for. */
-static char ckpt_lock_held[2048];
+static char ckpt_lock_held[CKPT_PATH_MAX];
 
 static inline void ckpt_unlock_atexit(void)
 {

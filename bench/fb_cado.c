@@ -325,12 +325,6 @@ int fb_load_cado(const char *path, double scale, fb_t *fb)
          * power of one prime", and a prime power written in the short form as
          * an ispow disagreement -- both naming this file as the source. */
         p = q;
-        if (long_form) {
-            int pk = 1;
-            const uint32_t base_p = is_power(q, &pk);
-            if (base_p) { p = base_p; kk = pk; }
-        }
-        if (kk > 1 && q > max_power_q) max_power_q = q;
 
         s = after_first;
         if (long_form) {
@@ -352,6 +346,18 @@ int fb_load_cado(const char *path, double scale, fb_t *fb)
                 cado_line_error(path, linenr, "missing ':' after exponents");
                 goto done;
             }
+            /* Classify only now, and only when the line's own declared
+             * exponent says a proper power is possible. is_power() is trial
+             * division to sqrt(q), which returns after the first divisor for a
+             * composite but runs the full loop for a prime -- ~11,800
+             * iterations at lim 1.4e8 and ~65,500 near 2^32. The format permits
+             * an ordinary prime in the general long form (`p:1,0: r`), and
+             * classifying those would put that loop on a per-line path. */
+            if (nexp_u >= 2) {
+                int pk = 1;
+                const uint32_t base_p = is_power(q, &pk);
+                if (base_p) { p = base_p; kk = pk; }
+            }
             if (nexp_u > INT_MAX || oldexp_u > INT_MAX ||
                 oldexp_u >= nexp_u || nexp_u < (uint32_t)kk) {
                 cado_line_error(path, linenr,
@@ -359,6 +365,7 @@ int fb_load_cado(const char *path, double scale, fb_t *fb)
                 goto done;
             }
         }
+        if (kk > 1 && q > max_power_q) max_power_q = q;
         if (fb_log_delta_checked(p, (int)nexp_u, (int)oldexp_u, scale, &lg)) {
             cado_line_error(path, linenr,
                             "factor-base log increment is not representable in 8 bits");
@@ -460,9 +467,9 @@ int fb_load_cado(const char *path, double scale, fb_t *fb)
             j++;
         }
     }
-    /* EXTERNAL, not PRECLASSIFIED: this is the trust boundary for a text file
-     * the parser above has only read, never verified. The sieve fast path in
-     * fb_validate() is the single authority on what is prime here. */
+    /* The trust boundary for a text file the parser above has only read, never
+     * verified. The sieve fast path in fb_validate() is the single authority on
+     * what is prime here. */
     if (fb_validate(fb, FB_VALIDATE_EXTERNAL_PRIME_POWERS, path) != 0)
         goto done;
 

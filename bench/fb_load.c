@@ -182,8 +182,7 @@ int fb_validate(fb_t *fb, fb_validate_policy_t policy, const char *source)
 
     if (policy != FB_VALIDATE_EXTERNAL_PRIMES &&
         policy != FB_VALIDATE_EXTERNAL_PRIME_POWERS &&
-        policy != FB_VALIDATE_GENERATED_PRIME_POWERS &&
-        policy != FB_VALIDATE_PRECLASSIFIED_PRIME_POWERS)
+        policy != FB_VALIDATE_GENERATED_PRIME_POWERS)
         return fb_validation_error(fb, source, UINT32_MAX,
                                    "unknown validation policy %d", (int)policy);
     if (fb->n == 0)
@@ -192,10 +191,9 @@ int fb_validate(fb_t *fb, fb_validate_policy_t policy, const char *source)
     if (!fb->primes || !fb->roots)
         return fb_validation_error(fb, source, UINT32_MAX,
                                    "missing modulus or root array");
-    if ((policy == FB_VALIDATE_GENERATED_PRIME_POWERS ||
-         policy == FB_VALIDATE_PRECLASSIFIED_PRIME_POWERS) && !fb->ispow)
+    if (policy == FB_VALIDATE_GENERATED_PRIME_POWERS && !fb->ispow)
         return fb_validation_error(fb, source, UINT32_MAX,
-                                   "generated or preclassified factor base has no ispow array");
+                                   "generated factor base has no ispow array");
 
     /* Structural pass. It is deliberately separate from classification so we
      * know whether the fast sieve is appropriate before spending any primality
@@ -226,7 +224,6 @@ int fb_validate(fb_t *fb, fb_validate_policy_t policy, const char *source)
     }
 
     if (policy != FB_VALIDATE_GENERATED_PRIME_POWERS &&
-        policy != FB_VALIDATE_PRECLASSIFIED_PRIME_POWERS &&
         nunique >= sieve_unique_min && maxq <= sieve_q_limit &&
         (uint64_t)maxq <= (uint64_t)nunique * sieve_max_span_per_modulus) {
         prime_list = prime_list_build(maxq, &nprime);
@@ -242,8 +239,7 @@ int fb_validate(fb_t *fb, fb_validate_policy_t policy, const char *source)
         if (!have_classified || q != classified_q) {
             fb_modulus_kind_t kind;
 
-            if (policy == FB_VALIDATE_GENERATED_PRIME_POWERS ||
-                policy == FB_VALIDATE_PRECLASSIFIED_PRIME_POWERS) {
+            if (policy == FB_VALIDATE_GENERATED_PRIME_POWERS) {
                 /* The zero-flag entries were already proven prime by
                  * prime_list_build() inside an in-process generator, so
                  * reclassifying that stream here would re-sieve a range this

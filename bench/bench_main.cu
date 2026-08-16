@@ -1253,6 +1253,15 @@ static int bench_main_impl(int argc, char **argv)
          * running siever's .part and only then discover the lock -- reporting
          * the conflict after doing the damage, with the victim still writing
          * to an unlinked inode and its final rename doomed to ENOENT. */
+        /* Length is checked here for the same reason the lock is taken here:
+         * before --restart's unlink and before anything is opened. Discovering
+         * an unusable --candidates path after remove(part) has already run
+         * would report the problem having done the damage, which is precisely
+         * what the lock ordering above exists to prevent. Once both pass, no
+         * name derived anywhere in this program can truncate. */
+        if ((cfg.relations && ckpt_path_usable(cfg.relations, "--relations")) ||
+            (cfg.candidates && ckpt_path_usable(cfg.candidates, "--candidates")))
+            return 1;
         if (cfg.relations) {
             if (ckpt_lock(cfg.relations, ckpt_lock_held,
                           sizeof ckpt_lock_held)) {
@@ -1262,7 +1271,7 @@ static int bench_main_impl(int argc, char **argv)
             atexit(ckpt_unlock_atexit);
         }
         if (cfg.relations) {
-            char part[2048], cpath[2048];
+            char part[CKPT_PATH_MAX], cpath[CKPT_PATH_MAX];
             char fp[17];
             struct stat st;
             ckpt_t ck;
@@ -1276,7 +1285,7 @@ static int bench_main_impl(int argc, char **argv)
                            part, (long long)st.st_size);
                 remove(part); remove(cpath);
                 if (cfg.candidates) {
-                    char cp2[2048];
+                    char cp2[CKPT_PATH_MAX];
                     if (ckpt_part_path(cfg.candidates, cp2, sizeof cp2))
                         return 1;
                     remove(cp2);
@@ -1327,7 +1336,7 @@ static int bench_main_impl(int argc, char **argv)
                  * resume that supplies it again truncates the whole file away. */
                 {
                     struct stat cst;
-                    char cpart[2048] = "";
+                    char cpart[CKPT_PATH_MAX] = "";
                     if (cfg.candidates &&
                         ckpt_part_path(cfg.candidates, cpart, sizeof cpart))
                         return 1;
