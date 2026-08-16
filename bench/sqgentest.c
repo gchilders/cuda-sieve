@@ -31,6 +31,59 @@ static int check_root(const poly_t *P, int side, const qsel_t *s)
     return v == 0;
 }
 
+static int qsel_validation(void)
+{
+    poly_t P, Z;
+    qsel_t s;
+    memset(&P, 0, sizeof P);
+    P.deg = 2;
+    strcpy(P.cs[0], "-1");
+    strcpy(P.cs[1], "0");
+    strcpy(P.cs[2], "1");          /* f(x) = x^2 - 1 */
+    strcpy(P.y0s, "-1");
+    strcpy(P.y1s, "1");            /* G(x) = x - 1   */
+
+    s.q = 7; s.rho = ~(uint64_t)0;  /* UINT64_MAX mod 7 == 1 */
+    if (qsel_validate(&s, &P, 1) != QSEL_VALID || s.rho != 1) {
+        fprintf(stderr, "qsel validation: failed to canonicalise a valid root\n");
+        return -1;
+    }
+    s.q = 7; s.rho = 2;
+    if (qsel_validate(&s, &P, 1) != QSEL_ERR_NOT_ROOT || s.rho != 2) return -1;
+    s.q = 9; s.rho = 1;
+    if (qsel_validate(&s, &P, 1) != QSEL_ERR_Q_COMPOSITE) return -1;
+    s.q = 0; s.rho = 0;
+    if (qsel_validate(&s, &P, 1) != QSEL_ERR_Q_RANGE) return -1;
+    s.q = 1; s.rho = 0;
+    if (qsel_validate(&s, &P, 1) != QSEL_ERR_Q_RANGE) return -1;
+    s.q = UINT64_C(1) << 32; s.rho = 1;
+    if (qsel_validate(&s, &P, 1) != QSEL_ERR_Q_RANGE) return -1;
+    s.q = UINT32_C(4294967291); s.rho = 1; /* largest 32-bit prime */
+    if (qsel_validate(&s, &P, 1) != QSEL_VALID || s.rho != 1) return -1;
+    s.q = 7; s.rho = 8;
+    if (qsel_validate(&s, &P, 0) != QSEL_VALID || s.rho != 1) return -1;
+
+    /* Explicit --rho 0 used to be mistaken for "rho omitted" by truth-value
+     * tests in the single-q path. Zero is a legitimate affine root. */
+    memset(&Z, 0, sizeof Z);
+    Z.deg = 1;
+    strcpy(Z.cs[0], "0");
+    strcpy(Z.cs[1], "1");            /* z(x) = x */
+    s.q = 5; s.rho = 0;
+    if (qsel_validate(&s, &Z, 1) != QSEL_VALID || s.rho != 0) return -1;
+
+    if (qsel_validate(&s, &P, 2) != QSEL_ERR_SIDE) return -1;
+    P.y1s[0] = 0;
+    if (qsel_validate(&s, &P, 0) != QSEL_ERR_POLY) return -1;
+    strcpy(P.y1s, "1");
+    strcpy(P.cs[1], "1x");
+    s.q = 7; s.rho = 1;
+    if (qsel_validate(&s, &P, 1) != QSEL_ERR_POLY || s.rho != 1) return -1;
+
+    printf("PASS   central special-q validation\n");
+    return 0;
+}
+
 static int algebraic_above_lim(void)
 {
     poly_t P;
@@ -185,7 +238,7 @@ static int missing_rational_coefficient(void)
 
 int main(void)
 {
-    if (algebraic_above_lim() || rational_open_count() ||
+    if (qsel_validation() || algebraic_above_lim() || rational_open_count() ||
         inclusive_single_prime() || oracle_agreement() ||
         missing_rational_coefficient()) return 1;
     return 0;

@@ -22,16 +22,6 @@
 
 #define MAXLIMB 8
 
-/* las's fb_log_delta: the marginal log of going from p^oldexp to p^nexp. */
-static uint8_t fb_log_delta(uint32_t p, int nexp, int oldexp, double scale)
-{
-    double l2 = log2((double)p);
-    long a = (long)floor((double)nexp   * l2 * scale + 0.5);
-    long b = (long)floor((double)oldexp * l2 * scale + 0.5);
-    long d = a - b;
-    return (uint8_t)(d < 0 ? 0 : (d > 255 ? 255 : d));
-}
-
 typedef struct { uint32_t l[MAXLIMB]; int n, neg; } bigint_t;
 
 /* decimal string -> base-2^32 limbs, little-endian */
@@ -78,7 +68,13 @@ int rfb_build(const poly_t *P, uint32_t lim, int maxbits, double scale, fb_t *fb
     uint32_t nproj = 0, npow = 0, nprojpow = 0;
     uint32_t powmax;
 
+    if (!P || !fb) return -1;
     memset(fb, 0, sizeof(*fb));
+    if (!isfinite(scale) || scale <= 0.0) {
+        fprintf(stderr, "rfb_build: scale %.17g must be finite and positive\n",
+                scale);
+        return -1;
+    }
     if (maxbits < 1 || maxbits > 31) {
         fprintf(stderr, "rfb_build: maxbits must be in [1,31]\n");
         return -1;
@@ -120,7 +116,12 @@ int rfb_build(const poly_t *P, uint32_t lim, int maxbits, double scale, fb_t *fb
         proj = (y1 == 0);
         fb->primes[k] = p;
         fb->ispow[k]  = 0;                 /* e == 1 */
-        fb->logp[k]   = fb_log_delta(p, 1, 0, scale);
+        if (fb_log_delta_checked(p, 1, 0, scale, &fb->logp[k])) {
+            fprintf(stderr,
+                    "rfb_build: p=%u has no finite 8-bit log at scale %.17g\n",
+                    p, scale);
+            free(plist); fb_free(fb); return -1;
+        }
         if (proj) {
             /* rr == 0 mod p: the classical "b == 0 (mod p)" case */
             fb->roots[k] = p;
@@ -155,7 +156,13 @@ int rfb_build(const poly_t *P, uint32_t lim, int maxbits, double scale, fb_t *fb
             fb->roots[k]  = (uint32_t)(((uint64_t)(qk - num % qk) % qk
                                         * pl_invmod_any(den, qk)) % (uint64_t)qk)
                             + (proj ? qk : 0u);
-            fb->logp[k]   = fb_log_delta(p, e, e - 1, scale);
+            if (fb_log_delta_checked(p, e, e - 1, scale, &fb->logp[k])) {
+                fprintf(stderr,
+                        "rfb_build: p=%u exponents %d,%d have no finite"
+                        " 8-bit log at scale %.17g\n",
+                        p, e, e - 1, scale);
+                free(plist); fb_free(fb); return -1;
+            }
             fb->ispow[k]  = 1;             /* e >= 2 by construction */
             k++; npow++; if (proj) nprojpow++;
         }
@@ -177,6 +184,14 @@ int rfb_build(const poly_t *P, uint32_t lim, int maxbits, double scale, fb_t *fb
             fb->primes[m+1] = q; fb->roots[m+1] = r;
             fb->logp[m+1] = l; fb->ispow[m+1] = w;
         }
+    }
+    /* Prime entries came from prime_list_build(), so use the generated policy
+     * to avoid constructing the same sieve twice. The validator still checks
+     * every structural invariant and independently verifies all power rungs. */
+    if (fb_validate(fb, FB_VALIDATE_GENERATED_PRIME_POWERS,
+                    "rfb_build") != 0) {
+        fb_free(fb);
+        return -1;
     }
     printf("rational factor base: %u ideals up to %u (%u prime-power of which"
            " %u projective, %u projective primes) at scale %.3f\n",

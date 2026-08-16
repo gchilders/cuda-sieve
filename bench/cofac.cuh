@@ -866,8 +866,9 @@ __global__ void k_cofac(const mz<L> *__restrict n, mz<L> lim2, uint32_t lpb,
                         uint32_t s2nv)
 {
     const uint32_t cnt = *njp;
-    const uint32_t stride = gridDim.x * blockDim.x;
-    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < cnt; i += stride) {
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t ii = bench_grid_thread_x(); ii < cnt; ii += stride) {
+        const uint32_t i = (uint32_t)ii;
         const uint32_t t = sel[i];
         uint32_t o[CF_MAXFAC];
         uint64_t acc = 0;
@@ -895,17 +896,20 @@ __global__ void k_cofac(const mz<L> *__restrict n, mz<L> lim2, uint32_t lpb,
 __global__ void k_cof_selflags(uint32_t n, const uint8_t *__restrict st,
                                uint32_t *__restrict flag)
 {
-    const uint32_t stride = gridDim.x * blockDim.x;
-    for (uint32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < n; t += stride)
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t tt = bench_grid_thread_x(); tt < n; tt += stride) {
+        const uint32_t t = (uint32_t)tt;
         flag[t] = (st[t] == CF_INCOMPLETE) ? 1u : 0u;
+    }
 }
 
 __global__ void k_cof_selscatter(uint32_t n, const uint32_t *__restrict flag,
                                  const uint32_t *__restrict off,
                                  uint32_t *__restrict sel, uint32_t *__restrict nsel)
 {
-    const uint32_t stride = gridDim.x * blockDim.x;
-    for (uint32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < n; t += stride) {
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t tt = bench_grid_thread_x(); tt < n; tt += stride) {
+        const uint32_t t = (uint32_t)tt;
         if (flag[t]) sel[off[t]] = t;
         if (t == n - 1) *nsel = off[t] + flag[t];
     }
@@ -1042,8 +1046,9 @@ __global__ void k_cof_enqueue(const bn_t *__restrict cof0, const uint8_t *__rest
                               uint32_t n, uint32_t base, uint32_t lpb0, uint32_t lpb1,
                               cofq_t Q)
 {
-    const uint32_t stride = gridDim.x * blockDim.x;
-    for (uint32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < n; t += stride) {
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t tt = bench_grid_thread_x(); tt < n; tt += stride) {
+        const uint32_t t = (uint32_t)tt;
         const uint32_t d = base + t;
         Q.d_a[d] = a[t]; Q.d_b[d] = b[t];
         Q.d_nsp0[d] = 0; Q.d_nsp1[d] = 0;
@@ -1087,16 +1092,20 @@ __global__ void k_cof_enqueue(const bn_t *__restrict cof0, const uint8_t *__rest
  * can never be a relation. */
 __global__ void k_cof_gate(uint32_t n, uint8_t *__restrict st0, uint8_t *__restrict st1)
 {
-    const uint32_t stride = gridDim.x * blockDim.x;
-    for (uint32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < n; t += stride)
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t tt = bench_grid_thread_x(); tt < n; tt += stride) {
+        const uint32_t t = (uint32_t)tt;
         if (st0[t] != CF_OK && st1[t] == CF_INCOMPLETE) st1[t] = CF_DEAD;
+    }
 }
 __global__ void k_rel_flags(uint32_t n, const uint8_t *__restrict st0,
                             const uint8_t *__restrict st1, uint32_t *__restrict flag)
 {
-    const uint32_t stride = gridDim.x * blockDim.x;
-    for (uint32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < n; t += stride)
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t tt = bench_grid_thread_x(); tt < n; tt += stride) {
+        const uint32_t t = (uint32_t)tt;
         flag[t] = (st0[t] == CF_OK && st1[t] == CF_OK) ? 1u : 0u;
+    }
 }
 
 /* Gather the relations into the front of the queue's own arrays. Only these
@@ -1105,8 +1114,9 @@ __global__ void k_rel_gather(uint32_t n, const uint32_t *__restrict flag,
                              const uint32_t *__restrict off, uint32_t cap,
                              uint32_t *__restrict idx, uint32_t *__restrict nrel)
 {
-    const uint32_t stride = gridDim.x * blockDim.x;
-    for (uint32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < n; t += stride) {
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t tt = bench_grid_thread_x(); tt < n; tt += stride) {
+        const uint32_t t = (uint32_t)tt;
         if (flag[t] && off[t] < cap) idx[off[t]] = t;
         if (t == n - 1) *nrel = off[t] + flag[t];
     }
@@ -1119,8 +1129,9 @@ __global__ void k_rel_pack(uint32_t nr, const uint32_t *__restrict idx, cofq_t Q
                            uint32_t *__restrict osp0, uint8_t *__restrict onsp0,
                            uint32_t *__restrict osp1, uint8_t *__restrict onsp1)
 {
-    const uint32_t stride = gridDim.x * blockDim.x;
-    for (uint32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < nr; t += stride) {
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t tt = bench_grid_thread_x(); tt < nr; tt += stride) {
+        const uint32_t t = (uint32_t)tt;
         const uint32_t r = idx[t];
         oa[t] = Q.d_a[r]; ob[t] = Q.d_b[r];
         ofn0[t] = Q.d_fn0[r]; ofn1[t] = Q.d_fn1[r];
@@ -1197,29 +1208,36 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
                      uint32_t ecm_curves)
 {
     const uint32_t nb = (cap + TD_SCAN_BLK - 1) / TD_SCAN_BLK;
+    uint32_t *h_s = NULL;
+    uint8_t *h_s2mask = NULL;
+    int rc = -1;
+
+#define COF_INIT_CK(x) do { if (CUDA_CHECKED(x)) goto done; } while (0)
     memset(Q, 0, sizeof(*Q)); memset(O, 0, sizeof(*O));
     Q->cap = cap;
     Q->ecm = ecm; Q->ecm_curves = ecm_curves;
     if (ecm) {
-        uint32_t *h_s = NULL;
-        uint8_t *h_s2mask = NULL;
         Q->ns = cf_ecm_plan(ecm_b1, &h_s);
-        if (!Q->ns) { fprintf(stderr, "  cofac queue: empty ECM plan for B1=%u\n", ecm_b1); return -1; }
-        CK(cudaMalloc(&Q->d_s, (size_t)Q->ns * 4));
-        CK(cudaMemcpy(Q->d_s, h_s, (size_t)Q->ns * 4, cudaMemcpyHostToDevice));
-        free(h_s);
+        if (!Q->ns) {
+            fprintf(stderr, "  cofac queue: empty ECM plan for B1=%u\n", ecm_b1);
+            goto done;
+        }
+        COF_INIT_CK(cudaMalloc(&Q->d_s, (size_t)Q->ns * 4));
+        COF_INIT_CK(cudaMemcpy(Q->d_s, h_s, (size_t)Q->ns * 4,
+                               cudaMemcpyHostToDevice));
+        free(h_s); h_s = NULL;
         if (ecm_b2) {
-            Q->s2nv = cf_ecm_stage2_plan(ecm_b1, ecm_b2, &Q->s2vmin, &h_s2mask);
+            Q->s2nv = cf_ecm_stage2_plan(ecm_b1, ecm_b2, &Q->s2vmin,
+                                         &h_s2mask);
             if (!Q->s2nv) {
                 fprintf(stderr, "  cofac queue: empty ECM stage-2 plan for"
                         " B1=%u B2=%u\n", ecm_b1, ecm_b2);
-                free(h_s2mask);
-                cudaFree(Q->d_s); Q->d_s = NULL; Q->ns = 0;
-                return -1;
+                goto done;
             }
-            CK(cudaMalloc(&Q->d_s2mask, Q->s2nv));
-            CK(cudaMemcpy(Q->d_s2mask, h_s2mask, Q->s2nv, cudaMemcpyHostToDevice));
-            free(h_s2mask);
+            COF_INIT_CK(cudaMalloc(&Q->d_s2mask, Q->s2nv));
+            COF_INIT_CK(cudaMemcpy(Q->d_s2mask, h_s2mask, Q->s2nv,
+                                   cudaMemcpyHostToDevice));
+            free(h_s2mask); h_s2mask = NULL;
         }
         printf("  cofactor queue: ECM B1 = %u, %u prime powers, B2 = %u"
                " (%u giant steps), %u curves per round\n", ecm_b1, Q->ns,
@@ -1234,42 +1252,71 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
      * against a 12 GB card, and removes the failure mode instead of retuning
      * the threshold for one more job. */
     Q->rcap = cap;
-    CK(cudaMalloc(&Q->d_c0, (size_t)cap * sizeof(mz<3>)));
-    CK(cudaMalloc(&Q->d_c1, (size_t)cap * sizeof(mz<3>)));
-    CK(cudaMalloc(&Q->d_st0, cap)); CK(cudaMalloc(&Q->d_st1, cap));
-    CK(cudaMalloc(&Q->d_sm0, (size_t)cap * 4)); CK(cudaMalloc(&Q->d_sm1, (size_t)cap * 4));
-    CK(cudaMalloc(&Q->d_a, (size_t)cap * 8)); CK(cudaMalloc(&Q->d_b, (size_t)cap * 8));
-    CK(cudaMalloc(&Q->d_f0, (size_t)cap * TD_FMAX * 4));
-    CK(cudaMalloc(&Q->d_f1, (size_t)cap * TD_FMAX * 4));
-    CK(cudaMalloc(&Q->d_fn0, cap)); CK(cudaMalloc(&Q->d_fn1, cap));
-    CK(cudaMalloc(&Q->d_sp0, (size_t)cap * CF_MAXFAC * 4));
-    CK(cudaMalloc(&Q->d_sp1, (size_t)cap * CF_MAXFAC * 4));
-    CK(cudaMalloc(&Q->d_nsp0, cap)); CK(cudaMalloc(&Q->d_nsp1, cap));
-    CK(cudaMalloc(&Q->d_flag, (size_t)cap * 4));
-    CK(cudaMalloc(&Q->d_off, (size_t)cap * 4));
-    CK(cudaMalloc(&Q->d_bsum, (size_t)nb * 4));
-    CK(cudaMalloc(&Q->d_idx, (size_t)Q->rcap * 4));
-    CK(cudaMalloc(&Q->d_nrel, 4));
-    CK(cudaMalloc(&Q->d_sel, (size_t)cap * 4));
-    CK(cudaMalloc(&Q->d_nsel, 4));
-    CK(cudaMalloc(&O->d_a, (size_t)Q->rcap * 8)); CK(cudaMalloc(&O->d_b, (size_t)Q->rcap * 8));
-    CK(cudaMalloc(&O->d_f0, (size_t)Q->rcap * TD_FMAX * 4));
-    CK(cudaMalloc(&O->d_f1, (size_t)Q->rcap * TD_FMAX * 4));
-    CK(cudaMalloc(&O->d_fn0, Q->rcap)); CK(cudaMalloc(&O->d_fn1, Q->rcap));
-    CK(cudaMalloc(&O->d_sp0, (size_t)Q->rcap * CF_MAXFAC * 4));
-    CK(cudaMalloc(&O->d_sp1, (size_t)Q->rcap * CF_MAXFAC * 4));
-    CK(cudaMalloc(&O->d_nsp0, Q->rcap)); CK(cudaMalloc(&O->d_nsp1, Q->rcap));
-    CK(cudaHostAlloc((void **)&O->a, (size_t)Q->rcap * 8, cudaHostAllocDefault));
-    CK(cudaHostAlloc((void **)&O->b, (size_t)Q->rcap * 8, cudaHostAllocDefault));
-    CK(cudaHostAlloc((void **)&O->f0, (size_t)Q->rcap * TD_FMAX * 4, cudaHostAllocDefault));
-    CK(cudaHostAlloc((void **)&O->f1, (size_t)Q->rcap * TD_FMAX * 4, cudaHostAllocDefault));
-    CK(cudaHostAlloc((void **)&O->fn0, Q->rcap, cudaHostAllocDefault));
-    CK(cudaHostAlloc((void **)&O->fn1, Q->rcap, cudaHostAllocDefault));
-    CK(cudaHostAlloc((void **)&O->sp0, (size_t)Q->rcap * CF_MAXFAC * 4, cudaHostAllocDefault));
-    CK(cudaHostAlloc((void **)&O->sp1, (size_t)Q->rcap * CF_MAXFAC * 4, cudaHostAllocDefault));
-    CK(cudaHostAlloc((void **)&O->nsp0, Q->rcap, cudaHostAllocDefault));
-    CK(cudaHostAlloc((void **)&O->nsp1, Q->rcap, cudaHostAllocDefault));
-    return 0;
+    COF_INIT_CK(cudaMalloc(&Q->d_c0, (size_t)cap * sizeof(mz<3>)));
+    COF_INIT_CK(cudaMalloc(&Q->d_c1, (size_t)cap * sizeof(mz<3>)));
+    COF_INIT_CK(cudaMalloc(&Q->d_st0, cap));
+    COF_INIT_CK(cudaMalloc(&Q->d_st1, cap));
+    COF_INIT_CK(cudaMalloc(&Q->d_sm0, (size_t)cap * 4));
+    COF_INIT_CK(cudaMalloc(&Q->d_sm1, (size_t)cap * 4));
+    COF_INIT_CK(cudaMalloc(&Q->d_a, (size_t)cap * 8));
+    COF_INIT_CK(cudaMalloc(&Q->d_b, (size_t)cap * 8));
+    COF_INIT_CK(cudaMalloc(&Q->d_f0, (size_t)cap * TD_FMAX * 4));
+    COF_INIT_CK(cudaMalloc(&Q->d_f1, (size_t)cap * TD_FMAX * 4));
+    COF_INIT_CK(cudaMalloc(&Q->d_fn0, cap));
+    COF_INIT_CK(cudaMalloc(&Q->d_fn1, cap));
+    COF_INIT_CK(cudaMalloc(&Q->d_sp0, (size_t)cap * CF_MAXFAC * 4));
+    COF_INIT_CK(cudaMalloc(&Q->d_sp1, (size_t)cap * CF_MAXFAC * 4));
+    COF_INIT_CK(cudaMalloc(&Q->d_nsp0, cap));
+    COF_INIT_CK(cudaMalloc(&Q->d_nsp1, cap));
+    COF_INIT_CK(cudaMalloc(&Q->d_flag, (size_t)cap * 4));
+    COF_INIT_CK(cudaMalloc(&Q->d_off, (size_t)cap * 4));
+    COF_INIT_CK(cudaMalloc(&Q->d_bsum, (size_t)nb * 4));
+    COF_INIT_CK(cudaMalloc(&Q->d_idx, (size_t)Q->rcap * 4));
+    COF_INIT_CK(cudaMalloc(&Q->d_nrel, 4));
+    COF_INIT_CK(cudaMalloc(&Q->d_sel, (size_t)cap * 4));
+    COF_INIT_CK(cudaMalloc(&Q->d_nsel, 4));
+    COF_INIT_CK(cudaMalloc(&O->d_a, (size_t)Q->rcap * 8));
+    COF_INIT_CK(cudaMalloc(&O->d_b, (size_t)Q->rcap * 8));
+    COF_INIT_CK(cudaMalloc(&O->d_f0, (size_t)Q->rcap * TD_FMAX * 4));
+    COF_INIT_CK(cudaMalloc(&O->d_f1, (size_t)Q->rcap * TD_FMAX * 4));
+    COF_INIT_CK(cudaMalloc(&O->d_fn0, Q->rcap));
+    COF_INIT_CK(cudaMalloc(&O->d_fn1, Q->rcap));
+    COF_INIT_CK(cudaMalloc(&O->d_sp0, (size_t)Q->rcap * CF_MAXFAC * 4));
+    COF_INIT_CK(cudaMalloc(&O->d_sp1, (size_t)Q->rcap * CF_MAXFAC * 4));
+    COF_INIT_CK(cudaMalloc(&O->d_nsp0, Q->rcap));
+    COF_INIT_CK(cudaMalloc(&O->d_nsp1, Q->rcap));
+    COF_INIT_CK(cudaHostAlloc((void **)&O->a, (size_t)Q->rcap * 8,
+                              cudaHostAllocDefault));
+    COF_INIT_CK(cudaHostAlloc((void **)&O->b, (size_t)Q->rcap * 8,
+                              cudaHostAllocDefault));
+    COF_INIT_CK(cudaHostAlloc((void **)&O->f0,
+                              (size_t)Q->rcap * TD_FMAX * 4,
+                              cudaHostAllocDefault));
+    COF_INIT_CK(cudaHostAlloc((void **)&O->f1,
+                              (size_t)Q->rcap * TD_FMAX * 4,
+                              cudaHostAllocDefault));
+    COF_INIT_CK(cudaHostAlloc((void **)&O->fn0, Q->rcap,
+                              cudaHostAllocDefault));
+    COF_INIT_CK(cudaHostAlloc((void **)&O->fn1, Q->rcap,
+                              cudaHostAllocDefault));
+    COF_INIT_CK(cudaHostAlloc((void **)&O->sp0,
+                              (size_t)Q->rcap * CF_MAXFAC * 4,
+                              cudaHostAllocDefault));
+    COF_INIT_CK(cudaHostAlloc((void **)&O->sp1,
+                              (size_t)Q->rcap * CF_MAXFAC * 4,
+                              cudaHostAllocDefault));
+    COF_INIT_CK(cudaHostAlloc((void **)&O->nsp0, Q->rcap,
+                              cudaHostAllocDefault));
+    COF_INIT_CK(cudaHostAlloc((void **)&O->nsp1, Q->rcap,
+                              cudaHostAllocDefault));
+    rc = 0;
+
+done:
+    free(h_s);
+    free(h_s2mask);
+    if (rc) cofq_free(Q, O);
+#undef COF_INIT_CK
+    return rc;
 }
 
 static void cq_emit_side(FILE *o, const uint32_t *f, int nf,
@@ -1292,10 +1339,12 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     const uint32_t nb = (n + TD_SCAN_BLK - 1) / TD_SCAN_BLK;
     mz<3> l0, l1;
     uint32_t nr = 0;
-    cudaEvent_t e0, e1, e2;
+    cudaEvent_t e0 = NULL, e1 = NULL, e2 = NULL;
     float t0 = 0, t1 = 0;
     double h0;
+    int rc = -1;
     if (!n) return 0;
+#define COF_FLUSH_CK(x) do { if (CUDA_CHECKED(x)) goto done; } while (0)
     /* 3 limbs, not 2. lim0^2 needs more than 64 bits once rlim exceeds 2^32.
      * No job here is close -- the largest rlim so far is 134200000, about
      * 2^27, giving lim0^2 ~ 2^54 -- so this is headroom, not a live fix. It is
@@ -1320,17 +1369,19 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     S.curves = Q->ecm_curves; S.d_s = Q->d_s; S.ns = Q->ns;
     S.d_s2mask = Q->d_s2mask; S.s2vmin = Q->s2vmin; S.s2nv = Q->s2nv;
 
-    cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventCreate(&e2);
-    cudaEventRecord(e0);
+    COF_FLUSH_CK(cudaEventCreate(&e0));
+    COF_FLUSH_CK(cudaEventCreate(&e1));
+    COF_FLUSH_CK(cudaEventCreate(&e2));
+    COF_FLUSH_CK(cudaEventRecord(e0));
     cf_run_rounds<3>(Q->d_c0, l0, lpb0, n, Q->d_st0, Q->d_sp0, Q->d_nsp0,
                      &S, &W, NULL, blocks, threads);
     /* The class-aware gate: a record whose rational side did not split is dead
      * whatever the algebraic side does, so its 3-limb job is never started. */
     k_cof_gate<<<blocks, threads>>>(n, Q->d_st0, Q->d_st1);
-    cudaEventRecord(e1);
+    COF_FLUSH_CK(cudaEventRecord(e1));
     cf_run_rounds<3>(Q->d_c1, l1, lpb1, n, Q->d_st1, Q->d_sp1, Q->d_nsp1,
                      &S, &W, NULL, blocks, threads);
-    cudaEventRecord(e2);
+    COF_FLUSH_CK(cudaEventRecord(e2));
 
     k_rel_flags<<<blocks, threads>>>(n, Q->d_st0, Q->d_st1, Q->d_flag);
     k_scan_pass1<<<nb, TD_SCAN_BLK>>>(Q->d_flag, n, Q->d_off, Q->d_bsum);
@@ -1338,12 +1389,12 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     k_scan_pass3<<<nb, TD_SCAN_BLK>>>(Q->d_off, n, Q->d_bsum);
     k_rel_gather<<<blocks, threads>>>(n, Q->d_flag, Q->d_off, Q->rcap,
                                       Q->d_idx, Q->d_nrel);
-    CK(cudaDeviceSynchronize()); CK(cudaGetLastError());
-    cudaEventElapsedTime(&t0, e0, e1); cudaEventElapsedTime(&t1, e1, e2);
+    COF_FLUSH_CK(cudaDeviceSynchronize()); COF_FLUSH_CK(cudaGetLastError());
+    COF_FLUSH_CK(cudaEventElapsedTime(&t0, e0, e1));
+    COF_FLUSH_CK(cudaEventElapsedTime(&t1, e1, e2));
     Q->ms_rat += t0; Q->ms_alg += t1;
-    cudaEventDestroy(e0); cudaEventDestroy(e1); cudaEventDestroy(e2);
 
-    CK(cudaMemcpy(&nr, Q->d_nrel, 4, cudaMemcpyDeviceToHost));
+    COF_FLUSH_CK(cudaMemcpy(&nr, Q->d_nrel, 4, cudaMemcpyDeviceToHost));
     /* Unreachable while rcap == cap, which it now is: every relation comes from
      * a distinct queued record, so nr <= n <= cap. It was reachable under the
      * old rcap = cap/4, which assumed relations were at most a quarter of
@@ -1355,26 +1406,26 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
         fprintf(stderr, "  cofac queue: %u relations in a flush of %u exceeds"
                 " the %u readback slots (rcap invariant broken)\n",
                 nr, n, Q->rcap);
-        return -1;
+        goto done;
     }
     Q->nseen += n; Q->nrel += nr;
-    if (!nr) { Q->n = 0; return 0; }
+    if (!nr) { Q->n = 0; rc = 0; goto done; }
 
     k_rel_pack<<<blocks, threads>>>(nr, Q->d_idx, *Q, O->d_a, O->d_b,
                                     O->d_f0, O->d_fn0, O->d_f1, O->d_fn1,
                                     O->d_sp0, O->d_nsp0, O->d_sp1, O->d_nsp1);
-    CK(cudaDeviceSynchronize()); CK(cudaGetLastError());
+    COF_FLUSH_CK(cudaDeviceSynchronize()); COF_FLUSH_CK(cudaGetLastError());
     h0 = host_ms();
-    CK(cudaMemcpy(O->a, O->d_a, (size_t)nr * 8, cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(O->b, O->d_b, (size_t)nr * 8, cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(O->f0, O->d_f0, (size_t)nr * TD_FMAX * 4, cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(O->f1, O->d_f1, (size_t)nr * TD_FMAX * 4, cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(O->fn0, O->d_fn0, nr, cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(O->fn1, O->d_fn1, nr, cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(O->sp0, O->d_sp0, (size_t)nr * CF_MAXFAC * 4, cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(O->sp1, O->d_sp1, (size_t)nr * CF_MAXFAC * 4, cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(O->nsp0, O->d_nsp0, nr, cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(O->nsp1, O->d_nsp1, nr, cudaMemcpyDeviceToHost));
+    COF_FLUSH_CK(cudaMemcpy(O->a, O->d_a, (size_t)nr * 8, cudaMemcpyDeviceToHost));
+    COF_FLUSH_CK(cudaMemcpy(O->b, O->d_b, (size_t)nr * 8, cudaMemcpyDeviceToHost));
+    COF_FLUSH_CK(cudaMemcpy(O->f0, O->d_f0, (size_t)nr * TD_FMAX * 4, cudaMemcpyDeviceToHost));
+    COF_FLUSH_CK(cudaMemcpy(O->f1, O->d_f1, (size_t)nr * TD_FMAX * 4, cudaMemcpyDeviceToHost));
+    COF_FLUSH_CK(cudaMemcpy(O->fn0, O->d_fn0, nr, cudaMemcpyDeviceToHost));
+    COF_FLUSH_CK(cudaMemcpy(O->fn1, O->d_fn1, nr, cudaMemcpyDeviceToHost));
+    COF_FLUSH_CK(cudaMemcpy(O->sp0, O->d_sp0, (size_t)nr * CF_MAXFAC * 4, cudaMemcpyDeviceToHost));
+    COF_FLUSH_CK(cudaMemcpy(O->sp1, O->d_sp1, (size_t)nr * CF_MAXFAC * 4, cudaMemcpyDeviceToHost));
+    COF_FLUSH_CK(cudaMemcpy(O->nsp0, O->d_nsp0, nr, cudaMemcpyDeviceToHost));
+    COF_FLUSH_CK(cudaMemcpy(O->nsp1, O->d_nsp1, nr, cudaMemcpyDeviceToHost));
     if (fo)
         for (uint32_t k = 0; k < nr; k++) {
             int64_t a = O->a[k], b = O->b[k];
@@ -1389,7 +1440,14 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
         }
     Q->ms_host += host_ms() - h0;
     Q->n = 0;
-    return 0;
+    rc = 0;
+
+done:
+    if (e0 && CUDA_CHECKED(cudaEventDestroy(e0)) && rc == 0) rc = -1;
+    if (e1 && CUDA_CHECKED(cudaEventDestroy(e1)) && rc == 0) rc = -1;
+    if (e2 && CUDA_CHECKED(cudaEventDestroy(e2)) && rc == 0) rc = -1;
+#undef COF_FLUSH_CK
+    return rc;
 }
 
 /* ---- host driver: cofactorise an emitted candidate batch ---------------- *

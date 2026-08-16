@@ -29,6 +29,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <errno.h>
+#include <limits.h>
 
 /* If q = p^k with k > 1, return the BASE PRIME p and set *kk = k; else 0.
  *
@@ -56,139 +58,418 @@ static uint32_t is_power(uint32_t q, int *kk)
     return 0;                         /* prime */
 }
 
-static uint8_t log_delta(uint32_t p, int nexp, int oldexp, double scale)
+typedef struct {
+    uint32_t *q, *r;
+    uint8_t *logp;
+    uint32_t n, cap;
+} fbvec_t;
+
+static void fbvec_free(fbvec_t *v)
 {
-    double l2 = log2((double)p);
-    long a = (long)floor((double)nexp   * l2 * scale + 0.5);
-    long b = (long)floor((double)oldexp * l2 * scale + 0.5);
-    long d = a - b;
-    return (uint8_t)(d < 0 ? 0 : (d > 255 ? 255 : d));
+    if (!v) return;
+    free(v->q);
+    free(v->r);
+    free(v->logp);
+    memset(v, 0, sizeof(*v));
+}
+
+static int fbvec_reserve(fbvec_t *v, uint32_t need)
+{
+    uint32_t cap;
+    uint32_t *q, *r;
+    uint8_t *logp;
+
+    if (need <= v->cap) return 0;
+    cap = v->cap ? v->cap : 4096u;
+    while (cap < need) {
+        if (cap > UINT32_MAX / 2u) { cap = need; break; }
+        cap *= 2u;
+    }
+    if (cap < need) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+#if SIZE_MAX <= UINT32_MAX
+    if ((size_t)cap > SIZE_MAX / sizeof(*v->q) ||
+        (size_t)cap > SIZE_MAX / sizeof(*v->r) ||
+        (size_t)cap > SIZE_MAX / sizeof(*v->logp)) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+#endif
+
+    /* Grow each array in place when possible. If a later realloc fails, the
+     * arrays already grown remain valid and v->cap deliberately stays at the
+     * old common capacity. A later retry can finish the growth safely, while
+     * peak RSS never includes a complete old and complete new three-array
+     * vector at the same time. */
+    q = (uint32_t *)realloc(v->q, (size_t)cap * sizeof(*v->q));
+    if (!q) return -1;
+    v->q = q;
+    r = (uint32_t *)realloc(v->r, (size_t)cap * sizeof(*v->r));
+    if (!r) return -1;
+    v->r = r;
+    logp = (uint8_t *)realloc(v->logp, (size_t)cap * sizeof(*v->logp));
+    if (!logp) return -1;
+    v->logp = logp;
+    v->cap = cap;
+    return 0;
+}
+
+static int fbvec_push(fbvec_t *v, uint32_t q, uint32_t r, uint8_t logp)
+{
+    if (v->n == UINT32_MAX) { errno = EOVERFLOW; return -1; }
+    if (fbvec_reserve(v, v->n + 1u)) return -1;
+    v->q[v->n] = q;
+    v->r[v->n] = r;
+    v->logp[v->n] = logp;
+    v->n++;
+    return 0;
+}
+
+typedef struct {
+    uint32_t q, r, order;
+    uint8_t logp;
+} fbsort_entry_t;
+
+static int fbsort_cmp(const void *aa, const void *bb)
+{
+    const fbsort_entry_t *a = (const fbsort_entry_t *)aa;
+    const fbsort_entry_t *b = (const fbsort_entry_t *)bb;
+    if (a->q != b->q) return a->q < b->q ? -1 : 1;
+    if (a->order != b->order) return a->order < b->order ? -1 : 1;
+    return 0;
+}
+
+/* A hostile file can contain far more power entries than a normal makefb
+ * output. The old insertion sort was quadratic in that count, turning strict
+ * parsing into an easy CPU denial of service. Sort a temporary AoS view with
+ * qsort and retain input order for equal moduli. */
+static int fbvec_sort_by_q(fbvec_t *v)
+{
+    fbsort_entry_t *a;
+    uint32_t i;
+
+    if (v->n < 2u) return 0;
+#if SIZE_MAX <= UINT32_MAX
+    if ((size_t)v->n > SIZE_MAX / sizeof(*a)) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+#endif
+    a = (fbsort_entry_t *)malloc((size_t)v->n * sizeof(*a));
+    if (!a) return -1;
+    for (i = 0; i < v->n; i++) {
+        a[i].q = v->q[i];
+        a[i].r = v->r[i];
+        a[i].logp = v->logp[i];
+        a[i].order = i;
+    }
+    qsort(a, v->n, sizeof(*a), fbsort_cmp);
+    for (i = 0; i < v->n; i++) {
+        v->q[i] = a[i].q;
+        v->r[i] = a[i].r;
+        v->logp[i] = a[i].logp;
+    }
+    free(a);
+    return 0;
+}
+
+static char *cado_skip_space(char *s)
+{
+    while (*s == ' ' || *s == '\t') s++;
+    return s;
+}
+
+static int cado_at_end(char *s)
+{
+    s = cado_skip_space(s);
+    if (*s == '\0' || *s == '#') return 1;
+    if (*s == '\n') return s[1] == '\0';
+    if (*s == '\r') return s[1] == '\0' ||
+                            (s[1] == '\n' && s[2] == '\0');
+    return 0;
+}
+
+static int cado_u32(char **sp, uint32_t *out)
+{
+    char *s = cado_skip_space(*sp), *end;
+    unsigned long long v;
+
+    if (*s < '0' || *s > '9') return -1;
+    errno = 0;
+    v = strtoull(s, &end, 10);
+    if (errno == ERANGE || end == s || v > UINT32_MAX) return -1;
+    *sp = end;
+    *out = (uint32_t)v;
+    return 0;
+}
+
+static int cado_maxbits_comment(char *line, int *maxbits)
+{
+    char *s = cado_skip_space(line);
+    uint32_t v;
+
+    if (*s++ != '#') return 0;
+    s = cado_skip_space(s);
+    if (strncmp(s, "maxbits", 7) != 0 ||
+        (s[7] && s[7] != ' ' && s[7] != '\t' && s[7] != '='))
+        return 0;
+    s = cado_skip_space(s + 7);
+    /* Only the assignment form is metadata. Other prose comments beginning
+     * with "maxbits" are ordinary comments and must not abort the load. */
+    if (*s != '=') return 0;
+    s++;
+    if (cado_u32(&s, &v) || !cado_at_end(s) || v < 1u || v > 32u)
+        return -1;
+    *maxbits = (int)v;
+    return 1;
+}
+
+static int cado_line_error(const char *path, unsigned long linenr,
+                           const char *msg)
+{
+    fprintf(stderr, "fb_load_cado: %s:%lu: %s\n", path, linenr, msg);
+    return -1;
 }
 
 int fb_load_cado(const char *path, double scale, fb_t *fb)
 {
-    FILE *f = fopen(path, "r");
+    enum { LINE_CAP = 65536 };
+    FILE *f = NULL;
     char *line = NULL;
-    size_t linecap = 0;
-    ssize_t len;
-    uint32_t na = 0, nb = 0, capa = 1u << 23, capb = 1u << 16;
-    uint32_t *qa, *ra, *qb, *rb, i, j, k;
-    uint8_t  *la, *lb;
+    fbvec_t base = {0}, power = {0};
+    uint32_t i, j, k;
     unsigned long linenr = 0;
-    int file_maxbits = 0;
+    uint32_t max_power_q = 0;
+    int file_maxbits = 0, maxbits_seen = 0;
+    int rc = -1;
 
+    if (!fb || !path) { errno = EINVAL; return -1; }
     memset(fb, 0, sizeof(*fb));
-    if (!f) { fprintf(stderr, "fb_load_cado: cannot open %s\n", path); return -1; }
+    if (!isfinite(scale) || scale <= 0.0) {
+        fprintf(stderr, "fb_load_cado: scale %.17g must be finite and positive\n",
+                scale);
+        return -1;
+    }
+    f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "fb_load_cado: cannot open %s\n", path);
+        return -1;
+    }
+    line = (char *)malloc(LINE_CAP);
+    if (!line) goto done;
 
-    qa = (uint32_t *)malloc((size_t)capa * 4);   /* k == 1, already ascending */
-    ra = (uint32_t *)malloc((size_t)capa * 4);
-    la = (uint8_t  *)malloc((size_t)capa);
-    qb = (uint32_t *)malloc((size_t)capb * 4);   /* k >  1, few hundred       */
-    rb = (uint32_t *)malloc((size_t)capb * 4);
-    lb = (uint8_t  *)malloc((size_t)capb);
-    if (!qa || !ra || !la || !qb || !rb || !lb) { fclose(f); return -1; }
-
-    while ((len = getline(&line, &linecap, f)) > 0) {
-        char *s = line, *e;
-        uint32_t q, p;
-        int nexp = 1, oldexp = 0, kk = 1;
+    while (fgets(line, LINE_CAP, f)) {
+        char *s, *after_first, *scan;
+        uint32_t q, p, nexp_u = 1u, oldexp_u = 0u;
+        int kk = 1, long_form = 0, comment_kind;
         uint8_t lg;
+        fbvec_t *dst;
+        uint32_t before;
+
         linenr++;
+        if (!strchr(line, '\n') && !feof(f)) {
+            int ch;
+            while ((ch = fgetc(f)) != '\n' && ch != EOF) {}
+            cado_line_error(path, linenr, "line exceeds 65535 bytes");
+            goto done;
+        }
+        s = cado_skip_space(line);
+        if (!*s || ((*s == '\n' || *s == '\r') && cado_at_end(s)))
+            continue;
         if (*s == '#') {
-            int mb;
-            if (sscanf(s, "# maxbits = %d", &mb) == 1) file_maxbits = mb;
+            int parsed_maxbits = file_maxbits;
+            comment_kind = cado_maxbits_comment(s, &parsed_maxbits);
+            if (comment_kind < 0) {
+                cado_line_error(path, linenr,
+                                "malformed # maxbits comment (want 1..32)");
+                goto done;
+            }
+            if (comment_kind > 0) {
+                if (maxbits_seen && parsed_maxbits != file_maxbits) {
+                    cado_line_error(path, linenr,
+                                    "conflicting # maxbits declarations");
+                    goto done;
+                }
+                file_maxbits = parsed_maxbits;
+                maxbits_seen = 1;
+            }
             continue;
         }
-        if (*s == '\n') continue;
-        q = (uint32_t)strtoul(s, &e, 10);
-        if (e == s || *e != ':') continue;
-        s = e + 1;
-        p = q;
-        if (strchr(s, ':')) {                     /* long form */
-            uint32_t base = is_power(q, &kk);
-            if (base) p = base; else kk = 1;
-            nexp = (int)strtoul(s, &e, 10);
-            if (e == s || *e != ',') {
-                fprintf(stderr, "fb_load_cado:%lu: bad nexp\n", linenr); goto fail;
-            }
-            s = e + 1;
-            oldexp = (int)strtoul(s, &e, 10);
-            if (e == s || *e != ':') {
-                fprintf(stderr, "fb_load_cado:%lu: bad oldexp\n", linenr); goto fail;
-            }
-            s = e + 1;
+
+        if (cado_u32(&s, &q) || q < 2u) {
+            cado_line_error(path, linenr,
+                            "modulus must be a complete unsigned 32-bit integer >= 2");
+            goto done;
         }
-        lg = log_delta(p, nexp, oldexp, scale);
-        for (;;) {                                 /* comma-separated roots */
+        s = cado_skip_space(s);
+        if (*s++ != ':') {
+            cado_line_error(path, linenr, "missing ':' after modulus");
+            goto done;
+        }
+        after_first = s;
+        for (scan = s; *scan && *scan != '\n' && *scan != '\r' && *scan != '#'; scan++)
+            if (*scan == ':') { long_form = 1; break; }
+
+        if (bench_is_prime32(q)) {
+            p = q;
+            kk = 1;
+        } else {
+            p = is_power(q, &kk);
+            if (!p) {
+                cado_line_error(path, linenr,
+                                "modulus is neither prime nor a prime power");
+                goto done;
+            }
+        }
+        if (!long_form && kk != 1) {
+            cado_line_error(path, linenr,
+                            "prime-power modulus requires q:nexp,oldexp: form");
+            goto done;
+        }
+        if (kk > 1 && q > max_power_q) max_power_q = q;
+
+        s = after_first;
+        if (long_form) {
+            if (cado_u32(&s, &nexp_u)) {
+                cado_line_error(path, linenr, "invalid nexp");
+                goto done;
+            }
+            s = cado_skip_space(s);
+            if (*s++ != ',') {
+                cado_line_error(path, linenr, "missing ',' between exponents");
+                goto done;
+            }
+            if (cado_u32(&s, &oldexp_u)) {
+                cado_line_error(path, linenr, "invalid oldexp");
+                goto done;
+            }
+            s = cado_skip_space(s);
+            if (*s++ != ':') {
+                cado_line_error(path, linenr, "missing ':' after exponents");
+                goto done;
+            }
+            if (nexp_u > INT_MAX || oldexp_u > INT_MAX ||
+                oldexp_u >= nexp_u || nexp_u < (uint32_t)kk) {
+                cado_line_error(path, linenr,
+                                "exponents must satisfy 0 <= oldexp < nexp and nexp >= v_p(q)");
+                goto done;
+            }
+        }
+        if (fb_log_delta_checked(p, (int)nexp_u, (int)oldexp_u, scale, &lg)) {
+            cado_line_error(path, linenr,
+                            "factor-base log increment is not representable in 8 bits");
+            goto done;
+        }
+
+        dst = kk > 1 ? &power : &base;
+        before = dst->n;
+        for (;;) {
             uint32_t r;
-            while (*s == ' ' || *s == '\t') s++;
-            if (*s < '0' || *s > '9') break;
-            r = (uint32_t)strtoul(s, &e, 10);
-            s = e;
-            if (kk > 1) {
-                if (nb == capb) {
-                    capb *= 2;
-                    qb = (uint32_t *)realloc(qb, (size_t)capb * 4);
-                    rb = (uint32_t *)realloc(rb, (size_t)capb * 4);
-                    lb = (uint8_t  *)realloc(lb, (size_t)capb);
-                    if (!qb || !rb || !lb) goto fail;
-                }
-                qb[nb] = q; rb[nb] = r; lb[nb] = lg; nb++;
-            } else {
-                if (na == capa) {
-                    capa *= 2;
-                    qa = (uint32_t *)realloc(qa, (size_t)capa * 4);
-                    ra = (uint32_t *)realloc(ra, (size_t)capa * 4);
-                    la = (uint8_t  *)realloc(la, (size_t)capa);
-                    if (!qa || !ra || !la) goto fail;
-                }
-                qa[na] = q; ra[na] = r; la[na] = lg; na++;
+            s = cado_skip_space(s);
+            if (cado_u32(&s, &r)) {
+                cado_line_error(path, linenr,
+                                dst->n == before ? "entry has no roots" : "missing root after ','");
+                goto done;
             }
-            if (*s == ',') s++; else break;
+            if ((uint64_t)r >= (uint64_t)q * 2u) {
+                cado_line_error(path, linenr,
+                                "root must be smaller than 2*q");
+                goto done;
+            }
+            if (fbvec_push(dst, q, r, lg)) {
+                cado_line_error(path, linenr,
+                                errno == EOVERFLOW ? "too many factor-base entries" : "out of memory");
+                goto done;
+            }
+            s = cado_skip_space(s);
+            if (*s == ',') { s++; continue; }
+            if (!cado_at_end(s)) {
+                cado_line_error(path, linenr, "trailing characters after root list");
+                goto done;
+            }
+            break;
         }
     }
-    free(line);
-    fclose(f);
-
-    /* the k==1 stream must already be ascending for the merge to be valid */
-    for (i = 1; i < na; i++)
-        if (qa[i] < qa[i - 1]) {
-            fprintf(stderr, "fb_load_cado: base primes not ascending at %u\n", i);
-            goto fail2;
-        }
-    /* insertion-sort the power entries (a few hundred) */
-    for (i = 1; i < nb; i++) {
-        uint32_t q = qb[i], r = rb[i]; uint8_t l = lb[i];
-        int32_t m = (int32_t)i - 1;
-        while (m >= 0 && qb[m] > q) { qb[m+1] = qb[m]; rb[m+1] = rb[m]; lb[m+1] = lb[m]; m--; }
-        qb[m+1] = q; rb[m+1] = r; lb[m+1] = l;
+    if (ferror(f)) {
+        fprintf(stderr, "fb_load_cado: read error on %s\n", path);
+        goto done;
+    }
+    if (!base.n && !power.n) {
+        fprintf(stderr, "fb_load_cado: %s contains no factor-base entries\n", path);
+        goto done;
     }
 
-    fb->n      = na + nb;
+    for (i = 1; i < base.n; i++)
+        if (base.q[i] < base.q[i - 1]) {
+            fprintf(stderr, "fb_load_cado: %s: base primes not ascending at entry %u\n",
+                    path, i);
+            goto done;
+        }
+    if (maxbits_seen &&
+        (uint64_t)max_power_q > (UINT64_C(1) << file_maxbits)) {
+        fprintf(stderr,
+                "fb_load_cado: %s: prime-power modulus %u exceeds"
+                " # maxbits = %d\n",
+                path, max_power_q, file_maxbits);
+        goto done;
+    }
+    if (fbvec_sort_by_q(&power)) {
+        fprintf(stderr,
+                "fb_load_cado: %s: could not sort prime-power entries: %s\n",
+                path, errno == EOVERFLOW ? "size overflow" : "out of memory");
+        goto done;
+    }
+
+    if ((uint64_t)base.n + power.n > UINT32_MAX) {
+        errno = EOVERFLOW;
+        fprintf(stderr, "fb_load_cado: %s has too many entries\n", path);
+        goto done;
+    }
+    fb->n = base.n + power.n;
     fb->maxbits = file_maxbits;
-    fb->primes = (uint32_t *)malloc((size_t)fb->n * 4);
-    fb->roots  = (uint32_t *)malloc((size_t)fb->n * 4);
-    fb->logp   = (uint8_t  *)malloc((size_t)fb->n);
-    fb->ispow  = (uint8_t  *)malloc((size_t)fb->n);
-    if (!fb->primes || !fb->roots || !fb->logp || !fb->ispow) goto fail2;
-    /* The merge already knows which stream an entry came from: the qb stream IS
-     * the proper prime powers. Record it, so nothing downstream ever has to
-     * re-derive it with a primality test. */
-    for (i = j = k = 0; k < fb->n; k++) {
-        int takea = (i < na) && (j >= nb || qa[i] <= qb[j]);
-        if (takea) { fb->primes[k] = qa[i]; fb->roots[k] = ra[i]; fb->logp[k] = la[i];
-                     fb->ispow[k] = 0; i++; }
-        else       { fb->primes[k] = qb[j]; fb->roots[k] = rb[j]; fb->logp[k] = lb[j];
-                     fb->ispow[k] = 1; j++; }
+#if SIZE_MAX <= UINT32_MAX
+    if ((size_t)fb->n > SIZE_MAX / sizeof(*fb->primes)) {
+        errno = EOVERFLOW;
+        goto done;
     }
-    printf("text factor base %s: %u ideals (%u prime, %u prime-power)"
-           " at scale %.3f\n", path, fb->n, na, nb, scale);
-    free(qa); free(ra); free(la); free(qb); free(rb); free(lb);
-    return 0;
+#endif
+    fb->primes = (uint32_t *)malloc((size_t)fb->n * sizeof(*fb->primes));
+    fb->roots = (uint32_t *)malloc((size_t)fb->n * sizeof(*fb->roots));
+    fb->logp = (uint8_t *)malloc((size_t)fb->n * sizeof(*fb->logp));
+    fb->ispow = (uint8_t *)malloc((size_t)fb->n * sizeof(*fb->ispow));
+    if (!fb->primes || !fb->roots || !fb->logp || !fb->ispow) goto done;
 
-fail:
-    free(line); fclose(f);
-fail2:
-    free(qa); free(ra); free(la); free(qb); free(rb); free(lb);
-    return -1;
+    for (i = j = k = 0; k < fb->n; k++) {
+        int take_base = i < base.n &&
+                        (j >= power.n || base.q[i] <= power.q[j]);
+        if (take_base) {
+            fb->primes[k] = base.q[i];
+            fb->roots[k] = base.r[i];
+            fb->logp[k] = base.logp[i];
+            fb->ispow[k] = 0;
+            i++;
+        } else {
+            fb->primes[k] = power.q[j];
+            fb->roots[k] = power.r[j];
+            fb->logp[k] = power.logp[j];
+            fb->ispow[k] = 1;
+            j++;
+        }
+    }
+    if (fb_validate(fb, FB_VALIDATE_PRECLASSIFIED_PRIME_POWERS, path) != 0)
+        goto done;
+
+    printf("text factor base %s: %u ideals (%u prime, %u prime-power)"
+           " at scale %.3f\n", path, fb->n, base.n, power.n, scale);
+    rc = 0;
+
+done:
+    if (f && fclose(f) && rc == 0) rc = -1;
+    free(line);
+    fbvec_free(&base);
+    fbvec_free(&power);
+    if (rc) fb_free(fb);
+    return rc;
 }

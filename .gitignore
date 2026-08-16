@@ -24,6 +24,7 @@ bench/sqgentest
 bench/dumpcmp
 bench/mkcofbatch
 bench/.arch.stamp
+bench/.boinc.stamp
 *.d
 
 # All per-job working state lives under work/: poly, factor base, relations,
