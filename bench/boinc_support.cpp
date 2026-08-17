@@ -21,6 +21,9 @@
 #include <unistd.h>
 #include <vector>
 #endif
+/* APP_INIT_DATA comes from app_ipc.h, which boinc_api.h includes for C++
+ * translation units. Including it directly here would put it ahead of
+ * boinc_win.h on Windows builds, which BOINC's headers require first. */
 #include "boinc_api.h"
 
 struct resolved_path_node {
@@ -148,6 +151,56 @@ extern "C" int bench_boinc_init(void)
            boinc_is_standalone() ? "standalone" : "client");
 #endif
     return 0;
+}
+
+extern "C" int bench_boinc_gpu_device(void)
+{
+#ifdef HAVE_BOINC
+    APP_INIT_DATA aid;
+
+    /* The client's per-task GPU assignment lives in init_data.xml, and this is
+     * the only mechanism that is not deprecated. The client ALSO appends
+     * "--device N" to the command line, but only when the app version declares
+     * an api_version below 7.5 (client/app_start.cpp:
+     * `if (!app_version->api_version_at_least(7, 5))`, over a call marked
+     * "NOTE: this is deprecated. Use app_init_data instead."). That test is on
+     * the APP VERSION, not the client: a current client silently stops
+     * supplying the argument as soon as the project declares a modern
+     * api_version, and an application reading only the command line then runs
+     * every task of a multi-GPU host on device 0.
+     *
+     * boinc_get_init_data() needs the runtime to have come up; it reads the
+     * copy boinc_init_options() already parsed. */
+    if (boinc_state != BOINC_READY) return -1;
+    /* Every released boinc_get_init_data() returns 0 unconditionally. Checked
+     * anyway so this does not read stale data if that contract ever changes. */
+    if (boinc_get_init_data(aid)) return -1;
+
+    /* -1 is BOINC's sentinel for "no GPU assigned", and it is set by
+     * APP_INIT_DATA::clear() rather than by the parse, so it also holds on the
+     * standalone path where init_data.xml does not exist at all. The client
+     * writes the same -1 for a task whose app version claims no coprocessor. */
+    if (aid.gpu_device_num < 0) return -1;
+
+    /* The index is an ordinal within ONE coprocessor's device list, not a
+     * machine-wide GPU number. An index taken from the AMD or Intel list
+     * carries no information about CUDA ordinals: acting on it would run this
+     * task on an NVIDIA card the client never reserved for it, colliding with
+     * whatever the client did place there -- the exact failure this function
+     * exists to prevent. Refuse it and let CUDA's default device stand, with
+     * the misconfiguration on the record in the uploaded stderr. */
+    if (aid.gpu_type[0] && strncmp(aid.gpu_type, "NVIDIA", 6) != 0) {
+        fprintf(stderr,
+                "BOINC: this is a CUDA application but the client assigned a"
+                " '%s' device (index %d); ignoring the assignment. The app"
+                " version's plan class is not an NVIDIA one.\n",
+                aid.gpu_type, aid.gpu_device_num);
+        return -1;
+    }
+    return aid.gpu_device_num;
+#else
+    return -1;
+#endif
 }
 
 extern "C" int bench_boinc_resolve_path(const char *option,

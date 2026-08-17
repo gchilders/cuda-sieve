@@ -102,7 +102,16 @@ The BOINC build:
 
 - initialises and finishes through the BOINC API;
 - requests normal host-thread priority for the CUDA feeder thread;
-- accepts BOINC's `--device N` CUDA-device argument;
+- runs on the GPU the client assigned to the task, read from `init_data.xml`
+  (`<gpu_device_num>`) through `boinc_get_init_data()`. This is what keeps
+  concurrent tasks on a multi-GPU host off a single card, and it is the only
+  non-deprecated way to learn the assignment: the client also appends
+  `--device N` to the command line, but only while the **app version** declares
+  an `<api_version>` below 7.5, so that argument disappears the moment a
+  project declares a modern one. The assignment therefore outranks `--device`,
+  which selects the card only when there is no assignment — standalone runs,
+  and app versions the client treats as CPU-only. Each task's stderr records
+  which of the two happened and which card was used;
 - resolves every explicitly supplied input or output filename through
   `boinc_resolve_filename_s()` and follows native BOINC output links before
   staging and renaming result files; and
@@ -120,8 +129,20 @@ names declared in its workunit template, for example:
 
 ```text
 --pipeline --cofactor --poly job_file --fb1 roots_file --logI 14 \
---qrange 15000000:16000000 --relations result_file --device 0
+--qrange 15000000:16000000 --relations result_file
 ```
+
+Do not put `--device` in a workunit or app version command line: it is shared
+by every task on every host, so it cannot express a per-task assignment. A
+`--device` that disagrees with the client is ignored, with a line in stderr.
+
+If a host's tasks all report the same card, read the task's stderr first:
+
+- `BOINC: client assigned CUDA device N` — the assignment arrived. Compare `N`
+  across concurrent tasks on that host.
+- `BOINC: no GPU assignment in init_data.xml` — the client sent none, so it
+  does not consider this a GPU app version. That is a project-side plan class
+  or `<coproc>` declaration to fix; no application change can work around it.
 
 This integration does not yet add checkpoint files. BOINC can suspend and
 resume a live process, but a process that exits and is restarted begins the

@@ -354,6 +354,9 @@ uint64_t verify_count_updates(const fb_t *fb, const qlat_t *L,
  * reported monotonically, and bench_boinc_finish() terminates through the
  * BOINC API. */
 int  bench_boinc_init(void);
+/* The CUDA device the client assigned to this task, from init_data.xml, or -1
+ * when there is no BOINC assignment (including every non-BOINC build). */
+int  bench_boinc_gpu_device(void);
 int  bench_boinc_resolve_path(const char *option, const char *logical_name,
                               const char **resolved_name);
 void bench_boinc_fraction_done(double fraction_done);

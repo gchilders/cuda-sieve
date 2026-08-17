@@ -200,7 +200,12 @@ static void usage(void)
 "  --verbose-q      print a line per special-q instead of a band summary\n"
 "\n"
 "RUNTIME\n"
-"  --device N       select CUDA device N (also accepted from the BOINC client)\n"
+#ifdef HAVE_BOINC
+"  --device N       select CUDA device N, used only when the BOINC client did\n"
+"                   not assign one; its assignment wins  [CUDA's default]\n"
+#else
+"  --device N       select CUDA device N  [CUDA's default device]\n"
+#endif
 "  --threads N      threads per block, multiple of 32  [256]\n"
 "  --blocks N       0 = auto (6 per SM)        [0]\n"
 "  --fill-blocks N  fill only; 0 = auto (1152, absolute -- NOT per SM) [0]\n"
@@ -437,7 +442,7 @@ static int bench_main_impl(int argc, char **argv)
     const char *cofac_in = NULL;
     const char *check_rel = NULL;
     int blocking_sync = 0;
-    int cuda_device = -1;       /* BOINC passes --device N to CUDA apps */
+    int cuda_device = -1;       /* -1 = ask BOINC, else CUDA's default */
     /* Which values the COMMAND LINE supplied. Precedence is
      *      explicit flag  >  job file  >  derived  >  refuse
      * and these are what distinguishes the first level from the rest. A
@@ -959,16 +964,94 @@ static int bench_main_impl(int argc, char **argv)
         if (rho_set) rho %= q;
     }
 
-    /* BOINC's CUDA application convention appends --device N. CUDA 12 and
-     * later initialise a device's primary context in cudaSetDevice(), so a
-     * scheduling policy must be attached before that call. cudaInitDevice()
-     * does exactly that for the selected device without accidentally creating
-     * a context on device 0. Older runtimes lack that API; there the legacy
+    /* Which GPU. A BOINC client assigns one per task and reports it in
+     * init_data.xml. Reading the command line alone left every task on a
+     * multi-GPU host running on device 0 (reported by Greg Childers,
+     * NFS@Home); see bench_boinc_gpu_device() for why "--device N" from the
+     * client cannot be relied on.
+     *
+     * The ASSIGNMENT WINS over --device, which is the opposite of this file's
+     * usual "explicit flag beats everything" rule, because here the flag is
+     * not per-task: a --device in an app version's <cmdline> or a workunit
+     * template is shared by every task on every host, so honouring it would
+     * silently reinstate the all-tasks-on-one-card bug for the whole project.
+     * The client is the only party that knows what else is running on the
+     * host, and a volunteer excludes a card through cc_config <exclude_gpu>,
+     * which the client already applies before computing this number. --device
+     * therefore selects the card only when there is no assignment: standalone
+     * runs, non-BOINC builds, and app versions the client treats as CPU-only.
+     *
+     * Whether an assignment arrived at all is the first thing to check when a
+     * host reports every task on one card, so it goes to stderr, which BOINC
+     * uploads with the result -- stdout is discarded with the slot. */
+    {
+        const int boinc_device = bench_boinc_gpu_device();
+        if (boinc_device >= 0) {
+            if (cuda_device >= 0 && cuda_device != boinc_device)
+                fprintf(stderr,
+                        "BOINC: ignoring --device %d; the client assigned this"
+                        " task CUDA device %d\n", cuda_device, boinc_device);
+            cuda_device = boinc_device;
+            fprintf(stderr, "BOINC: client assigned CUDA device %d\n",
+                    cuda_device);
+        }
+#ifdef HAVE_BOINC
+        else if (cuda_device < 0) {
+            /* Distinguishes "the client assigned device 0" from "the client
+             * assigned nothing", which is what tells a project whether its app
+             * version's plan class actually declares an NVIDIA coprocessor.
+             * Without that declaration the client sets neither this field nor
+             * --device, and every task on the host lands on the same card no
+             * matter what the application does. */
+            fprintf(stderr,
+                    "BOINC: no usable GPU assignment in init_data.xml; using"
+                    " CUDA's default device\n");
+        }
+#endif
+    }
+
+    /* CUDA 12 and later initialise a device's primary context inside
+     * cudaSetDevice(), so a scheduling policy must be attached before that
+     * call -- and, with the assignment above, to a device that is not
+     * necessarily 0. cudaInitDevice() does exactly that for the selected
+     * device without accidentally creating a context on device 0. Older
+     * runtimes lack that API; there the legacy
      * cudaSetDeviceFlags() ordering is safe only for CUDA's default device, so
      * select first for a nonzero assignment and verify the effective flags. */
+    int ndev = 0;               /* CUDA devices visible to THIS process */
     {
         const int selected_device = cuda_device >= 0 ? cuda_device : 0;
         cudaError_t err;
+
+        /* The client and this process can disagree about how many GPUs exist
+         * -- a card outside this build's gencode set, a driver/runtime
+         * mismatch, CUDA_VISIBLE_DEVICES in the environment. That surfaces
+         * downstream as a bare "invalid device ordinal", which does not say
+         * whether the ordinal or the enumeration is the wrong one, on a host
+         * whose only report is the uploaded stderr. Name both numbers here,
+         * once. This does not create a primary context on any device, so it is
+         * safe ahead of the flag/selection ordering below. */
+        err = cudaGetDeviceCount(&ndev);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "bench: cannot enumerate CUDA devices: %s\n",
+                    cudaGetErrorString(err));
+            return 1;
+        }
+        if (ndev < 1) {
+            fprintf(stderr, "bench: this process sees no CUDA device\n");
+            return 1;
+        }
+        if (selected_device >= ndev) {
+            fprintf(stderr,
+                    "bench: CUDA device %d requested, but this process sees"
+                    " only %d device%s (valid ordinals 0..%d).%s\n",
+                    selected_device, ndev, ndev == 1 ? "" : "s", ndev - 1,
+                    getenv("CUDA_VISIBLE_DEVICES")
+                        ? " CUDA_VISIBLE_DEVICES is set, which renumbers"
+                          " devices from 0."
+                        : "");
+            return 1;
+        }
 
         if (blocking_sync) {
 #if CUDART_VERSION >= 12000
@@ -1053,8 +1136,9 @@ static int bench_main_impl(int argc, char **argv)
      * diagnostic. There is no useful run on a device we cannot query, so a
      * failure here is fatal rather than a default.
      *
-     * The current device is the one selected by --device, or CUDA's default
-     * when that option is absent. The line below prints the actual selection. */
+     * The current device is the one selected by --device or by the BOINC
+     * assignment, or CUDA's default when there is neither. The line below
+     * prints the actual selection. */
     {
         cudaDeviceProp prop;
         int dev = 0;
@@ -1065,6 +1149,13 @@ static int bench_main_impl(int argc, char **argv)
                     " fall back to a hardcoded grid width\n");
             return 1;
         }
+#ifdef HAVE_BOINC
+        /* The one line that answers "did this task actually run on the card the
+         * client gave it?". The grid: line below carries the same ordinal, but
+         * on stdout, which the client discards with the slot directory. */
+        fprintf(stderr, "BOINC: running on CUDA device %d of %d: %s\n",
+                dev, ndev, prop.name);
+#endif
         {
             const uint64_t ab = (uint64_t)prop.multiProcessorCount * 6u;
             if (!ab || ab > BENCH_BLOCKS_MAX ||
@@ -1100,13 +1191,13 @@ static int bench_main_impl(int argc, char **argv)
          * block records having already fixed once. */
         if (cfg.blocks == 0) {
             cfg.blocks = auto_blocks;
-            printf("grid: %d SMs x 6 = %d blocks (%s, %d MB L2)\n",
-                   prop.multiProcessorCount, cfg.blocks, prop.name,
+            printf("grid: %d SMs x 6 = %d blocks (dev %d: %s, %d MB L2)\n",
+                   prop.multiProcessorCount, cfg.blocks, dev, prop.name,
                    prop.l2CacheSize >> 20);
         } else {
-            printf("grid: %d blocks on %d SMs (%s, %d MB L2)  [--blocks; auto"
-                   " would be %d]\n", cfg.blocks, prop.multiProcessorCount,
-                   prop.name, prop.l2CacheSize >> 20,
+            printf("grid: %d blocks on %d SMs (dev %d: %s, %d MB L2)  [--blocks;"
+                   " auto would be %d]\n", cfg.blocks, prop.multiProcessorCount,
+                   dev, prop.name, prop.l2CacheSize >> 20,
                    auto_blocks);
         }
         /* Reported, NOT resolved. cfg.fill_blocks/fill_threads stay 0 for

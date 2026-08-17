@@ -286,7 +286,7 @@ Grid width comes from `multiProcessorCount`. Every run opens with the line it
 derived, on stdout, including when `--blocks` overrides it:
 
 ```
-grid: 48 SMs x 6 = 288 blocks (NVIDIA GeForce RTX 5070, 48 MB L2)
+grid: 48 SMs x 6 = 288 blocks (dev 0: NVIDIA GeForce RTX 5070, 48 MB L2)
 grid: 1152 x 32 for fill (absolute, not per SM)
 ```
 
@@ -295,9 +295,16 @@ is queried at runtime, so it always matches the device actually in use — a
 wrong number means the wrong GPU was selected, not a stale binary. A *stale*
 binary shows up as the line being **absent**.
 
-There is no `cudaSetDevice` and no `--device` flag: device 0 is always used.
-On a multi-GPU box select another card with `CUDA_VISIBLE_DEVICES=1` and
-confirm it on this line.
+The `dev N:` field is the CUDA ordinal actually in use, which is the one thing
+that tells two identical cards apart in a log. It is the BOINC client's
+`gpu_device_num` assignment under a BOINC build, `--device N` when there is no
+assignment, and CUDA's default device otherwise.
+
+For an ordinary (non-BOINC) run, `CUDA_VISIBLE_DEVICES=1` also still works and
+renumbers the chosen card to `dev 0`. Do **not** combine it with a BOINC
+build: masking hides the very ordinal the client assigned, so `cudaSetDevice`
+fails and the task errors out. Use `--device`, or the client's own
+`cc_config.xml` `<exclude_gpu>`, instead.
 
 **Fill has its own grid AND its own block width, and neither scales with the
 card.** `--blocks` is 6 per SM; fill instead uses a fixed **1152 blocks of 32
