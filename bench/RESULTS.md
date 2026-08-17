@@ -2337,6 +2337,72 @@ contention while wall time grows. The standalone and pipeline sieve totals are
 not a one-side/two-side scaling A/B: they use different q, roots, norm scales,
 and the pipeline adds the rational side.
 
+## Finding 55 — the item-0 geometry alarm is a false alarm; the factor-base convention is the real mismatch, and it is q-dependent
+
+**Date:** 2026-08-16. No GPU: source reading, document archaeology, and one
+direct count of the checked-in factor base. STATUS item 0 raised the
+possibility that the GPU was timed on an `I14e` rectangle while being graded
+against an `I15e` CPU baseline — a headline flattered by up to 4×, and the
+largest single effect in that file. It is not what happened.
+
+**Findings 43 and 44 are `I15e` on both sides.** The standalone benchmark
+defaults to `cfg.logI = 15; cfg.J = 16384` (`bench_main.cu:426`), and `--J`
+otherwise defaults to `2^(logI-1)` (`:977`). `git log -S'cfg.logI = 15'`
+returns only the initial checkin, so the default has never moved. The
+finding 43/44 reproduce commands pass neither flag, so they sieved
+`2^15 × 2^14 = 5.369e8` positions — which is both the `A` printed in this
+file's header and exactly the rectangle `gnfs-lasieve4I15e` sieves.
+`RUNBOOK.md:101` fixes the mapping (`--logI N` ↔ `gnfs-lasieve4I{N}e`).
+
+So **64.371 ms/q (38.177 + 26.194) is an `I15e` measurement**, finding 43's
+`gnfs-lasieve4I15e` sweep is its matching comparator, and the CPU row to grade
+it against is the 104.5 J/q one. The margin for that number is 4.3–5.5×, not
+1.5–2.0×.
+
+**The confusion is still live, in the other direction.** Every *pipeline* run on
+record passes `--logI 14 --J 8192` — `README.md`, `RUNBOOK.md:74`, `:407`,
+findings 50 and 54, and both c147 bands — while the c183 timings item 0 builds
+its 70–90 ms/q projection on are standalone runs at the `logI 15` default.
+Item 0 therefore projects a pipeline number from a rectangle no pipeline run has
+ever used. The rule that follows: **a verdict band states its geometry and is
+graded against the matching CPU row.** At defaults the pipeline sieves `I15e`;
+at the documented invocation it sieves `I14e`. Both are defensible; mixing them
+is worth 4×.
+
+**The factor-base convention is the mismatch that survives, and it is not a
+constant.** Standalone side 1 truncates the base at q by default
+(`bench_main.cu:773-774`) — GGNFS's convention, and what the equal-work profile
+was built to match. The pipeline does not: `fbbound = alim` (`:1360`), and
+per-q truncation is item 3, unbuilt. Counted directly over `oracle/c183.fb1`
+(bucketed `(p, root)` entries, `p >= 2^15`; `alim` 134.2M):
+
+| special-q | entries at or below q | fraction of full base |
+|---:|---:|---:|
+| 50M | 2,997,498 | 0.394 |
+| 120.000011M | 6,840,491 | 0.900 |
+| 130M | 7,377,232 | 0.970 |
+| >= 134.2M (`alim`) | 7,601,777 | 1.000 |
+
+At the q the equal-work profile was measured, truncation removes 10% of the
+base. At the verdict band's **low probe, q ≈ 50M, the pipeline's full base
+carries 2.54× the bucketed entries GGNFS sieves at that same q** — and side-1
+transform, fill, and bucket occupancy all scale with entry count. Consequences
+for item 0's band as specified:
+
+- The three probes will show a strong q-dependence in ms/q that is **not** yield
+  drift and must not be read as such.
+- The 70–90 ms/q projection is anchored at q=120M, truncated, standalone. It is
+  roughly right at the 130M probe and **optimistic at 50M**.
+- At the 190M probe truncation is a no-op — q is above `alim` — so the item-3
+  full-vs-truncated A/B has no signal there at all.
+
+Two corrections to older text while it was open. `prototype.md:255` says the
+base reaches "the full 7.6M at q≥170M"; it reaches 7,601,777 at `alim` =
+134.2M and cannot grow past it. And this file's header quotes 6,843,511 entries
+at q=120,000,011 against a direct count of 6,840,491 at `bkthresh` 2^15 — 3,020
+apart, unexplained, and not worth chasing except as a note that the header
+figure is not reproducible to the digit.
+
 ## Not addressed in this round
 
 > **This section is a snapshot of one round, not a current status list**, and it

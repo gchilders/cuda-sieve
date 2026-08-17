@@ -452,6 +452,9 @@ typedef struct {
     int      resume;        /* continue an existing NAME.part from its sidecar  */
     int      restart;       /* --restart: discard that .part instead of resuming */
     const char *stopfile;   /* --stop-file: stop cleanly once this path exists  */
+    /* ---- run log; see runlog.h and STATUS.md 12b ---- */
+    const char *logpath;    /* --log: timestamped run record, appended         */
+    double   log_every_s;   /* --log-every: seconds between records [300]      */
     /* Loaded from the sidecar when resume is set. The scale/allowance the band
      * was originally derived with travel in cfg.scale/scale0/allowance*, which
      * bench_main.cu overwrites from the checkpoint before deriving its own --

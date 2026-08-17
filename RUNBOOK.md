@@ -59,11 +59,12 @@ Two practical notes:
 - **`--relations msieve.dat` writes directly**, saving a full duplicate of the
   relation file — ~8 GB on a c151 at 65M relations (~128 bytes each). Budget
   ~15 GB per job including msieve's `.mat` / `.cyc` / `.chk` / `.dep`.
-- **`bench` writes `NAME.part` and renames on success.** If a long run is
-  interrupted, `mv msieve.dat.part msieve.dat` keeps everything written so far.
-  Note it OVERWRITES rather than appends, so if you sieve in several runs, send
-  them to separate files and `cat` them together. `--target-rels` is there so
-  you can do it in one.
+- **`bench` writes `NAME.part` and renames on success.** The `.part` is the
+  durable artifact, not scratch: after every cofactor flush it is fsynced and
+  `NAME.part.ckpt` records the resume point. **Rerunning the same command
+  resumes there** — it does not overwrite, and it does not need the several
+  files and a `cat` this note used to prescribe. See "Stopping and resuming"
+  below.
 
 ## Sieving
 
@@ -160,6 +161,79 @@ band ends, so `ls` shows nothing during it either.
 
 The relation figure advances at queue flush boundaries rather than per q, so it
 moves in steps and the rate is slightly understated early in a run. It settles.
+
+**Redirected, that line is written as whole lines instead**, every five minutes
+rather than every 30 s, without the carriage return and erase that only mean
+something on a terminal. That cadence is fixed and independent of
+`--log-every`: the run log is a separate, richer stream on its own clock.
+
+### Stopping and resuming
+
+Relations stage to `NAME.part`; the rename to `NAME` is the "band completed"
+marker. After every cofactor flush — the one instant the file holds a whole
+number of special-q — the `.part` is fsynced and `NAME.part.ckpt` records the
+next `(q, rho)`, the byte offset, the relation count, the derived scale and
+allowance, and a job fingerprint.
+
+- **Rerunning the same command resumes**, truncating the `.part` to the
+  recorded offset, which also discards any torn final line from a `kill -9`.
+- **`SIGINT`/`SIGTERM` stop cleanly** at the next special-q, draining the queue
+  first, so a planned stop loses nothing. A second signal exits at once and
+  falls back to the previous checkpoint.
+- **`--stop-file PATH`** stops cleanly once that path exists — the same thing
+  for a run with no terminal to press `^C` in.
+- **`--restart`** discards an existing `.part` and its checkpoint.
+- `NAME.lock` refuses a second writer and clears itself if the recorded pid is
+  gone.
+- A `.part` whose fingerprint disagrees with the current command is **refused,
+  not appended to**: the polynomial, both sides' bounds, `logI`/`J`,
+  `--sq-side`, `--maxbits` and the whole cofactor configuration are all in it,
+  because every one of them changes which relations a run emits while leaving
+  each individual line verifiable.
+
+### Logging an unattended run
+
+```sh
+bench --pipeline --cofactor ... --relations msieve.dat \
+      --log msieve.runlog --log-every 300
+```
+
+`--log` appends; `--log-every` is seconds and defaults to 300 (~864 records
+over three days, so there is nothing to rotate). A resumed session appends a
+second header block to the same file, which is what happened and is more useful
+than a directory of fragments.
+
+The header block records the commit, the full argv, the job fingerprint, the
+card and driver, the geometry **labelled `I14e`/`I15e`**, the factor-base
+convention with entry counts, the derived gate, and the resume point. Quoting a
+band's ms/q without those is how the same number gets compared against two
+different CPU baselines — see `bench/RESULTS.md` finding 55.
+
+Each record carries the progress numbers plus the four that say whether they
+can be compared to anything:
+
+```
+2026-08-16T21:03:44-0400 +2s  q=15000523 nq=42 rel=0 cand=7972 rel/s=0.0 \
+    pct=28.00 eta=-- ms/q=41.38 acc/wall=0.800 gpu=98% board=182.4W load=3.26
+```
+
+- **`acc/wall`** is `GPU-accounted / wall (excl cofac)`, the running form of
+  the band summary's line. There is no "good" value: a faster card sits lower
+  when perfectly healthy, so compare it against *your own* idle baseline on the
+  same card, job and band length. Falling during a run means the host started
+  competing (finding 53).
+- **`gpu=` and `board=`** come from NVML, bound to the card by PCI ID. They are
+  absent (`n/a`) on a host with no driver library. Board watts are **not** the
+  metric of record; whole-box watts need a meter.
+- **`load=`** is the one-minute load average — the thing finding 53 says must
+  be known on both boxes before any wall-clock comparison between them means
+  anything.
+- **`+2s` is monotonic elapsed time.** Compute rates from it, not from the
+  timestamps: under WSL2 the clock resyncs to the Windows host and can step
+  backwards mid-run.
+
+Mid-band warnings — bucket overflow, norm overflow, the candidate cap, a target
+not reached — are written to both stderr and the log.
 
 ### Special-q on the rational side (SNFS)
 

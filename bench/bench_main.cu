@@ -1,6 +1,7 @@
 /* CLI for the standalone bucket-fill benchmark. */
 #include "bench.h"
 #include "ckpt.h"
+#include "runlog.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -157,6 +158,13 @@ static void usage(void)
 "  falls back to the previous checkpoint.\n"
 "  --restart        discard an existing .part and its checkpoint, start over\n"
 "  --stop-file P    stop cleanly once path P exists (for unattended runs)\n"
+"  --log PATH       append a run log: a header naming the commit, argv, job\n"
+"                   fingerprint, card, geometry and FB convention, then a\n"
+"                   timestamped record carrying progress alongside\n"
+"                   GPU-accounted/wall, GPU utilisation, board watts and host\n"
+"                   load -- the four numbers that say whether the progress\n"
+"                   ones can be compared to anything (finding 53)\n"
+"  --log-every S    seconds between run-log records         [300]\n"
 "\n"
 "PARAMETERS  (precedence: this flag > .job file > derived from the poly)\n"
 "  The byte scale and survivor allowance are ALWAYS derived, as las does, from\n"
@@ -390,6 +398,15 @@ static int check_cofactor_bounds(const bench_cfg_t *cfg, uint32_t alim,
 
 static int bench_main_impl(int argc, char **argv)
 {
+    /* Identity of the card this process actually selected, captured where the
+     * device is queried and read much later by the run-log header. Captured
+     * rather than re-queried: between those two points lie the BOINC
+     * assignment, --device and the ordinal bounds check, and a second
+     * cudaGetDevice() would record whatever the current device had become
+     * instead of what the run was configured with. */
+    char dev_name[256] = "";
+    char dev_pci[32] = "";          /* NVML's domain:bus:device.function */
+    int  dev_ordinal = -1, dev_count = 0;
     const char *fbpath = "../oracle/input.job.afb.0";
     const char *polypath = "../oracle/c183.poly";
     bench_cfg_t cfg;
@@ -434,6 +451,9 @@ static int bench_main_impl(int argc, char **argv)
     cfg.cof_ecm = 0; cfg.ecm_b1 = 1000; cfg.ecm_b2 = 0; cfg.ecm_curves = 16;
     cfg.fb_maxbits = 0;
     cfg.resume = 0; cfg.restart = 0; cfg.stopfile = NULL;
+    /* 300 s is ~864 records over a three-day band, which is why runlog.h needs
+     * no rotation. STATUS.md item 12b. */
+    cfg.logpath = NULL; cfg.log_every_s = 300.0;
     cfg.resume_q = 0; cfg.resume_rho = 0;
     cfg.resume_rel_bytes = 0; cfg.resume_cand_bytes = 0;
     cfg.resume_nrel = 0; cfg.resume_nq = 0;
@@ -695,6 +715,26 @@ static int bench_main_impl(int argc, char **argv)
          * whatever filesystem the queue runs in. Under BOINC it is moot anyway,
          * since direct_process_action leaves suspend and quit to the runtime. */
         else if (!strcmp(argv[i], "--stop-file") && i + 1 < argc) cfg.stopfile = argv[++i];
+        /* Resolved like every other named output: under BOINC the log is a
+         * workunit output file with a logical name, and writing it to the
+         * literal string would put it outside the slot directory. */
+        else if (!strcmp(argv[i], "--log") && i + 1 < argc) {
+            if (bench_boinc_resolve_path("--log", argv[++i], &cfg.logpath)) return 1;
+        }
+        else if (!strcmp(argv[i], "--log-every") && i + 1 < argc) {
+            char *end = NULL;
+            const double v = strtod(argv[++i], &end);
+            /* A zero or negative period would write a record per special-q on
+             * a job whose q take milliseconds -- millions of lines over a
+             * multi-day band, which is the one failure mode "no rotation"
+             * cannot absorb. */
+            if (!end || *end || !(v >= 1.0) || v > 86400.0) {
+                fprintf(stderr, "--log-every %s: want seconds in [1, 86400]\n",
+                        argv[i]);
+                return 1;
+            }
+            cfg.log_every_s = v;
+        }
         else if (!strcmp(argv[i], "--lpb") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 32) { fprintf(stderr, "--lpb %ld out of range 1..32\n", v); return 1; } cfg.lpb = (uint32_t)v; lpb_set = 1; }
         else if (!strcmp(argv[i], "--mfb") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 96) { fprintf(stderr, "--mfb %ld out of range 1..96\n", v); return 1; } cfg.mfb = (uint32_t)v; mfb_set = 1; }
         else if (!strcmp(argv[i], "--cofgate") && i + 1 < argc) {
@@ -1149,6 +1189,13 @@ static int bench_main_impl(int argc, char **argv)
                     " fall back to a hardcoded grid width\n");
             return 1;
         }
+        snprintf(dev_name, sizeof dev_name, "%s", prop.name);
+        /* NVML's own spelling of a bus ID: eight-digit domain, then bus and
+         * device in two hex digits each. Function is always 0 for a GPU. */
+        snprintf(dev_pci, sizeof dev_pci, "%08x:%02x:%02x.0",
+                 prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
+        dev_ordinal = dev;
+        dev_count = ndev;
 #ifdef HAVE_BOINC
         /* The one line that answers "did this task actually run on the card the
          * client gave it?". The grid: line below carries the same ordinal, but
@@ -1234,7 +1281,7 @@ static int bench_main_impl(int argc, char **argv)
     if (!cfg.pipeline) {
         static const char *pipeline_only[] = {
             "--target-rels", "--lambda0", "--lambda1", "--sq-side",
-            "--restart", "--stop-file", NULL
+            "--restart", "--stop-file", "--log", "--log-every", NULL
         };
         int nbad = 0;
         for (int i = 1; i < argc; i++)
@@ -1975,6 +2022,119 @@ static int bench_main_impl(int argc, char **argv)
         printf("side 0 (rational) : bucketed %u <= p < %u : %u entries,"
                " line-sieved %u\n", bkthresh, rlim, fb0.n, fbs0.n);
 
+        /* ---- run log (STATUS.md item 12b) ----
+         *
+         * Opened HERE, after every refusal above has had its chance: a log
+         * whose header describes a run that then declined to start is worse
+         * than no log, because the header is the part a reader trusts. By this
+         * point the band, the resume state, the derived gate and both factor
+         * bases are settled, so every field below is the value the run will
+         * actually use rather than the value it was asked for. */
+        if (cfg.logpath) {
+            char job[2048], cmd[4096];
+            size_t k = 0;
+            int drv = 0, rt = 0;
+            const int drv_ok = cudaDriverGetVersion(&drv) == cudaSuccess;
+            const int rt_ok = cudaRuntimeGetVersion(&rt) == cudaSuccess;
+            char ver[64];
+            runlog_open(cfg.logpath, cfg.log_every_s);
+            /* Reported rather than dropped. Two of the four numbers this log
+             * exists to carry come from NVML, and without this line three days
+             * of `gpu=n/a board=n/a` give no way to tell a missing driver
+             * library from a PCI lookup that found the wrong card. */
+            if (runlog_gpu_bind(dev_pci) == 0)
+                runlog_note("telemetry", "NVML bound to %s", dev_pci);
+            else
+                runlog_note("telemetry", "NVML unavailable; the gpu= and"
+                            " board= columns will read n/a");
+            ckpt_job_text(&POLY, &cfg, job, sizeof job);
+            runlog_note("commit", "%s", runlog_build_desc());
+            /* The full command line. Reconstructing it from the printed
+             * parameters is what findings 43-44 needed and did not have; see
+             * finding 55. ckpt_fp_cat is the tested bounded append -- it
+             * clamps k to the buffer size on overflow and never advances past
+             * it -- and it is already in this translation unit. */
+            cmd[0] = 0;
+            for (int i = 0; i < argc; i++)
+                ckpt_fp_cat(cmd, sizeof cmd, &k, "%s%s", i ? " " : "", argv[i]);
+            runlog_note("argv", "%s", cmd);
+            runlog_note("job", "%s", job);
+            {
+                char fp[17];
+                ckpt_fingerprint(&POLY, &cfg, fp);
+                runlog_note("fingerprint", "%s", fp);
+            }
+            /* A failed version query would otherwise read as "driver 0.0",
+             * which is indistinguishable from a real answer in the one field
+             * that ties a log to an environment. */
+            if (drv_ok && rt_ok)
+                snprintf(ver, sizeof ver, "driver %d.%d, runtime %d.%d",
+                         drv / 1000, (drv % 1000) / 10,
+                         rt / 1000, (rt % 1000) / 10);
+            else
+                snprintf(ver, sizeof ver, "driver/runtime version unavailable");
+            runlog_note("device", "CUDA %d of %d: %s [%s], %s",
+                        dev_ordinal, dev_count, dev_name, dev_pci, ver);
+            /* Geometry in one field, in the units the CPU comparison uses.
+             * logI 15 is gnfs-lasieve4I15e and logI 14 is I14e, and grading a
+             * band against the wrong one of those is worth 4x (finding 55), so
+             * the number belongs in the run's own record and not only in the
+             * source defaults. */
+            runlog_note("geometry", "logI=%d J=%u (I%de, area %.4g) region=2^%d"
+                        " maxbits=%d blocks=%d threads=%d fill=%dx%d",
+                        cfg.logI, cfg.J, cfg.logI,
+                        (double)(1u << cfg.logI) * cfg.J, cfg.log_region,
+                        maxbits, cfg.blocks, cfg.threads,
+                        cfg.fill_blocks ? cfg.fill_blocks : FILL_BLOCKS_DEFAULT,
+                        cfg.fill_threads ? cfg.fill_threads
+                                         : FILL_THREADS_DEFAULT);
+            /* The factor-base convention, spelled out rather than implied. The
+             * pipeline runs the FULL base while GGNFS truncates at q, and the
+             * ratio between the two is 2.54x at q=50M and 1.03x at 130M on the
+             * c183 -- finding 55, and the reason a band's ms/q cannot be read
+             * without this line. */
+            runlog_note("fb", "side1 %u entries p in [%u, %u)%s; side0 %u"
+                        " entries p in [%u, %u)", fb1.n, bkthresh, fbbound,
+                        fbbound >= alim ? " = full base to alim"
+                                        : " (truncated below alim)",
+                        fb0.n, bkthresh, rlim);
+            runlog_note("gate", "sq-side %d  scale %.4f/%.4f  allowance"
+                        " %.2f/%.2f  lpb %u/%u  mfb %u/%u", cfg.sq_side,
+                        cfg.scale, cfg.scale0, cfg.allowance, cfg.allowance0,
+                        cfg.lpb, cfg.lpb0, cfg.mfb, cfg.mfb0);
+            if (cfg.resume)
+                runlog_note("resume", "at q=%llu rho=%llu after %llu q,"
+                            " %llu relations",
+                            (unsigned long long)cfg.resume_q,
+                            (unsigned long long)cfg.resume_rho,
+                            cfg.resume_nq, cfg.resume_nrel);
+            {   /* The band as resolved, not the name of the mechanism that
+                 * supplied it: "qrange" alone is the one header field that
+                 * would tell a reader nothing about which special-q the run
+                 * covered. On a resume cfg.qmin is already the checkpoint's q,
+                 * which is the number that matters -- the argv note carries
+                 * what was typed. */
+                char band[128];
+                if (cfg.qlist)
+                    snprintf(band, sizeof band, "qlist %s", cfg.qlist);
+                else if (cfg.qmax)
+                    snprintf(band, sizeof band, "qrange %llu:%llu",
+                             (unsigned long long)cfg.qmin,
+                             (unsigned long long)cfg.qmax);
+                else
+                    snprintf(band, sizeof band, "qrange %llu: (open)",
+                             (unsigned long long)cfg.qmin);
+                runlog_note("band", "%s  target-rels %llu  nq %u  relations %s",
+                            band, (unsigned long long)cfg.target_rels,
+                            cfg.nq_max,
+                            cfg.relations ? cfg.relations : "(none)");
+            }
+            /* Timestamped, unlike the notes above: it is the record every
+             * later one is an elapsed time from, and it is what distinguishes
+             * the sessions of a resumed job in an appended file. */
+            runlog_record("band start%s", cfg.resume ? " (resumed)" : "");
+        }
+
         {
             /* ql is already built and validated: the single-q path now runs
              * before scale derivation rather than here, so that q=0, a
@@ -1988,6 +2148,7 @@ static int bench_main_impl(int argc, char **argv)
             free(ql);
             sqgen_free(qgen);
         }
+        runlog_close();
         fb_free(&fb1); fb_free(&fbs1); fb_free(&fb0); fb_free(&fbs0);
         return prc;
     }

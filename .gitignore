@@ -26,6 +26,7 @@ bench/mkcofbatch
 bench/.arch.stamp
 bench/.boinc.stamp
 bench/.link.stamp
+bench/.git.stamp
 *.d
 
 # All per-job working state lives under work/: poly, factor base, relations,

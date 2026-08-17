@@ -4,7 +4,7 @@
 the order they were discovered, including the ones later refuted, because the
 refutations are the most useful part. That makes them bad at answering "what
 does this thing do today". This file answers only that, and holds nothing that
-is not current. **Last updated 2026-08-14.**
+is not current. **Last updated 2026-08-16.**
 
 ## Architecture
 
@@ -35,6 +35,47 @@ and a job fingerprint. Rerunning the same command resumes there; `--restart`
 discards; SIGINT/SIGTERM and `--stop-file` stop cleanly at the next special-q;
 `NAME.lock` refuses a second writer. See item 12a, including what has not yet
 been exercised on a GPU.
+
+`--log PATH` appends a run log: a header block naming the commit, argv, job
+fingerprint, card, geometry and factor-base convention, then a timestamped
+record every `--log-every` seconds (300 by default) carrying progress
+alongside `GPU-accounted / wall`, GPU utilisation, board watts and host load.
+Item 12b.
+
+### Distributed packaging (BOINC), added 2026-08-15/16
+
+Optional and compiled only under `HAVE_BOINC=1`; the ordinary build has no
+BOINC dependency and its wrappers are no-ops. The app initialises and finishes
+through the BOINC API, resolves every named input and output through
+`boinc_resolve_filename_s()`, requests normal host-thread priority for the
+feeder thread, and reports a nondecreasing fraction done at special-q
+boundaries. `README.md` is the reference for building and for the workunit
+command line.
+
+**Which GPU a task runs on** is read from `init_data.xml`
+(`<gpu_device_num>`, via `boinc_get_init_data()`) and **outranks `--device`**,
+which is the opposite of this codebase's usual precedence and deliberate: a
+`--device` in an app version or workunit template is shared by every task on
+every host, so honouring it reinstates the all-tasks-on-card-0 bug the
+assignment exists to prevent. `--device` selects only when there is no
+assignment. Each task's stderr records which of the two happened, the device
+count this process can see, and the card actually used. Startup also refuses an
+ordinal past `cudaGetDeviceCount()` with both numbers named, rather than
+letting it surface as a bare "invalid device ordinal".
+
+**None of this has run against a real multi-GPU client** — see item 13. There
+are no checkpoint files in the BOINC sense either: a suspended process resumes,
+but a process that exits and restarts begins the current band again (12a's
+sidecar is the repo's own mechanism, not BOINC's).
+
+**The application is Linux-only, and that is a bigger gap than it looks for a
+volunteer project.** `boinc_support.cpp` guards its POSIX paths with
+`#ifndef _WIN32`, which reads as a Windows build being within reach; it is not.
+`ckpt.h` uses `fsync`, `ftruncate`, `kill` and `<unistd.h>` unguarded, and
+`runlog.c` adds `<dlfcn.h>` and `getloadavg` on the same terms. Windows is most
+of the volunteer host population, so this is worth costing before a wider
+deployment rather than discovering per-file; the guards in `boinc_support.cpp`
+should not be read as evidence that the rest is close.
 
 ## Current size limits, and what lifting them entails
 
@@ -363,18 +404,34 @@ absent from every document in the repo.
    | `I15e`, measured | 104.5 | 18.9–24.3 J/q | **4.3–5.5×** |
    | `I15e`, finding 43 | 64.9 | 18.9–24.3 J/q | 2.7–3.4× |
 
-   **The headline result swings 3× on a sieve-geometry choice, and nothing in
-   this file currently pins it down.** The GPU runs `--logI 14` with `--J 8192`
-   — the `I14e` geometry, `2^14 × 2^13`. Finding 43's CPU baseline used
-   `I15e`, `2^15 × 2^14`, four times the sieve area. If the GPU is graded
-   against the `I15e` row while sieving an `I14e` rectangle, the verdict
-   flatters the GPU by up to 4× and the project's chartered number is wrong in
-   the direction nobody would catch by re-reading it. Finding 43 says its GPU
-   timing was "on the equal-work profile", so this may already be handled —
-   but the words are not enough, and **confirming the geometry match is now
-   the first thing item 0 has to do**, ahead of the bands, the meter, or
-   anything else here. The 4× is larger than every other effect in this file
-   combined.
+   **Geometry: checked 2026-08-16, and it matches — finding 55.** The concern
+   was that the GPU sieved an `I14e` rectangle (`2^14 × 2^13`) while being
+   graded against finding 43's `I15e` CPU baseline (`2^15 × 2^14`, four times
+   the area), flattering the verdict by up to 4×. It did not: the standalone
+   benchmark defaults to `logI 15, J 16384` (`bench_main.cu:426`, unchanged
+   since the initial checkin), the finding 43/44 commands pass neither flag,
+   and `5.369e8` positions is what this file's own header records. **So
+   64.371 ms/q is an `I15e` number, the `I15e` row is its comparator, and the
+   margin for it is 4.3–5.5×.**
+
+   What is still unpinned is the *pipeline*: every pipeline run on record uses
+   `--logI 14 --J 8192`, so item 0's 70–90 ms/q projection takes standalone
+   `I15e` milliseconds and calls them a pipeline number. **A verdict band
+   states its geometry in its log header and is graded against the matching CPU
+   row** — `I14e` → 37.4 J/q, `I15e` → 104.5 J/q. Mixing them is still worth
+   4×; it is now a run-discipline requirement rather than an open question.
+
+   **The mismatch that survives is the factor-base convention, and it is
+   q-dependent** (finding 55). Standalone side 1 truncates the base at q, as
+   GGNFS does (`bench_main.cu:773-774`); the pipeline does not (`:1360`,
+   `fbbound = alim`), because per-q truncation is item 3 and unbuilt. Counted
+   on `oracle/c183.fb1`, the pipeline's full base carries **2.54× the bucketed
+   entries GGNFS sieves at q ≈ 50M**, 1.11× at 120M, 1.03× at 130M, and 1.00×
+   at 190M (above `alim`, where truncation is a no-op). So the 70–90 ms/q
+   projection — anchored at q=120M, truncated, standalone — is roughly right at
+   the 130M probe and **optimistic at the 50M probe**, the three probes will
+   show a q-dependence in ms/q that is not yield drift, and the item-3 A/B has
+   no signal at all at 190M.
 
    Note also that `I14e` and `I15e` are not interchangeable for the CPU: the
    larger area wins 2.2× the relations per special-q (68.9 vs 31.6) while
@@ -385,9 +442,9 @@ absent from every document in the repo.
 
    The c183's own standalone
    sieve measures 38.2 + 26.2 ms for the two sides (RESULTS.md "Reproduce",
-   side 1 truncated at q), so with TD and the heavier mfba-92 3LP cofactor
-   load the pipeline projects to roughly **70–90 ms/q — about 2× inside the
-   harder bar**. That is a projection, not a measurement, and nothing measured
+   `I15e` geometry, side 1 truncated at q, at q=120M), so with TD and the
+   heavier mfba-92 3LP cofactor load the pipeline projects to roughly
+   **70–90 ms/q — about 2× inside the harder bar**. That is a projection, not a measurement, and nothing measured
    contradicts it — which is exactly why the run should happen now: it is a
    wall-plug meter and a weekend, not a project. Needs: the meter (item 6);
    bands at q ≈ 50M / 130M / 190M for the yield drift; relations
@@ -885,25 +942,82 @@ absent from every document in the repo.
       rho)` also must not be charged against the generator's own limit, or the
       band stops early and reports a range exhausted that is nowhere near it.
 
-    **12b. Logging.** Console today, nothing on disk. A tee is the obvious
-    version and is worth less than it looks: finding 53 is that host contention
-    costs up to 29% of wall while every GPU counter reads normal, and that any
-    cross-box wall or ETA comparison is invalid without knowing host load on
-    both. So the heartbeat should carry `GPU-accounted / wall`, GPU
-    utilisation, board watts and host load average — which makes an unattended
-    run *auditable after the fact* rather than something that had to be
-    watched, and that is a prerequisite for item 0 rather than a convenience.
-    Log a header once (git commit, full argv, fingerprint, card and driver,
-    geometry, FB convention, resume point) — RESULTS.md has already had to grow
-    a warning that findings 48/54 are c147 while 43/44 are c183; a logged
-    header ends that class of confusion. The existing reporter is a 30 s `\r`
-    line (`pipeline.cuh:1401`): split on `isatty(1)`, console keeps `\r`, the
-    file gets timestamped newline records every 5 min (~864 lines over three
-    days, so **no rotation**). Route the mid-band stderr warnings — bucket
-    overflow, norm overflow, candidate cap, target-not-reached — into it too.
+    **12b. Logging — BUILT 2026-08-16**, in `bench/runlog.{c,h}` plus the
+    reporter and warning sites in `pipeline.cuh` and the header block in
+    `bench_main.cu`. `--log PATH` appends a run log; `--log-every S` sets the
+    record period (default 300 s, ~864 lines over three days, so **no
+    rotation**). Both are `--pipeline`-only and resolved through
+    `boinc_resolve_filename_s()` like every other named output.
+
+    A tee was the obvious version and worth less than it looks: finding 53 is
+    that host contention costs up to 29% of wall while every GPU counter reads
+    normal, and that any cross-box wall or ETA comparison is invalid without
+    knowing host load on both. So each record carries `GPU-accounted / wall`
+    (the running form of the band summary's line, built from the same terms),
+    GPU utilisation, board watts and the host load average alongside q,
+    relations, candidates, ms/q, percent and ETA. The header block carries the
+    commit (`git describe --dirty`, stamped into `runlog.o` alone so a commit
+    costs no CUDA recompile), the full argv, the job fingerprint, the card with
+    its PCI ID and driver, the **geometry labelled `I14e`/`I15e`**, the
+    **factor-base convention** with entry counts and whether the base is
+    truncated, the derived gate, and the resume point. Finding 55 is what that
+    header exists to prevent.
+
+    Verified on a GPU 2026-08-16, c147: header, heartbeat, band-end record,
+    the `isatty(1)` split (a redirected console gets whole lines every five
+    minutes — its own constant, *not* `--log-every` — instead of a `\r` line
+    and a stray `\033[K`), and NVML binding. **Not yet exercised: the `resume`
+    note** (it needs a checkpointed band, so it comes with 12a's verification)
+    and any BOINC-resolved log path.
+
+    Three implementation notes worth keeping:
+
+    - **`nq` and `rel` mean the same thing in every record**, including the
+      band-end one: totals across sessions, with `rel` counted the way the
+      heartbeat counts it (what reached the file, not the subset trial
+      division finished — 374 against 111 on one smoke run). Session-only
+      aggregates carry their own `_session` keys. A log where one key means two
+      things is worse than one field short, because nothing in the file says
+      which reading applies to which line.
+
+    - **NVML is bound by PCI bus ID, never by CUDA ordinal.** NVML enumerates
+      by PCI order while CUDA can be reordered by `CUDA_DEVICE_ORDER` and
+      renumbered by `CUDA_VISIBLE_DEVICES`, so an ordinal reads another card's
+      watts whenever those disagree — silently, and precisely on the multi-GPU
+      hosts of item 13. It is `dlopen`ed, so there is no build dependency and a
+      host without the driver library logs `n/a`.
+    - **Every record carries monotonic elapsed seconds as well as a
+      timestamp.** Observed on this box during the verification run: WSL2
+      resyncs its clock to the Windows host, and one band's records came out
+      with a two-second backwards step mid-run, which is enough to make a
+      record appear to precede the one above it. Compute rates from the
+      elapsed column; the timestamp is for lining a run up against a meter or
+      another machine.
 
     **12c. The queue itself.** A job list consumed without intervention, so
     finishing one job starts the next rather than leaving the card idle
     overnight. Depends on 12a; unscoped beyond that. **Item 9 stops being
     cosmetic here**: its ~15–20 s of redundant startup is noise in a multi-day
     run and real overhead in anything that restarts the process per job.
+13. **Validate the BOINC GPU assignment** *(added 2026-08-16)*. The
+    multi-GPU fix is written and compiles; nothing has exercised it against a
+    client. It was written from a field report (every task on a multi-GPU host
+    landing on device 0), so the failure it fixes is the one already observed,
+    and a silent regression looks exactly like success on a single-card box.
+
+    Testable here, no second card and no client: `boinc_get_init_data()` reads
+    the `init_data.xml` in the working directory, so a `HAVE_BOINC=1` build run
+    in a directory holding a hand-written one exercises the whole read path.
+    Four cases worth pinning, each identified by its stderr line — (a) an
+    NVIDIA assignment is read and used; (b) an assignment overrides a
+    conflicting `--device`, with the notice printed; (c) a non-NVIDIA
+    `gpu_type` is refused rather than acted on; (d) no assignment falls through
+    to `--device` and then to CUDA's default. An assignment of 1 on a one-card
+    box should also produce the bounded "sees only 1 device" refusal rather
+    than an invalid-ordinal error.
+
+    Not testable here, and both are project-side rather than application-side:
+    that the client emits `<gpu_device_num>` at all for this app version's plan
+    class, and that concurrent tasks land on distinct cards. Those need a
+    multi-GPU host running the real client, i.e. the reporter who saw the
+    original failure.

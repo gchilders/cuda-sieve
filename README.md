@@ -61,9 +61,13 @@ pipeline:
 ```
 
 The job's `rlim`, `alim`, large-prime bounds, cofactor bounds, and polynomial
-are read from the `.job` file. See [`RUNBOOK.md`](RUNBOOK.md) before starting
-a long run; it documents supported inputs, output handling, parameter
-precedence, verification, and msieve handoff.
+are read from the `.job` file. Adding `--log msieve.runlog` appends a run
+record: a header naming the commit, argv, job fingerprint, card, geometry and
+factor-base convention, then a timestamped line every five minutes carrying
+progress alongside GPU-accounted/wall, GPU utilisation, board watts and host
+load. See [`RUNBOOK.md`](RUNBOOK.md) before starting a long run; it documents
+supported inputs, output handling, parameter precedence, stopping and resuming,
+logging, verification, and msieve handoff.
 
 ## Optional BOINC application build
 

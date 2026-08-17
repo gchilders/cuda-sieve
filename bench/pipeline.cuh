@@ -19,6 +19,7 @@
 #define CUDA_SIEVE_PIPELINE_CUH
 
 #include "ckpt.h"
+#include "runlog.h"
 #include <signal.h>
 
 /* ---- clean stop -------------------------------------------------------- *
@@ -424,8 +425,8 @@ static int pipe_side_perq(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
         uint32_t hov = 0;
         PERQ_CK(cudaMemcpy(&hov, d_overflow, 4, cudaMemcpyDeviceToHost));
         if (hov) {
-            fprintf(stderr, "  side %d: bucket array OVERFLOWED by %u records\n",
-                    side, hov);
+            runlog_warn("  side %d: bucket array OVERFLOWED by %u records",
+                        side, hov);
             goto done;
         }
     }
@@ -882,12 +883,12 @@ static int pipe_td_perq(pipe_td_t *C, const fb_t *fb1, const fb_t *fbs1,
     CK(cudaMemcpy(&hflags, C->d_flags, 4, cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(&hovf, C->d_ovf, 8, cudaMemcpyDeviceToHost));
     if (hflags & TDF_NORM_OVERFLOW) {
-        fprintf(stderr, "  ** NORM OVERFLOW: a norm exceeded %d bits\n", BN_LIMBS * 32);
+        runlog_warn("  ** NORM OVERFLOW: a norm exceeded %d bits", BN_LIMBS * 32);
         return -1;
     }
     if (hflags & TDF_LIST_TRUNCATED) {
-        fprintf(stderr, "  ** %llu large-prime records past the %u/survivor cap\n",
-                hovf, PIPE_K);
+        runlog_warn("  ** %llu large-prime records past the %u/survivor cap",
+                    hovf, PIPE_K);
         return -1;
     }
     CK(cudaMemcpy(&nacc, C->d_nacc, 4, cudaMemcpyDeviceToHost));
@@ -1291,6 +1292,20 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     {
     const double t_band = host_ms();
     double t_report = t_band, t_ckpt = t_band;
+    /* The \r line is for a human watching a terminal. Redirected to a file it
+     * is a single unreadable line that grows a carriage return every 30 s, so
+     * a redirect gets whole lines every five minutes instead -- ~864 of them
+     * over a three-day band rather than 8,640.
+     *
+     * FIVE MINUTES IS THIS STREAM'S OWN CONSTANT, not --log-every. Reading the
+     * log's period here coupled two unrelated outputs: `--log-every 86400`
+     * with no --log at all would have left a redirected run printing one
+     * progress line per day, and a plain redirect with no logging flags would
+     * have silently moved from 30 s to 300 s because log_every_s defaults to
+     * 300 whether or not a log exists. The run log (--log) is a separate,
+     * richer stream on its own clock. */
+    const int reporting_to_tty = isatty(1);
+    const double report_ms = reporting_to_tty ? 30000.0 : 300000.0;
 #ifdef HAVE_BOINC
     double t_boinc_report = t_band - 1000.0; /* report after the first q */
 #endif
@@ -1488,9 +1503,9 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                                         &ckpt_written, &ckpt_warned);
             }
             if (nacc > Q.cap) {
-                fprintf(stderr, "  q=%llu: %u candidates exceeds the %u-slot"
-                        " cofactor queue\n", (unsigned long long)cur->q,
-                        nacc, Q.cap);
+                runlog_warn("  q=%llu: %u candidates exceeds the %u-slot"
+                            " cofactor queue", (unsigned long long)cur->q,
+                            nacc, Q.cap);
                 rc = -1; break;
             }
             k_cof_enqueue<<<blocks, cfg->threads>>>(
@@ -1662,11 +1677,22 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
          * Progress is reported against whichever goal is actually in force: a
          * relation target if one was given, otherwise an explicit --nq count,
          * generated numeric q interval, or list length. Rate-limited to one
-         * update every 30 s: it is a single \r line, but a band runs for hours
-         * and nobody needs it faster than that.
+         * update per report_ms -- 30 s on a terminal, where it is a single \r
+         * line and a band runs for hours, and the log's own period when stdout
+         * is redirected and each update costs a line.
          */
-        if (!cfg->verbose_q &&
-            (host_ms() - t_report > 30000.0 || (!qgen && qi + 1 == nq))) {
+        /* Two consumers on two clocks: the console line, and the run log,
+         * which is due on its own period and carries the four numbers that say
+         * whether the progress ones can be compared to anything (runlog.h,
+         * finding 53). Both predicates are evaluated every q -- deliberately,
+         * rather than short-circuiting one against the other, which would skip
+         * the log's clock on exactly the q where both came due and post the
+         * record a special-q late. The shared arithmetic below is done once
+         * for whichever is asking. */
+        const int console_due = !cfg->verbose_q &&
+            (host_ms() - t_report > report_ms || (!qgen && qi + 1 == nq));
+        const int log_due = runlog_due();
+        if (console_due || log_due) {
             /* Two different numbers, and mixing them is how a resumed run
              * reports a nonsense rate: the goal is measured against everything
              * on disk, the RATE only against what this session produced in the
@@ -1677,7 +1703,7 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
             const double el = (host_ms() - t_band) / 1000.0;
             const double rps = el > 0 ? mine / el : 0.0;
             double frac, eta;
-            t_report = host_ms();
+            if (console_due) t_report = host_ms();
             frac = pipe_progress_fraction(cfg, qgen != NULL, nq, nqdone,
                                              cur->q, rels);
             if (cfg->target_rels)
@@ -1685,7 +1711,8 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
             else
                 eta = frac > 0 ? el * (1.0 / frac - 1.0) : 0.0;
             if (eta < 0.0) eta = 0.0;
-            {   /* Q.n counts queued CANDIDATE records, not relations -- only
+            if (console_due) {
+                /* Q.n counts queued CANDIDATE records, not relations -- only
                  * ~2/3 of them survive splitting on this job, and the band
                  * summary keeps nseen and nrel apart for that reason. Labelled
                  * "cand" so the line cannot be read as pending relations.
@@ -1698,6 +1725,11 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                  * end-of-line rather than trusting a trailing pad to cover the
                  * widest case. */
                 char queued[32] = "";
+                /* The erase-to-end-of-line and the carriage return are a
+                 * terminal's, not a file's: redirected, they make one line
+                 * carrying an ANSI escape per update. A redirect gets plain
+                 * newline-terminated lines instead. */
+                const char *end = reporting_to_tty ? "\033[K\r" : "\n";
                 if (cfg->cofactor && Q.n)
                     snprintf(queued, sizeof queued, " +%u cand", Q.n);
                 /* rps == 0 means "no relation has flushed yet", not "done".
@@ -1713,20 +1745,65 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                     const int eta_minutes =
                         (int)fmod(floor(eta / 60.0), 60.0);
                     printf("    q=%llu  %u q  %llu rel%s  %.0f rel/s  %.1f%%"
-                           "  ETA %.0fh %02dm\033[K\r",
+                           "  ETA %.0fh %02dm%s",
                            (unsigned long long)cur->q, qi + 1, rels, queued,
-                           rps, 100.0 * frac, eta_hours, eta_minutes);
+                           rps, 100.0 * frac, eta_hours, eta_minutes, end);
                 } else if (rps > 0.0) {
                     printf("    q=%llu  %u q  %llu rel%s  %.0f rel/s  %.1f%%"
-                           "  ETA inf\033[K\r",
+                           "  ETA inf%s",
                            (unsigned long long)cur->q, qi + 1, rels, queued,
-                           rps, 100.0 * frac);
+                           rps, 100.0 * frac, end);
                 } else {
                     printf("    q=%llu  %u q  %llu rel%s  -- rel/s  %.1f%%"
-                           "  ETA --h --m\033[K\r",
+                           "  ETA --h --m%s",
                            (unsigned long long)cur->q, qi + 1, rels, queued,
-                           100.0 * frac);
+                           100.0 * frac, end);
                 }
+            }
+            if (log_due) {
+                /* The same progress numbers, plus what makes them auditable.
+                 *
+                 * GPU-accounted/wall is the running form of the band summary's
+                 * line, and identical to it in construction: the cofactor
+                 * queue is out of BOTH terms because its flush is host-timed
+                 * and mixes device and host work, and leaving it in the
+                 * denominator alone would make the ratio move with survivor
+                 * density -- a dense band would read as a contended host on an
+                 * idle box. Compare it against your own idle baseline on the
+                 * same card, job and band length; an absolute reading is not
+                 * meaningful (finding 53).
+                 *
+                 * Utilisation, board watts and load average are sampled here
+                 * rather than averaged: this is a spot check that says whether
+                 * the box was busy, not a power measurement. The metric of
+                 * record is whole-box watts from a meter (STATUS.md item 6),
+                 * and a board sensor cannot be promoted to it. */
+                const double devsum = tm.rank + tm.emit + tm.summary
+                    + tm.resieve + tm.td + tm.classify + tm.compact + tm.record;
+                const double denom = acc_wall - tm.cofac;
+                const double accwall = denom > 0.0
+                    ? (acc_tr + acc_fi + acc_ap + acc_isect + devsum) / denom
+                    : 0.0;
+                char gpu[48] = "gpu=n/a", pwr[32] = "board=n/a";
+                char eta_s[32] = "eta=--";
+                double load[3] = {0.0, 0.0, 0.0};
+                unsigned int util = 0;
+                double watts = 0.0;
+                if (runlog_gpu_util(&util) == 0)
+                    snprintf(gpu, sizeof gpu, "gpu=%u%%", util);
+                if (runlog_gpu_watts(&watts) == 0)
+                    snprintf(pwr, sizeof pwr, "board=%.1fW", watts);
+                if (getloadavg(load, 3) < 1) load[0] = -1.0;
+                if (rps > 0.0 && isfinite(eta))
+                    snprintf(eta_s, sizeof eta_s, "eta=%.2fh", eta / 3600.0);
+                runlog_record(
+                    "q=%llu nq=%llu rel=%llu cand=%u rel/s=%.1f pct=%.2f %s"
+                    " ms/q=%.2f acc/wall=%.3f %s %s load=%.2f",
+                    (unsigned long long)cur->q,
+                    base_nq + (unsigned long long)(qi + 1), rels,
+                    cfg->cofactor ? Q.n : 0u, rps, 100.0 * frac, eta_s,
+                    nqdone ? acc_wall / nqdone : 0.0, accwall, gpu, pwr,
+                    load[0]);
             }
         }
         fflush(stdout);
@@ -1743,17 +1820,24 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         char queued[32] = "";
         if (cfg->cofactor && Q.n)
             snprintf(queued, sizeof queued, " +%u cand", Q.n);
+        /* The erase clears the tail of the \r line this one replaces, and the
+         * leading newline breaks away from it. Both are a terminal's, not a
+         * file's: redirected, the progress line above already ended in a
+         * newline, so the lead would only add a blank line. */
+        const char *erase = reporting_to_tty ? "\033[K" : "";
+        const char *lead = reporting_to_tty ? "\n" : "";
         if (count_limit_reached)
             /* base_nq + nq_max reconstructs what the operator actually typed:
              * a resumed run holds only the REMAINING budget in cfg->nq_max, so
              * echoing it raw prints a number nobody passed, next to a q count
              * that then disagrees with it. */
-            printf("\n    q=%llu  %llu q  %llu rel%s  [--nq %llu reached]\033[K\n",
-                   (unsigned long long)last_q.q, base_nq + nqdone, rels, queued,
-                   base_nq + cfg->nq_max);
+            printf("%s    q=%llu  %llu q  %llu rel%s  [--nq %llu reached]%s\n",
+                   lead, (unsigned long long)last_q.q, base_nq + nqdone, rels,
+                   queued, base_nq + cfg->nq_max, erase);
         else
-            printf("\n    q=%llu  %llu q  %llu rel%s  [q range exhausted]\033[K\n",
-                   (unsigned long long)last_q.q, base_nq + nqdone, rels, queued);
+            printf("%s    q=%llu  %llu q  %llu rel%s  [q range exhausted]%s\n",
+                   lead, (unsigned long long)last_q.q, base_nq + nqdone, rels,
+                   queued, erase);
     }
 
 #ifdef HAVE_BOINC
@@ -1783,8 +1867,9 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         else {
             acc_rel += cs[0]; acc_cand += cs[1];
             if (cs[2]) {
-                fprintf(stderr, "  %u candidates in this band have more than the"
-                        " %d recorded factors; raise TD_FMAX\n", cs[2], TD_FMAX);
+                runlog_warn("  %u candidates in this band have more than the"
+                            " %d recorded factors; raise TD_FMAX", cs[2],
+                            TD_FMAX);
                 rc = -1;
             }
         }
@@ -1810,15 +1895,15 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                    (unsigned long long)cfg->target_rels, base_nq + nqdone, have);
             target_reached = 1;
         } else if (count_limit_reached) {
-            fprintf(stderr,
+            runlog_warn(
                     "\n  note: --nq %llu reached after %llu q with %llu relations;"
-                    " --target-rels %llu was not reached\n",
+                    " --target-rels %llu was not reached",
                     base_nq + cfg->nq_max, base_nq + nqdone, have,
                     (unsigned long long)cfg->target_rels);
         } else if (source_exhausted) {
-            fprintf(stderr,
+            runlog_warn(
                     "\n  WARNING: special-q source exhausted after %llu q with"
-                    " %llu relations; --target-rels %llu was NOT reached\n",
+                    " %llu relations; --target-rels %llu was NOT reached",
                     base_nq + nqdone, have,
                     (unsigned long long)cfg->target_rels);
         }
@@ -1861,12 +1946,18 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         const char *fate = ckpt_written
             ? "the .part is kept; rerun the same command to resume"
             : "nothing was checkpointed, so no output is kept";
+        /* Into the log as well as stderr. A band that dies on its FIRST q
+         * never reaches the summary below -- that whole block is guarded on
+         * nqdone -- so without this the log ends with a header, possibly a few
+         * heartbeats, and no indication that anything went wrong. Read a week
+         * later, or under BOINC where stderr is a separate upload, that is
+         * indistinguishable from a run still in progress. */
         if (qgen)
-            fprintf(stderr, "  band FAILED after %u generated q; %s\n",
-                    nqdone, fate);
+            runlog_warn("  band FAILED after %u generated q; %s",
+                        nqdone, fate);
         else
-            fprintf(stderr, "  band FAILED after %u of %u q; %s\n",
-                    nqdone, nq, fate);
+            runlog_warn("  band FAILED after %u of %u q; %s",
+                        nqdone, nq, fate);
     }
     if (stopped && ckpt_written)
         printf("\n  stopped after %u q this session (%llu total, %llu"
@@ -1972,6 +2063,39 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         printf("  %-34s %8.3f\n", "COMPLETE RELATIONS/q", (double)acc_rel / N);
         printf("  %-34s %8llu\n", "total relations", (unsigned long long)acc_rel);
         printf("  %-34s %8llu\n", "total candidates", (unsigned long long)acc_cand);
+        /* The band summary in one record, so the log ends with the numbers a
+         * reader would otherwise have to reconstruct from the last heartbeat
+         * and the console output the session no longer has. Timing terms are
+         * the summary's own, so the two cannot disagree.
+         *
+         * `nq` and `rel` MEAN HERE WHAT THEY MEAN IN A HEARTBEAT: totals
+         * across sessions, and `rel` counted the way the heartbeat counts it
+         * -- Q.nrel under --cofactor, which is what reached the file, not
+         * acc_rel, which is only the subset trial division completed without
+         * splitting (111 against 374 on a 3-q c147 smoke run). The
+         * session-only aggregates get their own names rather than reusing
+         * those two keys for a second quantity: a log where one key means two
+         * things is worse than one field short, because nothing in the file
+         * says which reading applies to which line. */
+        runlog_record("band end  nq=%llu  rel=%llu  nq_session=%u"
+                      "  rel_session=%llu  cand_session=%llu  wall=%.2fms/q"
+                      "  sieve=%.2fms/q  td=%.2fms/q  acc/wall=%.3f"
+                      "  rel/q=%.3f%s",
+                      base_nq + nqdone,
+                      base_rel + (cfg->cofactor ? Q.nrel
+                                                : (unsigned long long)acc_rel),
+                      nqdone,
+                      cfg->cofactor ? Q.nrel : (unsigned long long)acc_rel,
+                      (unsigned long long)acc_cand,
+                      acc_wall / N, acc_sieve / N, acc_td / N,
+                      (acc_sieve + acc_isect + dev * N) / (acc_wall - tm.cofac),
+                      /* rel_session per q, not the summary's COMPLETE
+                       * RELATIONS/q, which counts only what trial division
+                       * finished -- next to rel_session on the same line the
+                       * two would read as a contradiction. */
+                      (double)(cfg->cofactor ? Q.nrel
+                                             : (unsigned long long)acc_rel) / N,
+                      stopped ? "  [stopped cleanly]" : (rc ? "  [FAILED]" : ""));
         if (cfg->cofactor) {
             printf("\n  --- cofactorisation, cross-q queue ---\n");
             printf("  %-34s %8.2f ms\n", "rational queue", Q.ms_rat / N);

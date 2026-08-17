@@ -154,7 +154,9 @@ CPP_SRCS = boinc_support.cpp
 CU_OBJS  = $(CU_SRCS:.cu=.o)
 C_OBJS   = $(C_SRCS:.c=.o)
 CPP_OBJS = $(CPP_SRCS:.cpp=.o)
-OBJS     = $(CU_OBJS) $(C_OBJS) $(CPP_OBJS) fbgen_lib.o
+# runlog.o is deliberately NOT in C_SRCS: fbtest links C_OBJS, and it is a
+# CPU-only gate that must keep building on a machine with no driver library.
+OBJS     = $(CU_OBJS) $(C_OBJS) $(CPP_OBJS) runlog.o fbgen_lib.o
 
 # Switching HAVE_BOINC on an existing tree must rebuild boinc_support.o; make
 # otherwise sees the same source timestamp and quietly reuses the no-op object.
@@ -163,6 +165,33 @@ OBJS     = $(CU_OBJS) $(C_OBJS) $(CPP_OBJS) fbgen_lib.o
 BOINC_STAMP := .boinc.stamp
 BOINC_SIGNATURE := HAVE_BOINC=$(HAVE_BOINC)|BOINC_CPPFLAGS=$(BOINC_CPPFLAGS)|BOINC_LIBS=$(BOINC_LIBS)|BOINC_HOST_STATIC=$(BOINC_HOST_STATIC)|HOST_TUNE=$(HOST_TUNE)
 $(shell [ "$$(cat $(BOINC_STAMP) 2>/dev/null)" = '$(BOINC_SIGNATURE)' ] || printf '%s' '$(BOINC_SIGNATURE)' > $(BOINC_STAMP))
+
+# The commit the binary was built from, stamped into the run log's header so a
+# log can be traced back to a source tree (STATUS.md item 12b). --dirty matters
+# more than the hash: an uncommitted tree is exactly the case where the hash
+# alone would be a lie. Stamped like the two above so that moving HEAD rebuilds
+# it -- and ONLY runlog.o depends on it, which is why the string lives in that
+# 200-line object and not in bench_main.cu: a commit must not cost a recompile
+# of a CUDA translation unit. Unlike the nvidia-smi probe further up, `git
+# describe` is local, cheap, and safe to run while a job is sieving.
+#
+# --dirty alone is not enough: git considers a tree with only UNTRACKED files
+# clean, so a build from commit X plus a new uncommitted source stamps a bare
+# X and the log's central claim becomes false in exactly the case the flag was
+# added for. The porcelain check covers that; it lists untracked files but not
+# ignored ones, so build products do not trip it.
+#
+# Kept as three plain assignments: a `case` inside $(shell ...) ends the make
+# function at its first `*)`, and `wc -l` rather than the file list keeps a
+# filename containing `$` or a paren out of a macro definition.
+GIT_STAMP := .git.stamp
+GIT_RAW  := $(shell git -C . describe --always --abbrev=8 2>/dev/null)
+GIT_DIRT := $(shell git -C . status --porcelain 2>/dev/null | wc -l)
+GIT_DESC := $(if $(GIT_RAW),$(GIT_RAW)$(if $(filter-out 0,$(GIT_DIRT)),-dirty),unknown)
+$(shell [ "$$(cat $(GIT_STAMP) 2>/dev/null)" = '$(GIT_DESC)' ] || printf '%s' '$(GIT_DESC)' > $(GIT_STAMP))
+
+runlog.o: CFLAGS += -DBENCH_GIT_DESC='"$(GIT_DESC)"'
+runlog.o: $(GIT_STAMP)
 
 # CUDART_LINK changes the link line and nothing else, so it gets its own stamp.
 # Folding it into BOINC_SIGNATURE would make every object depend on it, and
@@ -174,9 +203,13 @@ $(shell [ "$$(cat $(LINK_STAMP) 2>/dev/null)" = '$(LINK_SIGNATURE)' ] || printf 
 
 all: bench fbtest fbgen sqgentest dumpcmp mkcofbatch
 
+# -ldl for runlog.o, which dlopen()s libnvidia-ml at run time rather than
+# linking it: the heartbeat's GPU columns must not become a build dependency,
+# and a host with a driver but no toolkit still has the versioned soname. On
+# glibc 2.34 and later dlopen is in libc and this resolves to an empty stub.
 bench: $(OBJS) $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP)
 	$(NVCC) $(NVCC_ARCH) --cudart $(CUDART_LINK) -Xlinker --gc-sections \
-		$(BENCH_LINKFLAGS) -o $@ $(OBJS) $(BENCH_LIBS) -lm
+		$(BENCH_LINKFLAGS) -o $@ $(OBJS) $(BENCH_LIBS) -lm -ldl
 
 # Only the CUDA objects care about the arch; the C objects are host-only.
 $(CU_OBJS): $(ARCH_STAMP)
@@ -223,7 +256,7 @@ mkcofbatch: mkcofbatch.c
 -include $(OBJS:.o=.d)
 
 clean:
-	rm -f bench fbtest fbgen sqgentest dumpcmp mkcofbatch *.o *.d $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP)
+	rm -f bench fbtest fbgen sqgentest dumpcmp mkcofbatch *.o *.d $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP) $(GIT_STAMP)
 
 .PHONY: all clean check cofcheck fbgencheck sqgencheck
 
