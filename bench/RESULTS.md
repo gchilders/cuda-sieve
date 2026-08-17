@@ -2403,6 +2403,297 @@ at q=120,000,011 against a direct count of 6,840,491 at `bkthresh` 2^15 — 3,02
 apart, unexplained, and not worth chasing except as a note that the header
 figure is not reproducible to the digit.
 
+## Finding 56 — the host is not a scheduling problem: renice buys nothing, and the idle box still leaves 11.5% of wall unaccounted
+
+**Date:** 2026-08-17, RTX 5070, c147 band (`--logI 14`, 400 q), item 4's "free
+experiment" as STATUS specifies it.
+
+STATUS's decision rule was: *"If renicing moves that number toward the mid-90s,
+the contention penalty is a scheduling problem and the code below is not
+urgent."* **It does not move.**
+
+| condition | runnable threads | wall ms/q | acc/wall | GPU util |
+|---|---:|---:|---:|---:|
+| **idle** (3 runs, 400 q) | 1 | **23.28** | **0.885** | **89.5%** |
+| idle, 1500 q | 1 | 23.80 | 0.883 | 90% |
+| 12 `gnfs-lasieve4I15e`, equal priority | 13 | 24.72 | 0.854 | 86% |
+| 12 sievers, sieve favoured (them at nice 19) | 13 | 24.50 | 0.857 | 86% |
+| 15 spinners, clean box (`ctl` below) | 16 | 24.76 | 0.835 | 86% |
+| 12 sievers **+** 15 spinners, equal priority | 27 | 26.49 | 0.798 | 77% |
+| 12 sievers + 15 spinners, sieve favoured | 27 | 26.28 | 0.812 | 81% |
+
+**The penalty tracks oversubscription, not busyness.** At one runnable thread
+per logical CPU the cost is **~6%** and the two independent measurements of it
+agree (+6.2% with 12 real sievers, +6.4% with 15 spinners). Past that it
+roughly doubles: the 27-thread rows are 1.7x subscribed and cost ~14%. The
+first version of this finding quoted that 14% as "saturation", which was wrong
+— those runs still had a draining siever queue underneath the spinners. The
+operational lever this leaves is **worker count**, not any scheduler knob:
+keep competing work at or below `nproc - 1`.
+
+Each paired comparison is ~1%, against 2-10% spread *within* an arm. Method
+note: renice is one-way for a non-root user, so the equal-priority arm was
+reproduced by running `bench` itself at nice 19 — both parties at 19 is the
+same CFS weighting as both at 0.
+
+**Why priority cannot work here, which the item was not accounting for.** 15
+spinners plus the feeder thread is exactly 16 runnable threads on 16 logical
+CPUs, so nothing is waiting for a slot: the feeder is *sharing a physical core*
+with a competitor over SMT. Nice values decide who is scheduled, not who you
+share a core with. On 8 physical cores you cannot isolate the sieve by
+subtraction (STATUS already said this) and it turns out you cannot isolate it
+by priority either. The untested lever that follows is **affinity** — pin the
+process and keep competitors off both its hyperthreads — which is still zero
+code and has not been tried.
+
+**The larger number is structural and needs no competitor at all.** On a
+verified-idle box `acc/wall` is 0.885 and GPU utilisation 89.5%: ~11.5% of wall
+with the card idle, which is host prep and launch/sync on the critical path,
+i.e. items 4.1 and 4.2 exactly. Contention adds ~6% at 12 workers and ~14% at
+saturation on top of that.
+
+**But it amortises away with area, which decides how much item 4 is worth.**
+Host work per special-q is roughly fixed while GPU work scales with the
+rectangle:
+
+| job | area | acc/wall | GPU util | host gap |
+|---|---|---:|---:|---:|
+| c147, `logI 14 J 8192` | `2^27` | 0.885 | 89.5% | 11.5% |
+| c183, `logI 15 J 16384` | `2^29` | 0.946 | 97.5% | 5.4% |
+| c183, `logI 15 J 32768` | `2^30` | 0.962 | 98.5% | 3.8% |
+
+At the geometry a C195 would deploy at, item 4's entire prize is under 4% and
+part of that is interleaved launch/sync that overlap cannot recover. It is a
+small-job concern, not a prerequisite for anything.
+
+Even the 1.7x-oversubscribed 14% is well short of finding 53's 28.7%. The
+likely difference is the competitor: pure-ALU spinners contend for scheduling
+slots and core resources, while finding 53's real workloads also contend for
+memory bandwidth and L3. Finding 53 remains canonical for the memory-bound
+case.
+
+**`SCHED_FIFO` and `--blocking-sync` fail too, closing the list.** Run with
+root 2026-08-17, 15 spinners, four arms interleaved within each rep so the
+ordering survives drift (RT throttling confirmed at 950000/1000000 first — the
+feeder spins by default, so an unthrottled FIFO task could hold a CPU):
+
+| arm | what it changes | wall ms/q | vs ctl | acc/wall |
+|---|---|---:|---:|---:|
+| `ctl` | nothing | **24.76** | — | 0.835 |
+| `rt` | `chrt -f 1` | 25.15 | +1.6% | 0.827 |
+| `blk` | `--blocking-sync` | 25.35 | +2.4% | 0.824 |
+| `rtblk` | both | **25.88** | **+4.5%** | 0.809 |
+
+`rt` lost in 3 of 3 reps and `rtblk` in 3 of 3. Two mechanisms, both the same
+shape as the `taskset` failure: `chrt` sets the policy for the **whole
+process**, so the CUDA runtime's helper threads become real-time and can invert
+priority against the normal-priority kernel work they depend on (under WSL2
+that includes the GPU virtualisation path); and `--blocking-sync` hands back
+the core only to pay wake-up latency into a busy runqueue at every sync.
+`rtblk` -- sleep, then wake at real-time priority, the textbook low-latency
+recipe -- is the **worst** arm, not the best.
+
+**Every zero-code lever is now exhausted: nice, taskset, chrt, blocking sync.**
+The ~6% one-to-one contention cost is not a scheduling problem in any sense a
+scheduler knob can reach; it is contention for core resources (SMT siblings,
+cache, memory bandwidth). The remedies that remain are to run fewer competing
+threads, to make the GPU less dependent on the host (items 4.1 and 4.2, worth
+under 4% at C195 geometry per the area table above), or to accept it.
+
+**Affinity fails too, and pinning alone is actively harmful.** Same harness,
+15 spinners, three arms interleaved (siblings are adjacent pairs here, so
+physical core 0 is cpus 0-1):
+
+| arm | spinners | bench | wall ms/q | acc/wall | GPU util |
+|---|---|---|---:|---:|---:|
+| none | 0-15 | anywhere | 25.27 | 0.823 | 83% |
+| pin only | 0-15 | 0-1 | **26.73** | 0.789 | 76% |
+| isolated | 2-15 | 0-1 | 25.76 | 0.811 | 80% |
+
+`taskset` pins the **whole process**, and `bench` is not one thread — the CUDA
+runtime carries its own helper threads, so pinning crams them onto two
+hyperthreads instead of sixteen and costs 5.8%. Reserving the core for the
+process only recovers that, to roughly the unpinned baseline. Extracting value
+this way would need per-thread affinity on the feeder thread alone
+(`pthread_setaffinity_np`), which is code — and therefore competes with
+double-buffering, which is better code for the same problem.
+
+**Both zero-code levers for item 4 are now exhausted.** Note also what neither
+tool addresses: `taskset` constrains only the caller and never keeps others
+off a CPU. Real reservation is cgroup v2 cpusets (`cpuset.cpus.partition`),
+`isolcpus=`, or `nohz_full=`; the only lever that changes preemption *latency*
+rather than placement is `SCHED_FIFO` via `chrt`, which needs privileges and
+is the one plausible remaining test. On this box all of them sit above a
+second scheduler regardless: WSL2's vCPUs are dispatched by the Windows
+host.
+
+## Finding 57 — the CPU baseline is per PRIME q and ours is per (q, rho) PAIR; item 0's margin was overstated 1.53x
+
+**Date:** 2026-08-17, both sides measured in one session on one box, idle.
+This is the second time a unit mismatch has flattered the GPU (finding 55 was
+the first), and it is the same shape: two conventions living unlabelled in one
+document.
+
+### The control
+
+`gnfs-lasieve4I15e` on the c183 (`oracle/input.job`, its own `.afb.0`),
+algebraic special-q, default `J = I/2`, over q in `[120000000, 120005000)` —
+the same interval and the same `2^15 x 2^14` rectangle the GPU had just
+sieved. Four workers over disjoint subranges, 235 s wall on an idle box.
+
+| | GGNFS `I15e` | cuda-sieve `logI 15 --J 16384` |
+|---|---:|---:|
+| relations | 12,398 | 13,941 |
+| distinct primes q | 176 | — |
+| **(q, rho) pairs** | **269** | **300** |
+| **relations per (q, rho)** | **46.09** | **46.47** |
+
+**Yield matches to 0.8%** — and ours is achieved while sieving 11% *more*
+factor base, since GGNFS trimmed to `FB_bound 119999999` (6,844,120 of
+7,605,406 entries) and the pipeline runs the full base to `alim`. There is no
+yield gap on this job at this geometry. Any future claim of one needs a control
+like this, not a cross-session comparison.
+
+### The unit mismatch
+
+GGNFS averages **1.528 roots per prime** here (269 pairs over 176 primes), and
+it reports per *prime*. Our `--nq`, `ms/q` and `rel/q` are per *(q, rho) pair*.
+Three independent numbers confirm that the CPU rows under item 6 are per prime:
+
+| STATUS I15e row | today, per prime |
+|---|---|
+| 68.9 rel/q (q=130M) | 70.44 (q=120M; yield falls with q) |
+| 474.8 ms/q | 3.138 core-s x 1.528 / N_eff 10.24 = **468 ms** |
+| 104.5 J/q | 468 ms x 220 W = **103.0 J** |
+
+All three reconcile within 1.5%, so the CPU baseline is sound — it is only
+mislabelled. Item 0's margin table then put a per-pair GPU energy
+("70-90 ms/q x 270 W = 18.9-24.3 J/q") against that per-prime 104.5 J and
+claimed 4.3-5.5x.
+
+### The corrected verdict, both sides in one unit
+
+| | per (q, rho) pair | per prime q |
+|---|---:|---:|
+| GPU wall (idle box, `--cofactor`) | 98.5 ms | 150.5 ms |
+| CPU whole box, N_eff 10.24 | 306 ms | 468 ms |
+| **time advantage** | **3.11x** | **3.11x** |
+| GPU energy at 270 W whole-box | 26.6 J | 40.6 J |
+| CPU energy at 220 W | 67.4 J | 103.0 J |
+| **energy advantage** | **2.53x** | **2.53x** |
+
+**~2.5x on whole-box relations per joule at matched yield, not 4.3-5.5x.** It
+still clears item 0's "beats the CPU outright" bar with margin. Caveats: one
+q interval at q=120M rather than the 50M/130M/190M drift probes; relations not
+deduplicated, which is immaterial on a band covering 0.004% of `lim`; N_eff
+10.24 is finding 43's, not re-measured; the 270 W whole-box GPU figure is
+derived (item 6) while the 183.6 W board figure was measured today; and the
+single-core CPU rate comes from a 4-worker run, so it may slightly understate a
+truly unloaded core.
+
+**The rule this leaves behind: state the unit.** A relation count or a time
+"per q" is meaningless in this project unless it says *prime* or *pair*, and
+the factor between them is 1.528 on this polynomial and different on every
+other one.
+
+### The J sweep
+
+Same c183, same band, `--logI 15`, geometry the only variable, two repeats
+each (rel/q identical to three decimals — the pipeline is deterministic):
+
+| J | area | ms/q | rel/q | acc/wall | GPU util | board W | J/q | **rel/J** |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| `2^14` | `2^29` (15e) | 98.5 | 46.47 | 0.946 | 97.5% | 183.6 | 18.1 | **2.57** |
+| `2^15` | `2^30` | 200.3 | 68.49 | 0.962 | 98.5% | 182.9 | 36.6 | **1.87** |
+
+Doubling J costs **2.03x the time for 1.47x the relations**, so rel/J falls
+27%. `J = 2^14` is the better energy choice and `J = 2^15` the better
+relations-per-q-range choice — the same trade the CPU shows between I14e and
+I15e (2.9x time for 2.2x relations), but **worse for us**: the CPU buys big
+rectangles to amortise its per-q root transform, which is 12% of its wall and
+about 1% of ours. Having little per-q overhead to amortise, the GPU should
+prefer *smaller* areas than the CPU does. Pick the larger J only when the q
+range, not the energy, is the binding constraint.
+
+## Finding 58 — equal-work control on the C194: 3.3x, not 4.9x, and a 14% yield hole at a 1:1 rectangle
+
+**Date:** 2026-08-17, RTX 5070 against `gnfs-lasieve4I15e`/`I16e` on the
+NFS@Home C194 (`rlim 160M, alim 240M, lpbr 32, lpba 33, mfbr 63, mfba 95`,
+algebraic special-q). Both sievers over the same q window, same `(q, rho)`
+pairs, four GGNFS workers on four physical cores.
+
+### The control, and why q = 250M
+
+GGNFS truncates the special-q side's factor base at q (`Warning: lowering
+FB_bound to ...`), which finding 55 showed is worth 2.54x on the c183 and is
+worse here: at q = 20M with `alim` 240M we carry ~13.16M entries against its
+~1.27M, a **10x** work difference that no like-for-like claim survives.
+
+**Above `alim` the truncation cannot bite.** Sieving at q = 250M > 240M leaves
+GGNFS on the full base — verified by the absence of any `lowering FB_bound`
+line in the logs — so both sievers carry the identical factor base. That is the
+first genuinely equal-work comparison this project has, and it is the owner's
+suggestion, not a planned one.
+
+### Yield: parity at 2:1, a hole at 1:1
+
+99 pairs each side, q window `[250000000, 250002000)`:
+
+| geometry | rectangle | GPU rel/pair | GGNFS rel/pair | ours vs theirs |
+|---|---|---:|---:|---:|
+| 15e | `2^15 x 2^14` (2:1) | 34.28 | 34.88 | **-1.7%** |
+| 15e `-J 15` | `2^15 x 2^15` (**1:1**) | 46.54 | 54.39 | **-14.4%** |
+| 16e | `2^16 x 2^15` (2:1) | 77.40 | 79.14 | **-2.2%** |
+
+Yield parity at both 2:1 geometries, independently confirming finding 57's
+0.8% agreement on the c183. **The 1:1 rectangle is the outlier, and the aspect
+ratio is what separates it from the other two, not the area** — 16e is twice
+the area of `-J 15` and matches. Yield scaling by area says the same thing:
+ours 2.258x against GGNFS's 2.269x going to 16e (agreement), but 1.358x against
+1.560x going to `-J 15`.
+
+The mechanism is almost certainly **known defect #1**, the largest-term norm
+approximation, ~2 bits off the true rectangle maximum. A rectangle as tall as
+it is wide widens the norm's range over `j`, the approximation degrades with
+it, and the survivor gate is scaled from a value that no longer describes the
+region. See item 5, which this gives a measured payoff for the first time.
+**Do not deploy `-J 15` until that is fixed**: the area scaling looks
+attractive and 14% of the relations are missing.
+
+### Throughput: the 4.9x was the factor base
+
+| geometry | GPU ms/pair | CPU ms/pair (N_eff 10.24) | time | GPU rel/s | CPU rel/s | rel/s |
+|---|---:|---:|---:|---:|---:|---:|
+| 15e | 109.6 | 369.0 | **3.37x** | 313 | 94.5 | **3.31x** |
+| 15e `-J 15` | 211.8 | 634.5 | 3.00x | 220 | 85.7 | 2.57x |
+| 16e | 460.0 | 1133.2 | 2.46x | 168 | 69.8 | 2.41x |
+
+The same measurement at **q = 20M**, where GGNFS was on a base 10x smaller,
+reads 4.91x on rel/s — decomposing as 2.01x on time and 2.44x on yield, the
+yield half being the convention rather than the siever. **At equal work it is
+3.31x**, which lands on finding 57's independently measured 3.11x for the c183.
+Energy agrees too: 29.6 J/pair against 81.2 J/pair whole-box is **2.74x**,
+against the c183's 2.53x — two jobs, two q, within 8%.
+
+### The GPU's area penalty is real and larger than the CPU's
+
+Relative to its own 15e rate, GGNFS keeps 0.91 / 0.74 of its relations/s at
+`-J 15` / 16e. We keep **0.70 / 0.54**, so our margin decays from 3.31x to
+2.41x across the same span. Time scaling: 1.93x / 4.20x for us against 1.72x /
+3.07x for GGNFS. This is finding 57's conclusion — the CPU buys large
+rectangles to amortise a per-q root transform that is 12% of its wall and ~1%
+of ours — now measured at matched factor base rather than inferred.
+
+**For a C194 on this hardware, run 15e.** Best throughput, best energy, largest
+margin over the CPU, and the one alternative that looked good on area scaling
+is currently paying a fixable 14% yield penalty.
+
+Caveats. `N_eff` 10.24 is finding 43's, measured on the **c183 at I15e**; a
+C194 at 16e on the full base has a much larger working set, so real 16-worker
+scaling there is probably worse than 10.24, which flatters the CPU in the 16e
+row. One q window of 99 pairs per configuration. The GPU whole-box 270 W is
+derived (item 6) while its board figure (175.9 W at 15e) was measured here.
+
 ## Not addressed in this round
 
 > **This section is a snapshot of one round, not a current status list**, and it

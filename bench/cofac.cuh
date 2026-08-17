@@ -56,6 +56,7 @@
 #define CUDA_SIEVE_COFAC_CUH
 
 #include <stdint.h>
+#include <errno.h>          /* strtoull ERANGE in the relation gate */
 
 #define CF_OK         0   /* fully split, every prime within lpb */
 #define CF_DEAD       1   /* a prime factor exceeds 2^lpb: never a relation */
@@ -797,7 +798,7 @@ CF_FN int mz_ecm(mz<L> *fac, const mz<L> *n, uint32_t sigma,
  * around them is unchanged. */
 template <int L, int METHOD, int STAGE2>
 CF_FN int mz_split(const mz<L> *n0, const mz<L> *lim2, uint32_t lpb,
-                   uint32_t c0, uint32_t budget, uint32_t *out, int *nout,
+                   uint32_t c0, uint32_t budget, uint64_t *out, int *nout,
                    uint64_t *acc, const uint32_t *__restrict s, uint32_t ns,
                    const uint8_t *__restrict s2mask, uint32_t s2vmin,
                    uint32_t s2nv)
@@ -811,7 +812,12 @@ CF_FN int mz_split(const mz<L> *n0, const mz<L> *lim2, uint32_t lpb,
         if (mz_cmp<L>(&m, lim2) < 0) {              /* prime by size */
             if ((uint32_t)mz_bits<L>(&m) > lpb) return CF_DEAD;
             if (nf >= CF_MAXFAC) return CF_OVERFLOW;
-            out[nf++] = m.v[0];
+            /* Two limbs. The bound just checked is lpb, not 32, so at
+             * lpb > 32 this factor legitimately needs 64 bits; m.v[0] alone
+             * used to emit its low half. L is 2 or 3 at every instantiation,
+             * but the guard costs nothing and makes the assumption explicit. */
+            if constexpr (L >= 2) out[nf++] = ((uint64_t)m.v[1] << 32) | m.v[0];
+            else                  out[nf++] = (uint64_t)m.v[0];
             continue;
         }
         if (mz_sprp2<L>(&m)) return CF_DEAD;        /* prime, and >= lim2 > 2^lpb */
@@ -859,7 +865,7 @@ __global__ void k_cofac(const mz<L> *__restrict n, mz<L> lim2, uint32_t lpb,
                         const uint32_t *__restrict sel,
                         const uint32_t *__restrict njp,
                         uint8_t *__restrict status,
-                        uint32_t *__restrict fac, uint8_t *__restrict nfac,
+                        uint64_t *__restrict fac, uint8_t *__restrict nfac,
                         unsigned long long *__restrict iters,
                         const uint32_t *__restrict s, uint32_t ns,
                         const uint8_t *__restrict s2mask, uint32_t s2vmin,
@@ -870,7 +876,7 @@ __global__ void k_cofac(const mz<L> *__restrict n, mz<L> lim2, uint32_t lpb,
     for (uint64_t ii = bench_grid_thread_x(); ii < cnt; ii += stride) {
         const uint32_t i = (uint32_t)ii;
         const uint32_t t = sel[i];
-        uint32_t o[CF_MAXFAC];
+        uint64_t o[CF_MAXFAC];
         uint64_t acc = 0;
         int k = 0, st;
         mz<L> v;
@@ -952,7 +958,7 @@ typedef struct {
  * so an exhausted budget is never turned into a proof of anything. */
 template <int L>
 static void cf_run_rounds(const mz<L> *d_n, mz<L> lim2, uint32_t lpb, uint32_t n,
-                          uint8_t *d_status, uint32_t *d_fac, uint8_t *d_nfac,
+                          uint8_t *d_status, uint64_t *d_fac, uint8_t *d_nfac,
                           const cf_sched_t *S, const cf_work_t *W,
                           unsigned long long *d_iters, int blocks, int threads)
 {
@@ -1018,20 +1024,22 @@ typedef struct {
      * buying nothing worth a second instantiation to keep in step. */
     mz<3>    *d_c0;   mz<3>   *d_c1;      /* the two cofactors, narrowed */
     uint8_t  *d_st0,  *d_st1;             /* CF_* per side                */
-    uint32_t *d_sm0,  *d_sm1;             /* residual when no split needed */
+    /* 64-BIT, NOT 32. These two and d_sp0/d_sp1 below hold *resulting primes*,
+     * which are bounded by lpb rather than by lim -- so at lpb 33 (a C194 asks
+     * for lpba 33) a uint32 stores the low 32 bits of a 33-bit prime and the
+     * relation stops reconstructing its own norm. The trial-division lists
+     * d_f0/d_f1 stay 32-bit on purpose: those are FACTOR-BASE primes, bounded
+     * by lim, and lim is well under 2^32 even for a C208. */
+    uint64_t *d_sm0,  *d_sm1;             /* residual when no split needed */
     int64_t  *d_a,    *d_b;
-    uint32_t *d_f0,   *d_f1;              /* cap * TD_FMAX                */
+    uint32_t *d_f0,   *d_f1;              /* cap * TD_FMAX, FB primes < lim */
     uint8_t  *d_fn0,  *d_fn1;
-    uint32_t *d_sp0,  *d_sp1;             /* cap * CF_MAXFAC split primes */
+    uint64_t *d_sp0,  *d_sp1;             /* cap * CF_MAXFAC split primes */
     uint8_t  *d_nsp0, *d_nsp1;
     uint32_t *d_flag, *d_off, *d_bsum, *d_idx, *d_nrel;
     uint32_t *d_sel, *d_nsel;             /* compacted job list per round  */
     uint32_t *d_s, ns, ecm_curves; int ecm;   /* ECM stage-1 prime powers  */
     uint8_t  *d_s2mask; uint32_t s2vmin, s2nv;/* ECM stage-2 schedule      */
-    /* pinned mirrors, sized for the relations only */
-    int64_t  *h_a, *h_b;
-    uint32_t *h_f0, *h_f1, *h_sp0, *h_sp1;
-    uint8_t  *h_fn0, *h_fn1, *h_nsp0, *h_nsp1;
     double ms_rat, ms_alg, ms_host;
     unsigned long long nseen, nrel, ndead, nstuck;
 } cofq_t;
@@ -1065,13 +1073,23 @@ __global__ void k_cof_enqueue(const bn_t *__restrict cof0, const uint8_t *__rest
         /* A side within lpb needs no splitting, but its residual is still a
          * prime of the relation whenever it is not 1. */
         {
+            /* bn_fits_u64, not a hand-rolled two-limb pack: this branch is
+             * taken when the residual is already within lpb, and at lpb > 32
+             * that residual is a prime needing 64 bits. The helper also
+             * REJECTS a value with limbs above the low two set, so a future
+             * change to lpb or the bits accounting cannot silently reinstate
+             * the truncation this whole path exists to remove. A 0 here is a
+             * residual that did not fit, which cannot happen while
+             * bits <= lpb <= 64 and is emitted as "no residual" if it ever
+             * does -- visible as a failed reconstruction, not a wrong one. */
+            uint64_t sm = 0;
             bn_t v = cof0[t];
             if ((uint32_t)bits0[t] > lpb0) {
                 Q.d_c0[d].v[0] = v.v[0]; Q.d_c0[d].v[1] = v.v[1];
                 Q.d_c0[d].v[2] = v.v[2];
                 Q.d_sm0[d] = 0; Q.d_st0[d] = CF_INCOMPLETE;
             } else {
-                Q.d_sm0[d] = (bits0[t] > 1) ? v.v[0] : 0u;
+                Q.d_sm0[d] = (bits0[t] > 1 && bn_fits_u64(&v, &sm)) ? sm : 0ull;
                 Q.d_st0[d] = CF_OK;
             }
             v = cof1[t];
@@ -1079,7 +1097,7 @@ __global__ void k_cof_enqueue(const bn_t *__restrict cof0, const uint8_t *__rest
                 Q.d_c1[d].v[0] = v.v[0]; Q.d_c1[d].v[1] = v.v[1]; Q.d_c1[d].v[2] = v.v[2];
                 Q.d_sm1[d] = 0; Q.d_st1[d] = CF_INCOMPLETE;
             } else {
-                Q.d_sm1[d] = (bits1[t] > 1) ? v.v[0] : 0u;
+                Q.d_sm1[d] = (bits1[t] > 1 && bn_fits_u64(&v, &sm)) ? sm : 0ull;
                 Q.d_st1[d] = CF_OK;
             }
         }
@@ -1126,8 +1144,8 @@ __global__ void k_rel_pack(uint32_t nr, const uint32_t *__restrict idx, cofq_t Q
                            int64_t *__restrict oa, int64_t *__restrict ob,
                            uint32_t *__restrict of0, uint8_t *__restrict ofn0,
                            uint32_t *__restrict of1, uint8_t *__restrict ofn1,
-                           uint32_t *__restrict osp0, uint8_t *__restrict onsp0,
-                           uint32_t *__restrict osp1, uint8_t *__restrict onsp1)
+                           uint64_t *__restrict osp0, uint8_t *__restrict onsp0,
+                           uint64_t *__restrict osp1, uint8_t *__restrict onsp1)
 {
     const uint64_t stride = bench_grid_stride_x();
     for (uint64_t tt = bench_grid_thread_x(); tt < nr; tt += stride) {
@@ -1157,19 +1175,21 @@ __global__ void k_rel_pack(uint32_t nr, const uint32_t *__restrict idx, cofq_t Q
 
 /* ---- the queue, host side ---------------------------------------------- */
 
-static int cf_u32cmp(const void *x, const void *y)
+static int cf_u64cmp(const void *x, const void *y)
 {
-    uint32_t a = *(const uint32_t *)x, b = *(const uint32_t *)y;
+    uint64_t a = *(const uint64_t *)x, b = *(const uint64_t *)y;
     return a < b ? -1 : (a > b);
 }
 
 
 typedef struct {
     int64_t  *a, *b;
-    uint32_t *f0, *f1, *sp0, *sp1;
+    uint32_t *f0, *f1;
+    uint64_t *sp0, *sp1;              /* split primes: bounded by lpb, not lim */
     uint8_t  *fn0, *fn1, *nsp0, *nsp1;
     int64_t  *d_a, *d_b;
-    uint32_t *d_f0, *d_f1, *d_sp0, *d_sp1;
+    uint32_t *d_f0, *d_f1;
+    uint64_t *d_sp0, *d_sp1;
     uint8_t  *d_fn0, *d_fn1, *d_nsp0, *d_nsp1;
 } cofq_out_t;
 
@@ -1256,16 +1276,16 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
     COF_INIT_CK(cudaMalloc(&Q->d_c1, (size_t)cap * sizeof(mz<3>)));
     COF_INIT_CK(cudaMalloc(&Q->d_st0, cap));
     COF_INIT_CK(cudaMalloc(&Q->d_st1, cap));
-    COF_INIT_CK(cudaMalloc(&Q->d_sm0, (size_t)cap * 4));
-    COF_INIT_CK(cudaMalloc(&Q->d_sm1, (size_t)cap * 4));
+    COF_INIT_CK(cudaMalloc(&Q->d_sm0, (size_t)cap * 8));
+    COF_INIT_CK(cudaMalloc(&Q->d_sm1, (size_t)cap * 8));
     COF_INIT_CK(cudaMalloc(&Q->d_a, (size_t)cap * 8));
     COF_INIT_CK(cudaMalloc(&Q->d_b, (size_t)cap * 8));
     COF_INIT_CK(cudaMalloc(&Q->d_f0, (size_t)cap * TD_FMAX * 4));
     COF_INIT_CK(cudaMalloc(&Q->d_f1, (size_t)cap * TD_FMAX * 4));
     COF_INIT_CK(cudaMalloc(&Q->d_fn0, cap));
     COF_INIT_CK(cudaMalloc(&Q->d_fn1, cap));
-    COF_INIT_CK(cudaMalloc(&Q->d_sp0, (size_t)cap * CF_MAXFAC * 4));
-    COF_INIT_CK(cudaMalloc(&Q->d_sp1, (size_t)cap * CF_MAXFAC * 4));
+    COF_INIT_CK(cudaMalloc(&Q->d_sp0, (size_t)cap * CF_MAXFAC * 8));
+    COF_INIT_CK(cudaMalloc(&Q->d_sp1, (size_t)cap * CF_MAXFAC * 8));
     COF_INIT_CK(cudaMalloc(&Q->d_nsp0, cap));
     COF_INIT_CK(cudaMalloc(&Q->d_nsp1, cap));
     COF_INIT_CK(cudaMalloc(&Q->d_flag, (size_t)cap * 4));
@@ -1281,8 +1301,8 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
     COF_INIT_CK(cudaMalloc(&O->d_f1, (size_t)Q->rcap * TD_FMAX * 4));
     COF_INIT_CK(cudaMalloc(&O->d_fn0, Q->rcap));
     COF_INIT_CK(cudaMalloc(&O->d_fn1, Q->rcap));
-    COF_INIT_CK(cudaMalloc(&O->d_sp0, (size_t)Q->rcap * CF_MAXFAC * 4));
-    COF_INIT_CK(cudaMalloc(&O->d_sp1, (size_t)Q->rcap * CF_MAXFAC * 4));
+    COF_INIT_CK(cudaMalloc(&O->d_sp0, (size_t)Q->rcap * CF_MAXFAC * 8));
+    COF_INIT_CK(cudaMalloc(&O->d_sp1, (size_t)Q->rcap * CF_MAXFAC * 8));
     COF_INIT_CK(cudaMalloc(&O->d_nsp0, Q->rcap));
     COF_INIT_CK(cudaMalloc(&O->d_nsp1, Q->rcap));
     COF_INIT_CK(cudaHostAlloc((void **)&O->a, (size_t)Q->rcap * 8,
@@ -1299,11 +1319,16 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
                               cudaHostAllocDefault));
     COF_INIT_CK(cudaHostAlloc((void **)&O->fn1, Q->rcap,
                               cudaHostAllocDefault));
+    /* x8, matching d_sp0/d_sp1 and the readback: split primes are 64-bit (see
+     * cofq_t). Sizing these two at 4 while the copy asked for 8 is not a
+     * silent overrun -- cudaMemcpy rejects it outright with "invalid argument"
+     * on a pinned buffer that short -- but it is exactly the pair of numbers a
+     * width change can leave disagreeing, so they are commented together. */
     COF_INIT_CK(cudaHostAlloc((void **)&O->sp0,
-                              (size_t)Q->rcap * CF_MAXFAC * 4,
+                              (size_t)Q->rcap * CF_MAXFAC * 8,
                               cudaHostAllocDefault));
     COF_INIT_CK(cudaHostAlloc((void **)&O->sp1,
-                              (size_t)Q->rcap * CF_MAXFAC * 4,
+                              (size_t)Q->rcap * CF_MAXFAC * 8,
                               cudaHostAllocDefault));
     COF_INIT_CK(cudaHostAlloc((void **)&O->nsp0, Q->rcap,
                               cudaHostAllocDefault));
@@ -1319,15 +1344,32 @@ done:
     return rc;
 }
 
-static void cq_emit_side(FILE *o, const uint32_t *f, int nf,
-                         const uint32_t *sp, int nsp)
+/* The relation format for one side: ascending hex, comma separated.
+ *
+ * The list is 64-bit even though the trial-division half is not -- a relation's
+ * primes are bounded by lpb, and mixing widths in one sorted array is how a
+ * 33-bit split prime would get truncated on its way to the file.
+ *
+ * Shared by both emitters. They differ only in how the trial-division half
+ * arrives (an array from the inline queue, a hex string from a --candidates
+ * file), and keeping the sort and the format in one place is what stops the
+ * two output paths drifting: the 64-bit widening had to touch the array type,
+ * the comparator and the format string, and would have had to do it twice. */
+static void cf_emit_sorted(FILE *o, uint64_t *v, int n)
 {
-    uint32_t v[TD_FMAX + CF_MAXFAC];
+    qsort(v, n, sizeof v[0], cf_u64cmp);
+    for (int i = 0; i < n; i++)
+        fprintf(o, "%s%llx", i ? "," : "", (unsigned long long)v[i]);
+}
+
+static void cq_emit_side(FILE *o, const uint32_t *f, int nf,
+                         const uint64_t *sp, int nsp)
+{
+    uint64_t v[TD_FMAX + CF_MAXFAC];
     int n = 0;
     for (int i = 0; i < nf && n < TD_FMAX + CF_MAXFAC; i++) v[n++] = f[i];
     for (int i = 0; i < nsp && n < TD_FMAX + CF_MAXFAC; i++) v[n++] = sp[i];
-    qsort(v, n, sizeof v[0], cf_u32cmp);
-    for (int i = 0; i < n; i++) fprintf(o, "%s%x", i ? "," : "", v[i]);
+    cf_emit_sorted(o, v, n);
 }
 
 /* Split everything queued, then write only the relations. */
@@ -1422,8 +1464,8 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     COF_FLUSH_CK(cudaMemcpy(O->f1, O->d_f1, (size_t)nr * TD_FMAX * 4, cudaMemcpyDeviceToHost));
     COF_FLUSH_CK(cudaMemcpy(O->fn0, O->d_fn0, nr, cudaMemcpyDeviceToHost));
     COF_FLUSH_CK(cudaMemcpy(O->fn1, O->d_fn1, nr, cudaMemcpyDeviceToHost));
-    COF_FLUSH_CK(cudaMemcpy(O->sp0, O->d_sp0, (size_t)nr * CF_MAXFAC * 4, cudaMemcpyDeviceToHost));
-    COF_FLUSH_CK(cudaMemcpy(O->sp1, O->d_sp1, (size_t)nr * CF_MAXFAC * 4, cudaMemcpyDeviceToHost));
+    COF_FLUSH_CK(cudaMemcpy(O->sp0, O->d_sp0, (size_t)nr * CF_MAXFAC * 8, cudaMemcpyDeviceToHost));
+    COF_FLUSH_CK(cudaMemcpy(O->sp1, O->d_sp1, (size_t)nr * CF_MAXFAC * 8, cudaMemcpyDeviceToHost));
     COF_FLUSH_CK(cudaMemcpy(O->nsp0, O->d_nsp0, nr, cudaMemcpyDeviceToHost));
     COF_FLUSH_CK(cudaMemcpy(O->nsp1, O->d_nsp1, nr, cudaMemcpyDeviceToHost));
     if (fo)
@@ -1491,12 +1533,12 @@ typedef struct {
  * reported as stuck rather than counted as dead. */
 template <int L>
 static int cf_run_side(mz<L> *h_n, uint32_t nj, uint64_t lim, uint32_t lpb,
-                       uint8_t *h_status, uint32_t *h_fac, uint8_t *h_nfac,
+                       uint8_t *h_status, uint64_t *h_fac, uint8_t *h_nfac,
                        int blocks, int threads, int verbose, double *ms_out,
                        const cf_sched_t *S, const char *side_name)
 {
     mz<L> *d_n = NULL; uint8_t *d_status = NULL, *d_nfac = NULL;
-    uint32_t *d_fac = NULL;
+    uint64_t *d_fac = NULL;
     unsigned long long *d_iters = NULL, *h_iters = NULL;
     cf_work_t W;
     const uint32_t nb = (nj + TD_SCAN_BLK - 1) / TD_SCAN_BLK;
@@ -1514,7 +1556,7 @@ static int cf_run_side(mz<L> *h_n, uint32_t nj, uint64_t lim, uint32_t lpb,
     CK(cudaMalloc(&d_n, (size_t)nj * sizeof(mz<L>)));
     CK(cudaMalloc(&d_status, nj));
     CK(cudaMalloc(&d_nfac, nj));
-    CK(cudaMalloc(&d_fac, (size_t)nj * CF_MAXFAC * 4));
+    CK(cudaMalloc(&d_fac, (size_t)nj * CF_MAXFAC * 8));
     CK(cudaMalloc(&d_iters, (size_t)nj * 8));
     /* The standalone path used to run every slot every round, because the
      * compaction lived only in the inline queue. Same executor now, so it gets
@@ -1559,7 +1601,7 @@ static int cf_run_side(mz<L> *h_n, uint32_t nj, uint64_t lim, uint32_t lpb,
 
     CK(cudaMemcpy(h_status, d_status, nj, cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(h_nfac, d_nfac, nj, cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(h_fac, d_fac, (size_t)nj * CF_MAXFAC * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(h_fac, d_fac, (size_t)nj * CF_MAXFAC * 8, cudaMemcpyDeviceToHost));
 
     /* Where does the bounded splitting work actually go? Rho reports loop
      * iterations. ECM reports ladder bits plus every stage-2 giant step and
@@ -1632,6 +1674,70 @@ static int cf_norm_exact(bn_t *out, const tdpoly_t *P, int64_t a, int64_t b)
     return ovf;
 }
 
+/* ---- 64-bit helpers for the gate --------------------------------------- *
+ *
+ * HOST ONLY, and deliberately so: `__uint128_t` is a compiler extension, and
+ * these run once per emitted factor in a verification pass, never in a kernel.
+ * They exist because raising lpb past 32 moved the gate's own arithmetic out
+ * of range -- a 33-bit prime cannot be primality-tested by bench_is_prime32
+ * nor divided out by bn_divmod_u32_pre, so without these the gate would have
+ * had to skip exactly the factors the widening introduces. */
+
+/* x /= d, returning the remainder. Steps in 64-BIT limbs, not 32: with a
+ * divisor above 2^32 a 32-bit-limb long division produces quotient digits that
+ * do not fit the limb they are stored in. */
+static uint64_t cf_bn_divmod_u64(bn_t *x, uint64_t d)
+{
+    unsigned __int128 rem = 0;
+    for (int i = BN_LIMBS - 2; i >= 0; i -= 2) {
+        const uint64_t lo = ((uint64_t)x->v[i + 1] << 32) | x->v[i];
+        const unsigned __int128 cur = (rem << 64) | lo;
+        const uint64_t q = (uint64_t)(cur / d);
+        rem = cur % d;
+        x->v[i] = (uint32_t)q;
+        x->v[i + 1] = (uint32_t)(q >> 32);
+    }
+    return (uint64_t)rem;
+}
+
+static uint64_t cf_mulmod64(uint64_t a, uint64_t b, uint64_t m)
+{
+    return (uint64_t)((unsigned __int128)a * b % m);
+}
+
+/* Miller-Rabin over the seven bases that are DETERMINISTIC for every n < 2^64
+ * (Jaeschke / Sinclair). Not probabilistic: the gate's whole purpose is to
+ * catch a composite emitted as a prime, so a test that can be fooled by one
+ * would be no test at all. */
+static int cf_is_prime64(uint64_t n)
+{
+    static const uint64_t W[7] = { 2, 325, 9375, 28178, 450775, 9780504,
+                                   1795265022 };
+    uint64_t d = n - 1;
+    int s = 0;
+    if (n < 2) return 0;
+    if (!(n & 1)) return n == 2;
+    while (!(d & 1)) { d >>= 1; s++; }
+    for (int i = 0; i < 7; i++) {
+        uint64_t a = W[i] % n, x = 1, p = a;
+        uint64_t e = d;
+        int r, composite = 1;
+        if (!a) continue;                 /* n divides the witness */
+        while (e) {
+            if (e & 1) x = cf_mulmod64(x, p, n);
+            p = cf_mulmod64(p, p, n);
+            e >>= 1;
+        }
+        if (x == 1 || x == n - 1) continue;
+        for (r = 1; r < s; r++) {
+            x = cf_mulmod64(x, x, n);
+            if (x == n - 1) { composite = 0; break; }
+        }
+        if (composite) return 0;
+    }
+    return 1;
+}
+
 /* Returns 0 if every relation reconstructs, else the number that did not. */
 /* One line, verified in place (the parse writes NULs over the separators).
  * Returns 1 if it rebuilds both norms exactly, 0 if it does not, and -1 for a
@@ -1662,16 +1768,29 @@ static int cf_check_one(char *line, tdpoly_t *tp, uint32_t lpb0, uint32_t lpb1,
             for (side = 0; side < 2 && !bad; side++) {
                 const uint32_t lpb = side ? lpb1 : lpb0;
                 char *q = fld[side];
+                /* The largest prime this side may carry. Computed rather than
+                 * written as `1ull << lpb` because lpb may now be 64, where
+                 * that shift is undefined. */
+                const uint64_t maxp = lpb >= 64 ? 0xFFFFFFFFFFFFFFFFull
+                                                : ((1ull << lpb) - 1u);
                 while (*q) {
-                    unsigned long long v = strtoull(q, &e, 16);
+                    unsigned long long v;
+                    errno = 0;
+                    v = strtoull(q, &e, 16);
                     if (e == q) { bad = 1; break; }
-                    /* 64-bit throughout, and the lpb test is no longer skipped
-                     * at lpb == 32. strtoul already returned 64 bits on LP64,
-                     * so a 33-bit factor was in range of the variable and
-                     * exempt from the bound -- caught only if it also happened
-                     * not to divide. `v > 0xffffffff` now rejects it directly,
-                     * which also makes `1ull << 32` safe to evaluate. */
-                    if (!v || v > 0xffffffffull || v >= (1ull << lpb)) {
+                    /* ERANGE, not just the lpb bound. Dropping the old
+                     * `v > 0xffffffff` test also dropped the only rejection of
+                     * strtoull's saturation, and at lpb 64 the bound below
+                     * cannot catch it: a field wider than 64 bits returns
+                     * ULLONG_MAX, which is <= maxp. It would then be reported
+                     * as a composite factor rather than as a malformed line. */
+                    if (errno == ERANGE) { (*nprime)++; bad = 1; break; }
+                    /* 64-bit throughout. This used to also reject anything
+                     * above 2^32 outright, which was correct while the
+                     * cofactoriser could not represent such a factor and is
+                     * now exactly wrong: at lpb 33 those are the factors the
+                     * widening exists to emit. The lpb bound is the real one.  */
+                    if (!v || v > maxp) {
                         (*nprime)++; bad = 1; break;
                     }
                     /* THE GATE'S BLIND SPOT UNTIL NOW. Exact division cannot
@@ -1681,15 +1800,24 @@ static int cf_check_one(char *line, tdpoly_t *tp, uint32_t lpb0, uint32_t lpb1,
                      * shape an incompletely split cofactor has -- the most
                      * likely real defect in the ECM/rho path, and the one
                      * failure this gate exists to catch. */
-                    if (!bench_is_prime32((uint32_t)v)) {
+                    if (!(v <= 0xffffffffull ? bench_is_prime32((uint32_t)v)
+                                             : cf_is_prime64(v))) {
                         (*ncomp)++; bad = 1; break;
                     }
                     {   /* exact division: a factor that does not divide is a
-                         * reconstruction failure, not a rounding question */
+                         * reconstruction failure, not a rounding question.
+                         * The 32-bit Barrett path stays for the common case --
+                         * every trial-division factor is an FB prime below
+                         * lim -- and only a large prime pays for 128-bit. */
                         bn_t t = N[side];
                         int top = bn_top(&t);
-                        if (top < 0 || bn_divmod_u32_pre(&t, (uint32_t)v,
-                                                        bn_recip_u32((uint32_t)v), top)) {
+                        if (top < 0) { bad = 1; break; }
+                        if (v <= 0xffffffffull) {
+                            if (bn_divmod_u32_pre(&t, (uint32_t)v,
+                                                  bn_recip_u32((uint32_t)v), top)) {
+                                bad = 1; break;
+                            }
+                        } else if (cf_bn_divmod_u64(&t, v)) {
                             bad = 1; break;
                         }
                         N[side] = t;
@@ -1834,22 +1962,21 @@ typedef struct { char *ab, *f0, *f1; } cf_rest_t;
 
 /* Append the split primes to a side's trial-division factor list and print it
  * in the relation format: ascending hex, comma separated. */
-static void cf_emit_side(FILE *o, const char *tdfac, const uint32_t *extra,
+static void cf_emit_side(FILE *o, const char *tdfac, const uint64_t *extra,
                          int nextra)
 {
-    uint32_t f[TD_FMAX + CF_MAXFAC + 2];
+    uint64_t f[TD_FMAX + CF_MAXFAC + 2];
     int n = 0;
     const char *p = tdfac;
     while (*p && n < TD_FMAX + CF_MAXFAC) {
         char *end;
-        unsigned long v = strtoul(p, &end, 16);
+        unsigned long long v = strtoull(p, &end, 16);
         if (end == p) break;
-        f[n++] = (uint32_t)v;
+        f[n++] = (uint64_t)v;
         p = end; if (*p == ',') p++;
     }
     for (int i = 0; i < nextra && n < TD_FMAX + CF_MAXFAC; i++) f[n++] = extra[i];
-    qsort(f, n, sizeof f[0], cf_u32cmp);
-    for (int i = 0; i < n; i++) fprintf(o, "%s%x", i ? "," : "", f[i]);
+    cf_emit_sorted(o, f, n);
 }
 
 /* Cofactorise a `--candidates` batch and write the relations it yields.
@@ -1875,10 +2002,11 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
     uint32_t nrec = 0, n0 = 0, n1 = 0;
     cf_rest_t *rest = NULL;
     mz<3> *j0 = NULL; mz<3> *j1 = NULL;
-    uint32_t *i0 = NULL, *i1 = NULL, *fac0 = NULL, *fac1 = NULL;
+    uint32_t *i0 = NULL, *i1 = NULL;
+    uint64_t *fac0 = NULL, *fac1 = NULL;   /* resulting primes: lpb-bounded */
     uint8_t *st0 = NULL, *st1 = NULL, *nf0 = NULL, *nf1 = NULL;
     uint8_t *side0ok = NULL;
-    uint32_t *small0 = NULL, *small1 = NULL;
+    uint64_t *small0 = NULL, *small1 = NULL;
     double ms0 = 0, ms1 = 0, thost;
     uint32_t nrel = 0, nrel2 = 0, dead0 = 0, dead1 = 0, stuck0 = 0, stuck1 = 0, novf = 0;
     uint8_t *alg_job = NULL;
@@ -1903,8 +2031,8 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
     j1 = (mz<3> *)malloc((size_t)nrec * sizeof(mz<3>));
     i0 = (uint32_t *)malloc((size_t)nrec * 4);
     i1 = (uint32_t *)malloc((size_t)nrec * 4);
-    small0 = (uint32_t *)malloc((size_t)nrec * 4);
-    small1 = (uint32_t *)malloc((size_t)nrec * 4);
+    small0 = (uint64_t *)malloc((size_t)nrec * 8);
+    small1 = (uint64_t *)malloc((size_t)nrec * 8);
     side0ok = (uint8_t *)malloc(nrec);
     alg_job = (uint8_t *)calloc(nrec, 1);
     if (!rest || !j0 || !j1 || !i0 || !i1 || !small0 || !small1 || !side0ok || !alg_job) {
@@ -1937,8 +2065,15 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
                 /* A side that does NOT need splitting still carries a residual
                  * prime, and it is part of the relation. Dropping it emits a
                  * factorisation whose product is not the norm. */
-                small0[r] = ns0 ? 0u : (v0.v[0] > 1u ? v0.v[0] : 0u);
-                small1[r] = ns1 ? 0u : (v1.v[0] > 1u ? v1.v[0] : 0u);
+                /* Two limbs: an unsplit residual within lpb is a prime of
+                 * the relation, and at lpb > 32 it does not fit in one. The
+                 * third limb is checked rather than assumed zero -- it is
+                 * zero only because the residual is within lpb <= 64, which
+                 * is an invariant of the caller and not of this line. */
+                small0[r] = (ns0 || v0.v[2] || (v0.v[0] <= 1u && !v0.v[1]))
+                    ? 0ull : (((uint64_t)v0.v[1] << 32) | v0.v[0]);
+                small1[r] = (ns1 || v1.v[2] || (v1.v[0] <= 1u && !v1.v[1]))
+                    ? 0ull : (((uint64_t)v1.v[1] << 32) | v1.v[0]);
                 if (ns0) { j0[n0] = v0; i0[n0] = r; n0++; }
                 if (ns1) { j1[n1] = v1; i1[n1] = r; n1++; alg_job[r] = 1; }
             }
@@ -1950,7 +2085,7 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
     thost = host_ms() - thost;
 
     st0 = (uint8_t *)malloc(n0 ? n0 : 1); nf0 = (uint8_t *)calloc(n0 ? n0 : 1, 1);
-    fac0 = (uint32_t *)malloc((size_t)(n0 ? n0 : 1) * CF_MAXFAC * 4);
+    fac0 = (uint64_t *)malloc((size_t)(n0 ? n0 : 1) * CF_MAXFAC * 8);
     if (ecm) {
         ns = cf_ecm_plan(ecm_b1, &h_s);
         if (!ns) { fprintf(stderr, "  cofac: empty ECM plan for B1=%u\n", ecm_b1); return -1; }
@@ -2000,7 +2135,7 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
         n1 = keep;
     }
     st1 = (uint8_t *)malloc(n1 ? n1 : 1); nf1 = (uint8_t *)calloc(n1 ? n1 : 1, 1);
-    fac1 = (uint32_t *)malloc((size_t)(n1 ? n1 : 1) * CF_MAXFAC * 4);
+    fac1 = (uint64_t *)malloc((size_t)(n1 ? n1 : 1) * CF_MAXFAC * 8);
     if (cf_run_side<3>(j1, n1, lim1, lpb1, st1, fac1, nf1,
                        blocks, threads, 1, &ms1, &sched, "algebraic")) return -1;
     for (uint32_t k = 0; k < n1; k++) {
@@ -2018,7 +2153,7 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
         setvbuf(fo, NULL, _IOFBF, 1 << 22);
     }
     {
-        uint32_t *ex0 = (uint32_t *)calloc(nrec, CF_MAXFAC * 4);
+        uint64_t *ex0 = (uint64_t *)calloc(nrec, CF_MAXFAC * 8);
         uint8_t  *ne0 = (uint8_t *)calloc(nrec, 1);
         uint8_t  *done1 = (uint8_t *)calloc(nrec, 1);
         for (uint32_t r = 0; r < nrec; r++)
@@ -2049,7 +2184,7 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
          * `small1` alone silently dropped every record whose algebraic
          * cofactor trial division had already reduced to 1. */
         for (uint32_t r = 0; r < nrec; r++) {
-            uint32_t one1 = small1[r];
+            uint64_t one1 = small1[r];
             if (done1[r] || alg_job[r] || !side0ok[r]) continue;
             nrel2++;
             if (fo) {

@@ -4,7 +4,7 @@
 the order they were discovered, including the ones later refuted, because the
 refutations are the most useful part. That makes them bad at answering "what
 does this thing do today". This file answers only that, and holds nothing that
-is not current. **Last updated 2026-08-16.**
+is not current. **Last updated 2026-08-17.**
 
 ## Architecture
 
@@ -33,8 +33,9 @@ every cofactor flush it is fsynced and `NAME.part.ckpt` records the next
 `(q, rho)`, the byte offset, the relation count, the derived scale/allowance
 and a job fingerprint. Rerunning the same command resumes there; `--restart`
 discards; SIGINT/SIGTERM and `--stop-file` stop cleanly at the next special-q;
-`NAME.lock` refuses a second writer. See item 12a, including what has not yet
-been exercised on a GPU.
+`NAME.lock` refuses a second writer. Verified on a GPU 2026-08-16: a stopped
+and resumed band reproduces the uninterrupted one byte for byte, `kill -9` and
+a torn final line included. See item 12a.
 
 `--log PATH` appends a run log: a header block naming the commit, argv, job
 fingerprint, card, geometry and factor-base convention, then a timestamped
@@ -85,7 +86,7 @@ refuses inputs outside the limits below; there is no unsafe override.
 | quantity | current limit | immediate reason |
 |---|---:|---|
 | sieve area `I*J` | `2^31` positions | the exclusive end `xmax` and the hot plattice walks use `uint32_t` |
-| `lpb` | 32 | each split large prime and unsplit small residual is stored in one `uint32_t` |
+| `lpb` | 64 | a resulting prime is stored in one `uint64_t` (was 32 until 2026-08-17) |
 | `mfb` | 96 | the production cofactor queue narrows residuals to `mz<3>`, three 32-bit limbs |
 | large primes per side | 3 | `ceil(mfb/lpb) <= 3` is checked before the run |
 
@@ -136,10 +137,10 @@ or measured.
 residual sent to cofactorisation*. Raising one does not inherently require
 raising the other:
 
-- Raising `lpb` above 32 requires a two-word or `uint64_t` representation for
-  split primes, unsplit prime residuals, sorting, emission, primality checking,
-  and relation reconstruction. It does **not** require four-limb rho/ECM when
-  `mfb <= 96`.
+- Raising `lpb` above 32 required a `uint64_t` representation for split
+  primes, unsplit prime residuals, sorting, emission, primality checking, and
+  relation reconstruction. It did **not** require four-limb rho/ECM at
+  `mfb <= 96`. **Done 2026-08-17** — see "64-bit large primes" below.
 - Raising `mfb` above 96 requires `mz<4>` arithmetic even when the actual
   maximum is only 101 bits. Rho, ECM, probable-prime testing, GCD, and exact
   division all pay the wider modular-arithmetic cost.
@@ -161,8 +162,37 @@ host dispatch captures the obvious win because current jobs do not use 3LP on
 both sides. The criterion is nevertheless the bit bound, not the label: a 2LP
 side with `mfb=65` still needs three limbs.
 
+### 64-bit large primes — BUILT AND VERIFIED 2026-08-17
+
+`lpb` up to 64 is supported. The widening was confined to values bounded by
+`lpb` rather than by `lim`: the split primes and unsplit prime residuals in the
+cofactor queue (`d_sp0/1`, `d_sm0/1`), `mz_split`'s output, the relation
+emitter on both the inline and `--cofac` paths, and the reconstruction gate.
+The trial-division lists stay 32-bit deliberately — those are factor-base
+primes, bounded by `lim`, which is well under `2^32` even for a C208. The
+cofactor arithmetic did not change at all: `mfb <= 96` is still `mz<3>`.
+
+The gate needed its own 64-bit arithmetic, which is the part that was not a
+retype: `bench_is_prime32` cannot test a 33-bit factor and `bn_divmod_u32_pre`
+cannot divide one out, so `cf_is_prime64` (deterministic Miller-Rabin, the
+seven bases valid below `2^64`) and `cf_bn_divmod_u64` (128-bit long division,
+stepping in 64-bit limbs because a divisor above `2^32` overflows a 32-bit
+quotient digit) were added host-side. Without them the gate would have skipped
+exactly the factors the change introduces.
+
+Verified three ways: the 1500-q c147 band is **byte-identical** to its
+pre-change MD5, so nothing moved at `lpb <= 32`; the c183 golden q at `lpb 33`
+emits 58 relations carrying 24 factors above `2^32`, all reconstructing; and
+that same file is **refused** when re-read at `lpb 32`, so the bound is
+load-bearing rather than decorative. All three are now cases in `cofcheck.sh`.
+On a 400-q c147 band at `lpb 33`, 8,810 of 2,075,496 emitted factors exceed
+`2^32`, the largest `0x1ffd77b3b`.
+
+What this does **not** cover is `mfb > 96`, which is the separate four-limb
+problem below.
+
 This makes `lpb=33` with `mfb=64/95` a materially smaller extension than
-`lpb=35` with `mfb=64/101`: the former needs 64-bit factor outputs but retains
+`lpb=35` with `mfb=64/101`: the former needed 64-bit factor outputs but retains
 two- and three-limb cofactor kernels; the latter needs a four-limb kernel on
 the 101-bit side. Both ratios still ask for at most three large primes, so
 `CF_MAXFAC` is not the blocker.
@@ -230,7 +260,7 @@ required surplus.
 |---|---|---:|
 | A=32 whole-area endpoint/walk support | not started | about 1 week |
 | A=32 stateful slabbing for 12 GB | not started | about 2–3 weeks |
-| 64-bit large-prime outputs and gates | not started | part of the LPB/MFB work |
+| 64-bit large-prime outputs and gates | **done 2026-08-17** | — |
 | per-side `mz<2>` / `mz<3>` / `mz<4>` dispatch | arithmetic templates exist; queue/launch work not started | about 1--2 weeks with LPB widening |
 | target cofactor corpus, rho/ECM crossover, and filter test | not captured or measured | required before a performance claim |
 
@@ -328,6 +358,22 @@ Cards with measured band data: **RTX 5070** (WSL2), **RTX 5090**, **RTX 4090**,
 - **Superseded:** an earlier rel/J table built on *nameplate* TDP concluded the
   design "does not want wide expensive GPUs". It is retracted — see the
   RETRACTED block in `RESULTS.md`. Do not quote the old numbers.
+- **Confirmed on a second job, and the 1:1 rectangle is the exception**
+  *(finding 58)*. On the NFS@Home C194, sieving above `alim` so GGNFS cannot
+  truncate its base either, yield is at parity on both 2:1 geometries (−1.7%,
+  −2.2%) and **−14.4% at `2^15 × 2^15`** — an aspect-ratio effect, not an area
+  one, and the first measured cost of the norm approximation (item 5).
+  Throughput at that equal-work point is **3.31×** the CPU box and **2.74×** on
+  energy, against the c183's 3.11× and 2.53×. The same measurement at q=20M
+  reads 4.91×, inflated by the factor-base convention alone.
+- **Yield matches GGNFS at matched geometry, and the verdict margin is ~2.5×
+  rather than 4.3–5.5×.** A same-session control (finding 57) sieved the c183
+  over one q interval with `gnfs-lasieve4I15e` and with this pipeline at the
+  identical `2^15 × 2^14` rectangle: **46.09 vs 46.47 relations per (q, rho)
+  pair**, a 0.8% agreement, with our side carrying 11% more factor base. The
+  correction to the margin is a *unit* error, not a performance one — the CPU
+  rows are per **prime q** and ours are per **(q, rho) pair**, and this
+  polynomial averages 1.528 roots per prime. **Always state which.**
 
 Measured end-to-end on the 5070 (c147 band, 1340 q, same binary, geometry the
 only variable): fill −6.1%, apply +0.06%, wall −2.1%, relations byte-identical.
@@ -404,6 +450,27 @@ absent from every document in the repo.
    | `I15e`, measured | 104.5 | 18.9–24.3 J/q | **4.3–5.5×** |
    | `I15e`, finding 43 | 64.9 | 18.9–24.3 J/q | 2.7–3.4× |
 
+   > **RETRACTED 2026-08-17 — the two columns are in different units.** The
+   > CPU J/q above are **per prime q**; the GPU column is **per (q, rho)
+   > pair**, which is what `--nq` and the band summary count. GGNFS averages
+   > **1.528 roots per prime** on this polynomial, so every margin in the table
+   > is inflated by that factor. Finding 57 measured both sides in one session
+   > at matched geometry and matched yield (46.47 rel/pair against GGNFS's
+   > 46.09, a 0.8% agreement) and the honest figure is:
+   >
+   > | | per (q, rho) pair | per prime q |
+   > |---|---:|---:|
+   > | GPU wall / energy | 98.5 ms / 26.6 J | 150.5 ms / 40.6 J |
+   > | CPU whole box / energy | 306 ms / 67.4 J | 468 ms / 103.0 J |
+   > | **advantage** | **3.11× time, 2.53× energy** | same |
+   >
+   > **~2.5× on whole-box relations/joule**, which still clears the "beats the
+   > CPU outright" bar. Do not quote 4.3–5.5×.
+   >
+   > **State the unit in every future number.** "Per q" is ambiguous in this
+   > project and has now cost two corrections; item 0's own `3.12 core-s/q` is
+   > per *pair* while item 6's `474.8 ms/q` is per *prime*, in the same file.
+
    **Geometry: checked 2026-08-16, and it matches — finding 55.** The concern
    was that the GPU sieved an `I14e` rectangle (`2^14 × 2^13`) while being
    graded against finding 43's `I15e` CPU baseline (`2^15 × 2^14`, four times
@@ -439,6 +506,14 @@ absent from every document in the repo.
    `I15e` the better relations-per-q-range. A real c183 job picks `I15e` or
    above. Which of those the GPU should be held to is a question about the
    deployment, not about the hardware.
+
+   **The GPU shows the same trade and a worse one** *(finding 57,
+   2026-08-17)*. Doubling J at fixed I — `2^15 × 2^14` → `2^15 × 2^15` — costs
+   **2.03× the time for 1.47× the relations**, so rel/J falls 27% (2.57 →
+   1.87). The CPU's reason for large rectangles is amortising its per-q root
+   transform, 12% of its wall and about 1% of ours, so **the GPU should prefer
+   smaller areas than the CPU does**. Take the larger J only when the q range,
+   not energy, is the binding constraint.
 
    The c183's own standalone
    sieve measures 38.2 + 26.2 ms for the two sides (RESULTS.md "Reproduce",
@@ -560,6 +635,40 @@ absent from every document in the repo.
    but it triples under CPU contention (finding 53). It is three different
    problems and they do not have the same fix:
 
+   **MEASURED 2026-08-17, and it moves this item DOWN — finding 56.** The free
+   experiment below was run and **renice buys nothing**: ~1% in every paired
+   comparison, at 12 competing workers and at full saturation alike. The reason
+   is that at 16 runnable threads on 16 logical CPUs nothing waits for a slot —
+   the feeder thread *shares a physical core* over SMT, and nice values do not
+   decide who you share a core with.
+
+   **Affinity, `SCHED_FIFO` and `--blocking-sync` were then all tried and all
+   fail** (finding 56). `taskset` pins the whole process including the CUDA
+   runtime's threads, so pinning *alone* costs 5.8% and reserving the physical
+   core only returns to parity; `chrt -f 1` costs 1.6%; `--blocking-sync`
+   costs 2.4%; and the two combined — the textbook low-latency recipe — are
+   the **worst** arm at 4.5%. **Every zero-code lever is exhausted.**
+
+   **What the contention actually is:** it tracks *oversubscription*, not
+   busyness. At one runnable thread per logical CPU it costs ~6%, measured
+   twice independently (12 real sievers, 15 spinners); at 1.7x subscribed it
+   roughly doubles. No scheduler knob reaches it because it is contention for
+   core resources — SMT siblings, cache, memory bandwidth. **The operational
+   lever is worker count: keep competing work at or below `nproc - 1`.**
+
+   Note also that `taskset` never keeps *others* off a CPU. Real reservation is
+   cgroup v2 `cpuset.cpus.partition`, `isolcpus=` or `nohz_full=`; under WSL2
+   all of them still sit above the Windows host's own scheduler.
+
+   Two numbers now bound the prize. On a **verified-idle box** `acc/wall` is
+   0.885 and GPU utilisation 89.5%, so the structural gap is **11.5%** on the
+   c147 — contention adds ~6% at 12 workers and ~14% at saturation on top.
+   But the gap **shrinks with area**, because host work per q is fixed while
+   GPU work is not: 11.5% at `2^27`, 5.4% at `2^29`, **3.8% at `2^30`**. At the
+   geometry a C195 would deploy at, this whole item is worth under 4%, part of
+   which is interleaved launch/sync that overlap cannot recover. Treat it as a
+   small-job concern; it is not a prerequisite for the LPB work or item 0.
+
    Two thirds of it is *prep* (host per-q tables/staging, small-prime tables)
    and one third is *launch + sync overhead* (`host: unaccounted`). **Finding
    53 holds the canonical table** — do not copy it here; it has drifted once
@@ -613,14 +722,16 @@ absent from every document in the repo.
      why the renice lever matters more here than on a wide box: on 8 cores you
      cannot isolate the sieve by subtraction, only by priority.
 
-   **The live instrument is GPU utilisation, not the summary.**
-   `GPU-accounted / wall` only prints at the end of a run, but `nvidia-smi`
-   reads out continuously, and a host that is starving the GPU shows up as
-   utilisation below ~95%. Observed 88–89% during the co-scheduled snfs236 run,
-   i.e. the GPU had nothing to do about a tenth of the time. If renicing moves
-   that number toward the mid-90s, the contention penalty is a scheduling
-   problem and the code below is not urgent. If it does not, the dependency is
-   architectural and this item is the top of the list.
+   **The live instrument is GPU utilisation, and it is now automatic.** Every
+   `--log` record carries `gpu=` and `acc/wall` (item 12b), so the pair of runs
+   this rule needs is a `grep`. The rule was: if renicing moves utilisation
+   toward the mid-90s the penalty is a scheduling problem, and otherwise the
+   dependency is architectural. **Resolved 2026-08-17: it does not move, so the
+   dependency is architectural** — but see the measured prize above before
+   concluding that makes this item urgent. A caution that survives: 88–89%
+   during the co-scheduled snfs236 run is *not* comparable to the 89.5% idle
+   figure on the c147, because utilisation is a function of the job's area as
+   much as of the host.
 
    One caution retained: this interacts with item 1: two concurrent q roughly
    **doubles host work per unit time**, so on a contended host that experiment
@@ -632,6 +743,20 @@ absent from every document in the repo.
    special-q side is degree 1 with `d = [1, -3.5e-24]`, so largest-term and
    true-rectangle are the *same number* and this buys nothing there. The ~2-bit
    gap is a GNFS-side problem.
+
+   **MEASURED PAYOFF, 2026-08-17: 14% of the relations at a 1:1 rectangle**
+   (finding 58). Against GGNFS on the C194 at matched factor base, our yield is
+   at parity on both **2:1** geometries — −1.7% at `2^15 × 2^14`, −2.2% at
+   `2^16 × 2^15` — and **−14.4% at `2^15 × 2^15`**. Area is not the variable:
+   16e is twice the area of the 1:1 case and matches. A rectangle as tall as it
+   is wide widens the norm's range over `j`, which is exactly where a
+   largest-term approximation degrades, and the survivor gate is then scaled
+   from a value that no longer describes the region.
+
+   That makes this item a **prerequisite for `--J` at 1:1**, which is otherwise
+   an attractive option: it reaches a relation target at a much lower q than
+   `J = I/2` does. Until then, deploy 2:1 geometries only — see RUNBOOK's
+   `testsieve.sh` section, whose own example compares the two.
 6. **Whole-box power**, to close the metric of record — the meter half of
    item 0. **The meter exists**: the UPS reports real watts. It is not a
    parallel task to item 10, it is a **prerequisite** for it (see there).
@@ -757,10 +882,17 @@ absent from every document in the repo.
    than the report threshold. **Do not "fix" it by tightening the default** —
    the current gate finds every relation GGNFS finds (verified, zero misses
    over 2,531), so any trade of yield for speed must be made deliberately.
-8. **A = 32 sieve areas and LPB/MFB widening**, for jobs like AS276. All three
-   independent blockers remain: the `2^32` exclusive position endpoint, the
-   14–16 GB whole-area footprint, and the `lpb 35 / mfb 101` factor/cofactor
-   widths. The current design assessment, performance accounting, alternatives,
+8. **A = 32 sieve areas and MFB widening**, for jobs like AS276. **One of the
+   three blockers is gone**: `lpb` now goes to 64 (2026-08-17), so the
+   large-prime half of this item is done and a C194's `lpba 33 / mfba 95` runs
+   today. What remains is the `2^32` exclusive position endpoint, the 14–16 GB
+   whole-area footprint, and `mfb > 96`, which needs `mz<4>` and costs roughly
+   1.8–2× on the cofactor stage.
+
+   **Neither remaining blocker binds a C195 at NFS@Home's geometry.** They
+   sieve `2^15 × 2^14` and would prefer `2^15 × 2^15` — `2^30`, half the
+   current area limit — so no A=32 work is required for that class of job at
+   all. The current design assessment, performance accounting, alternatives,
    and work status are consolidated in **"Current size limits, and what lifting
    them entails"** above; that section is canonical rather than duplicating a
    moving design here.
@@ -819,15 +951,49 @@ absent from every document in the repo.
     the host thread; item 4 is the within-job half of this and this is the
     between-job half. Split into three pieces, in dependency order.
 
-    **12a. Checkpoint / resume / clean stop — BUILT 2026-08-11**, in
-    `bench/ckpt.h` plus changes to `pipeline.cuh`, `bench_main.cu` and
-    `cofac.cuh`. **Compiles clean and the host-side half is tested; none of the
-    write path has run on a GPU.** What is unverified: that checkpoints are
-    actually emitted during a band, that the signal drain works, and that a
-    resumed run produces correct continued output. `make check` has not been
-    run against it either. Verify with a short c147 band — run, `^C` mid-band,
-    rerun the same command, `--check-relations` the joined file — before
-    trusting it with a long job.
+    **12a. Checkpoint / resume / clean stop — BUILT 2026-08-11, VERIFIED ON A
+    GPU 2026-08-16**, in `bench/ckpt.h` plus changes to `pipeline.cuh`,
+    `bench_main.cu` and `cofac.cuh`.
+
+    **The result is stronger than "no relations lost": a stopped and resumed
+    band reproduces the uninterrupted one byte for byte.** A 1500-q c147 band
+    (`--cofactor`, 178,406 relations, 23.2 MB) was run three ways — straight
+    through; `SIGINT` at q 776 and resumed; `kill -9` at q 671, a 25-byte torn
+    line appended by hand to the `.part`, and resumed — and all three files
+    have the same MD5. The torn tail was truncated away, and all 178,406
+    relations pass `--check-relations`. The same comparison without
+    `--cofactor` (where the `--candidates` batch is non-empty) gives
+    byte-identical relation *and* candidate files, with no NUL run from a
+    mis-sized `ftruncate`.
+
+    Each constraint in the checklist below was exercised as a case rather than
+    read: the clean stop drained 125k queued candidates and exited 0 in 0.2 s;
+    `--stop-file` stopped at q 896 with a valid resume point, and a stop file
+    that already exists refuses to start; the lock named the live pid and
+    refused a second writer, released itself on a clean exit, and was taken
+    over when the recorded pid was gone; a resume with `--lpb 29` was refused
+    on the fingerprint; the single-q path refused to continue a resumable band;
+    `--restart` discarded 3.5 MB; `--nq 1500` became 724 remaining after 776
+    completed, so the two sessions summed to exactly the band that was asked
+    for; and resuming a checkpoint holding 9.6 MB of candidates without
+    `--candidates` was refused rather than stranding them. `make check` passes
+    (cofcheck's 30 cases, fbgencheck, sqgencheck, fbtest).
+
+    Unverified still: **anything on a multi-day timescale** — every case above
+    is seconds to a minute long — and resume across a *reboot* or a different
+    machine, where the page cache is cold and the fsync ordering is what is
+    actually being tested.
+
+    **One unexplained observation, recorded so it is findable if it recurs.**
+    The first interrupt attempt of the session (2026-08-16 22:20, `timeout -s
+    INT 15s`, another GPU job having just exited) died with no clean-stop
+    output at all: empty `.part`, no sidecar, and the lock left behind. Six
+    later interrupts — three direct `kill -INT`, `timeout -s INT`, `timeout
+    --foreground -s INT`, and `--stop-file` — all drained and checkpointed
+    correctly, so it did not reproduce and the verification above stands. The
+    signature to watch for is a band that exits on a signal with no "stopping
+    cleanly" line: that means the handler did not run, and the run loses
+    everything since the last flush rather than nothing.
 
     The mechanism rests on one property of the existing code:
     `pipeline.cuh:1228` flushes the cofactor queue *before* enqueuing the
@@ -966,9 +1132,10 @@ absent from every document in the repo.
     Verified on a GPU 2026-08-16, c147: header, heartbeat, band-end record,
     the `isatty(1)` split (a redirected console gets whole lines every five
     minutes — its own constant, *not* `--log-every` — instead of a `\r` line
-    and a stray `\033[K`), and NVML binding. **Not yet exercised: the `resume`
-    note** (it needs a checkpointed band, so it comes with 12a's verification)
-    and any BOINC-resolved log path.
+    and a stray `\033[K`), and NVML binding. The `resume` note was exercised by
+    12a's verification the same day — a resumed session appends its own header
+    block, carrying the resume point and the narrowed band. **Not yet
+    exercised: a BOINC-resolved log path.**
 
     Three implementation notes worth keeping:
 

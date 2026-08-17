@@ -288,11 +288,15 @@ static int validate_qsel_or_report(qsel_t *sel, const poly_t *P, int side,
     return -1;
 }
 
-/* Cofactoriser bounds. The representation is narrow ON PURPOSE -- split
- * factors are emitted as a single uint32 limb and both cofactors are mz<3> --
- * so a bound outside that design does not degrade, it silently truncates: a
- * 33-bit factor is stored as its low 32 bits and the relation stops
- * reconstructing its own norm. Refuse.
+/* Cofactoriser bounds. The representation is FIXED-WIDTH on purpose -- a
+ * resulting prime is one uint64 and both cofactors are mz<3> -- so a bound
+ * outside that design does not degrade, it silently truncates, and a relation
+ * that has lost the top of a factor stops reconstructing its own norm. Refuse.
+ *
+ * The widths moved on 2026-08-17: split factors and unsplit prime residuals
+ * were a single uint32, which capped lpb at 32. They are 64-bit now, which is
+ * why the bound below is 64 and why an NFS@Home C194 (lpba 33, mfba 95) runs.
+ * The COFACTOR width did not move: mfb is still bounded by mz<3>.
  *
  * This MUST run after the .job file has been read. It used to sit inline in
  * main() ahead of poly_load, so it only ever saw command-line values -- and
@@ -307,9 +311,15 @@ static int check_cofactor_bounds(const bench_cfg_t *cfg, uint32_t alim,
     const uint32_t lpb1 = cfg->lpb ? cfg->lpb : 32;
     const uint32_t mfb1 = cfg->mfb ? cfg->mfb : 92;
     int bad = 0;
-    if (lpb1 > 32 || cfg->lpb0 > 32) {
-        fprintf(stderr, "lpb %u / side-0 %u: split factors are emitted as one"
-                " 32-bit limb, so lpb > 32 truncates them\n", lpb1, cfg->lpb0);
+    /* 64, not 32: split factors and unsplit prime residuals are stored in
+     * uint64 throughout the queue, the emitter and the reconstruction gate, so
+     * the representation ends at 64 and not before. Everything between 32 and
+     * 64 that would nonetheless be wrong is refused by a check with an actual
+     * reason -- the parts test below, and lim^2 > 2^lpb further down, which
+     * binds around lpb 55 for an alim of 240M. A C194 asks for lpba 33. */
+    if (lpb1 > 64 || cfg->lpb0 > 64) {
+        fprintf(stderr, "lpb %u / side-0 %u: a resulting prime is stored in one"
+                " 64-bit word, so lpb > 64 truncates it\n", lpb1, cfg->lpb0);
         bad = 1;
     }
     if (mfb1 > 96) {
@@ -629,7 +639,7 @@ static int bench_main_impl(int argc, char **argv)
             fprintf(stderr, "note: --auto-params is the default now and is"
                             " ignored; drop it\n");
         else if (!strcmp(argv[i], "--blocking-sync")) blocking_sync = 1;
-        else if (!strcmp(argv[i], "--lpb0") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 32) { fprintf(stderr, "--lpb0 %ld out of range 1..32\n", v); return 1; } cfg.lpb0 = (uint32_t)v; lpb0_set = 1; }
+        else if (!strcmp(argv[i], "--lpb0") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 64) { fprintf(stderr, "--lpb0 %ld out of range 1..64\n", v); return 1; } cfg.lpb0 = (uint32_t)v; lpb0_set = 1; }
         else if (!strcmp(argv[i], "--mfb0") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 96) { fprintf(stderr, "--mfb0 %ld out of range 1..96\n", v); return 1; } cfg.mfb0 = (uint32_t)v; mfb0_set = 1; }
         /* Range-checked like --lpb0/--mfb0 above, and for the same reason. An
          * unchecked --lambda1 0.01 gives allowance 0.32, bound 1, and a band
@@ -735,7 +745,7 @@ static int bench_main_impl(int argc, char **argv)
             }
             cfg.log_every_s = v;
         }
-        else if (!strcmp(argv[i], "--lpb") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 32) { fprintf(stderr, "--lpb %ld out of range 1..32\n", v); return 1; } cfg.lpb = (uint32_t)v; lpb_set = 1; }
+        else if (!strcmp(argv[i], "--lpb") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 64) { fprintf(stderr, "--lpb %ld out of range 1..64\n", v); return 1; } cfg.lpb = (uint32_t)v; lpb_set = 1; }
         else if (!strcmp(argv[i], "--mfb") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 96) { fprintf(stderr, "--mfb %ld out of range 1..96\n", v); return 1; } cfg.mfb = (uint32_t)v; mfb_set = 1; }
         else if (!strcmp(argv[i], "--cofgate") && i + 1 < argc) {
             if (bench_boinc_resolve_path("--cofgate", argv[++i], &cfg.cofgate)) return 1;

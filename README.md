@@ -11,7 +11,7 @@ limitations and unfinished experiments in [`bench/STATUS.md`](bench/STATUS.md)
 are part of its release status.
 
 The current production path is limited to a `2^31`-position sieve area,
-`lpb <= 32`, `mfb <= 96`, and at most three large primes per side. These are
+`lpb <= 64`, `mfb <= 96`, and at most three large primes per side. These are
 checked limits, not suggested settings. The separate representation, memory,
 cofactor-performance, and filtering implications of lifting them are laid out
 in [Current size limits, and what lifting them entails](bench/STATUS.md#current-size-limits-and-what-lifting-them-entails).
@@ -155,6 +155,9 @@ current band again.
 ## Repository map
 
 - [`bench/`](bench/) contains the implementation, build, and test programs.
+- [`bench/testsieve.sh`](bench/testsieve.sh) test-sieves a job at several q
+  and projects the whole run — relations, days, energy, and where a relation
+  target is met — across geometries and factor-base bounds.
 - [`bench/STATUS.md`](bench/STATUS.md) is the current architecture, validation,
   known-defect, and open-experiment summary.
 - [`bench/RESULTS.md`](bench/RESULTS.md) is the chronological benchmark lab

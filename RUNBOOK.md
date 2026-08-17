@@ -114,27 +114,78 @@ you either state them or let them derive.
 The production binary currently refuses:
 
 - a sieve rectangle with more than `2^31` positions;
-- `lpbr` or `lpba` above 32;
-- `mfbr` or `mfba` above 96; or
-- a ratio `ceil(mfb/lpb)` above 3 on either side.
+- `lpbr` or `lpba` above 64;
+- `mfbr` or `mfba` above 96;
+- a ratio `ceil(mfb/lpb)` above 3 on either side; or
+- `lim^2 <= 2^lpb` on either side, which makes the "prime by size" test in the
+  splitter unsound (it binds around `lpb 55` at an `alim` of 240M).
 
 These are representation limits, not tuning advice, and there is no supported
 override. In particular, an A=32 job (`--logI 16 --J 65536`) would wrap the
-current 32-bit exclusive position endpoint and is therefore refused; an
-`lpb 35 / mfb 101` side needs both 64-bit large-prime outputs and a four-limb
-cofactor kernel.
+current 32-bit exclusive position endpoint and is therefore refused.
+
+**`lpb` above 32 is supported as of 2026-08-17** — an NFS@Home C194 asks for
+`lpba 33` with `mfba 95`, and that runs today. What it did *not* require is any
+change to the cofactor arithmetic: `mfb <= 96` still means three limbs, and
+`ceil(96/33) = 3` still fits the splitter. An `lpb 35 / mfb 101` side is the
+different problem, because 101 bits needs a four-limb kernel.
 
 LPB and MFB should not be conflated. LPB is the bound on each resulting prime;
-raising it above 32 requires widening the split-prime, emission, and validation
-paths. MFB is the maximum composite residual sent to cofactorisation and sets
+raising it above 32 widened the split-prime, emission, and validation paths to
+64 bits (done 2026-08-17). MFB is the maximum composite residual sent to cofactorisation and sets
 the arithmetic width: up to 64 bits can use two 32-bit limbs, up to 96 three,
-and up to 128 four. Thus `lpb 33` with `mfb 64/95` would not itself require
-four-limb rho or ECM, although that configuration is not implemented today.
+and up to 128 four. Thus `lpb 33` with `mfb 64/95` does not require
+four-limb rho or ECM, and is exactly the configuration that now runs.
 
 For the current status, proposed per-side fixed-width kernel dispatch, A=32
 memory/slabbing options, and why the end metric is time to a filterable matrix
 rather than raw relations/s, see [Current size limits, and what lifting them
 entails](bench/STATUS.md#current-size-limits-and-what-lifting-them-entails).
+
+### Sizing a job first: `testsieve.sh`
+
+Before committing days to a band, test-sieve it. `bench/testsieve.sh` samples
+the yield curve at several q, integrates it, and projects the whole run:
+
+```sh
+cd bench
+./testsieve.sh --poly c194.job --fb1 c194.roots1 \
+    --qmin 20000000 --qmax 200000000 --points 5 \
+    --target-rels 300000000 --geom 15,16384 --geom 15,32768
+```
+
+```
+  === projection over [20000000, 200000000) ===
+  geometry     relations      GPU days     energy kWh   rel/kJ     target reached at q
+  15,16384     4.58e+08       13.01        54.0         2356.0     123343539  (7.83 d)
+  15,32768     6.51e+08       25.35        108.0        1675.3      86640790  (9.89 d)
+```
+
+Read that as: the taller rectangle reaches the target at a **much lower q**
+(86.6M against 123.3M) but takes **two days longer** and 2× the energy to get
+there.
+
+**And do not take the `J = I` row at face value yet.** Measured against GGNFS
+on the same rectangle, our yield at `2^15 × 2^15` is **14% low**, while both
+2:1 geometries are at parity — an aspect-ratio effect traced to the norm
+approximation (`bench/RESULTS.md` finding 58, `bench/STATUS.md` item 5). So the
+projection above understates how long a 1:1 run really takes to reach a target,
+and the honest advice today is **2:1 rectangles only**: `J = I/2`, which is the
+default. Revisit when item 5 lands.
+
+It differs from GGNFS's `test_sieve.sh` in three ways. It can sweep
+**geometry** (`--geom logI,J`, repeatable) and the **factor-base bounds**
+(`--rlim`/`--alim`), which a per-I compiled siever cannot. It reports
+**energy**, taken from the run log's board-watt samples. And everything is per
+**(q, rho) pair** rather than per prime q — stated in its own header, because
+the two differ by ~1.5× on a degree-5 polynomial and confusing them has cost
+this project one wrong headline already (`bench/RESULTS.md` finding 57).
+
+Two cautions. The default `--width 2000` sieves ~100 pairs per point, which is
+a few seconds but visibly noisy: on the C194 the projected total moved 11%
+between a 2,000-wide and a 20,000-wide sample. Widen it when the number
+matters. And the projected days are **GPU-busy** days with startup excluded —
+a real run adds the factor-base load once and whatever the host steals.
 
 ### Progress output
 

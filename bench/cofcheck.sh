@@ -169,7 +169,55 @@ else
     printf 'FAIL   %-34s expected 36, got %s\n' "derived allowance policy" "$got"; fail=1
 fi
 
-expect_refused "lpb above the 32-bit limb"    --cofactor --lpb 33
+# ---- large primes above 2^32 ----------------------------------------------
+# lpb 33 is a REAL configuration, not an edge: an NFS@Home C194 asks for
+# lpba 33 with mfba 95. Split factors, unsplit prime residuals, the emitter and
+# the reconstruction gate are all 64-bit, so the limit is the 64-bit word and
+# nothing below it.
+expect_refused "lpb above the 64-bit word"    --cofactor --lpb 65
+# --lpb 65 is rejected by the ARGUMENT PARSER, which is not the check that
+# matters. check_cofactor_bounds() exists for the values that arrive from a
+# .job FILE, where nothing range-checks them -- its own comment says so. That
+# branch needs a job file to reach it.
+{ cat $POLY; printf 'rlim: 134200000\nalim: 134200000\nlpbr: 31\nlpba: 65\nmfbr: 60\nmfba: 92\n'; } > $TMP/lpb65.job
+if ./bench --pipeline --cadofb $FB --poly $TMP/lpb65.job $Q --cofactor \
+           --relations $TMP/r.txt >$TMP/o 2>&1; then
+    printf 'FAIL   %-34s accepted, should have been refused\n' "job-file lpba above 64"; fail=1
+else
+    printf 'PASS   %-34s refused\n' "job-file lpba above 64"
+fi
+# The positive half, and it is the one that matters: refusal cases alone would
+# still pass with the whole 64-bit path broken. Pinned on an exact count AND on
+# a factor actually exceeding 2^32 -- without the second assertion this case
+# would silently stop exercising the widening if the gate or the job ever
+# moved. Through `run`, so it carries $PIN like every other count-pinned case:
+# 59 has to be a function of the widening, not of the allowance policy.
+got=$(run --cofactor --cof-rounds 2 --cof-budget 65536 --lpb 33 \
+          --relations $TMP/l33.txt | grep 'total relations' | tail -1 | awk '{print $NF}')
+# length > 8 hex digits is the whole test: any 8-digit value is below 2^32 by
+# definition. `|| echo 0` because a failed run above leaves no file, and a bare
+# command substitution would take `set -e` down with it before the FAIL prints.
+big=$(awk -F: '!/^#/ && NF>=3 {
+          n = split($2","$3, f, ",");
+          for (i = 1; i <= n; i++) if (length(f[i]) > 8) c++
+      } END {print c+0}' $TMP/l33.txt 2>/dev/null || echo 0)
+if [ "$got" = "59" ] && [ "$big" -gt 0 ] && \
+   ./bench --check-relations $TMP/l33.txt --poly $POLY --lpb 33 --lpb0 31 2>&1 \
+   | grep -q 'PASS'; then
+    printf 'PASS   %-34s 59 relations, %s factors > 2^32, all reconstruct\n' \
+           "lpb 33 emits and verifies" "$big"
+else
+    printf 'FAIL   %-34s expected 59 relations with >2^32 factors, got %s / %s\n' \
+           "lpb 33 emits and verifies" "$got" "$big"; fail=1
+fi
+# The gate's lpb bound must be load-bearing, not decorative: the same file read
+# back at lpb 32 has to be REFUSED, or "verifies at lpb 33" proves nothing.
+if ./bench --check-relations $TMP/l33.txt --poly $POLY --lpb 32 --lpb0 31 2>&1 \
+   | grep -q 'FAIL'; then
+    printf 'PASS   %-34s same file refused at lpb 32\n' "lpb bound is enforced"
+else
+    printf 'FAIL   %-34s lpb 32 accepted a 33-bit factor\n' "lpb bound is enforced"; fail=1
+fi
 expect_refused "mfb above the 3-limb cofactor" --cofactor --mfb 97
 expect_refused "zero rho budget"              --cofactor --cof-budget 0
 expect_refused "rho rounds overflowing shift" --cofactor --cof-rounds 40
