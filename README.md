@@ -119,6 +119,11 @@ The BOINC build:
 - resolves every explicitly supplied input or output filename through
   `boinc_resolve_filename_s()` and follows native BOINC output links before
   staging and renaming result files; and
+- detects whether it is actually managed by a BOINC core client (as opposed to
+  a BOINC build launched standalone) and, only in managed mode, discards
+  unusable staging/checkpoint artifacts so a volunteer task recomputes instead
+  of requiring manual repair. A persistent counter limits this to three
+  recoveries per workunit; and
 - reports a nondecreasing fraction done at special-q boundaries, normally no
   more than once per second, with an immediate end-of-band update. The
   denominator is, in priority order, `--target-rels`, `--nq`, a bounded

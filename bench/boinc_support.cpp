@@ -203,6 +203,15 @@ extern "C" int bench_boinc_gpu_device(void)
 #endif
 }
 
+extern "C" int bench_boinc_is_managed(void)
+{
+#ifdef HAVE_BOINC
+    return boinc_state == BOINC_READY && !boinc_is_standalone();
+#else
+    return 0;
+#endif
+}
+
 extern "C" int bench_boinc_resolve_path(const char *option,
                                          const char *logical_name,
                                          const char **resolved_name)

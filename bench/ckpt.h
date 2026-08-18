@@ -66,22 +66,22 @@ typedef struct {
  * so ckpt_written never becomes 1 and a clean stop discards the .part holding
  * the whole session. */
 #define CKPT_PATH_MAX 2048
-/* Longest suffix appended below: ".part.ckpt.tmp" is 14 bytes. */
-#define CKPT_SUFFIX_MAX 16
+/* Longest suffix appended below: ".part.recover.tmp" is 17 bytes. */
+#define CKPT_SUFFIX_MAX 20
 
 /* Check ONCE, where the path enters the program, that every name derived from
  * it will fit. Callers that pass this may then build .part, .part.ckpt,
- * .part.ckpt.tmp and .lock without any of them being able to truncate, which
- * is what makes the four names consistent with each other. The names are
- * derived, not typed: under BOINC `relations` is a resolved absolute
- * slot/project path, so the margin is not the one the command line suggests. */
+ * .part.ckpt.tmp, .part.recover[.tmp] and .lock without any of them being able
+ * to truncate. The names are derived, not typed: under BOINC `relations` is a
+ * resolved absolute slot/project path, so the margin is not the one the
+ * command line suggests. */
 static inline int ckpt_path_usable(const char *relations, const char *what)
 {
     const size_t n = relations ? strlen(relations) : 0;
     if (n + CKPT_SUFFIX_MAX >= (size_t)CKPT_PATH_MAX) {
         fprintf(stderr,
-                "%s: path is %zu bytes; the .part, .part.ckpt and .lock names"
-                " derived from it must fit in %d\n",
+                "%s: path is %zu bytes; the .part, checkpoint, recovery and"
+                " lock names derived from it must fit in %d\n",
                 what, n, CKPT_PATH_MAX);
         return -1;
     }
@@ -117,6 +117,17 @@ static inline int ckpt_ckpt_path(const char *relations, char *out, size_t n)
 static inline int ckpt_lock_path(const char *relations, char *out, size_t n)
 {
     return ckpt_path_fmt(relations, out, n, ".lock");
+}
+
+static inline int ckpt_recovery_path(const char *relations, char *out, size_t n)
+{
+    return ckpt_path_fmt(relations, out, n, ".part.recover");
+}
+
+static inline int ckpt_recovery_tmp_path(const char *relations, char *out,
+                                         size_t n)
+{
+    return ckpt_path_fmt(relations, out, n, ".part.recover.tmp");
 }
 
 /* ---- fingerprint ------------------------------------------------------- */
@@ -240,7 +251,7 @@ static inline int ckpt_write(const char *relations, const poly_t *P,
 
 /* ---- read -------------------------------------------------------------- */
 
-/* 0 = loaded, -1 = absent or unreadable, -2 = present but malformed. A
+/* 0 = loaded, -1 = absent, -2 = present but malformed, -3 = unreadable. A
  * malformed checkpoint is NOT treated as absent: silently starting over would
  * discard a file the operator believes is being resumed. */
 static inline int ckpt_read(const char *relations, ckpt_t *ck)
@@ -253,7 +264,11 @@ static inline int ckpt_read(const char *relations, ckpt_t *ck)
      * nothing about what is on disk, and telling an operator to discard a
      * resumable .part on that basis is the one answer that loses work. */
     if (ckpt_ckpt_path(relations, path, sizeof path)) return -2;
-    if (!(f = fopen(path, "r"))) return -1;
+    if (!(f = fopen(path, "r"))) {
+        if (errno == ENOENT) return -1;
+        perror(path);
+        return -3;
+    }
     memset(ck, 0, sizeof *ck);
     while (fgets(line, sizeof line, f)) {
         char key[64]; char val[256];
@@ -282,7 +297,16 @@ static inline int ckpt_read(const char *relations, ckpt_t *ck)
         else if (!strcmp(key, "allowance"))   { ck->allowance = strtod(val, 0); got |= 128; }
         else if (!strcmp(key, "allowance0"))  { ck->allowance0 = strtod(val, 0); got |= 256; }
     }
-    fclose(f);
+    {
+        const int read_bad = ferror(f);
+        const int saved_errno = errno;
+        const int close_bad = fclose(f);
+        if (read_bad || close_bad) {
+            if (read_bad) errno = saved_errno;
+            perror(path);
+            return -3;
+        }
+    }
     if (got != 511) {
         fprintf(stderr, "resume: %s is missing required fields\n", path);
         return -2;

@@ -17,11 +17,13 @@
 set -u
 usage() {
     cat <<'EOF'
-usage: ./testsieve.sh --poly JOB.job --fb1 FB [options]
+usage: ./testsieve.sh --poly JOB.job [--fb1 FB] [options]
        ./testsieve.sh                       # prompt for parameters
 
   --poly PATH        the job file (required)
-  --fb1 PATH         algebraic factor base from fbgen (required)
+  --fb1 PATH         custom caller-managed algebraic factor base
+                     [omit for checked/rebuilt fbase.mLOGI cache]
+  --fb-threads N     threads when rebuilding the default factor base [all CPUs]
   --qmin N           band start                          [20000000]
   --qmax N           band end, for the projection        [10 x qmin]
   --points N         sample points across the band       [5]
@@ -47,7 +49,9 @@ EOF
 }
 
 POLY=
-FB=
+FB=fbase
+FB_MANAGED=1
+FB_THREADS=${FB_THREADS:-}
 QMIN=20000000
 QMAX=
 POINTS=5
@@ -71,7 +75,8 @@ fi
 while [ $# -gt 0 ]; do
     case "$1" in
         --poly) POLY=$2; shift 2 ;;
-        --fb1) FB=$2; shift 2 ;;
+        --fb1) FB=$2; FB_MANAGED=0; shift 2 ;;
+        --fb-threads) FB_THREADS=$2; shift 2 ;;
         --qmin) QMIN=$2; shift 2 ;;
         --qmax) QMAX=$2; shift 2 ;;
         --points) POINTS=$2; shift 2 ;;
@@ -103,16 +108,40 @@ prompt_value() {
     printf '%s' "${answer:-$default}"
 }
 
+default_fb_threads() {
+    local n
+    n=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+    [[ "$n" =~ ^[0-9]+$ ]] || n=1
+    [ "$n" -le 256 ] || n=256
+    printf '%s' "$n"
+}
+
+canonical_decimal() {
+    local n=$1
+    while [ "${#n}" -gt 1 ] && [ "${n#0}" != "$n" ]; do n=${n#0}; done
+    printf '%s' "$n"
+}
+
 if [ "$INTERACTIVE" = 1 ]; then
     echo "Interactive test-sieve setup (press Enter to accept a default)."
     POLY=$(prompt_value "Job file" "${POLY:-input.job}")
-    FB=$(prompt_value "Algebraic factor base" "${FB:-fbase}")
+    read -r -p "Algebraic factor base [$FB]: " answer
+    if [ -n "$answer" ]; then
+        FB=$answer
+        # Typing a path is an explicit choice and must not authorize overwrite.
+        FB_MANAGED=0
+    fi
+    if [ "$FB_MANAGED" = 1 ]; then
+        [ -n "$FB_THREADS" ] || FB_THREADS=$(default_fb_threads)
+        FB_THREADS=$(prompt_value "Factor-base build threads" "$FB_THREADS")
+    fi
     QMIN=$(prompt_value "Band start q" "$QMIN")
     # Same reason as the validation block below: this $(( )) must not see an
     # unvalidated answer.
     if ! [[ "$QMIN" =~ ^[0-9]+$ ]] || [ "$QMIN" -le 1 ]; then
         echo "qmin must be an integer greater than 1" >&2; exit 2
     fi
+    QMIN=$(canonical_decimal "$QMIN")
     qmax_default=${QMAX:-$((QMIN * 10))}
     QMAX=$(prompt_value "Band end q" "$qmax_default")
     POINTS=$(prompt_value "Sample points" "$POINTS")
@@ -153,10 +182,12 @@ if [ -z "$POLY" ] || [ -z "$FB" ]; then usage; exit 2; fi
 if ! [[ "$QMIN" =~ ^[0-9]+$ ]] || [ "$QMIN" -le 1 ]; then
     echo "qmin must be an integer greater than 1" >&2; exit 2
 fi
+QMIN=$(canonical_decimal "$QMIN")
 if [ -n "$QMAX" ] && ! [[ "$QMAX" =~ ^[0-9]+$ ]]; then
     echo "qmax must be an integer" >&2; exit 2
 fi
 [ -n "$QMAX" ] || QMAX=$((QMIN * 10))
+QMAX=$(canonical_decimal "$QMAX")
 if [ "$QMAX" -le "$QMIN" ]; then
     echo "qmax must be greater than qmin" >&2; exit 2
 fi
@@ -164,25 +195,122 @@ if ! [[ "$POINTS" =~ ^[0-9]+$ && "$WIDTH" =~ ^[0-9]+$ ]] ||
    [ "$POINTS" -eq 0 ] || [ "$WIDTH" -eq 0 ]; then
     echo "points and width must be positive integers" >&2; exit 2
 fi
+POINTS=$(canonical_decimal "$POINTS")
+WIDTH=$(canonical_decimal "$WIDTH")
 if [ -n "$TARGET" ] && ! [[ "$TARGET" =~ ^[0-9]+$ ]]; then
     echo "target-rels must be a nonnegative integer" >&2; exit 2
 fi
+[ -z "$TARGET" ] || TARGET=$(canonical_decimal "$TARGET")
+for bound_name in RLIM ALIM; do
+    bound=${!bound_name}
+    if [ -n "$bound" ]; then
+        if ! [[ "$bound" =~ ^[0-9]+$ ]]; then
+            echo "${bound_name,,} must be a positive integer" >&2; exit 2
+        fi
+        bound=$(canonical_decimal "$bound")
+        if [ "$bound" -eq 0 ]; then
+            echo "${bound_name,,} must be a positive integer" >&2; exit 2
+        fi
+        printf -v "$bound_name" '%s' "$bound"
+    fi
+done
 if [ "$SQ_SIDE" != 0 ] && [ "$SQ_SIDE" != 1 ]; then
     echo "sq-side must be 1 (algebraic) or 0 (rational)" >&2; exit 2
 fi
+NORMALIZED_GEOMS=()
 for geom in "${GEOMS[@]}"; do
-    if ! [[ "$geom" =~ ^[0-9]+,[0-9]+$ ]] ||
-       [ "${geom%%,*}" -eq 0 ] || [ "${geom##*,}" -eq 0 ]; then
-        echo "geometry must be a positive logI,J pair (for example 15,16384)" >&2
+    if ! [[ "$geom" =~ ^[0-9]+,[0-9]+$ ]]; then
+        echo "geometry must be logI,J with logI in [2,20] and positive J" >&2
         exit 2
     fi
+    logI=$(canonical_decimal "${geom%%,*}")
+    J=$(canonical_decimal "${geom##*,}")
+    if [ "$logI" -lt 2 ] || [ "$logI" -gt 20 ] || [ "$J" = 0 ]; then
+        echo "geometry must be logI,J with logI in [2,20] and positive J" >&2
+        exit 2
+    fi
+    NORMALIZED_GEOMS+=("$logI,$J")
 done
+GEOMS=("${NORMALIZED_GEOMS[@]}")
 [ -x ./bench ] || { echo "run me from the bench directory (no ./bench here)" >&2; exit 2; }
+
+# The default factor base is a managed cache, like input.job.afb.0 in the
+# GGNFS test sieve. Native fbgen files identify their exact polynomial, lim,
+# and maxbits in the first four lines, so inspect those directly instead of
+# trusting a filename. Custom --fb1 paths remain caller-managed and are never
+# overwritten.
+MANAGE_FB=$FB_MANAGED
+declare -A FB_BY_LOGI=() SEEN_LOGI=()
+for geom in "${GEOMS[@]}"; do SEEN_LOGI[${geom%%,*}]=1; done
+
+if [ "$MANAGE_FB" = 1 ]; then
+    [ -n "$FB_THREADS" ] || FB_THREADS=$(default_fb_threads)
+    if ! [[ "$FB_THREADS" =~ ^[0-9]+$ ]]; then
+        echo "fb-threads must be an integer in [1,256]" >&2; exit 2
+    fi
+    FB_THREADS=$(canonical_decimal "$FB_THREADS")
+    if [ "$FB_THREADS" -eq 0 ] || [ "$FB_THREADS" -gt 256 ]; then
+        echo "fb-threads must be an integer in [1,256]" >&2; exit 2
+    fi
+    [ -x ./fbgen ] || make fbgen
+    [ -x ./fbgen ] || { echo "could not build ./fbgen" >&2; exit 1; }
+
+    EFFECTIVE_ALIM=$ALIM
+    if [ -z "$EFFECTIVE_ALIM" ]; then
+        EFFECTIVE_ALIM=$(sed -nE \
+            's/\r$//; s/^[[:space:]]*alim[[:space:]]*:[[:space:]]*([0-9]+)[[:space:]]*$/\1/p' \
+            "$POLY" | tail -1)
+    fi
+    if ! [[ "$EFFECTIVE_ALIM" =~ ^[0-9]+$ ]] || [ "$EFFECTIVE_ALIM" -lt 2 ]; then
+        echo "the default factor base needs --alim or an alim: value in $POLY" >&2
+        exit 2
+    fi
+    EFFECTIVE_ALIM=$(canonical_decimal "$EFFECTIVE_ALIM")
+
+    fb_header_err=$(mktemp)
+    if ! expected_fb_text=$(./fbgen --poly "$POLY" --lim 2 --maxbits 1 \
+            --threads 1 2>"$fb_header_err"); then
+        cat "$fb_header_err" >&2
+        rm -f "$fb_header_err"
+        echo "could not derive factor-base metadata from $POLY" >&2
+        exit 1
+    fi
+    rm -f "$fb_header_err"
+    mapfile -t EXPECTED_FB_HEADER < <(printf '%s\n' "$expected_fb_text" | sed -n '1,2p')
+    if [ ${#EXPECTED_FB_HEADER[@]} -ne 2 ]; then
+        echo "could not derive factor-base metadata from $POLY" >&2; exit 1
+    fi
+
+    for logI in "${!SEEN_LOGI[@]}"; do
+        cache_fb="${FB}.m${logI}"
+        FB_BY_LOGI[$logI]=$cache_fb
+
+        mapfile -t actual_header < <(sed -n '1,4p' "$cache_fb" 2>/dev/null)
+        cache_valid=1
+        [ ${#actual_header[@]} -eq 4 ] || cache_valid=0
+        if [ "$cache_valid" = 1 ]; then
+            [ "${actual_header[0]}" = "${EXPECTED_FB_HEADER[0]}" ] || cache_valid=0
+            [ "${actual_header[1]}" = "${EXPECTED_FB_HEADER[1]}" ] || cache_valid=0
+            [ "${actual_header[2]}" = "# lim = $EFFECTIVE_ALIM" ] || cache_valid=0
+            [ "${actual_header[3]}" = "# maxbits = $logI" ] || cache_valid=0
+        fi
+
+        if [ "$cache_valid" = 1 ]; then
+            echo "[testsieve] factor-base cache valid: $cache_fb"
+        else
+            echo "[testsieve] rebuilding stale or missing factor base: $cache_fb"
+            ./fbgen --poly "$POLY" --lim "$EFFECTIVE_ALIM" \
+                --maxbits "$logI" --threads "$FB_THREADS" --out "$cache_fb" || exit 1
+        fi
+    done
+    echo
+fi
 
 TMP=$(mktemp -d)
 # Announce the path when keeping: mktemp -d names are random, nothing else in
 # the output contains one (the per-point messages print basenames), so a kept
 # directory was previously findable only by hunting /tmp by mtime.
+# shellcheck disable=SC2317  # invoked indirectly by trap
 cleanup() {
     if [ "$KEEP" = 1 ]; then echo "[testsieve] kept relation files and logs in $TMP"
     else rm -rf "$TMP"; fi
@@ -199,10 +327,14 @@ ROWS="$TMP/rows.txt"; : > "$ROWS"
 
 for geom in "${GEOMS[@]}"; do
     logI=${geom%%,*}; J=${geom##*,}
+    geom_fb=$FB
+    [ "$MANAGE_FB" = 0 ] || geom_fb=${FB_BY_LOGI[$logI]}
     area=$(python3 -c "import math;print('2^%.4g'%math.log2((1<<$logI)*$J))")
     printf '  --- logI %s, J %s  (area %s) ---\n' "$logI" "$J" "$area"
-    printf '  %-12s %-8s %-9s %-10s %-9s %-8s %-8s %-8s\n' \
-           q0 pairs exp-pairs n-yield rel/pair ms/pair rel/s board_W
+    printf '  %-12s %-8s %-9s %-10s %-12s %-9s %-8s %-8s %-8s\n' \
+           q0 pairs exp-pairs n-yield exp-rel rel/pair ms/pair rel/s board_W
+    PREV="$TMP/prev.txt"
+    : > "$PREV"
     for i in $(seq 0 $((POINTS - 1))); do
         # Linear spacing. Yield falls smoothly with q, so the trapezoid rule
         # over evenly spaced points is the right shape; log spacing would
@@ -218,7 +350,7 @@ for geom in "${GEOMS[@]}"; do
         q1=$((q0 + WIDTH - 1))
         tag="g${logI}_${J}_$i"
         # shellcheck disable=SC2086
-        if ! ./bench --pipeline --cofactor --poly "$POLY" --fb1 "$FB" \
+        if ! ./bench --pipeline --cofactor --poly "$POLY" --fb1 "$geom_fb" \
             --sq-side "$SQ_SIDE" \
             --logI "$logI" --J "$J" --qrange "$q0:$q1" \
             ${RLIM:+--rlim $RLIM} ${ALIM:+--alim $ALIM} $EXTRA \
@@ -248,27 +380,35 @@ for geom in "${GEOMS[@]}"; do
                    "$q0" "$tag.out"
             continue
         fi
-        python3 - "$q0" "$WIDTH" "$pairs" "$rel" "$ms" "${bw:-0}" "$logI,$J" "$ROWS" <<'EOF'
+        python3 - "$q0" "$WIDTH" "$pairs" "$rel" "$ms" "${bw:-0}" \
+            "$logI,$J" "$ROWS" "$PREV" <<'EOF'
 import math
 import sys
-q0,w,pairs,rel,ms,bw,geom,rows = sys.argv[1:]
+q0,w,pairs,rel,ms,bw,geom,rows,prev_file = sys.argv[1:]
 q0,w,pairs,rel,ms,bw = int(q0),int(w),int(pairs),int(rel),float(ms),float(bw)
 relpair = rel/pairs if pairs else 0.0
 expected = w/math.log(q0)
 nrel = relpair*expected
 nsecs = expected*ms/1000.0
 rels    = relpair/(ms/1000.0) if ms else 0.0
-print("  %-12d %-8d %-9.1f %-10.1f %-9.2f %-8.2f %-8.0f %-8s" %
-      (q0, pairs, expected, nrel, relpair, ms, rels,
+exp_rel = ""
+previous = open(prev_file).read().split()
+if previous:
+    prev_q0, prev_nrel = int(previous[0]), float(previous[1])
+    exp_rel = "%.0f" % (((prev_nrel + nrel) / 2.0) * (q0 - prev_q0) / w)
+print("  %-12d %-8d %-9.1f %-10.1f %-12s %-9.2f %-8.2f %-8.0f %-8s" %
+      (q0, pairs, expected, nrel, exp_rel, relpair, ms, rels,
        ("%.1f"%bw) if bw else "n/a"))
 open(rows,"a").write("%s %d %d %d %.9f %.9f %.6f %.3f\n" %
                      (geom,q0,w,pairs,expected,nrel,nsecs,bw))
+open(prev_file,"w").write("%d %.9f\n" % (q0,nrel))
 EOF
     done
     echo
 done
 
-python3 - "$QMIN" "$QMAX" "${TARGET:-0}" "$ROWS" <<'EOF'
+projection_status=0
+python3 - "$QMIN" "$QMAX" "${TARGET:-0}" "$ROWS" <<'EOF' || projection_status=$?
 import sys
 qmin, qmax, target, rows = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
 data = {}
@@ -340,3 +480,18 @@ print("\n  Startup is excluded from every timing, and these are GPU-busy days:")
 print("  a real run adds the factor-base load once and whatever the host steals")
 print("  (RESULTS.md finding 56: ~6% at one competing thread per core).")
 EOF
+
+echo
+echo "--- $(basename "$POLY") (source job plus selected sieve side) ---"
+cat -- "$POLY" || [ "$projection_status" -ne 0 ] || projection_status=1
+if [ "$SQ_SIDE" = 1 ]; then
+    # Match the GGNFS test sieve's result.job display without modifying the
+    # user's input file or leaving a generated job in the worktree.
+    if [ -s "$POLY" ] && [ -n "$(tail -c1 -- "$POLY")" ]; then echo; fi
+    echo "lss: 0"
+fi
+[ -z "$RLIM" ] || echo "# test-sieve override: rlim=$RLIM"
+[ -z "$ALIM" ] || echo "# test-sieve override: alim=$ALIM"
+[ -z "$EXTRA" ] || echo "# test-sieve extra flags: $EXTRA"
+echo
+exit "$projection_status"

@@ -48,6 +48,7 @@ bench/input.job
 bench/*.m14
 bench/*.m15
 bench/*.m16
+bench/fbase.m*
 
 # Python bytecode from the analysis tools (relgeom.py and friends). Untracked
 # files set the build stamp's -dirty flag, which is what makes the run log's

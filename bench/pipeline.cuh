@@ -1919,13 +1919,21 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
             rc = -1;
         outputs_finalized = 1;
         if (commit && rc == 0 && ckpt_armed) {
-            char cp[CKPT_PATH_MAX];
+            char cp[CKPT_PATH_MAX], rp[CKPT_PATH_MAX], rtp[CKPT_PATH_MAX];
             /* Cannot fail here: the same name was built for every checkpoint
              * this band wrote, into a buffer of the same size. Checked anyway
              * because the band is already committed -- a stale sidecar is a
              * better outcome than an ignored return value. */
             if (ckpt_ckpt_path(cfg->relations, cp, sizeof cp) == 0)
                 remove(cp);      /* nothing left to resume */
+            /* A BOINC recovery budget spans the whole workunit, not merely one
+             * checkpoint interval. Clear it only after the final output has
+             * committed; otherwise a deterministic resume defect could write
+             * one good checkpoint per attempt and restart forever. */
+            if (ckpt_recovery_path(cfg->relations, rp, sizeof rp) == 0)
+                remove(rp);
+            if (ckpt_recovery_tmp_path(cfg->relations, rtp, sizeof rtp) == 0)
+                remove(rtp);
         }
     }
 #ifdef HAVE_BOINC

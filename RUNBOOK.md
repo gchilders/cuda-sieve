@@ -191,12 +191,27 @@ cd bench
     --target-rels 300000000 --geom 15,16384 --geom 15,32768
 ```
 
+When `--fb1` is omitted, `fbase` is the managed cache stem. Before sieving,
+the script compares its embedded polynomial, `lim`, and `maxbits` metadata with
+the selected job and geometry, rebuilding it with `fbgen` when it is missing
+or stale. Geometry sweeps use stable per-`logI` names such as `fbase.m15`,
+because prime-power depth is part of the factor base. Supplying `--fb1`, even
+as `--fb1 fbase`, makes that path caller-managed and the script never
+overwrites it. Rebuilds use up to 256 online CPUs by default; use
+`--fb-threads N` to cap that.
+
 The displayed `n-yield` and every projected quantity use the same
 normalization as `~/code/test-sieve`: expected pairs are `width / ln(q0)`, and
 `n-yield = raw relations * expected pairs / observed pairs`. The GPU-day and
 energy projections likewise replace the observed pair count with the expected
 count. This keeps a short interval that happens to contain unusually many
 special-q roots from masquerading as a higher-yielding sieve configuration.
+Each sample after the first also has an `exp-rel` value: the trapezoidal
+estimate between the preceding q point and that row, using the two normalized
+yields. At the end, the source job is displayed with the selected side's
+`lss: 0` and any command-line overrides called out separately; the source file
+is not modified.
+
 The final table reports normalized relations, GPU days, energy, relations per
 kilojoule, and (when requested) the q where the relation target is reached.
 
@@ -279,17 +294,35 @@ allowance, and a job fingerprint.
 
 - **Rerunning the same command resumes**, truncating the `.part` to the
   recorded offset, which also discards any torn final line from a `kill -9`.
+- An **empty `.part` with no checkpoint is discarded automatically** and the
+  band starts from the beginning. It contains no relations to preserve and can
+  be left when a process is killed between creating the staging file and its
+  first checkpoint. In a standalone launch, a nonempty uncheckpointed `.part`
+  is still refused. This unambiguous empty-file cleanup does not consume a
+  BOINC automatic-recovery attempt.
+- Under a **BOINC-managed launch**, unusable resume artifacts are discarded and
+  that workunit is recomputed from the beginning. This covers a missing or
+  malformed checkpoint, mismatched fingerprints or file lengths, and sampled
+  relations that fail reconstruction. BOINC volunteers should not have to edit
+  private project files to unstick a task. A persistent `.part.recover` counter
+  caps this at three automatic recoveries per workunit and is removed only when
+  the final result commits, so a deterministic defect cannot restart forever.
+  Unreadable files, active locks, other filesystem errors, bad inputs,
+  band/command mismatches and compute failures remain fatal because deleting
+  output cannot repair them.
 - **`SIGINT`/`SIGTERM` stop cleanly** at the next special-q, draining the queue
   first, so a planned stop loses nothing. A second signal exits at once and
   falls back to the previous checkpoint.
 - **`--stop-file PATH`** stops cleanly once that path exists — the same thing
   for a run with no terminal to press `^C` in.
-- **`--restart`** discards an existing `.part` and its checkpoint.
+- **`--restart`** discards an existing `.part` and its checkpoint, and clears
+  the BOINC automatic-recovery counter.
 - `NAME.lock` refuses a second writer and clears itself if the recorded pid is
   gone.
-- A `.part` whose fingerprint disagrees with the current command is **refused,
-  not appended to**: the polynomial, both sides' bounds, `logI`/`J`,
-  `--sq-side`, `--maxbits` and the whole cofactor configuration are all in it,
+- In standalone mode, a `.part` whose fingerprint disagrees with the current
+  command is **refused, not appended to**; managed BOINC recomputes it as
+  described above. The polynomial, both sides' bounds, `logI`/`J`, `--sq-side`,
+  `--maxbits` and the whole cofactor configuration are all in the fingerprint,
   because every one of them changes which relations a run emits while leaving
   each individual line verifiable.
 

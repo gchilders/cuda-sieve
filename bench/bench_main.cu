@@ -151,8 +151,10 @@ static void usage(void)
 "  of special-q -- the .part is fsynced and NAME.part.ckpt records the next\n"
 "  (q, rho), the byte offset and the derived scale. Rerunning the SAME command\n"
 "  resumes there: the .part is truncated to that offset, discarding any torn\n"
-"  final line, and sieving continues. A .part with no checkpoint, or one whose\n"
-"  job fingerprint differs, is refused rather than appended to or overwritten.\n"
+"  final line, and sieving continues. An empty .part with no checkpoint is\n"
+"  discarded automatically. Under a BOINC client, unusable staging/checkpoint\n"
+"  artifacts are discarded and recomputed, up to three times per workunit;\n"
+"  standalone runs still refuse nonempty or mismatched/corrupt artifacts.\n"
 "  SIGINT or SIGTERM stops cleanly at the next special-q, draining the queue\n"
 "  first, so a planned stop loses no work; a second signal exits at once and\n"
 "  falls back to the previous checkpoint.\n"
@@ -440,6 +442,153 @@ static int verify_walk_cases(void)
     printf("[verify] OK: %u cases x 24 primes x 5 roots enumerated"
            " identically, 4:1 through 1:2\n", nwalk);
     return 0;
+}
+
+#define BOINC_RESUME_RETRIES 3u
+
+typedef struct {
+    const char *part, *ckpt;
+    char ckpt_tmp[CKPT_PATH_MAX];
+    char candidates_part[CKPT_PATH_MAX];
+    char retry[CKPT_PATH_MAX], retry_tmp[CKPT_PATH_MAX];
+} resume_recovery_t;
+
+static int resume_recovery_init(resume_recovery_t *r,
+                                const bench_cfg_t *cfg,
+                                const char *part, const char *ckpt)
+{
+    memset(r, 0, sizeof *r);
+    r->part = part;
+    r->ckpt = ckpt;
+    if (ckpt_path_fmt(cfg->relations, r->ckpt_tmp, sizeof r->ckpt_tmp,
+                      ".part.ckpt.tmp") ||
+        ckpt_recovery_path(cfg->relations, r->retry, sizeof r->retry) ||
+        ckpt_recovery_tmp_path(cfg->relations, r->retry_tmp,
+                               sizeof r->retry_tmp) ||
+        (cfg->candidates &&
+         ckpt_part_path(cfg->candidates, r->candidates_part,
+                        sizeof r->candidates_part)))
+        return -1;
+    return 0;
+}
+
+/* Read a persistent BOINC recovery counter. The temporary is read too: if the
+ * process died between fsync and rename, forgetting that attempt would restore
+ * the unbounded restart loop this counter exists to prevent. */
+/* 1 = valid, 0 = absent, -1 = I/O error, -2 = malformed. The caller treats a
+ * malformed durable counter as fatal, but a malformed temporary as evidence
+ * that the process died while recording one additional attempt. */
+static int recovery_count_read_one(const char *path, unsigned *count)
+{
+    FILE *f = fopen(path, "r");
+    unsigned n;
+    char newline, extra;
+    int fields, close_bad;
+
+    if (!f) {
+        if (errno == ENOENT) return 0;
+        perror(path);
+        return -1;
+    }
+    fields = fscanf(f, "%u%c%c", &n, &newline, &extra);
+    close_bad = fclose(f);
+    if (close_bad) {
+        perror(path);
+        return -1;
+    }
+    if (fields != 2 || newline != '\n' || n == 0) {
+        return -2;
+    }
+    *count = n;
+    return 1;
+}
+
+static int recovery_count_write(const resume_recovery_t *r, unsigned count)
+{
+    FILE *f = fopen(r->retry_tmp, "w");
+    int bad = 0, saved_errno = 0;
+    if (!f) { perror(r->retry_tmp); return -1; }
+    if (fprintf(f, "%u\n", count) < 0) { bad = 1; saved_errno = errno; }
+    if (!bad && fflush(f)) { bad = 1; saved_errno = errno; }
+    if (!bad && fsync(fileno(f))) { bad = 1; saved_errno = errno; }
+    if (fclose(f) && !bad) { bad = 1; saved_errno = errno; }
+    if (bad) {
+        errno = saved_errno;
+        perror(r->retry_tmp);
+        remove(r->retry_tmp);
+        return -1;
+    }
+    if (rename(r->retry_tmp, r->retry)) {
+        perror(r->retry);
+        remove(r->retry_tmp);
+        return -1;
+    }
+    return 0;
+}
+
+/* BOINC volunteers cannot reasonably repair a task's private output files.
+ * If a relaunch finds staging state that cannot be resumed safely, recomputing
+ * that workunit is preferable to a permanent compute error -- but only a
+ * bounded number of times. A deterministic defect must eventually surface to
+ * the project rather than consuming the host forever. The counter survives
+ * recovery and is cleared only when the whole band commits successfully.
+ *
+ * Returns 0 outside BOINC, 1 after discarding, and -1 on an error or when the
+ * retry limit has been reached. */
+static int boinc_discard_bad_resume(const resume_recovery_t *r,
+                                    const char *why)
+{
+    const char *paths[4] = {
+        r->part, r->ckpt, r->ckpt_tmp, r->candidates_part
+    };
+    unsigned attempts = 0, durable = 0, inflight = 0;
+    int durable_status, inflight_status;
+
+    if (!bench_boinc_is_managed()) return 0;
+    durable_status = recovery_count_read_one(r->retry, &durable);
+    if (durable_status == -2) {
+        fprintf(stderr, "BOINC: malformed resume-recovery counter %s\n",
+                r->retry);
+        return -1;
+    }
+    if (durable_status < 0) return -1;
+
+    inflight_status = recovery_count_read_one(r->retry_tmp, &inflight);
+    if (inflight_status == -1) return -1;
+    attempts = durable;
+    if (inflight_status == -2) {
+        /* retry_tmp is scratch written before its atomic rename. Empty or
+         * partial content means that one recovery attempt was in flight when
+         * the process died; count it, then overwrite the scratch on the next
+         * recovery instead of making that torn file a permanent failure. */
+        attempts = durable == UINT_MAX ? durable : durable + 1;
+        fprintf(stderr,
+                "BOINC: torn resume-recovery temporary %s; counting it as "
+                "attempt %u\n", r->retry_tmp, attempts);
+    } else if (inflight_status > 0 && inflight > attempts) {
+        attempts = inflight;
+    }
+    if (attempts >= BOINC_RESUME_RETRIES) {
+        fprintf(stderr,
+                "BOINC: saved progress still cannot be resumed (%s); refusing "
+                "after %u automatic recovery attempts\n",
+                why, attempts);
+        return -1;
+    }
+    if (recovery_count_write(r, attempts + 1)) return -1;
+
+    fprintf(stderr,
+            "BOINC: saved progress cannot be resumed (%s); automatic recovery "
+            "%u/%u: discarding staging files and restarting this workunit\n",
+            why, attempts + 1, BOINC_RESUME_RETRIES);
+    for (unsigned i = 0; i < 4; i++) {
+        if (!paths[i][0]) continue;
+        if (remove(paths[i]) && errno != ENOENT) {
+            perror(paths[i]);
+            return -1;
+        }
+    }
+    return 1;
 }
 
 static int bench_main_impl(int argc, char **argv)
@@ -1487,23 +1636,102 @@ static int bench_main_impl(int argc, char **argv)
                 ckpt_ckpt_path(cfg.relations, cpath, sizeof cpath))
                 return 1;
             ckpt_fingerprint(&POLY, &cfg, fp);
+            resume_recovery_t recovery;
+            int part_exists;
+
+            if (resume_recovery_init(&recovery, &cfg, part, cpath)) return 1;
+            if (stat(part, &st) == 0)
+                part_exists = 1;
+            else if (errno == ENOENT)
+                part_exists = 0;
+            else {
+                perror(part);
+                return 1;
+            }
+
+#define BOINC_RECOVER_OR_RETURN(why) do {                              \
+                const int br_ = boinc_discard_bad_resume(&recovery, why); \
+                if (br_ < 0) return 1;                                 \
+                if (br_ > 0) goto resume_artifacts_ready;              \
+            } while (0)
+
+            /* A hard kill can land after fopen(NAME.part, "w") creates the
+             * staging file but before the first cofactor flush writes a
+             * checkpoint. There is no resume ambiguity when that file is
+             * empty: it contains no relation and restarting from the band's
+             * beginning cannot duplicate or lose work. Heal that state here
+             * so an unattended BOINC relaunch does not fail forever.
+             *
+             * A nonempty candidates .part is different: it may contain useful
+             * uncheckpointed output even while the relations file is empty.
+             * Preserve the old refusal in that case rather than silently
+             * overwriting it. An absent or empty candidates file is safe to
+             * restart alongside the empty relations file. */
+            if (!cfg.restart && part_exists && st.st_size == 0) {
+                struct stat sidecar_st;
+                int sidecar_missing = 0;
+                int candidates_empty = 1, candidates_present = 0;
+                char candidates_part[CKPT_PATH_MAX] = "";
+
+                if (stat(cpath, &sidecar_st)) {
+                    if (errno == ENOENT)
+                        sidecar_missing = 1;
+                    else {
+                        perror(cpath);
+                        return 1;
+                    }
+                }
+                if (sidecar_missing && cfg.candidates) {
+                    struct stat candidates_st;
+                    if (ckpt_part_path(cfg.candidates, candidates_part,
+                                       sizeof candidates_part))
+                        return 1;
+                    if (stat(candidates_part, &candidates_st) == 0) {
+                        candidates_present = 1;
+                        candidates_empty = candidates_st.st_size == 0;
+                    } else if (errno != ENOENT) {
+                        perror(candidates_part);
+                        return 1;
+                    }
+                }
+                if (sidecar_missing && candidates_empty) {
+                    printf("resume: discarding empty uncheckpointed %s; "
+                           "starting the band from the beginning\n", part);
+                    if (remove(part)) {
+                        perror(part);
+                        return 1;
+                    }
+                    if (candidates_present && remove(candidates_part)) {
+                        perror(candidates_part);
+                        return 1;
+                    }
+                    part_exists = 0;
+                }
+            }
             if (cfg.restart) {
-                if (stat(part, &st) == 0)
+                const char *restart_paths[6] = {
+                    part, cpath, recovery.ckpt_tmp,
+                    recovery.candidates_part, recovery.retry,
+                    recovery.retry_tmp
+                };
+                if (part_exists)
                     printf("resume: --restart, discarding %s (%lld bytes)\n",
                            part, (long long)st.st_size);
-                remove(part); remove(cpath);
-                if (cfg.candidates) {
-                    char cp2[CKPT_PATH_MAX];
-                    if (ckpt_part_path(cfg.candidates, cp2, sizeof cp2))
+                for (unsigned ri = 0; ri < 6; ri++) {
+                    if (!restart_paths[ri][0]) continue;
+                    if (remove(restart_paths[ri]) && errno != ENOENT) {
+                        perror(restart_paths[ri]);
                         return 1;
-                    remove(cp2);
+                    }
                 }
-            } else if (stat(part, &st) == 0) {
+                part_exists = 0;
+            } else if (part_exists) {
                 const int r = ckpt_read(cfg.relations, &ck);
                 /* Every branch here refuses rather than guesses. An existing
                  * .part is either resumable work or somebody else's data; the
                  * one thing this must never do is silently truncate it. */
                 if (r == -1) {
+                    BOINC_RECOVER_OR_RETURN("the .part has no checkpoint");
                     fprintf(stderr,
                         "bench: %s exists but %s does not.\n"
                         "  That file cannot be resumed automatically -- the"
@@ -1515,8 +1743,14 @@ static int bench_main_impl(int argc, char **argv)
                         "  --restart to discard it.\n", part, cpath);
                     return 1;
                 }
-                if (r == -2) return 1;      /* ckpt_read explained why */
+                if (r == -2) {              /* ckpt_read explained why */
+                    BOINC_RECOVER_OR_RETURN("the checkpoint is malformed");
+                    return 1;
+                }
+                if (r == -3) return 1;       /* unreadable: ckpt_read explained */
                 if (strcmp(ck.fp, fp)) {
+                    BOINC_RECOVER_OR_RETURN(
+                        "the checkpoint belongs to a different job");
                     fprintf(stderr,
                         "bench: %s belongs to a different job.\n"
                         "  checkpoint fingerprint %s, this run %s.\n"
@@ -1528,6 +1762,8 @@ static int bench_main_impl(int argc, char **argv)
                     return 1;
                 }
                 if (ck.rel_bytes > (unsigned long long)st.st_size) {
+                    BOINC_RECOVER_OR_RETURN(
+                        "the relation file is shorter than its checkpoint");
                     fprintf(stderr,
                         "bench: %s is %lld bytes but %s claims %llu.\n"
                         "  The relation file has been truncated or replaced"
@@ -1544,12 +1780,20 @@ static int bench_main_impl(int argc, char **argv)
                  * resume that supplies it again truncates the whole file away. */
                 {
                     struct stat cst;
-                    char cpart[CKPT_PATH_MAX] = "";
-                    if (cfg.candidates &&
-                        ckpt_part_path(cfg.candidates, cpart, sizeof cpart))
-                        return 1;
+                    int cpart_exists = 0;
+                    const char *cpart = recovery.candidates_part;
+                    if (cfg.candidates) {
+                        if (stat(cpart, &cst) == 0)
+                            cpart_exists = 1;
+                        else if (errno != ENOENT) {
+                            perror(cpart);
+                            return 1;
+                        }
+                    }
                     if (cfg.candidates && !ck.cand_bytes &&
-                        stat(cpart, &cst) == 0 && cst.st_size > 0) {
+                        cpart_exists && cst.st_size > 0) {
+                        BOINC_RECOVER_OR_RETURN(
+                            "candidate output is not represented by the checkpoint");
                         fprintf(stderr,
                             "bench: %s holds %lld bytes but the checkpoint"
                             " records none.\n"
@@ -1560,8 +1804,10 @@ static int bench_main_impl(int argc, char **argv)
                         return 1;
                     }
                     if (cfg.candidates && ck.cand_bytes &&
-                        (stat(cpart, &cst) || (unsigned long long)cst.st_size
-                                              < ck.cand_bytes)) {
+                        (!cpart_exists || (unsigned long long)cst.st_size
+                                          < ck.cand_bytes)) {
+                        BOINC_RECOVER_OR_RETURN(
+                            "candidate output is shorter than its checkpoint");
                         fprintf(stderr,
                             "bench: %s is missing or shorter than the %llu"
                             " bytes the checkpoint records.\n", cpart,
@@ -1569,6 +1815,8 @@ static int bench_main_impl(int argc, char **argv)
                         return 1;
                     }
                     if (!cfg.candidates && ck.cand_bytes) {
+                        BOINC_RECOVER_OR_RETURN(
+                            "the checkpoint requires candidate output not supplied by this launch");
                         fprintf(stderr,
                             "bench: the checkpoint records %llu bytes of"
                             " candidates but --candidates was not given.\n"
@@ -1589,6 +1837,8 @@ static int bench_main_impl(int argc, char **argv)
                                                            &nchecked);
                     if (bad < 0) return 1;
                     if (bad > 0) {
+                        BOINC_RECOVER_OR_RETURN(
+                            "sampled relations do not reconstruct");
                         fprintf(stderr,
                             "bench: %d of %u sampled relations in %s do not"
                             " reconstruct.\n"
@@ -1658,13 +1908,24 @@ static int bench_main_impl(int argc, char **argv)
                 printf("        scale %.4f/%.4f allowance %.2f/%.2f restored"
                        " from the checkpoint\n",
                        cfg.scale, cfg.scale0, cfg.allowance, cfg.allowance0);
-            } else if (access(cpath, F_OK) == 0) {
-                fprintf(stderr,
-                    "bench: %s exists but %s does not. Remove the checkpoint"
-                    " to start fresh.\n", cpath, part);
-                return 1;
+            } else {
+                struct stat checkpoint_st;
+                if (stat(cpath, &checkpoint_st) == 0) {
+                    BOINC_RECOVER_OR_RETURN(
+                        "a checkpoint exists without its relation file");
+                    fprintf(stderr,
+                        "bench: %s exists but %s does not. Remove the checkpoint"
+                        " to start fresh.\n", cpath, part);
+                    return 1;
+                }
+                if (errno != ENOENT) {
+                    perror(cpath);
+                    return 1;
+                }
             }
         }
+resume_artifacts_ready:
+#undef BOINC_RECOVER_OR_RETURN
 
         /* --qlist is read HERE, before the factor base, for two reasons. It
          * needs nothing from the base, so a missing or malformed list should

@@ -354,6 +354,9 @@ uint64_t verify_count_updates(const fb_t *fb, const qlat_t *L,
  * reported monotonically, and bench_boinc_finish() terminates through the
  * BOINC API. */
 int  bench_boinc_init(void);
+/* True only when a HAVE_BOINC build is running under a BOINC core client;
+ * false for ordinary builds and for a BOINC build launched standalone. */
+int  bench_boinc_is_managed(void);
 /* The CUDA device the client assigned to this task, from init_data.xml, or -1
  * when there is no BOINC assignment (including every non-BOINC build). */
 int  bench_boinc_gpu_device(void);
