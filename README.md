@@ -155,9 +155,11 @@ current band again.
 ## Repository map
 
 - [`bench/`](bench/) contains the implementation, build, and test programs.
-- [`bench/testsieve.sh`](bench/testsieve.sh) test-sieves a job at several q
-  and projects the whole run — relations, days, energy, and where a relation
-  target is met — across geometries and factor-base bounds.
+- [`bench/testsieve.sh`](bench/testsieve.sh) test-sieves a job at several q,
+  normalizes each yield to the expected special-q-pair count, and projects the
+  whole run — relations, days, energy, and where a relation target is met —
+  across geometries and factor-base bounds. Run it without arguments for
+  interactive setup.
 - [`bench/STATUS.md`](bench/STATUS.md) is the current architecture, validation,
   known-defect, and open-experiment summary.
 - [`bench/RESULTS.md`](bench/RESULTS.md) is the chronological benchmark lab

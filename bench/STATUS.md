@@ -64,8 +64,11 @@ count this process can see, and the card actually used. Startup also refuses an
 ordinal past `cudaGetDeviceCount()` with both numbers named, rather than
 letting it surface as a bare "invalid device ordinal".
 
-**None of this has run against a real multi-GPU client** — see item 13. There
-are no checkpoint files in the BOINC sense either: a suspended process resumes,
+**Reviewed and deployed 2026-08-17**: Greg Childers — who reported the
+original all-tasks-on-device-0 failure — signed off on the assignment change,
+and a BOINC queue is running with it. That closes item 13 as far as the
+application is concerned. There are no checkpoint files in the BOINC sense
+either: a suspended process resumes,
 but a process that exits and restarts begins the current band again (12a's
 sidecar is the repo's own mechanism, not BOINC's).
 
@@ -355,14 +358,27 @@ Cards with measured band data: **RTX 5070** (WSL2), **RTX 5090**, **RTX 4090**,
   answer — the local 5070 against the local CPU box, item 0 — because both
   sides of that comparison are on this UPS. Treat cross-card rel/J as an
   architecture note, not as a verdict input.
+- **THE BOX IS UNDERVOLTED AS OF 2026-08-17, and every timing taken after that
+  date is ~6.7% slower than one taken before it.** The card's V/F curve is
+  pinned to ~2900 MHz at 950 mV (stock was 2910 MHz at 1080 mV), which trades
+  6.7% of throughput for 28% of board power — **+14.6% whole-box rel/J**,
+  finding 61. It is *not* a code change and it is *not* reflected in any
+  finding numbered below 61: finding 58's 108.27 ms/pair, finding 60's apply
+  breakdown and every c147/c183 timing in this file were measured at stock.
+  Comparing a new measurement against an old one without accounting for this
+  will read as a 6.7% regression that is not there. Board draw is now ~140 W
+  and the card sits at 50–56 °C rather than 69 °C.
 - **Superseded:** an earlier rel/J table built on *nameplate* TDP concluded the
   design "does not want wide expensive GPUs". It is retracted — see the
   RETRACTED block in `RESULTS.md`. Do not quote the old numbers.
-- **Confirmed on a second job, and the 1:1 rectangle is the exception**
-  *(finding 58)*. On the NFS@Home C194, sieving above `alim` so GGNFS cannot
-  truncate its base either, yield is at parity on both 2:1 geometries (−1.7%,
-  −2.2%) and **−14.4% at `2^15 × 2^15`** — an aspect-ratio effect, not an area
-  one, and the first measured cost of the norm approximation (item 5).
+- **Confirmed on a second job, at every rectangle tested** *(findings 58, 65)*.
+  On the NFS@Home C194, sieving above `alim` so GGNFS cannot truncate its base
+  either, yield is **0.979–0.981 of GGNFS's at all four matched rectangles**
+  (`2^14 × 2^13`, `2^15 × 2^13`, `2^15 × 2^14`, `2^16 × 2^14`) — flat in
+  aspect ratio, flat in area, and flat in `j` within a rectangle. The earlier
+  "−14.4% at a 1:1 rectangle" was a geometry mismatch: `-J 15` widens I rather
+  than J, so it compared our square against GGNFS's wide rectangle. There is
+  no measured cost of the norm approximation (item 5).
   Throughput at that equal-work point is **3.31×** the CPU box and **2.74×** on
   energy, against the c183's 3.11× and 2.53×. The same measurement at q=20M
   reads 4.91×, inflated by the factor-base convention alone.
@@ -386,18 +402,50 @@ where the standalone gain is largest (16.7%).
 
 ## Known defects
 
+- **FIXED 2026-08-18 — non-primitive relations at small q (finding 68).**
+  `k_intersect_compact` filtered on `gcd(i,j) == 1` and assumed that made
+  `(a,b)` primitive. The lattice map has determinant q, not 1, so positions
+  with `q | b` gave `gcd(a,b) = q`; msieve rejects those with `error -6`. They
+  survive the sieve because such a point lies on the plattice line of *every*
+  root of q, so the sieve subtracts `deg * log(q)` — exactly the `q^deg` in the
+  norm — and the position looks as smooth as the much smaller `(a',b')` it is a
+  multiple of. Affected positions per q go as `I*J / q`, so it is invisible at
+  production q (~2 per q on a C194 at `2^29`) and conspicuous on a small SNFS
+  (~335 per q at `2^27` against q = 400009, giving 0.0995% bad relations).
+  Fixed by also rejecting `q | b`; the c147 band is byte-identical.
+  **`--check-relations` now tests `gcd(a,b) == 1`** — it previously verified
+  every factor and both norms, all of which a non-primitive relation passes,
+  which is why this shipped.
+
 - **Remaining-norm approximation.** The largest-term approximation differs from
   the true rectangle maximum by ~2 bits and costs ~0.13% of CADO's relations.
   The band-wide fixed scale is a second, unchecked approximation. This is the
   main known yield loss.
 - **Duplicate share 15.8–25%** from the full special-q-side factor base, at
-  ~1.34× the downstream TD/cofactor work for the same unique yield. Whether
-  truncating at `q` wins is untested — it also shortens the q range needed.
+  ~1.34× the downstream TD/cofactor work for the same unique yield.
   **These are whole-FB-band numbers.** Measured raw inflation runs 1.0021× on
-  the c147's 0.4%-wide band to 1.1877× on the c151's full-FB band, so the
-  defect scales with band coverage rather than being a fixed property of the
-  design; and the share truncation can mechanically remove is capped by `mfb`
-  headroom, which the c183's `mfba 92` makes generous. See item 3.
+  the c147's 0.4%-wide band, 1.1877× on the c151's full-FB band and 1.2325× on
+  the snfs2 corpus, so the defect scales with band coverage rather than being a
+  fixed property of the design.
+  **Truncating at `q` is now measured and does not fix it (finding 67):** on a
+  real 275M-relation band it removes only 1.78% of the duplicate finds, and on
+  a band stopping below `lim` it destroys more unique relations than it saves
+  in duplicate work. On a generous-`mfb` job — the c183's `mfba 92`, the C195's
+  95 — it does essentially nothing either way. Item 3 is closed; **this defect
+  stands, without that remedy.**
+  Note also that a corpus can carry duplication that is not ours at all: the
+  snfs2 corpus holds a hand-stitched restart's re-sieved q window (finding 67),
+  worth 1.4% of its relations. The `k = 1` stratum detects it.
+- **The walk gate tops out at logI 10, and every deployed geometry is 14–16.**
+  `--verify`'s eight cases (4:1 through 1:2, `make check` runs them via
+  `walkcheck`) establish that the Franke-Kleinjung walk is aspect-ratio-correct,
+  which is what finding 63 needed — but at I ≤ 1024. The x packing
+  `i + I/2 + (j << logI)` is a uint32 and only gets tight in the untested
+  logI 11–16 range, so a `pl_make`/`pl_next` bug specific to a large logI would
+  still ship. The blocker is `verify_cpu.c:35`: `check_one` sorts its reference
+  with an insertion sort, so at logI 15 the reference is ~16k entries and the
+  gate would cost ~2.7e8 comparisons per (p, root). Replacing that sort is what
+  would let the gate reach the geometry it is about.
 - **`k_fill_l1` (twolevel path) has never been swept** at any geometry. It
   takes an explicit `--fill-blocks` but defaults to its own 144 × 512, because
   the 1152 × 32 result was measured on `k_fill_atomic` — a different kernel
@@ -515,6 +563,16 @@ absent from every document in the repo.
    smaller areas than the CPU does**. Take the larger J only when the q range,
    not energy, is the binding constraint.
 
+   **But if you do want more area, buy it with I** *(finding 65)*. The two axes
+   are not interchangeable: at equal area the wide rectangle beats the square
+   by **+11.7% relations at `2^28` and +16.3% at `2^30`, for −0.3% device
+   time** — `2^16 × 2^14` returns 10,671 relations against `2^15 × 2^15`'s
+   9,176 on the same window. Doubling I costs 1.86 bits of `log2(maxnorm)`
+   against doubling J's 3.86, because `i` multiplies the shorter vector of the
+   reduced q-lattice and `j` the longer one. Measured rel per device-second
+   across the grid: `2^14 × 2^13` 390.6, `2^15 × 2^13` 387.2, `2^14 × 2^14`
+   336.0, `2^15 × 2^14` 323.9, `2^16 × 2^14` 260.6, `2^15 × 2^15` 223.4.
+
    The c183's own standalone
    sieve measures 38.2 + 26.2 ms for the two sides (RESULTS.md "Reproduce",
    `I15e` geometry, side 1 truncated at q, at q=120M), so with TD and the
@@ -553,7 +611,75 @@ absent from every document in the repo.
    Opt-in for the standalone benchmark, where reproducibility is the point;
    default-on is defensible for `--pipeline`, where a per-job knee cannot be
    derived and 15 trial fills cost ~60 ms of a multi-hour run.
-3. **Full vs q-truncated factor base**, compared at equal *deduplicated* yield.
+3. **Full vs q-truncated factor base — CLOSED 2026-08-18, do not build it
+   (finding 67).** Was: compared at equal *deduplicated* yield.
+   **Downgraded 2026-08-17 — worth 10–15%, not the ~25% an entry count
+   suggests, and it may simply be the wrong trade (finding 59).** Replayed
+   offline over the c151 corpus: truncation removes 18.4% of *potential*
+   re-finds and **zero unique relations** — but only because that band ends
+   exactly at `alim`, which is the favourable case, and because the potential
+   (1.52 finds/relation) is well above what is actually emitted (1.19, msieve's
+   own dedup). The sieving prize is small for a reason that generalises: cutting
+   the base from 33.5M to 15M drops the **entry count 53%** but the **bucket
+   records only 8%**, because they go as `Σ1/p ~ ln ln p`. That model is
+   confirmed by the C194 lim sweep, where 4× the lims moved the bucket array
+   +12% against +12.6% predicted. Entry count is the right axis only for the
+   root transform.
+
+   **ANSWERED AND CLOSED 2026-08-18 on a 275M-relation corpus — finding 67.**
+   Replayed over the SNFS `17327^61-1` dataset (41.5 GB, 339,445,456 lines,
+   band `q in [40M, 175M)` recovered from the corpus, `rlim` 67.1M):
+
+   - **On the band as run, truncation loses zero unique relations and removes
+     1.78% of the duplicate finds.** The zero is structural, not lucky: under
+     truncation a relation is found at its largest band prime `q`, and any
+     unsieved FB prime above `q` would itself be a band prime larger than `q`.
+     So **truncation is lossless exactly when `band_top >= lim`** — which is
+     also why the c151 showed zero, its band ending precisely at `alim`. Both
+     corpora were the favourable case.
+   - **In every configuration an operator would actually run, it is lossless.**
+     Only two shapes occur: `lim <= band_bottom` (truncation never binds) and
+     `band_bottom < lim <= band_top` (this job). A band whose *top* is below
+     `lim` would cap the base at `q < lim` for every q in the run, so the `lim`
+     that was set is never the one used — an operator lowers it instead. The
+     sweep confirms the boundary sits exactly at `band_top = lim`: below it the
+     trade goes negative (9.6% of unique relations lost at `0.70 x lim`, 6.0%
+     at 0.80, 2.8% at 0.90, 0 at 1.00), but that regime is a **test band**, not
+     a deployment.
+   - **This reconciles all four replays.** The two corpora that lost relations
+     are the two whose band stops short of `lim`, and neither is a production
+     run: the c147's band is 0.15M wide (a probe, `band_top` = 0.45x `alim`,
+     22.68% lost) and the snfs236 corpus is a partial slice (0.28x `rlim`). The
+     two complete bands — c151 at exactly 1.00x `alim`, snfs2 at 2.61x `rlim` —
+     both lose **zero**. So the c147's 22.68%, quoted here as the alarming
+     number, is a property of a narrow probe rather than of the design.
+   - **Generous `mfb` collapses both sides to under 2.5%.** At `mfb 92` — the
+     c183's value, and close to the C195's `mfba 95` — the unsieved primes fit
+     in the cofactor, and truncation becomes very nearly a no-op. So the
+     C195-shaped job this item was worrying about is the case where truncation
+     matters *least*, in either direction.
+
+   **So there is no version of this worth building.** The duplicate prize is
+   1.8% where it is safe and is outweighed by outright loss where it is not,
+   and the job class we care about is the one where it does nothing at all. The
+   separate sieving-work prize (fewer factor-base entries per q) remains what
+   finding 59 measured — 10–15%, bucket records only 8% — and is unaffected by
+   this; it is also unaffected by *this* item, since it needs the same per-q
+   truncation machinery for a return that finding 59 already called small.
+
+   Two by-products worth keeping. **P(re-found) is 0.6968 here** against 0.702
+   (snfs236) and 0.723 (c151) — three jobs, one number. And the **`k = 1`
+   stratum is a free integrity check on any corpus**: relations with only one
+   possible q cannot be re-found by our convention, so that row must read
+   exactly 1.0000 copies. Here it read 1.0141, and histogramming those
+   duplicates by q localised them to `q` in **[55,469,851, 57,129,679]** — 100%
+   duplicated inside that ~1.66M-wide window, exactly zero outside it. That is
+   a **stop/restart overlap sieved twice** (this run predates 12a, so the halves
+   were stitched by hand), not a property of the siever. Removing it takes the
+   duplicate inflation from 1.2325x to **1.2096x**. It is also the clearest
+   measurement of what 12a's byte-exact resume is worth: ~1.7M q of duplicate
+   sieving avoided.
+
    `nactive = lower_bound(primes, q)` on the already-sorted base, passed to
    transform/fill/resieve — no rebuild, no re-upload. The standalone harness
    already truncates statically (`--fbbound`, `fb_restrict` at
@@ -744,19 +870,36 @@ absent from every document in the repo.
    true-rectangle are the *same number* and this buys nothing there. The ~2-bit
    gap is a GNFS-side problem.
 
-   **MEASURED PAYOFF, 2026-08-17: 14% of the relations at a 1:1 rectangle**
-   (finding 58). Against GGNFS on the C194 at matched factor base, our yield is
-   at parity on both **2:1** geometries — −1.7% at `2^15 × 2^14`, −2.2% at
-   `2^16 × 2^15` — and **−14.4% at `2^15 × 2^15`**. Area is not the variable:
-   16e is twice the area of the 1:1 case and matches. A rectangle as tall as it
-   is wide widens the norm's range over `j`, which is exactly where a
-   largest-term approximation degrades, and the survivor gate is then scaled
-   from a value that no longer describes the region.
+   **The 1:1 anomaly that drove this item DOES NOT EXIST — finding 65,
+   2026-08-17.** `gnfs-lasieve4I15e -J 15` sets the i half-width, not the
+   j-height: it sieves `2^16 x 2^14`, while our `--J 32768` sieves
+   `2^15 x 2^15`. Findings 58 and 63 compared a square against a wide
+   rectangle. Recovering each run's rectangle from its own relations (invert
+   the q-lattice) and re-comparing at **matched** rectangles gives ours/theirs
+   = 0.9795, 0.9805, 0.9797, 0.9786 at `2^14 x 2^13`, `2^15 x 2^13`,
+   `2^15 x 2^14` and `2^16 x 2^14` — **flat, with no aspect-ratio dependence
+   and no j-dependence within a rectangle**. Finding 63 is retracted; its four
+   eliminations stand.
 
-   That makes this item a **prerequisite for `--J` at 1:1**, which is otherwise
-   an attractive option: it reaches a relation target at a much lower q than
-   `J = I/2` does. Until then, deploy 2:1 geometries only — see RUNBOOK's
-   `testsieve.sh` section, whose own example compares the two.
+   `sieve_allowance` and `sieve_bound_checked` are **exonerated by
+   arithmetic**, no GPU needed: the allowance is `mfb + max(2/scale, 1.5)` with
+   no geometry term, so the gate in *bits* goes 96.63 → 96.67 between those two
+   rectangles — very slightly looser. The bound falling 119 → 117 is
+   `las_scale` renormalising for a 3.86-bit larger norm, and both values
+   reproduce exactly from the source. Do not start there.
+
+   So this item is back to being justified only by its original ~2-bit argument
+   and the ~0.13% of CADO's relations under "Known defects": **low value at the
+   geometry we deploy, and no longer blocking anything.** The ~2% we sit below
+   GGNFS is uniform across every rectangle and every j, which is the shape of a
+   constant downstream residual (finding 62), not of a norm approximation that
+   degrades as the rectangle grows.
+
+   **What replaced it is an operational rule — buy area with I, not J.** At
+   equal area the wide rectangle yields +11.7% at `2^28` and +16.3% at `2^30`
+   for −0.3% device time, because doubling I costs 1.86 bits of
+   `log2(maxnorm)` where doubling J costs 3.86: `i` multiplies the shorter
+   vector of the reduced q-lattice and `j` the longer one. See item 0.
 6. **Whole-box power**, to close the metric of record — the meter half of
    item 0. **The meter exists**: the UPS reports real watts. It is not a
    parallel task to item 10, it is a **prerequisite** for it (see there).
@@ -864,7 +1007,27 @@ absent from every document in the repo.
    So the two numbers are probably measuring different work, and **s/q is the
    wrong axis to compare them on — rel/J is the right one**. Resolve by
    recording the job file alongside any future N_eff sweep.
-7. **Why our survivor gate is looser than GGNFS's at matched lambda.** Same q
+7. **Why our survivor gate is looser than GGNFS's at matched lambda —
+   DOWNGRADED 2026-08-17: the surplus does not exist at shipping defaults
+   (finding 62).** Measured at each siever's own gate, our cofactor volume
+   matches GGNFS's within **0.4%** on item 7's own config (c183 I14e: 784.85
+   against 781.7 per pair) and within **0.03%** on the C194 at 15e (1594.12
+   against 1594.8). Relations from those submissions differ by +0.9% and −1.7%
+   respectively — opposite signs, so no systematic deficit either.
+
+   The observation below stands as written, because it was made *at matched
+   lambda*: a given nominal bit value does mean different things to the two
+   gates. What is now measured is that this asymmetry **produces no surplus at
+   the defaults we ship** — our derived allowance lands on the same cofactor
+   volume GGNFS's lambda rule does, on two jobs and two geometries. The
+   operational worry below — that the bound "can only be set by sweeping, never
+   derived for a new job" — is answered: it *is* derived, and the derivation
+   now has two independent external checks. **No sweep is needed for a new
+   job.** Reopen only if a job is found where the volumes diverge.
+
+   The original observation, retained:
+
+   Same q
    range, same job, same nominal bits: `gnfs-lasieve4I14e` loses 17.3% of its
    yield going 91.8 → 87.5 bits where we lose 0.07% going to 88.0. We submit
    1,426 cofactors per special-q against GGNFS's 978 (`COF: 60664 tests`, 62 q)
@@ -904,47 +1067,67 @@ absent from every document in the repo.
    inverse per prime, each time. ~15–20 s of startup on snfs236. Irrelevant to
    a multi-day run, worth fixing before anything that restarts the process in a
    loop (parameter sweeps, `cofcheck`).
-10. **GPU power-limit sweep** *(added 2026-08-06; numbered out of order —
-    items 1–9 keep their numbers because findings cite them; in priority this
-    slots directly after item 0)*. Cheap, and it moves the metric of record
-    directly: consumer cards ship past their efficiency knee, and a board cap
-    at 60–80% of stock often buys 15–30% rel/J for single-digit rel/s — the
-    curve is the measurement. The 5070/5090 rel/J tie (28.1 vs 29.5) was taken
-    at stock; a capped curve may separate them and should raise both. Sweep
-    the cap in ~20 W steps over a fixed c147 band, plot rel/s and rel/J, pick
-    the knee; report the item-0 verdict at stock AND at the knee.
-    **Grade this on wall power, not board power — item 6 first.** Capping cuts
-    board watts but lengthens the run, and the ~115 W host constant (item 6) is
-    paid for that whole extra time. It is ~37% of a sieving box, and that is
-    enough to change the answer, not merely shade it. Worked example, a cap
-    trading 15% throughput for 40% less board power, using item 6's measured
-    115 W host and 155 W card:
+10. **GPU power-limit sweep — MEASURED 2026-08-17 (finding 61); a floor, not
+    a knee.** The premise was that consumer cards ship past their efficiency
+    knee and a 60–80% cap buys 15–30% rel/J. **The sieve is not power-limited
+    at stock**: it draws ~195 W against a 250 W limit, so only 70–77% binds at
+    all, and 70% is `power.min_limit`.
 
-    | | stock | capped | rel/J |
-    |---|---:|---:|---:|
-    | board only | 155 W | 93 W | 0.85 / 0.60 = **+42%** |
-    | whole box | 270 W | 208 W | 0.85 × 270/208 = **+10%** |
+    At the floor (175 W), three runs per setting with byte-identical relations:
+    **−10.0% board power for +1.83% time**, giving **+9.1% board rel/J and
+    +5.0% whole-box rel/J**. Nine percent of the power for half a percent of
+    the clock (2917 → 2902 MHz) — past the knee, as predicted.
 
-    So the board sensor reports a **4× larger win than the wall meter sees**.
-    Both are gains here, so the sign does not flip — but a sweep graded on the
-    board will keep capping well past the point where the wall stops improving,
-    and will pick a cap that is too low. Under WSL2
-    set the cap from the Windows side (`nvidia-smi -pl` as administrator) —
-    the WSL-side tool can read power but generally cannot set limits.
-11. **Apply breakdown** *(added 2026-08-06)*. Fill got findings 48–52's
-    attention because it scales worst across cards, but apply is where the
-    milliseconds are: 9.6 ms of the c147's 24.3 ms wall against fill's 7.1,
-    and it also scales poorly (2.01× on a 5090 with 2.67× the 5070's
-    bandwidth). `--norm const` and `--apply-mode plain` already isolate
-    norm-init and smem-atomic cost; one session splitting apply into
-    norm / bucket-add / threshold-scan says whether a second material win
-    exists or the stage is at its memory-system limit. Do this before any
-    further fill tuning — prior art
-    (`~/msieve-s/POLYSELECT_OPTIMIZATION_NOTES.md`) says scatter micro-tuning
-    on this GPU dies at the L2 transaction ceiling. **The ncu profile under
-    "Measured" narrows this**: fill is not at an L2 bandwidth ceiling (52% of
-    max) and wastes ~7× on store sectors, so the prior-art warning may not
-    transfer. Take the same profile of `k_apply` before assuming it does.
+    **The board sensor overstated the gain 1.8×** (9.1% against 5.0%), the
+    mechanism this item warned about: the cap lengthens the run and the ~105 W
+    host constant is paid for the extra time. Grading on the board sensor would
+    pick a cap that is too low. Robust to the host constant — 115 W gives 4.8%.
+
+    **The undervolt is the real lever, and it is ~3× the cap.** The card was
+    never power-limited; it sat far past its efficiency knee at 2910 MHz /
+    1080 mV. Re-pinned to ~2900 MHz at **950 mV**: −28.0% board power for
+    +6.7% time, i.e. **+30.2% board and +14.6% whole-box rel/J**, and 50–56 °C
+    instead of 69 °C. Both correctness gates were run first — `cofcheck`'s 30
+    exact counts and a byte-identical c147 band — because an unstable undervolt
+    computes *wrong answers* rather than crashing, which is the failure mode
+    that actually threatens a sieve.
+
+    **Applied to this box permanently**, so see the note under "Measured": every
+    timing after 2026-08-17 is ~6.7% slower than the numbers in findings 43–60.
+
+    Still unmeasured: **where the knee is**. 900 mV was not tried, so 950 mV is
+    known to be past the knee and stable, not known to be optimal. Reopen if
+    the last few percent are wanted, on this card or a different one.
+
+    Item-0 verdict: **3.10× time and 3.14× energy** against the CPU box at the
+    undervolt, from finding 58's equal-work 3.31× / 2.74× at stock.
+11. **Apply breakdown — ANSWERED 2026-08-17 (finding 60), and the answer is
+    "no cheap win".** Apply is where the milliseconds are — **54% of the sieve
+    chain** on the C194 at its deployment geometry, 21.94 ms against fill's
+    15.47 — which is why this was ranked ahead of further fill tuning.
+
+    It is **not** at its memory-system limit: DRAM 9.0%, L2 bandwidth 4.7%,
+    1.43 sectors per global load request, 341 waves per SM, SM throughput 71%.
+    The opposite character to fill, which is a latency-bound scatter with the
+    SMs idle — so the prior-art warning about the L2 transaction ceiling
+    (`~/msieve-s/POLYSELECT_OPTIMIZATION_NOTES.md`) describes neither kernel.
+
+    **But no single pipe is saturated either** — LSU 32%, ALU 30%, XU 23%, FMA
+    19%, issuing 0.70 instructions per cycle, largest stall short-scoreboard on
+    the shared-memory cells. Apply is *issue-limited with a balanced mix*.
+
+    Every identifiable lever was priced and all are small: norm init is 29% of
+    apply but `__log2f` recovers only 2.8% of it and dropping the fp64
+    cancellation guard only 1.8%; smem atomics are 3.4%; halving the cell width
+    moves 0.3%. **The accurate-`log2f` and cancellation-guard decisions both
+    stand** — each buys correctness for under 3%.
+
+    What remains is algorithmic: fewer instructions per position or per record,
+    i.e. a change to *what* apply computes. That is a much larger piece of work
+    than this item was scoped as, and nothing in the tuning space is worth
+    doing first. A `NORM_FAST_LOG2` build switch was added alongside the
+    existing `NORM_CANCEL_TOL` so both prices can be re-measured on another job
+    without editing the kernel.
 12. **Unattended operation — checkpoint, resume, clean stop, logging**
     *(added 2026-08-07, owner-stated requirement; scoped 2026-08-11)*. The GPU
     should not idle waiting on a human any more than it should idle waiting on
@@ -1166,11 +1349,17 @@ absent from every document in the repo.
     overnight. Depends on 12a; unscoped beyond that. **Item 9 stops being
     cosmetic here**: its ~15–20 s of redundant startup is noise in a multi-day
     run and real overhead in anything that restarts the process per job.
-13. **Validate the BOINC GPU assignment** *(added 2026-08-16)*. The
-    multi-GPU fix is written and compiles; nothing has exercised it against a
-    client. It was written from a field report (every task on a multi-GPU host
-    landing on device 0), so the failure it fixes is the one already observed,
-    and a silent regression looks exactly like success on a single-card box.
+13. **Validate the BOINC GPU assignment — CLOSED 2026-08-17.** Greg Childers,
+    who reported the original failure (every task on a multi-GPU host landing
+    on device 0), reviewed and signed off on the assignment change, and a BOINC
+    queue is now running with it. Both things this item said could not be
+    checked here — that the client emits `<gpu_device_num>` for this app
+    version's plan class, and that concurrent tasks land on distinct cards —
+    are answered affirmatively by a live queue on a real multi-GPU host.
+
+    What is written below stayed open for one session and is kept only as the
+    recipe for re-checking the read path after a change to it, since a silent
+    regression still looks exactly like success on a single-card box:
 
     Testable here, no second card and no client: `boinc_get_init_data()` reads
     the `init_data.xml` in the working directory, so a `HAVE_BOINC=1` build run
@@ -1188,3 +1377,26 @@ absent from every document in the repo.
     class, and that concurrent tasks land on distinct cards. Those need a
     multi-GPU host running the real client, i.e. the reporter who saw the
     original failure.
+14. **Use the survivor cell's real resolution — MEASURED AND CLOSED 2026-08-18
+    (finding 66): no win, do not build it.** `las_scale` derives the byte scale
+    from las's 255-value cell (`poly.c:584`) although ours is 16-bit with
+    `CINIT` 4096, so one byte unit is 0.82 bits and 10–13% of the survivor list
+    is admitted on rounding error alone.
+
+    **Removing them buys nothing.** Holding the gate fixed in bits and raising
+    the scale to 4.0, on an idle box, alternated: **112.44 against 112.43 ms/q**
+    — nothing, against a ~1.3% run-to-run spread — while survivors fall 10.3%
+    (71,580 → 64,241). Yield is neutral too (6,743 → 6,740).
+
+    The reason is that **the survivor count is not a cost driver on this
+    pipeline.** Fill and apply are ~70 ms of the 112 and are per *position*;
+    the whole trial-division block is 14 ms and moves 0.25 ms. Candidates/q is
+    flat to 0.04% (1590.68 → 1590.08), so the noise survivors never reach
+    cofactorisation — the rank scan and survivor filter kill them for 0.5 ms
+    total.
+
+    So `las_scale`'s 8-bit inheritance is harmless rather than a defect.
+    Recorded chiefly so the inference "fewer survivors must be faster" is not
+    made again: on this pipeline the survivor list is nearly free downstream,
+    which also means **survivor counts are a poor proxy for work** in any
+    cross-siever comparison (see item 7's funnel numbers).

@@ -201,6 +201,9 @@ static void usage(void)
 "                   relations to --relations; needs no sieving\n"
 "\n"
 "CHECKING\n"
+"  --verify-only    the Franke-Kleinjung walk gate only, then exit. Needs no\n"
+"                   GPU, no factor base and no polynomial, which is what lets\n"
+"                   `make check` run it on a card-less or busy box\n"
 "  --check-relations F  verify an emitted relation file: every factor divides,\n"
 "                   both norms rebuild to 1, every prime within its lpb\n"
 "  --cofgate FILE   gate the cofactors against CADO's own (a b cof0 cof1);\n"
@@ -406,6 +409,39 @@ static int check_cofactor_bounds(const bench_cfg_t *cfg, uint32_t alim,
     return bad;
 }
 
+/* The walk gate, hoisted so it can run with NO inputs at all: no GPU, no
+ * factor base, no polynomial. `make check` wires it in as a CPU gate
+ * (`walkcheck`), and a CPU gate that needs a card and a 60 MB untracked oracle
+ * file is not one. --verify still runs it and then falls through to the
+ * apply-parity benchmark, which is finding 32's gate and does want both. */
+static int verify_walk_cases(void)
+{
+    static const struct { int logI; uint32_t J; const char *shape; }
+    walk_cases[] = {
+        { 8,   64, "4:1" }, { 8,  128, "2:1" }, { 8,  256, "1:1" },
+        { 8,  512, "1:2" }, { 9,  256, "2:1" }, { 9,  512, "1:1" },
+        { 10, 512, "2:1" }, { 10,1024, "1:1" },
+    };
+    const unsigned nwalk = sizeof walk_cases / sizeof walk_cases[0];
+    printf("[verify] Franke-Kleinjung walk vs brute force, %u cases"
+           " over 4:1 to 1:2...\n", nwalk);
+    for (unsigned w = 0; w < nwalk; w++) {
+        /* nc is the number of primes CHECKED. verify_walk's loop can fall
+         * short of the quota without erroring (`checked < nprimes && p <
+         * 40*I`), and testing only nc < 0 would let a case that checked
+         * nothing pass vacuously. */
+        const int nc = verify_walk(walk_cases[w].logI, walk_cases[w].J, 24);
+        if (nc != 24) {
+            printf("[verify] FAILED at logI=%d J=%u (%s): %d of 24 primes\n",
+                   walk_cases[w].logI, walk_cases[w].J, walk_cases[w].shape, nc);
+            return 1;
+        }
+    }
+    printf("[verify] OK: %u cases x 24 primes x 5 roots enumerated"
+           " identically, 4:1 through 1:2\n", nwalk);
+    return 0;
+}
+
 static int bench_main_impl(int argc, char **argv)
 {
     /* Identity of the card this process actually selected, captured where the
@@ -539,6 +575,13 @@ static int bench_main_impl(int argc, char **argv)
         }
         else if (!strcmp(argv[i], "--reps") && i + 1 < argc) cfg.reps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--verify")) cfg.verify = 1;
+        /* The CPU half of --verify, and then exit. --verify itself falls
+         * through to run_bench() on purpose -- that is the apply-parity gate
+         * finding 32 added -- but the walk/transform gates are pure host
+         * enumeration, and `make check` wires them in as a CPU gate that must
+         * still work on a box with no card, a busy card, or no 60 MB oracle
+         * factor base to load. */
+        else if (!strcmp(argv[i], "--verify-only")) return verify_walk_cases();
         else if (!strcmp(argv[i], "--poly") && i + 1 < argc) {
             if (bench_boinc_resolve_path("--poly", argv[++i], &polypath)) return 1;
         }
@@ -713,6 +756,23 @@ static int bench_main_impl(int argc, char **argv)
             allowance0_set = 1;
         }
         else if (!strcmp(argv[i], "--relations") && i + 1 < argc) {
+            /* A relation file carries no build stamp and is byte-for-byte the
+             * same shape as production output, so a pricing binary's relations
+             * become indistinguishable from real ones the moment they leave
+             * this process. The run log and the stderr banner are both
+             * transient; refusing at the artifact is the only durable answer.
+             * Pricing builds exist to time the norm, not to emit relations --
+             * see the #warning on NORM_FAST_LOG2. */
+            if (*runlog_build_defs()) {
+                fprintf(stderr,
+                    "--relations refused: this binary was built with %s, which"
+                    " alters the norm.\n"
+                    "  Its relations are not production output and nothing in"
+                    " the file would say so.\n"
+                    "  Rebuild without DEFS to emit relations.\n",
+                    runlog_build_defs());
+                return 1;
+            }
             if (bench_boinc_resolve_path("--relations", argv[++i], &cfg.relations)) return 1;
         }
         else if (!strcmp(argv[i], "--candidates") && i + 1 < argc) {
@@ -1319,7 +1379,7 @@ static int bench_main_impl(int argc, char **argv)
          * silent no-op. */
         static const char *harness_only[] = {
             "--record-bytes", "--mode", "--cells", "--norm", "--apply-mode",
-            "--stage", "--reps", "--verify", "--side", "--dump", "--probe",
+            "--stage", "--reps", "--verify", "--verify-only", "--side", "--dump", "--probe",
             "--survbits", "--other-bits", "--emit", "--emit-cof", "--td",
             "--ab-resieve", "--resieve-sweep", NULL
         };
@@ -2059,6 +2119,9 @@ static int bench_main_impl(int argc, char **argv)
                             " board= columns will read n/a");
             ckpt_job_text(&POLY, &cfg, job, sizeof job);
             runlog_note("commit", "%s", runlog_build_desc());
+            if (*runlog_build_defs())
+                runlog_note("BUILD-DEFS", "%s  <- pricing build, NOT production"
+                            " output", runlog_build_defs());
             /* The full command line. Reconstructing it from the printed
              * parameters is what findings 43-44 needed and did not have; see
              * finding 55. ckpt_fp_cat is the tested bounded append -- it
@@ -2237,10 +2300,15 @@ static int bench_main_impl(int argc, char **argv)
 
     if (cfg.verify) {
         int nc;
-        printf("[verify] Franke-Kleinjung walk vs brute force (logI=8, J=128)...\n");
-        nc = verify_walk(8, 128, 24);
-        if (nc < 0) { printf("[verify] FAILED\n"); return 1; }
-        printf("[verify] OK: %d primes x 5 roots enumerated identically\n", nc);
+        /* SEVERAL ASPECT RATIOS, not just J = I/2. This gate ran only at
+         * (8, 128) -- 2:1 -- for the project's whole life, and every geometry
+         * ever deployed is also 2:1, so "the walk enumerates the rectangle"
+         * was established for one shape and assumed for the rest. That gap
+         * surfaced when 2^15 x 2^15 measured 14% short of GGNFS (finding 58)
+         * and the walk was the first suspect; finding 63 is where it was
+         * eliminated, and these cases are what establish that rather than
+         * leave it inferred. */
+        if (verify_walk_cases()) return 1;
         printf("[verify] root transform vs its definition, by set equality...\n");
         if (verify_transform(&L, 200) != 0) { printf("[verify] FAILED\n"); return 1; }
         printf("[verify] OK: q <= 200, every root in [0,2q) -- primes, prime\n"
@@ -2258,8 +2326,23 @@ static int bench_main_impl(int argc, char **argv)
 
 int main(int argc, char **argv)
 {
-    int rc = bench_boinc_init();
+    int rc;
+    rc = bench_boinc_init();
     if (rc) return bench_boinc_finish(rc);
+    /* A pricing build alters the norm, so its relations are not production
+     * output. The run log records that (BUILD-DEFS), but ONLY when --log was
+     * passed and only for --pipeline, so a pricing binary run without it left
+     * no marker anywhere. Say so unconditionally on stderr.
+     *
+     * AFTER bench_boinc_init(), not before: boinc_init_options() reopens
+     * stderr onto the slot's stderr.txt, which is the file that actually gets
+     * uploaded. Printing first sends the banner to the client's inherited
+     * stderr instead, so the volunteer's result would carry no marker at all --
+     * exactly the case this exists to cover. Empty, and therefore silent, in
+     * every shipping build. */
+    if (*runlog_build_defs())
+        fprintf(stderr, "*** PRICING BUILD: %s -- relations from this binary"
+                " are NOT production output ***\n", runlog_build_defs());
     rc = bench_main_impl(argc, argv);
     return bench_boinc_finish(rc);
 }

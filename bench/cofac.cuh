@@ -1746,7 +1746,7 @@ static int cf_is_prime64(uint64_t n)
  * Split out of cf_check_relations so resume can spot-check a handful of lines
  * from the head and tail of a multi-gigabyte .part instead of rescanning it. */
 static int cf_check_one(char *line, tdpoly_t *tp, uint32_t lpb0, uint32_t lpb1,
-                        uint32_t *nprime, uint32_t *ncomp)
+                        uint32_t *nprime, uint32_t *ncomp, uint32_t *nonprim)
 {
     int64_t a, b;
     char *p = line, *e;
@@ -1765,6 +1765,30 @@ static int cf_check_one(char *line, tdpoly_t *tp, uint32_t lpb0, uint32_t lpb1,
             { char *nlp = strchr(fld[1], '\n'); if (nlp) *nlp = 0; }
             if (cf_norm_exact(&N[1], &tp[1], a, b) ||
                 cf_norm_exact(&N[0], &tp[0], a, b)) return 0;
+            /* PRIMITIVITY. Both norms can rebuild to exactly 1 and the
+             * relation still be worthless: if gcd(a,b) = g > 1 then (a,b) is
+             * g times a smaller pair and carries no new information, and
+             * msieve refuses it outright ("error -6", relation.c). This gate
+             * checked every factor and both norms but not this, which is why a
+             * whole band of non-primitive relations shipped before anyone
+             * noticed downstream. See the primitivity note on
+             * k_intersect_compact for how they arise. */
+            {
+                int64_t u = a < 0 ? -a : a, v = b < 0 ? -b : b;
+                while (v) { int64_t t = u % v; u = v; v = t; }
+                /* Return 2, NOT 0. A non-primitive relation reconstructs
+                 * perfectly -- both norms rebuild, every factor prime and in
+                 * range -- so folding it into the "does not reconstruct" count
+                 * makes the RESUME spot-check refuse a sound .part with a
+                 * false diagnosis, sending the operator after file corruption
+                 * or a wrong polynomial. The two callers want opposite things:
+                 * the --check-relations GATE must fail on it, while resume must
+                 * not, because a .part written by a pre-finding-68 binary
+                 * legitimately holds ~0.1% of them on a small-q job and that is
+                 * no reason to strand a multi-day band. Resume tests `if (r)`
+                 * and so accepts 2; the gate tests `r == 1`. */
+                if (u != 1) { (*nonprim)++; return 2; }
+            }
             for (side = 0; side < 2 && !bad; side++) {
                 const uint32_t lpb = side ? lpb1 : lpb0;
                 char *q = fld[side];
@@ -1837,21 +1861,29 @@ static int cf_check_relations(const char *path, const poly_t *poly,
     FILE *f = fopen(path, "rb");
     char *line = NULL;
     size_t cap = 0;
-    uint32_t nok = 0, nbad = 0, nprime = 0, ncomp = 0;
+    uint32_t nok = 0, nbad = 0, nprime = 0, ncomp = 0, nonprim = 0;
     if (!f) { perror(path); return -1; }
     if (td_build_poly(&tp[1], poly, 1) || td_build_poly(&tp[0], poly, 0)) {
         fprintf(stderr, "check-relations: polynomial does not fit\n");
         fclose(f); return -1;
     }
     while (getline(&line, &cap, f) > 0) {
-        const int r = cf_check_one(line, tp, lpb0, lpb1, &nprime, &ncomp);
-        if (r > 0) nok++; else if (r == 0) nbad++;
+        const int r = cf_check_one(line, tp, lpb0, lpb1, &nprime, &ncomp, &nonprim);
+        /* r == 1 only: r == 2 is "reconstructs but is not primitive", which
+         * this gate must fail. */
+        if (r == 1) nok++; else if (r >= 0) nbad++;
     }
     free(line); fclose(f);
     printf("  relation reconstruction gate: %u of %u rebuild both norms exactly",
            nok, nok + nbad);
     if (nprime) printf(", %u carried a factor outside [2, 2^lpb)", nprime);
     if (ncomp)  printf(", %u carried a COMPOSITE factor", ncomp);
+    /* Named separately from the composite count. A non-primitive relation is
+     * perfectly factored -- both norms rebuild -- so reporting it as a
+     * composite factor sends the reader after the cofactoriser instead of
+     * after the survivor filter. */
+    if (nonprim) printf(", %u NON-PRIMITIVE (gcd(a,b) != 1; msieve error -6)",
+                        nonprim);
     printf("  %s\n", nbad ? "<-- FAIL" : "PASS");
     return (int)nbad;
 }
@@ -1880,7 +1912,7 @@ extern "C" int check_relations_sample(const char *path, const poly_t *poly,
     FILE *f = fopen(path, "rb");
     char *line = NULL, **keep = NULL;
     size_t cap = 0;
-    uint32_t nok = 0, nbad = 0, nprime = 0, ncomp = 0, seen = 0, nkeep = 0;
+    uint32_t nok = 0, nbad = 0, nprime = 0, ncomp = 0, nonprim = 0, seen = 0, nkeep = 0;
     long long size, end, head_end = 0;
     if (checked) *checked = 0;
     if (!f) { perror(path); return -1; }
@@ -1898,7 +1930,7 @@ extern "C" int check_relations_sample(const char *path, const poly_t *poly,
     while (seen < n && getline(&line, &cap, f) > 0) {
         int r;
         if (ftell(f) > end) break;      /* the line crosses the prefix end */
-        r = cf_check_one(line, tp, lpb0, lpb1, &nprime, &ncomp);
+        r = cf_check_one(line, tp, lpb0, lpb1, &nprime, &ncomp, &nonprim);
         if (r < 0) continue;
         seen++;
         if (r) nok++; else nbad++;
@@ -1937,7 +1969,7 @@ extern "C" int check_relations_sample(const char *path, const poly_t *poly,
                     char *s = keep[(first + i) % n];
                     int r;
                     if (!s) continue;
-                    r = cf_check_one(s, tp, lpb0, lpb1, &nprime, &ncomp);
+                    r = cf_check_one(s, tp, lpb0, lpb1, &nprime, &ncomp, &nonprim);
                     if (r < 0) continue;
                     seen++;
                     if (r) nok++; else nbad++;
@@ -1954,29 +1986,71 @@ done:
            " norms exactly", seen, path, nok);
     if (nprime) printf(", %u out of lpb range", nprime);
     if (ncomp)  printf(", %u composite", ncomp);
+    /* Reported, not fatal: see cf_check_one. A pre-finding-68 .part carries
+     * these legitimately, and refusing the resume over them would strand the
+     * band for a population msieve merely skips. */
+    if (nonprim)
+        printf(", %u NON-PRIMITIVE (harmless here; msieve skips them, and a"
+               " rebuilt binary no longer emits them)", nonprim);
     printf("  %s\n", nbad ? "<-- FAIL" : "PASS");
     return (int)nbad;
 }
 
 typedef struct { char *ab, *f0, *f1; } cf_rest_t;
 
-/* Append the split primes to a side's trial-division factor list and print it
- * in the relation format: ascending hex, comma separated. */
-static void cf_emit_side(FILE *o, const char *tdfac, const uint64_t *extra,
-                         int nextra)
+/* Fill `f` with a side's trial-division list plus its split primes, in the
+ * relation format's terms. Returns the count, or -1 if they do not all fit.
+ *
+ * THE TWO BOUNDS ARE DIFFERENT ON PURPOSE. The parse stops at TD_FMAX, which
+ * is what trial division can emit; the append then runs to TD_FMAX+CF_MAXFAC,
+ * the space reserved for split primes. Bounding BOTH loops at the combined
+ * size -- which is what this did -- let a long trial-division list eat the
+ * reservation, after which every split prime was dropped and the relation was
+ * written anyway, with a factor product that is not the norm. It then failed
+ * reconstruction somewhere else entirely, with nothing pointing back here.
+ *
+ * This path parses an externally supplied --candidates file, so a malformed or
+ * truncated record is a real input, not a can't-happen. The inline queue
+ * refuses the same condition outright (pipeline.cuh, `c0 > TD_FMAX`). */
+static int cf_fill_side(uint64_t *f, const char *tdfac, const uint64_t *extra,
+                        int nextra)
 {
-    uint64_t f[TD_FMAX + CF_MAXFAC + 2];
     int n = 0;
     const char *p = tdfac;
-    while (*p && n < TD_FMAX + CF_MAXFAC) {
+    while (*p) {
         char *end;
-        unsigned long long v = strtoull(p, &end, 16);
+        unsigned long long v;
+        if (n >= TD_FMAX) return -1;      /* more TD factors than TD can make */
+        v = strtoull(p, &end, 16);
         if (end == p) break;
         f[n++] = (uint64_t)v;
         p = end; if (*p == ',') p++;
     }
-    for (int i = 0; i < nextra && n < TD_FMAX + CF_MAXFAC; i++) f[n++] = extra[i];
-    cf_emit_sorted(o, f, n);
+    if (nextra < 0 || n + nextra > TD_FMAX + CF_MAXFAC) return -1;
+    for (int i = 0; i < nextra; i++) f[n++] = extra[i];
+    return n;
+}
+
+/* Both sides must be built BEFORE either is written: the relation is one line,
+ * so discovering the overflow half way through would leave a truncated line in
+ * the output, which is worse than the bug it guards.
+ *
+ * Fills both sides into caller-owned buffers and hands back the counts, rather
+ * than filling them to answer "does it fit" and throwing them away -- the
+ * emit then re-parsed the same hex lists, four cf_fill_side calls per relation
+ * instead of two. */
+typedef struct {
+    uint64_t f0[TD_FMAX + CF_MAXFAC + 2];
+    uint64_t f1[TD_FMAX + CF_MAXFAC + 2];
+    int n0, n1;
+} cf_rec_t;
+
+static int cf_rec_build(cf_rec_t *r, const char *f0, const uint64_t *e0, int n0,
+                        const char *f1, const uint64_t *e1, int n1)
+{
+    r->n0 = cf_fill_side(r->f0, f0, e0, n0);
+    r->n1 = cf_fill_side(r->f1, f1, e1, n1);
+    return r->n0 >= 0 && r->n1 >= 0;
 }
 
 /* Cofactorise a `--candidates` batch and write the relations it yields.
@@ -2009,6 +2083,12 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
     uint64_t *small0 = NULL, *small1 = NULL;
     double ms0 = 0, ms1 = 0, thost;
     uint32_t nrel = 0, nrel2 = 0, dead0 = 0, dead1 = 0, stuck0 = 0, stuck1 = 0, novf = 0;
+    /* Distinct from novf, which counts records whose SPLITTER produced more
+     * than CF_MAXFAC factors. This counts records whose trial-division list
+     * plus split primes will not fit the emit buffer -- a property of the
+     * input file, not of the split. */
+    uint32_t nover = 0;
+    cf_rec_t rb;
     uint8_t *alg_job = NULL;
     FILE *fo = NULL;
     char tmp[2048];
@@ -2167,12 +2247,18 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
         for (uint32_t k = 0; k < n1; k++) {
             uint32_t r = i1[k];
             if (st1[k] != CF_OK || !side0ok[r]) continue;
-            done1[r] = 1; nrel++;
+            done1[r] = 1;
+            if (!cf_rec_build(&rb, rest[r].f0, ex0 + (size_t)r * CF_MAXFAC, ne0[r],
+                              rest[r].f1, fac1 + (size_t)k * CF_MAXFAC, nf1[k])) {
+                nover++;
+                continue;          /* not counted in nrel: it is not one */
+            }
+            nrel++;
             if (fo) {
                 fprintf(fo, "%s:", rest[r].ab);
-                cf_emit_side(fo, rest[r].f0, ex0 + (size_t)r * CF_MAXFAC, ne0[r]);
+                cf_emit_sorted(fo, rb.f0, rb.n0);
                 fputc(':', fo);
-                cf_emit_side(fo, rest[r].f1, fac1 + (size_t)k * CF_MAXFAC, nf1[k]);
+                cf_emit_sorted(fo, rb.f1, rb.n1);
                 fputc('\n', fo);
             }
         }
@@ -2186,18 +2272,30 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
         for (uint32_t r = 0; r < nrec; r++) {
             uint64_t one1 = small1[r];
             if (done1[r] || alg_job[r] || !side0ok[r]) continue;
+            if (!cf_rec_build(&rb, rest[r].f0, ex0 + (size_t)r * CF_MAXFAC, ne0[r],
+                              rest[r].f1, &one1, one1 ? 1 : 0)) {
+                nover++;
+                continue;
+            }
             nrel2++;
             if (fo) {
                 fprintf(fo, "%s:", rest[r].ab);
-                cf_emit_side(fo, rest[r].f0, ex0 + (size_t)r * CF_MAXFAC, ne0[r]);
+                cf_emit_sorted(fo, rb.f0, rb.n0);
                 fputc(':', fo);
-                cf_emit_side(fo, rest[r].f1, &one1, one1 ? 1 : 0);
+                cf_emit_sorted(fo, rb.f1, rb.n1);
                 fputc('\n', fo);
             }
         }
         free(ex0); free(ne0); free(done1);
         printf("  relations: %u from the algebraic queue + %u whose algebraic"
                " side needed none\n", nrel, nrel2);
+        /* Loud, because the alternative this replaces was a wrong relation
+         * written silently. A nonzero count means the --candidates file holds
+         * records with more trial-division factors than TD_FMAX. */
+        if (nover)
+            fprintf(stderr, "  warning: %u record(s) had more factors than"
+                    " TD_FMAX+CF_MAXFAC and were SKIPPED rather than emitted"
+                    " with factors dropped\n", nover);
         nrel += nrel2;
     }
     if (fo) {
@@ -2220,7 +2318,9 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
     free(small0); free(small1); free(side0ok); free(alg_job);
     free(st0); free(st1); free(nf0); free(nf1); free(fac0); free(fac1);
     cudaFree(d_s); cudaFree(d_s2mask);
-    return novf ? -1 : 0;
+    /* Same discipline as novf: a batch that silently dropped records is not a
+     * clean batch, and the caller must not read it as one. */
+    return (novf || nover) ? -1 : 0;
 }
 
 #endif  /* __CUDACC__ */

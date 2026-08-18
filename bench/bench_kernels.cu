@@ -335,7 +335,27 @@ __global__ void k_apply(const uint32_t *__restrict buckets,
                  * slightly different functions. Accurate log2f is reproducible
                  * on both sides; norm init was 1.76 ms of a 27 ms apply, so the
                  * difference is affordable and correctness is not. */
+#ifdef NORM_FAST_LOG2
+#warning "NORM_FAST_LOG2: __log2f breaks CPU parity; --verify and dumpcmp will \
+report spurious cell mismatches. Pricing builds only, never for relations."
+                /* PRICING SWITCH, not a shipping option: __log2f is one MUFU
+                 * instruction against log2f's software sequence, and the point
+                 * of building with it is to measure what the accurate version
+                 * costs -- see the paragraph above for why the accurate one is
+                 * the default.
+                 *
+                 * This SILENTLY INVALIDATES THE PARITY GATE, which is why the
+                 * #warning above exists. poly.c's norm_target_host mirrors the
+                 * device expression deliberately -- same float type, same
+                 * clamp, same log2f -- so that "0 cells differ" means
+                 * something. Building with this breaks the mirror on the
+                 * device side only, and the ~2 ulp difference shows up as
+                 * scattered mismatches at threshold boundaries that read
+                 * exactly like a kernel regression. */
+                float lg = N.scale * (N.log2M + __log2f(fmaxf(s, 1e-30f)) - N.bias);
+#else
                 float lg = N.scale * (N.log2M + log2f(fmaxf(s, 1e-30f)) - N.bias);
+#endif
                 int ti = (int)floorf(lg + 0.5f);
                 const uint32_t TMAX = (CELLBITS == 8) ? 255u : CINIT;
                 t = (ti < 0) ? 0u : ((uint32_t)ti > TMAX ? TMAX : (uint32_t)ti);
@@ -628,9 +648,32 @@ static float time_kernel(cudaEvent_t a, cudaEvent_t b)
 
 /* ---- intersect + primitive filter + compaction ------------------------- *
  *
- * The two per-side survivor bitmaps are ANDed, positions with gcd(i,j) != 1
- * are dropped (they cannot give a relation: a and b would share a factor),
- * and what remains is compacted into a dense list.
+ * The two per-side survivor bitmaps are ANDed, positions that cannot give a
+ * PRIMITIVE (a,b) are dropped, and what remains is compacted into a dense
+ * list.
+ *
+ * PRIMITIVITY TAKES TWO TESTS, NOT ONE. gcd(i,j) != 1 is the obvious one, and
+ * for a long time it was the only one, on the reasoning that (a,b) inherits
+ * the primitivity of (i,j). It does not: (a,b) = M(i,j) with
+ * det M = +-q, and a non-unimodular map can destroy primitivity. Exactly one
+ * way, and it is cheap to test -- q | b (equivalently q | a, since a = rho*b
+ * mod q on the lattice), which makes (a,b) = q*(a',b').
+ *
+ * Any OTHER common prime p is already excluded: p | a and p | b with p != q
+ * implies (a/p, b/p) is still on the q-lattice, so (i,j) = p*(i',j') and the
+ * gcd test catches it. So gcd(a,b) is 1 or q, and `b % q` decides which.
+ *
+ * These are not rare curiosities on a small-q job. A point with q | a and q | b
+ * lies on the plattice line of EVERY root of q, so the sieve subtracts log(q)
+ * once per root; when the algebraic polynomial splits completely mod q, that
+ * is deg*log(q), which is precisely the q^deg sitting in F(a,b) = q^deg
+ * F(a',b'). Both sides then look perfectly smooth and the position sails
+ * through to trial division, which confirms the factorisation -- of a relation
+ * that is q times a smaller one. msieve rejects them with "error -6"
+ * (relation.c: gcd(a,b) != 1). Measured on an SNFS job with
+ * F = (x^7-1)/(x-1), alim 3.5M and q from 400009: 154 of 154,810 emitted
+ * relations were non-primitive, and every one had q = 1 (mod 7) -- the
+ * condition for that F to split completely.
  *
  * The list carries BOTH the sieve index x and the pair (a,b). Emitting only
  * (a,b) would be the natural-looking choice and it is the wrong one: every
@@ -880,19 +923,27 @@ __global__ void k_intersect_compact(const uint32_t *__restrict A,
                                     const uint32_t *__restrict B,
                                     uint32_t nword, uint32_t logI,
                                     int64_t a0, int64_t a1, int64_t b0, int64_t b1,
+                                    int64_t q,
                                     uint32_t *__restrict out_x,
                                     int64_t  *__restrict out_a,
                                     int64_t  *__restrict out_b,
                                     uint32_t cap,
                                     uint32_t *__restrict nout,
                                     unsigned long long *__restrict npre,
-                                    uint32_t *__restrict twosided)
+                                    uint32_t *__restrict twosided,
+                                    unsigned long long *__restrict nqb)
 {
     const uint32_t Imask = (1u << logI) - 1;
     const int32_t  Ihalf = (int32_t)(1u << (logI - 1));
     const uint64_t stride = bench_grid_stride_x();
     const uint32_t lane = threadIdx.x & 31u;
     unsigned long long pre = 0;
+    /* Counted separately so the gcd(i,j)-only population stays recoverable.
+     * That is the population CADO's after_sieve holds and dumpcmp --and
+     * reproduces, so the parity gate must be able to name it; folding the
+     * q|b rejections into the survivor count silently compares two different
+     * populations, which is RESULTS finding 40's mistake. */
+    unsigned long long qbrej = 0;
 
     /* Round the trip count up so every lane of a warp runs the same number of
      * iterations: the warp-aggregated atomic below needs a converged warp, and
@@ -913,7 +964,14 @@ __global__ void k_intersect_compact(const uint32_t *__restrict A,
             int32_t  i = (int32_t)(x & Imask) - Ihalf;
             uint32_t j = x >> logI;
             uint32_t ai = (uint32_t)(i < 0 ? -i : i);
-            if (bgcd(ai, j) == 1) keep |= 1u << k;
+            if (bgcd(ai, j) != 1) continue;
+            /* the second test: q | b makes (a,b) = q*(a',b'). One 64-bit
+             * modulo per two-sided survivor, which is ~1 position in 400. */
+            if (q > 1 && ((int64_t)i * a1 + (int64_t)j * b1) % q == 0) {
+                qbrej++;
+                continue;
+            }
+            keep |= 1u << k;
         }
 
         /* Warp-aggregated allocation: one atomicAdd per warp instead of one
@@ -961,6 +1019,7 @@ __global__ void k_intersect_compact(const uint32_t *__restrict A,
     }
     /* one atomic per thread, not one per survivor */
     if (pre) atomicAdd(npre, pre);
+    if (nqb && qbrej) atomicAdd(nqb, qbrej);
 }
 
 /* ======================= trial division, host side ======================= */
@@ -2121,7 +2180,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                 uint32_t *hother = NULL, *dother = NULL;
                 uint32_t *d_x = NULL, *d_n = NULL, hn = 0;
                 int64_t *d_a = NULL, *d_b = NULL;
-                unsigned long long *d_pre = NULL, hpre = 0;
+                unsigned long long *d_pre = NULL, hpre = 0, *d_qb = NULL, hqb = 0;
                 uint32_t *d_two = NULL;
                 /* cap: the two-sided count is ~1 in 400 of the area, but size
                  * it off the one-sided count so a bad pairing cannot overflow
@@ -2149,6 +2208,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                         CK(cudaMalloc(&d_b, (size_t)icap * 8));
                         CK(cudaMalloc(&d_n, 4));   CK(cudaMemset(d_n, 0, 4));
                         CK(cudaMalloc(&d_pre, 8)); CK(cudaMemset(d_pre, 0, 8));
+                        CK(cudaMalloc(&d_qb, 8));  CK(cudaMemset(d_qb, 0, 8));
                         CK(cudaMalloc(&d_two, (size_t)nbitword * 4));
                         CK(cudaMemset(d_two, 0, (size_t)nbitword * 4));
 
@@ -2159,11 +2219,12 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                         for (int rep = 0; rep < 3; rep++) {
                             CK(cudaMemset(d_n, 0, 4));
                             CK(cudaMemset(d_pre, 0, 8));
+                            CK(cudaMemset(d_qb, 0, 8));
                             cudaEventRecord(e3);
                             k_intersect_compact<1><<<blocks, cfg->threads>>>(
                                 D.survbits, dother, nbitword, cfg->logI,
-                                L->a0, L->a1, L->b0, L->b1,
-                                d_x, d_a, d_b, icap, d_n, d_pre, d_two);
+                                L->a0, L->a1, L->b0, L->b1, (int64_t)L->q,
+                                d_x, d_a, d_b, icap, d_n, d_pre, d_two, d_qb);
                             cudaEventRecord(e4);
                             CK(cudaEventSynchronize(e4));
                             CK(cudaGetLastError());
@@ -2174,13 +2235,23 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
 
                         CK(cudaMemcpy(&hn, d_n, 4, cudaMemcpyDeviceToHost));
                         CK(cudaMemcpy(&hpre, d_pre, 8, cudaMemcpyDeviceToHost));
+                        CK(cudaMemcpy(&hqb, d_qb, 8, cudaMemcpyDeviceToHost));
 
                         printf("\n  intersect+gcd+compact vs %s\n", cfg->other_bits);
                         printf("  %-26s %8llu\n", "two-sided, pre-gcd",
                                (unsigned long long)hpre);
-                        printf("  %-26s %8u  (%.1f%% of pre-gcd survive)\n",
-                               "primitive gcd(i,j)=1", hn,
-                               hpre ? 100.0 * hn / (double)hpre : 0.0);
+                        /* THIS is the number to compare against dumpcmp --and
+                         * and CADO's after_sieve: both apply the gcd(i,j) test
+                         * and nothing else. */
+                        printf("  %-26s %8llu  (%.1f%% of pre-gcd survive)"
+                               "  <- CADO-comparable\n",
+                               "primitive gcd(i,j)=1",
+                               (unsigned long long)hn + hqb,
+                               hpre ? 100.0 * (hn + hqb) / (double)hpre : 0.0);
+                        printf("  %-26s %8llu  (q | b: (a,b) = q*(a',b'),"
+                               " finding 68)\n",
+                               "  of which dropped", (unsigned long long)hqb);
+                        printf("  %-26s %8u\n", "emitted", hn);
                         if (hn > icap)
                             printf("  ** OVERFLOW: %u > cap %u, list truncated\n", hn, icap);
                         printf("  %-26s %8.3f ms  (best of 3; the first launch of any kernel\n"
@@ -2499,6 +2570,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                     if (hother) cudaFreeHost(hother);
                     cudaFree(dother); cudaFree(d_x); cudaFree(d_a);
                     cudaFree(d_b); cudaFree(d_n); cudaFree(d_pre); cudaFree(d_two);
+                    cudaFree(d_qb);
                 }
             }
             if (cfg->dump) {

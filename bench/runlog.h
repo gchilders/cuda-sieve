@@ -102,6 +102,11 @@ int  runlog_gpu_watts(double *w);
  * that happened to be checked out when a big CUDA object was last compiled. */
 const char *runlog_build_desc(void);
 
+/* The pricing -D's the binary was built with, empty for a shipping build. A
+ * non-empty value means the norm was deliberately altered and the run's
+ * relations are not production output. */
+const char *runlog_build_defs(void);
+
 #ifdef __cplusplus
 }
 #endif

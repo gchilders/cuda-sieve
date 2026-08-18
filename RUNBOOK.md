@@ -142,10 +142,47 @@ memory/slabbing options, and why the end metric is time to a filterable matrix
 rather than raw relations/s, see [Current size limits, and what lifting them
 entails](bench/STATUS.md#current-size-limits-and-what-lifting-them-entails).
 
+### Will it fit? VRAM sizing
+
+Two knobs move device memory and they are not interchangeable
+(`bench/RESULTS.md` finding 64):
+
+    VRAM ~ bucket(larger side, nearly flat in lim) + 25.4 B x (entries_r + entries_a)
+           + 3 x area/8 + ~1.45 GB fixed     where entries ~ pi(lim)
+
+- **Area is the expensive axis.** On a C194 the bucket array is 1.46 GB at
+  `2^29`, 2.91 GB at `2^30` and 5.20 GB at `2^31`. It is linear in `J` at fixed
+  `I` (1.46 → 2.91 is exactly 2×) but **sub-linear when `logI` rises**, because
+  `bkthresh` defaults to `1 << logI` and a higher start cuts `Σ1/p` — which is
+  why 2.91 → 5.20 is 1.79×, not 2×.
+- **Lim is the cheap one.** Doubling both lims doubles the factor base but
+  moves the bucket array only ~5%, because records go as `Σ1/p ~ ln ln p`. It
+  costs ~25 bytes per entry, summed over both sides.
+- The bucket array is sized by the **larger** side, not the sum — the two sides
+  share one allocation and run sequentially — so raising the smaller side's lim
+  is nearly free until it overtakes the other.
+- The two effects are equal at **area ≈ 6.7 × lim**; below that a job is
+  factor-base dominated, above it bucket dominated.
+
+Measured device-in-use totals for a C194 (`rlim 160M, alim 240M`): **3.63 GB**
+at 15e, 5.32 GB at `2^30`, **8.06 GB** at 16e — so 16e fits a 12 GB card with
+3.9 GB to spare. These are what `bench` reports as *device* memory in use
+(total − free), so on a desktop they include whatever else holds VRAM; the
+~1.45 GB constant above absorbs that too.
+
+**Do not size a job from an aborted startup.** The startup table lists only the
+bucket array, factor bases, bitmaps, trial-division context and cofactor queue
+— roughly 2.2 GB of the 3.63 GB above at 15e — and per-q buffers grow on demand
+afterwards. The "device memory, steady state" line is the complete figure and
+prints only on a *successful* run, so budget from the formula and confirm with a
+short completed band.
+
 ### Sizing a job first: `testsieve.sh`
 
 Before committing days to a band, test-sieve it. `bench/testsieve.sh` samples
-the yield curve at several q, integrates it, and projects the whole run:
+the yield curve at several q, normalizes each sample, integrates it, and
+projects the whole run. Run `./testsieve.sh` with no arguments for interactive
+prompts, or pass flags for a repeatable run:
 
 ```sh
 cd bench
@@ -154,31 +191,45 @@ cd bench
     --target-rels 300000000 --geom 15,16384 --geom 15,32768
 ```
 
-```
-  === projection over [20000000, 200000000) ===
-  geometry     relations      GPU days     energy kWh   rel/kJ     target reached at q
-  15,16384     4.58e+08       13.01        54.0         2356.0     123343539  (7.83 d)
-  15,32768     6.51e+08       25.35        108.0        1675.3      86640790  (9.89 d)
-```
+The displayed `n-yield` and every projected quantity use the same
+normalization as `~/code/test-sieve`: expected pairs are `width / ln(q0)`, and
+`n-yield = raw relations * expected pairs / observed pairs`. The GPU-day and
+energy projections likewise replace the observed pair count with the expected
+count. This keeps a short interval that happens to contain unusually many
+special-q roots from masquerading as a higher-yielding sieve configuration.
+The final table reports normalized relations, GPU days, energy, relations per
+kilojoule, and (when requested) the q where the relation target is reached.
 
-Read that as: the taller rectangle reaches the target at a **much lower q**
-(86.6M against 123.3M) but takes **two days longer** and 2× the energy to get
-there.
+**When comparing geometries, compare at equal area — and prefer the wider
+one.** The two axes are not interchangeable. At equal area a wide rectangle
+beats a square by **+11.7% relations at `2^28` and +16.3% at `2^30`, for −0.3%
+device time** (`bench/RESULTS.md` finding 65): `2^16 × 2^14` returns 10,671
+relations where `2^15 × 2^15` returns 9,176 on the same q window. Doubling I
+costs 1.86 bits of `log2(maxnorm)`; doubling J costs 3.86, because `i`
+multiplies the shorter vector of the reduced q-lattice and `j` the longer one.
+So a `J = I` row is a genuinely worse configuration than a wider rectangle of
+the same size — but it is not *broken*, and the sweep can be trusted as
+measured.
 
-**And do not take the `J = I` row at face value yet.** Measured against GGNFS
-on the same rectangle, our yield at `2^15 × 2^15` is **14% low**, while both
-2:1 geometries are at parity — an aspect-ratio effect traced to the norm
-approximation (`bench/RESULTS.md` finding 58, `bench/STATUS.md` item 5). So the
-projection above understates how long a 1:1 run really takes to reach a target,
-and the honest advice today is **2:1 rectangles only**: `J = I/2`, which is the
-default. Revisit when item 5 lands.
+An earlier version of this note said our yield at `2^15 × 2^15` was "14% low"
+against GGNFS and blamed the survivor gate. **Both claims are withdrawn**:
+`gnfs-lasieve4I15e -J 15` widens I rather than J, so that comparison was our
+square against GGNFS's `2^16 × 2^14`. At matched rectangles we run 0.979–0.981
+of GGNFS at every aspect ratio and area tested. See `bench/STATUS.md` item 5.
+
+**Before comparing yields against another siever, confirm the rectangles
+match** with `bench/relgeom.py --band QLO:QHI --skew S extent FILE...`, which recovers
+the region a run actually covered by inverting the q-lattice on its own
+relations. Two sessions
+went into explaining a "deficit" that was a `-J` flag meaning something other
+than assumed; the check takes seconds.
 
 It differs from GGNFS's `test_sieve.sh` in three ways. It can sweep
 **geometry** (`--geom logI,J`, repeatable) and the **factor-base bounds**
 (`--rlim`/`--alim`), which a per-I compiled siever cannot. It reports
-**energy**, taken from the run log's board-watt samples. And everything is per
-**(q, rho) pair** rather than per prime q — stated in its own header, because
-the two differ by ~1.5× on a degree-5 polynomial and confusing them has cost
+**energy**, taken from the run log's board-watt samples. And its observed and
+expected counts are **(q, rho) pairs**, rather than GGNFS's per-prime-q count;
+the distinction is stated in its own header because confusing them has cost
 this project one wrong headline already (`bench/RESULTS.md` finding 57).
 
 Two cautions. The default `--width 2000` sieves ~100 pairs per point, which is

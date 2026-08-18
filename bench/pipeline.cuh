@@ -1452,7 +1452,8 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
          * against the rank scan -- without the writes. */
         k_intersect_compact<1><<<blocks, cfg->threads>>>(
             S1.survbits, S0.survbits, nbitword, cfg->logI,
-            Lq.a0, Lq.a1, Lq.b0, Lq.b1, NULL, NULL, NULL, 0u, d_n, d_pre, d_two);
+            Lq.a0, Lq.a1, Lq.b0, Lq.b1, (int64_t)Lq.q,
+            NULL, NULL, NULL, 0u, d_n, d_pre, d_two, NULL);
         PIPE_CK(cudaEventRecord(eb));
         PIPE_CK(cudaEventSynchronize(eb));
         PIPE_CK(cudaGetLastError());

@@ -96,9 +96,18 @@ endif
 ARCH_STAMP := .arch.stamp
 $(shell [ "$$(cat $(ARCH_STAMP) 2>/dev/null)" = '$(NVCC_ARCH)' ] || printf '%s' '$(NVCC_ARCH)' > $(ARCH_STAMP))
 
-# Extra -D's for pricing experiments, e.g. make DEFS=-DNORM_CANCEL_TOL=0.0f.
-# Nothing in the default build sets this; it exists so a variant can be timed
-# without editing a header and forgetting to put it back.
+# Extra -D's for pricing experiments, e.g. make DEFS=-DNORM_CANCEL_TOL=0.0f or
+# make DEFS=-DNORM_FAST_LOG2. Nothing in the default build sets this; it exists
+# so a variant can be timed without editing a header and forgetting to put it
+# back.
+#
+# STAMPED, for the same reason GPU_ARCH and HAVE_BOINC are: objects carry no
+# record of the -D's that built them, so `make DEFS=-DNORM_FAST_LOG2` on an
+# existing tree would report everything up to date and link the ACCURATE
+# binary -- and the measurement would then report 0% for a switch that was
+# never compiled in. The stamp also reaches the run log, since a pricing build
+# otherwise stamps the same git description as a shipping one and its relations
+# would be indistinguishable from real output.
 DEFS      ?=
 
 # Optional BOINC application build.  Keep BOINC dependencies out of the default
@@ -184,13 +193,30 @@ $(shell [ "$$(cat $(BOINC_STAMP) 2>/dev/null)" = '$(BOINC_SIGNATURE)' ] || print
 # Kept as three plain assignments: a `case` inside $(shell ...) ends the make
 # function at its first `*)`, and `wc -l` rather than the file list keeps a
 # filename containing `$` or a paren out of a macro definition.
+#
+# The -f test is load-bearing and is NOT redundant with the content compare.
+# DEFS is empty in every default build, and `cat` on a missing file also yields
+# empty, so a content-only check reports "unchanged" and never creates the
+# stamp -- while $(OBJS) still depends on it, leaving every fresh clone and
+# every `make clean && make` dead at "No rule to make target '.defs.stamp'".
+# The four sibling stamps never hit this because none of their values can be
+# empty. Test existence first, then content.
+DEFS_STAMP := .defs.stamp
+$(shell { [ -f $(DEFS_STAMP) ] && [ "$$(cat $(DEFS_STAMP))" = '$(DEFS)' ]; } || \
+        printf '%s' '$(DEFS)' > $(DEFS_STAMP))
+# Every object AND the two tools that compile straight from .c to a binary
+# without going through $(OBJS). Those two escaped the stamp, so
+# `make DEFS=... dumpcmp` reported "up to date" and linked a binary built
+# without the define -- the exact hole the stamp exists to close.
+$(OBJS): $(DEFS_STAMP)
+
 GIT_STAMP := .git.stamp
 GIT_RAW  := $(shell git -C . describe --always --abbrev=8 2>/dev/null)
 GIT_DIRT := $(shell git -C . status --porcelain 2>/dev/null | wc -l)
 GIT_DESC := $(if $(GIT_RAW),$(GIT_RAW)$(if $(filter-out 0,$(GIT_DIRT)),-dirty),unknown)
 $(shell [ "$$(cat $(GIT_STAMP) 2>/dev/null)" = '$(GIT_DESC)' ] || printf '%s' '$(GIT_DESC)' > $(GIT_STAMP))
 
-runlog.o: CFLAGS += -DBENCH_GIT_DESC='"$(GIT_DESC)"'
+runlog.o: CFLAGS += -DBENCH_GIT_DESC='"$(GIT_DESC)"' -DBENCH_DEFS='"$(DEFS)"'
 runlog.o: $(GIT_STAMP)
 
 # CUDART_LINK changes the link line and nothing else, so it gets its own stamp.
@@ -237,11 +263,11 @@ fbgen_lib.o: fbgen.c bench.h
 sqgentest: sqgentest.c fbgen_lib.o poly.o primes.o
 	$(CC) $(CFLAGS) -Wl,--gc-sections -o $@ $^ -lm
 
-dumpcmp: dumpcmp.c
+dumpcmp: dumpcmp.c $(DEFS_STAMP)
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
 # joins the two per-side --emit-cof files into cofactorisation batch input
-mkcofbatch: mkcofbatch.c
+mkcofbatch: mkcofbatch.c $(DEFS_STAMP)
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
 %.o: %.cu
@@ -256,15 +282,38 @@ mkcofbatch: mkcofbatch.c
 -include $(OBJS:.o=.d)
 
 clean:
-	rm -f bench fbtest fbgen sqgentest dumpcmp mkcofbatch *.o *.d $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP) $(GIT_STAMP)
+	rm -f bench fbtest fbgen sqgentest dumpcmp mkcofbatch *.o *.d $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP) $(GIT_STAMP) $(DEFS_STAMP)
 
-.PHONY: all clean check cofcheck fbgencheck sqgencheck
+.PHONY: all clean check cofcheck fbgencheck sqgencheck walkcheck
 
 # `check` depended on fbtest alone, so the whole CUDA path -- kernels, the
 # cofactoriser, the pipeline -- could fail to compile while the gates reported
 # "all gates passed". Depend on `all`.
-check: all cofcheck fbgencheck sqgencheck
+check: all cofcheck fbgencheck sqgencheck walkcheck
 	./fbtest --fb1 ../oracle/c183.fb1
+
+# The lattice-walk gate, which nothing used to run. `--verify` is refused under
+# --pipeline (harness_only), and cofcheck/testsieve/every band run use
+# --pipeline -- so the walk cases were "permanent" in the source and dead in
+# practice. A regression in pl_make/pl_next at an untested aspect ratio would
+# have shipped.
+#
+# `--verify-only`, NOT `--verify`. The latter deliberately falls through to
+# run_bench() -- that fall-through is finding 32's apply-parity gate -- which
+# drags in a CUDA device and the 60 MB untracked ../oracle/input.job.afb.0.
+# This target is a CPU gate inside `check`, and a CPU gate that needs a card
+# and an untracked oracle file is not one: it would fail on a driverless box,
+# on a box whose card is busy, and on any fresh clone. --verify-only runs the
+# walk cases and exits, touching no input at all.
+walkcheck: bench
+	@out=$$(./bench --verify-only 2>&1); st=$$?; \
+	 printf '%s\n' "$$out" \
+	   | grep -E 'Franke-Kleinjung|primes x 5 roots|FAILED' \
+	   | sed 's/^/  /'; \
+	 if [ $$st -ne 0 ]; then \
+	   printf '%s\n' "$$out" | tail -20 | sed 's/^/  | /'; \
+	   echo "  walkcheck FAILED (exit $$st)"; exit 1; \
+	 fi
 
 fbgencheck: fbgen
 	./fbgencheck.sh

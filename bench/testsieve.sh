@@ -7,21 +7,18 @@
 # different binaries and J is fixed at I/2. Ours takes I and J at run time, so
 # geometry is a sweepable axis here, and so are the factor-base bounds.
 #
-# UNITS, STATED ONCE. Everything below is per **(q, rho) pair** -- one special-q
-# and one root of it -- because that is what `--nq` counts and what the band
-# summary divides by. GGNFS reports per PRIME q, and a degree-5 polynomial
-# averages ~1.5 roots per prime, so a number from this script is NOT comparable
-# to a GGNFS one until multiplied by that. Getting this wrong overstated the
-# project's headline figure by 1.53x once already (RESULTS.md finding 57).
-#
-# The projection integrates relations-per-unit-of-q across the band rather than
-# normalising per special-q, which sidesteps the pair/prime question entirely:
-# a q interval is a q interval whatever is inside it.
+# UNITS, STATED ONCE. `bench` processes **(q, rho) pairs** -- one special-q and
+# one root of it. Short q intervals contain a noisy number of those pairs, so
+# raw relation counts (and projections made directly from them) are misleading.
+# As in ~/code/test-sieve, every sample is normalized to the expected number of
+# special-q objects in its interval: width / ln(q0). The yield projection, time,
+# energy, and target crossing all use those normalized samples.
 
 set -u
 usage() {
     cat <<'EOF'
 usage: ./testsieve.sh --poly JOB.job --fb1 FB [options]
+       ./testsieve.sh                       # prompt for parameters
 
   --poly PATH        the job file (required)
   --fb1 PATH         algebraic factor base from fbgen (required)
@@ -30,21 +27,47 @@ usage: ./testsieve.sh --poly JOB.job --fb1 FB [options]
   --points N         sample points across the band       [5]
   --width N          q-interval sieved at each point     [2000]
   --target-rels N    also report where the target is met [job-sized guess off]
+  --side a|r         sieve algebraic or rational side              [a]
+  --sq-side 1|0      numeric alias for --side (bench convention)
   --geom "logI,J"    geometry to test; repeat for several   [15,16384]
   --rlim N/--alim N  override the job's factor-base bounds
   --extra "FLAGS"    passed through to bench verbatim
   --keep             keep the relation files and logs
+  -i, --interactive  prompt for parameters (no arguments does this too)
 
 Each point sieves a WIDTH-wide q interval, so wider costs more and measures
 better; the default holds roughly a hundred (q, rho) pairs at q ~ 2e7, which
 is a few seconds a point. Startup (factor-base load) is excluded from every
 timing: it is a one-off of seconds against a run of days.
+
+Yield normalization follows the reference test sieve:
+  expected pairs = WIDTH / ln(q0)
+  n-yield        = raw relations * expected pairs / observed pairs
 EOF
 }
 
-POLY= FB= QMIN=20000000 QMAX= POINTS=5 WIDTH=2000 TARGET= RLIM= ALIM= EXTRA=
+POLY=
+FB=
+QMIN=20000000
+QMAX=
+POINTS=5
+WIDTH=2000
+TARGET=
+SQ_SIDE=1
+RLIM=
+ALIM=
+EXTRA=
 KEEP=0
 GEOMS=()
+INTERACTIVE=0
+# Only prompt when there is a human to prompt. With stdin closed or redirected
+# -- a Makefile, cron, CI -- every `read` returns EOF instantly, so this used to
+# accept ALL the built-in defaults in silence and launch real sieve runs against
+# whatever input.job/fbase happened to be lying around. No arguments and no tty
+# is a usage error, which is what it was before the interactive mode existed.
+if [ $# -eq 0 ]; then
+    if [ -t 0 ]; then INTERACTIVE=1; else usage; exit 2; fi
+fi
 while [ $# -gt 0 ]; do
     case "$1" in
         --poly) POLY=$2; shift 2 ;;
@@ -54,26 +77,121 @@ while [ $# -gt 0 ]; do
         --points) POINTS=$2; shift 2 ;;
         --width) WIDTH=$2; shift 2 ;;
         --target-rels) TARGET=$2; shift 2 ;;
+        --side)
+            case "$2" in
+                a|A|1|algebraic) SQ_SIDE=1 ;;
+                r|R|0|rational) SQ_SIDE=0 ;;
+                *) echo "side must be algebraic/a or rational/r" >&2; exit 2 ;;
+            esac
+            shift 2
+            ;;
+        --sq-side) SQ_SIDE=$2; shift 2 ;;
         --geom) GEOMS+=("$2"); shift 2 ;;
         --rlim) RLIM=$2; shift 2 ;;
         --alim) ALIM=$2; shift 2 ;;
         --extra) EXTRA=$2; shift 2 ;;
         --keep) KEEP=1; shift ;;
+        -i|--interactive) INTERACTIVE=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown option $1" >&2; usage; exit 2 ;;
     esac
 done
-[ -n "$POLY" ] && [ -n "$FB" ] || { usage; exit 2; }
+
+prompt_value() {
+    local label=$1 default=$2 answer
+    read -r -p "$label [$default]: " answer
+    printf '%s' "${answer:-$default}"
+}
+
+if [ "$INTERACTIVE" = 1 ]; then
+    echo "Interactive test-sieve setup (press Enter to accept a default)."
+    POLY=$(prompt_value "Job file" "${POLY:-input.job}")
+    FB=$(prompt_value "Algebraic factor base" "${FB:-fbase}")
+    QMIN=$(prompt_value "Band start q" "$QMIN")
+    # Same reason as the validation block below: this $(( )) must not see an
+    # unvalidated answer.
+    if ! [[ "$QMIN" =~ ^[0-9]+$ ]] || [ "$QMIN" -le 1 ]; then
+        echo "qmin must be an integer greater than 1" >&2; exit 2
+    fi
+    qmax_default=${QMAX:-$((QMIN * 10))}
+    QMAX=$(prompt_value "Band end q" "$qmax_default")
+    POINTS=$(prompt_value "Sample points" "$POINTS")
+    WIDTH=$(prompt_value "q-interval width per point" "$WIDTH")
+
+    read -r -p "Target relations [none]: " answer
+    TARGET=${answer:-$TARGET}
+
+    side_default=a
+    [ "$SQ_SIDE" = 0 ] && side_default=r
+    read -r -p "Sieve algebraic (a) or rational (r) side? [${side_default}]: " answer
+    case "${answer:-$side_default}" in
+        a|A|1|algebraic) SQ_SIDE=1 ;;
+        r|R|0|rational) SQ_SIDE=0 ;;
+        *) echo "side must be algebraic/a or rational/r" >&2; exit 2 ;;
+    esac
+
+    geom_default=${GEOMS[*]:-15,16384}
+    read -r -p "Geometries, space separated [$geom_default]: " answer
+    read -r -a GEOMS <<< "${answer:-$geom_default}"
+
+    read -r -p "Rational factor-base bound [job]: " answer
+    RLIM=${answer:-$RLIM}
+    read -r -p "Algebraic factor-base bound [job]: " answer
+    ALIM=${answer:-$ALIM}
+    read -r -p "Extra bench flags [none]: " answer
+    EXTRA=${answer:-$EXTRA}
+    read -r -p "Keep relation files and logs? [y/N]: " answer
+    case "$answer" in y|Y|yes|YES) KEEP=1 ;; esac
+    echo
+fi
+
+if [ -z "$POLY" ] || [ -z "$FB" ]; then usage; exit 2; fi
 [ ${#GEOMS[@]} -gt 0 ] || GEOMS=("15,16384")
+# Validate BEFORE the $(( )) below. Bash arithmetic expands array subscripts,
+# so `--qmin 'a[$(cmd)]'` executes cmd inside $(( )) -- and the ^[0-9]+$ test
+# used to run afterwards, which is too late to matter.
+if ! [[ "$QMIN" =~ ^[0-9]+$ ]] || [ "$QMIN" -le 1 ]; then
+    echo "qmin must be an integer greater than 1" >&2; exit 2
+fi
+if [ -n "$QMAX" ] && ! [[ "$QMAX" =~ ^[0-9]+$ ]]; then
+    echo "qmax must be an integer" >&2; exit 2
+fi
 [ -n "$QMAX" ] || QMAX=$((QMIN * 10))
+if [ "$QMAX" -le "$QMIN" ]; then
+    echo "qmax must be greater than qmin" >&2; exit 2
+fi
+if ! [[ "$POINTS" =~ ^[0-9]+$ && "$WIDTH" =~ ^[0-9]+$ ]] ||
+   [ "$POINTS" -eq 0 ] || [ "$WIDTH" -eq 0 ]; then
+    echo "points and width must be positive integers" >&2; exit 2
+fi
+if [ -n "$TARGET" ] && ! [[ "$TARGET" =~ ^[0-9]+$ ]]; then
+    echo "target-rels must be a nonnegative integer" >&2; exit 2
+fi
+if [ "$SQ_SIDE" != 0 ] && [ "$SQ_SIDE" != 1 ]; then
+    echo "sq-side must be 1 (algebraic) or 0 (rational)" >&2; exit 2
+fi
+for geom in "${GEOMS[@]}"; do
+    if ! [[ "$geom" =~ ^[0-9]+,[0-9]+$ ]] ||
+       [ "${geom%%,*}" -eq 0 ] || [ "${geom##*,}" -eq 0 ]; then
+        echo "geometry must be a positive logI,J pair (for example 15,16384)" >&2
+        exit 2
+    fi
+done
 [ -x ./bench ] || { echo "run me from the bench directory (no ./bench here)" >&2; exit 2; }
 
 TMP=$(mktemp -d)
-cleanup() { [ "$KEEP" = 1 ] || rm -rf "$TMP"; }
+# Announce the path when keeping: mktemp -d names are random, nothing else in
+# the output contains one (the per-point messages print basenames), so a kept
+# directory was previously findable only by hunting /tmp by mtime.
+cleanup() {
+    if [ "$KEEP" = 1 ]; then echo "[testsieve] kept relation files and logs in $TMP"
+    else rm -rf "$TMP"; fi
+}
 trap cleanup EXIT
 
 echo "[testsieve] $(basename "$POLY")  band [$QMIN, $QMAX)  $POINTS points x ${WIDTH}-wide q intervals"
-echo "            all figures per (q, rho) PAIR; GGNFS reports per prime q, ~1.5x fewer"
+echo "            yields normalized to WIDTH/ln(q0) expected (q, rho) pairs"
+echo "            sieve side: $([ "$SQ_SIDE" = 1 ] && echo algebraic || echo rational)"
 [ -n "$RLIM$ALIM" ] && echo "            lim override: rlim=${RLIM:-job} alim=${ALIM:-job}"
 echo
 
@@ -83,8 +201,8 @@ for geom in "${GEOMS[@]}"; do
     logI=${geom%%,*}; J=${geom##*,}
     area=$(python3 -c "import math;print('2^%.4g'%math.log2((1<<$logI)*$J))")
     printf '  --- logI %s, J %s  (area %s) ---\n' "$logI" "$J" "$area"
-    printf '  %-12s %-8s %-10s %-9s %-9s %-8s %-8s %-8s\n' \
-           q0 pairs relations rel/pair rel/Mq ms/pair rel/s board_W
+    printf '  %-12s %-8s %-9s %-10s %-9s %-8s %-8s %-8s\n' \
+           q0 pairs exp-pairs n-yield rel/pair ms/pair rel/s board_W
     for i in $(seq 0 $((POINTS - 1))); do
         # Linear spacing. Yield falls smoothly with q, so the trapezoid rule
         # over evenly spaced points is the right shape; log spacing would
@@ -95,15 +213,17 @@ for geom in "${GEOMS[@]}"; do
         # final sample -- a fifth of the evidence, and the lowest-yield one --
         # entirely outside the interval being integrated.
         q0=$(python3 -c "print(int($QMIN + max(0,$QMAX - $QMIN - $WIDTH) * $i / max(1,$POINTS-1)))")
-        q1=$((q0 + WIDTH))
+        # bench's qrange upper bound is inclusive, so subtract one to sieve
+        # exactly WIDTH integers and keep the normalization denominator exact.
+        q1=$((q0 + WIDTH - 1))
         tag="g${logI}_${J}_$i"
         # shellcheck disable=SC2086
-        ./bench --pipeline --cofactor --poly "$POLY" --fb1 "$FB" \
+        if ! ./bench --pipeline --cofactor --poly "$POLY" --fb1 "$FB" \
+            --sq-side "$SQ_SIDE" \
             --logI "$logI" --J "$J" --qrange "$q0:$q1" \
             ${RLIM:+--rlim $RLIM} ${ALIM:+--alim $ALIM} $EXTRA \
             --relations "$TMP/$tag.dat" --log "$TMP/$tag.log" --log-every 1 \
-            > "$TMP/$tag.out" 2>&1
-        if [ $? -ne 0 ]; then
+            > "$TMP/$tag.out" 2>&1; then
             printf '  %-12s FAILED: %s\n' "$q0" \
               "$(grep -iE 'error|cannot|refus|does not fit' "$TMP/$tag.out" | head -1 | cut -c1-56)"
             continue
@@ -129,15 +249,20 @@ for geom in "${GEOMS[@]}"; do
             continue
         fi
         python3 - "$q0" "$WIDTH" "$pairs" "$rel" "$ms" "${bw:-0}" "$logI,$J" "$ROWS" <<'EOF'
+import math
 import sys
 q0,w,pairs,rel,ms,bw,geom,rows = sys.argv[1:]
 q0,w,pairs,rel,ms,bw = int(q0),int(w),int(pairs),int(rel),float(ms),float(bw)
 relpair = rel/pairs if pairs else 0.0
-relMq   = rel/(w/1e6)                      # relations per million of q-range
+expected = w/math.log(q0)
+nrel = relpair*expected
+nsecs = expected*ms/1000.0
 rels    = relpair/(ms/1000.0) if ms else 0.0
-print("  %-12d %-8d %-10d %-9.2f %-9.3g %-8.2f %-8.0f %-8s" %
-      (q0, pairs, rel, relpair, relMq, ms, rels, ("%.1f"%bw) if bw else "n/a"))
-open(rows,"a").write("%s %d %d %d %d %.6f %.3f\n" % (geom,q0,w,pairs,rel,ms,bw))
+print("  %-12d %-8d %-9.1f %-10.1f %-9.2f %-8.2f %-8.0f %-8s" %
+      (q0, pairs, expected, nrel, relpair, ms, rels,
+       ("%.1f"%bw) if bw else "n/a"))
+open(rows,"a").write("%s %d %d %d %.9f %.9f %.6f %.3f\n" %
+                     (geom,q0,w,pairs,expected,nrel,nsecs,bw))
 EOF
     done
     echo
@@ -148,24 +273,23 @@ import sys
 qmin, qmax, target, rows = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
 data = {}
 for ln in open(rows):
-    g,q0,w,pairs,rel,ms,bw = ln.split()
-    data.setdefault(g, []).append((int(q0), int(w), int(pairs), int(rel),
-                                   float(ms), float(bw)))
+    g,q0,w,pairs,expected,nrel,nsecs,bw = ln.split()
+    data.setdefault(g, []).append((int(q0), int(w), int(pairs), float(expected),
+                                   float(nrel), float(nsecs), float(bw)))
 if not data:
     print("  no usable points"); raise SystemExit(1)
 
 print("  === projection over [%d, %d) ===" % (qmin, qmax))
 print("  %-12s %-14s %-12s %-12s %-10s %s" %
-      ("geometry", "relations", "GPU days", "energy kWh", "rel/kJ", "target reached at q"))
+      ("geometry", "n-relations", "GPU days", "energy kWh", "rel/kJ", "target reached at q"))
 best = None
 for g, pts in data.items():
     pts.sort()
-    # Trapezoid over relations-per-unit-q and seconds-per-unit-q. Both curves
-    # are smooth in q -- yield falls, cost per pair is near flat -- so two
-    # integrals of the same partition keep them consistent with each other.
-    rel_dens  = [(q, rel / w) for q, w, p, rel, ms, bw in pts]
-    time_dens = [(q, (p * ms / 1000.0) / w) for q, w, p, rel, ms, bw in pts]
-    pw = [bw for q, w, p, rel, ms, bw in pts if bw > 0]
+    # Trapezoid over normalized relations and seconds per unit q. Normalizing
+    # both removes accidental prime/root-density swings from short samples.
+    rel_dens  = [(q, nrel / w) for q, w, p, expected, nrel, nsecs, bw in pts]
+    time_dens = [(q, nsecs / w) for q, w, p, expected, nrel, nsecs, bw in pts]
+    pw = [bw for q, w, p, expected, nrel, nsecs, bw in pts if bw > 0]
     watts = sum(pw) / len(pw) if pw else 0.0
 
     def integrate(dens, lo, hi):
@@ -191,7 +315,7 @@ for g, pts in data.items():
     tq = "-"
     if target:
         lo, hi = qmin, qmax
-        if integrate(rel_dens, qmin, qmax) < target:
+        if rels < target:            # already integrated over [qmin, qmax)
             tq = "not within band"
         else:
             for _ in range(60):

@@ -2617,6 +2617,16 @@ range, not the energy, is the binding constraint.
 
 ## Finding 58 — equal-work control on the C194: 3.3x, not 4.9x, and a 14% yield hole at a 1:1 rectangle
 
+> **PARTIALLY RETRACTED 2026-08-17 — the `15e -J 15` row is not a 1:1
+> rectangle and there is no yield hole (finding 65).** `-J n` on this lasieve
+> sets the i half-width, so `-J 15` sieves `2^16 x 2^14`, not `2^15 x 2^15`.
+> The "-14.4%" compared our square against GGNFS's wide rectangle. At matched
+> rectangles we are flat at 0.979-0.981 on four of them. **Everything else in
+> this finding stands**, including the equal-work 3.31x time / 2.74x energy and
+> the 15e and 16e rows, which are ordinary 2:1 geometries. Ignore the "do not
+> deploy `-J 15`" instruction at the end of the yield section.
+
+
 **Date:** 2026-08-17, RTX 5070 against `gnfs-lasieve4I15e`/`I16e` on the
 NFS@Home C194 (`rlim 160M, alim 240M, lpbr 32, lpba 33, mfbr 63, mfba 95`,
 algebraic special-q). Both sievers over the same q window, same `(q, rho)`
@@ -2642,23 +2652,48 @@ suggestion, not a planned one.
 | geometry | rectangle | GPU rel/pair | GGNFS rel/pair | ours vs theirs |
 |---|---|---:|---:|---:|
 | 15e | `2^15 x 2^14` (2:1) | 34.28 | 34.88 | **-1.7%** |
-| 15e `-J 15` | `2^15 x 2^15` (**1:1**) | 46.54 | 54.39 | **-14.4%** |
+| 15e `-J 15` | ~~`2^15 x 2^15` (1:1)~~ **actually `2^16 x 2^14`** | 46.54 | 54.39 | ~~-14.4%~~ * |
 | 16e | `2^16 x 2^15` (2:1) | 77.40 | 79.14 | **-2.2%** |
 
+\* **That row is not a 1:1 rectangle and the -14.4% is not real** — see the
+retraction above and finding 65. Our `2^15 x 2^15` is being compared with
+GGNFS's `2^16 x 2^14`; at the matched rectangle we run 0.9786 of GGNFS.
+
 Yield parity at both 2:1 geometries, independently confirming finding 57's
-0.8% agreement on the c183. **The 1:1 rectangle is the outlier, and the aspect
-ratio is what separates it from the other two, not the area** — 16e is twice
+0.8% agreement on the c183. ~~**The 1:1 rectangle is the outlier, and the aspect
+ratio is what separates it from the other two, not the area**~~ — 16e is twice
 the area of `-J 15` and matches. Yield scaling by area says the same thing:
 ours 2.258x against GGNFS's 2.269x going to 16e (agreement), but 1.358x against
 1.560x going to `-J 15`.
 
-The mechanism is almost certainly **known defect #1**, the largest-term norm
-approximation, ~2 bits off the true rectangle maximum. A rectangle as tall as
-it is wide widens the norm's range over `j`, the approximation degrades with
-it, and the survivor gate is scaled from a value that no longer describes the
-region. See item 5, which this gives a measured payoff for the first time.
-**Do not deploy `-J 15` until that is fixed**: the area scaling looks
-attractive and 14% of the relations are missing.
+**The mechanism is NOT the survivor gate, and is currently unknown.** The
+obvious explanation was known defect #1 -- the largest-term norm approximation,
+~2 bits off the true rectangle maximum, degrading as the rectangle grows taller
+-- which would mis-scale the survivor bound. Tested directly on 2026-08-17 by
+loosening the gate at both aspect ratios, since "a looser gate finds more" is
+true everywhere and proves nothing on its own:
+
+| allowance | 2:1 rel/pair | 1:1 rel/pair |
+|---|---:|---:|
+| derived | 34.28 | 46.54 |
+| +2 bits | 34.29 | 46.56 |
+| +4 bits | 34.34 | 46.61 |
+| +6 bits | 34.34 (+0.2%) | 46.63 (+0.2%) |
+
+**+6 bits recovers 0.2% at both.** The missing relations are not sitting just
+outside the threshold, so the gate is not what is losing them, and item 5 gets
+no credit for this. The funnel says the shortfall begins early -- doubling the
+area multiplies survivors by 1.48, candidates by 1.43 and relations by 1.36 --
+so it originates at or before the survivor stage rather than in
+cofactorisation.
+
+Candidates that remain, none of them tested: the byte **scale** rather than the
+allowance being mis-derived for a tall rectangle (`log2(maxnorm)` moves 203.59
+-> 207.45 and the scale 1.225 -> 1.200 between these two runs); a difference in
+what region GGNFS's `-J 15` actually covers; or the small-prime line sieve
+behaving differently when J exceeds I/2. **Do not deploy `-J 15` until this is
+understood** -- 14% of the relations are unaccounted for, and the cause is not
+the one that was assumed.
 
 ### Throughput: the 4.9x was the factor base
 
@@ -2693,6 +2728,1012 @@ C194 at 16e on the full base has a much larger working set, so real 16-worker
 scaling there is probably worse than 10.24, which flatters the CPU in the 16e
 row. One q window of 99 pairs per configuration. The GPU whole-box 270 W is
 derived (item 6) while its board figure (175.9 W at 15e) was measured here.
+
+## Finding 59 — q-truncation is worth 10-15%, not 25%: the factor base halves but the bucket records do not
+
+**Date:** 2026-08-17, no GPU. Offline replay over the c151 corpus in
+`work/c151/msieve.dat` — 1,000,609 relations sampled (every 15th of 15.0M),
+band `[15M, 33.5M]`, algebraic special-q, `alim` 33.5M, `mfba` 59.
+
+### What truncation would and would not find
+
+For each relation, the sq-side primes decide where it can be found. Under the
+FULL base every in-band sq-side prime is a q that re-finds it. Under GGNFS's
+truncation at q, everything above q stays in the cofactor, so the relation is
+findable at q only while that residual still fits `mfb` and the splitter's
+three-prime budget.
+
+| | unique | raw finds | inflation |
+|---|---:|---:|---:|
+| full base (potential) | 1,000,609 | 1,520,319 | **1.5194** |
+| truncated at q | 1,000,609 | 1,239,961 | **1.2392** |
+| **actually emitted** (msieve dedup, RUNBOOK:461) | | | **1.1877** |
+
+**Zero unique relations lost** — every relation keeps at least one valid q.
+That is item 3's "yield-neutral if the band reaches `lim`" precondition
+holding, not a general result: this band ends exactly at `alim`.
+
+**The replay computes POTENTIAL re-finds, not emissions**, and the gap between
+1.5194 and the 1.1877 msieve actually observed is the sieve region — a relation
+is re-found at q only if it also lies inside *that* q's rectangle, which this
+replay cannot model. So the duplicate prize is smaller than the 18.4% of
+potential finds truncation removes, and item 3's older 1.34x assumption is too
+pessimistic in the other direction.
+
+### The prize is small because `Σ1/p` is flat, not because the base is
+
+This is the part that changes the ranking. Truncating the c151's base from
+33.5M to 15M cuts the **entry count by 53%**. Bucket records go as `Σ1/p` over
+the bucketed range, which grows like `ln ln p`:
+
+    Σ(15M)   = ln ln 15.0e6 - ln ln 16384 = 0.5322
+    Σ(33.5M) = ln ln 33.5e6 - ln ln 16384 = 0.5797   ->  8.2% fewer records
+
+**The model is validated by measurement**, not asserted: the C194 lim sweep
+(finding 58's session) quadrupled both lims and moved the bucket array +12%,
+against +12.6% predicted by the same formula. Entry count is the wrong axis for
+sieving cost; it is the right one only for the root transform.
+
+So truncation buys roughly half the **transform** (a few percent of the sieve),
+**8-11% of fill and apply** (the bulk), and some fraction of an 18% duplicate
+reduction downstream. **Call it 10-15% overall.** An earlier estimate of ~25%
+in session was reasoned from entry count and was wrong in exactly the way this
+finding documents.
+
+### Which is why the full base may simply be the right choice
+
+Against 10-15%, truncation carries a real cost the c151 cannot show. A C194
+band of `[20M, ~130M]` against `alim` 240M does **not** reach `lim`, so
+relations whose largest sq-side prime lies above the band survive only if their
+residual fits `mfba 95`, and the rest are lost outright. The favourable case
+measured here is the exception rather than the rule.
+
+**Item 3 is therefore re-ranked below item 11**, where the milliseconds
+actually are. The owner's own observation drove this measurement: duplicates in
+practice have been much lower than the documentation assumed, which is
+confirmed at 1.19x actual against a 1.34x assumption.
+
+Item 7 is unaffected and remains separable — our gate admits ~46% more
+cofactors than GGNFS for comparable yield, which is pure downstream cost
+whatever the factor-base convention is.
+
+## Finding 60 — item 11 answered: apply is issue-limited, not memory-limited, and there is no cheap win in it
+
+**Date:** 2026-08-17, RTX 5070, C194 at its deployment geometry (`--logI 15`,
+`J` default 16384, full base to `alim` 240M, `--reps 100`). Item 11 asked
+whether a second material win exists in apply or whether the stage is at its
+memory-system limit. **Neither.**
+
+### The stage, and what it is made of
+
+| | ms |
+|---|---:|
+| transform + plattice | 3.45 |
+| fill | 15.47 |
+| **apply** | **21.94** |
+
+Apply is **54% of the sieve chain** here, well above fill -- the reverse of the
+c147 ordering that motivated findings 48-52, and a reason to stop tuning fill.
+
+Decomposed with the harness switches that already exist:
+
+| variant | apply ms | delta | reads as |
+|---|---:|---:|---|
+| baseline | 21.94 | — | |
+| `--norm const` | 15.54 | **-6.40** | norm init is **29% of apply** |
+| `--apply-mode plain` | 21.20 | -0.74 | smem atomics are **3.4%** |
+| `--cells 8` | 21.88 | -0.06 | cell traffic is **0.3%** |
+
+The cell result is the informative one: halving the cell array's memory traffic
+moves apply by 0.3%, so the stage is not limited by the thing its shared-memory
+layout was designed around.
+
+### The profile: not memory, and not one pipe
+
+`ncu`, one `k_apply` launch, against finding 56's fill profile on the same card:
+
+| | k_apply | k_fill (finding 56) |
+|---|---:|---:|
+| DRAM throughput | **9.03%** | 12.83% |
+| L2 bandwidth | **4.70%** | 52.11% |
+| L1 hit rate | 64.12% | 18.91% |
+| sectors per global load request | **1.43** | 8.7 B per 32 B sector |
+| waves per SM | **341.33** | 1.00 |
+| SM throughput | **71.00%** | 3.75% |
+
+Opposite characters. Fill is a latency-bound scatter with the SMs idle; apply
+is well-coalesced (1.43 sectors/request), massively oversubscribed (341 waves),
+and the SMs are busy. **The prior-art warning that scatter tuning on this GPU
+dies at the L2 transaction ceiling does not describe apply any more than it
+described fill.**
+
+But no single pipe is saturated either:
+
+| pipe | utilisation |
+|---|---:|
+| LSU | 32.3% |
+| ALU | 30.3% |
+| XU (transcendental) | 23.2% |
+| FMA | 18.5% |
+| **instructions issued** | **0.70 / cycle** |
+
+Largest stall is short-scoreboard at 1.19 per issue-active -- shared-memory
+dependency from the cell accumulation. So apply is **issue-limited with a
+balanced mix**: a lot of instructions, spread evenly, with no hot spot to
+attack.
+
+### Both micro-levers priced, both small
+
+Built behind `-D` switches so the numbers are reproducible rather than
+argued (`NORM_FAST_LOG2` was added for this; `NORM_CANCEL_TOL` already
+existed):
+
+| change | apply ms | saving |
+|---|---:|---:|
+| `__log2f` instead of `log2f` | 21.32 | **0.62 (2.8%)** |
+| cancellation guard + fp64 fallback removed | 21.56 | **0.39 (1.8%)** |
+
+**The accurate-`log2f` decision stands.** Its comment justifies the cost as
+affordable for host-replay reproducibility, and at 2.8% of apply -- 1.5% of the
+sieve chain -- it is. Likewise the `aabs` cancellation guard, which evaluates
+the polynomial a second time on every position to catch a case the comment says
+fires on under one cell in a thousand: 1.8%, which is a fair price for a norm
+that is right.
+
+### The answer
+
+Apply is not at its memory-system limit, **and there is no second material win
+available from tuning it either.** Everything identifiable is small: 2.8% from
+a less accurate log, 1.8% from dropping a correctness guard, 3.4% from the
+atomics, 0.3% from the cell width. A material improvement would have to cut
+instructions per position or per record -- an algorithmic change to what apply
+computes, not a tuning pass -- and that is a much larger piece of work than
+this item was scoped as. **Item 11 closes with a direction rather than a
+patch.**
+
+Caveat: one job, one geometry, one launch profiled. The decomposition switches
+are standalone-only (`--pipeline` refuses them), so these are single-side
+numbers at a synthetic root, which is what they have always been.
+
+## Finding 61 — the power cap buys 5% whole-box rel/J, and the card will not let us reach the knee
+
+**Date:** 2026-08-17, RTX 5070, C194 at its deployment geometry (`--logI 15`,
+J 16384, full base), q window `[250000000, 250002000)`, 99 (q, rho) pairs.
+Power limit set from the Windows side with MSI Afterburner, as item 10 requires
+— the WSL-side `nvidia-smi` can read limits but not set them.
+
+### First, a premise correction: the sieve is not power-limited at stock
+
+    power.limit 250 W (stock)   power.min_limit 175 W   power.max_limit 275 W
+
+and the sieve draws **~195 W steady** at 97% utilisation. So the card sits at
+**78% of its own stock limit while running flat out**, and a cap only begins to
+bind below that. Item 10 assumed the 60–80% range was available and worth
+15–30% of rel/J; on this card and this workload the entire bindable range is
+**70–77%**, about 20 W. The cap is not the lever the item assumed it was.
+
+### The measurement
+
+Three runs per setting, relations byte-identical (3,394) in all six, so the
+only variable is time and power:
+
+| | stock (250 W) | **70% (175 W)** | change |
+|---|---:|---:|---:|
+| ms/pair | 108.27 | 110.25 | **+1.83%** |
+| board watts | 195.2 | 175.7 | **−9.99%** |
+| SM clock | 2917 MHz | 2902 MHz | −0.5% |
+| board J/pair | 21.13 | 19.37 | **rel/J +9.1%** |
+| whole-box J/pair (+105 W host) | 32.50 | 30.95 | **rel/J +5.0%** |
+
+Run spreads were 1.2% (stock) and 0.4% (capped) with no overlap between the
+sets, so the 1.83% throughput cost is real rather than noise.
+
+**Nine percent of the power for half a percent of the clock.** That is the
+signature of operating past the efficiency knee — voltage scales superlinearly
+with frequency, so the last few MHz cost disproportionate power — and it is
+why the trade is favourable at all.
+
+### A note on the host constant, which every whole-box figure here rests on
+
+Item 6 measures it at ~105 W idle and ~115 W with the sieve's own core, and
+finding 58's derived 270 W whole-box against a 175.9 W board implies ~94 W. The
+tables here use **105 W**. At 115 W the cap result is +4.8% rather than +5.0%
+and **the undervolt is +13.8% rather than +14.6%**; at 94 W the undervolt is
++15.1%. The headline therefore moves about a point across the range of
+defensible values -- which changes no conclusion, but the constant should travel
+with the number. A wall meter on both configurations would remove the
+assumption and is the honest way to finish item 10.
+
+### The board sensor overstates the win, exactly as item 10 warned
+
+Board says **+9.1%**, the whole box says **+5.0%** — a factor of 1.8. The
+mechanism is item 10's: capping lengthens the run by 1.8% and the ~105 W host
+constant is paid for that extra time too. The item's worked example predicted a
+4× discrepancy for a larger cap; this is a small cap, and the direction and
+mechanism are confirmed. **Grading a power sweep on the board sensor would pick
+a cap that is too low.** The figure is robust to the host constant: using item
+6's ~115 W loaded value instead of ~105 W gives +4.8% rather than +5.0%.
+
+### The cap is a floor, not a knee — so the undervolt was measured too
+
+175 W is `power.min_limit`, and the curve is **still improving** where the card
+stops letting us follow it. The lever that reaches further is an **undervolt**:
+a V/F curve holding clocks near stock at lower voltage attacks the voltage term
+directly, rather than waiting for a cap to throttle clocks reactively.
+
+Operating point at stock, read from Afterburner under sustained load:
+**2910 MHz at 1080 mV**. Curve edited to ~2900 MHz at **950 mV** and flattened
+to the right so the card cannot boost past it.
+
+**Correctness first.** An unstable undervolt does not crash, it computes wrong
+answers, which for a sieve means plausible-looking corrupt relations. Both
+gates were run before any timing: `cofcheck.sh`'s 30 exact relation counts, and
+the 1500-q c147 band, which came back byte-identical (`47bb45b9...`). Only then
+the measurement, three runs, 3,394 relations in every one:
+
+| | stock | 70% cap | **950 mV** |
+|---|---:|---:|---:|
+| ms/pair | 108.27 | 110.25 | **115.55** (+6.7%) |
+| board watts | 195.2 | 175.7 | **140.5** (−28.0%) |
+| temperature | 69 °C | — | **50–56 °C** |
+| board J/pair | 21.13 | 19.37 | **16.24** |
+| board rel/J | — | +9.1% | **+30.2%** |
+| **whole-box rel/J** | — | +5.0% | **+14.6%** |
+
+**The undervolt is worth about 3x the power cap** on the metric of record, and
+it confirms the diagnosis: the card was never power-limited, it was sitting far
+past its efficiency knee. 28% of the board power was buying 6.7% of throughput.
+
+Two second-order effects. The clock settled at ~2850 rather than the 2900 asked
+for, so a small clock reduction rides along with the voltage drop and the 6.7%
+is not purely voltage. And the card now runs at **50–56 °C against 69 °C**,
+which matters over days: at 140 W it will hold clocks indefinitely, where the
+stock point was still warming when measured. The sustained cost over a real run
+is probably below 6.7%.
+
+**Where the knee actually is remains unmeasured** — 900 mV was not tried. What
+is established is that 950 mV is well past it and comfortably stable on this
+card.
+
+### The item-0 verdict at the floor
+
+Applying this to finding 58's equal-work comparison at 15e:
+
+| | stock | at 175 W | **at 950 mV** |
+|---|---:|---:|---:|
+| time advantage over the CPU box | 3.31× | 3.25× | **3.10×** |
+| whole-box energy advantage | 2.74× | 2.88× | **3.14×** |
+
+Caveat: whole-box GPU power is derived (board + item 6's host constant), not a
+wall-meter reading; only the board figure was measured here.
+
+## Finding 62 — item 7's surplus does not exist at shipping defaults: cofactor volume matches GGNFS within 0.4% on two jobs
+
+**Date:** 2026-08-17, no code change. Item 7 records that we submit **1,426
+cofactors per special-q against GGNFS's 978** — ~46% more, "almost all
+unproductive — time, not relations" — and treats that as an open cost. Measured
+directly, at each siever's own default gate, on both jobs:
+
+| job / geometry | q window | pairs | our cofactors/pair | GGNFS COF/pair | ratio |
+|---|---|---:|---:|---:|---:|
+| c183, I14e (item 7's own config) | `[120000000, 120001000)` | 67 | **784.85** | **781.7** | **1.004** |
+| C194, 15e | `[250000000, 250002000)` | 99 | **1594.12** | **1594.8** | **1.000** |
+
+Relations from those submissions, same windows: 21.04 against 20.85 per pair on
+the c183 (**we are 0.9% ahead**) and 34.28 against 34.88 on the C194 (**1.7%
+behind**). Opposite signs on the two jobs, so there is no systematic yield
+deficit either — the residual is job-level noise, not a gate defect.
+
+**This is not a refutation of item 7's measurement.** That comparison was
+explicitly *at matched lambda* — both sievers pinned to the same nominal bit
+threshold — and it found that a given bit value means different things to the
+two gates: GGNFS drops 17.3% of its yield going 91.8 → 87.5 bits where we drop
+0.07% going to 88.0. That asymmetry may well be real. What this finding shows
+is narrower and more useful: **at the defaults we actually ship, the asymmetry
+does not produce a surplus.** Our derived allowance (`mfb` + ~1.5 bits from our
+own quantisation) lands on the same cofactor volume GGNFS's lambda rule does,
+on two jobs three digits apart in size and at two different geometries.
+
+That also answers item 7's operational worry — *"until the cause is known the
+bound can only be set by sweeping, never derived for a new job"*. The bound
+**is** derived, and the derivation now has two independent checks against an
+external siever showing it lands within half a percent. A new job does not need
+a sweep.
+
+Method note: GGNFS's `COF: N tests` is its count of cofactorisation attempts
+and matches the last stage of its own `reports:` funnel (1,601/pair against
+1,594.8 on the C194), so it is the same quantity as our band summary's
+`cofactorisation candidates/q` — records handed to the splitter. The c183 rows
+carry finding 55's usual caveat that GGNFS truncates its base at q while we run
+the full one, worth 1.11x at q=120M; the C194 rows are at q > `alim` and so
+carry no such difference.
+
+## Finding 63 — RETRACTED: the 1:1 deficit is in the gate, not the sieve: four hypotheses eliminated
+
+> **RETRACTED 2026-08-17 by finding 65. The deficit it analyses does not
+> exist**: it compared our `2^15 x 2^15` against GGNFS's `-J 15`, which is
+> `2^16 x 2^14`. Do not quote the 12.7% cofactor gap, the 1.480-against-1.624
+> survivor scaling, or the conclusion that the scale/bound derivation is at
+> fault — all three are that mismatch. The `log2(maxnorm)` rise of 3.86 bits
+> is real and is simply what a taller rectangle costs.
+>
+> **The four eliminations below are sound and worth keeping**: the FK walk
+> passes at every aspect ratio, the enumeration loses nothing in the shared
+> region (finding 65 strengthens this to *all 6,743* of our 2:1 relations
+> reappearing at `2^15 x 2^15`), the splitter gains equally at both, and the
+> survivor list cap is not on the yield path. So is the side result that
+> `--cof-rounds 2 --cof-budget 65536` is well chosen.
+
+
+**Date:** 2026-08-17. Finding 58 measured our yield 14.4% below GGNFS at
+`2^15 x 2^15` while both 2:1 geometries sit at parity, and finding 58's own
+correction recorded the survivor gate as ruled out and the cause unknown. This
+narrows it to one stage and kills four candidate mechanisms.
+
+### Where it is NOT
+
+**Not the Franke-Kleinjung walk.** The shipped gate calls
+`verify_walk(8, 128, 24)` — I=256, J=128, i.e. **2:1, the only shape it has
+ever been run at**, and every geometry the project uses is 2:1. Called directly
+at other aspect ratios it passes everywhere:
+
+    logI 8  J 64   4:1  PASS      logI 9  J 256  2:1  PASS
+    logI 8  J 128  2:1  PASS      logI 9  J 512  1:1  PASS
+    logI 8  J 256  1:1  PASS      logI 10 J 512  2:1  PASS
+    logI 8  J 512  1:2  PASS      logI 10 J 1024 1:1  PASS
+
+The walk enumerates the rectangle exactly at 1:1 and even at 1:2. Worth keeping
+as a permanent case rather than a one-off.
+
+**Not the sieve's ENUMERATION** -- and the distinction matters, because the
+survivor *threshold* is implicated. Survivor bitmaps dumped at both geometries
+and histogrammed by row: over the 16,384 rows the two runs share, densities are
+identical to **0.3%** (2798.3 vs 2798.4 at j<1024; 1077.7 vs 1080.4 at
+j~16000). The rows the 1:1 run adds are simply less productive -- 1035 falling
+to 778 per row -- as larger norms at larger j predict. So nothing is lost in the
+region the two geometries have in common, and no position goes unvisited.
+
+That is *not* the same as the survivor count being right. Two different
+measurements are in play and they must not be compared to each other:
+
+| quantity | 2:1 | 1:1 | scaling |
+|---|---:|---:|---:|
+| pipeline two-sided survivors, real q | 71,754.8 | 106,172.1 | **1.480** |
+| standalone one-sided survivors, synthetic q | 27.12M | 41.79M | 1.541 |
+| GGNFS funnel stage 6 (comparable to the first row) | 47,356 | 76,900 | **1.624** |
+
+**Our two-sided survivors scale 1.480 against GGNFS's 1.624**, so the gate is
+already behind at the survivor stage -- consistent with the cofactor gap below
+and inconsistent with an earlier draft of this finding, which compared our
+one-sided 1.541 against GGNFS's *relation* scaling of 1.559 and read it as
+agreement. Those are different quantities.
+
+**Not the splitter giving up on harder cofactors.** Raising the budget from
+`rounds 2 / 65536` to `rounds 4 / 262144` gains **+1.9% at 2:1 and +2.2% at
+1:1** — the same at both, and saturating (rounds 6 adds nothing).
+
+**Not the survivor list cap.** `maxsurv` is `1<<22`, but the pipeline
+intersects through the uncapped **bitmap**; the list is not on the yield path.
+The standalone's "list truncated" notice is its own display cap.
+
+### Where it is
+
+Both funnels at q=250M, per (q, rho) pair:
+
+| | GGNFS 2:1 | GGNFS 1:1 | GGNFS scaling | **our scaling** |
+|---|---:|---:|---:|---:|
+| cofactors submitted | 1,594.8 | 2,606.9 | **1.635** | **1.428** |
+| relations | 34.88 | 54.39 | 1.559 | 1.358 |
+| relations per cofactor | 0.02187 | 0.02086 | −4.6% | **−4.9%** |
+
+The deficit decomposes exactly:
+
+    relations ratio 0.8557  =  cofactor ratio 0.8732  x  rel-per-cofactor ratio 0.9799
+
+so **we admit 12.7% fewer cofactors at 1:1** (equivalently, GGNFS admits 14.5%
+more -- an earlier draft quoted that figure as our shortfall, which inverts the
+ratio) and get **2.0% less out of each one**. The second term is *not* specific
+to 1:1: at 2:1 it is 1.7%, so a roughly constant ~2% downstream gap exists at
+both aspect ratios and is the same small residual finding 62 already recorded.
+
+**What is specific to 1:1 is the cofactor count**, which matches GGNFS to 0.04%
+at 2:1 (finding 62) and falls 12.7% short at 1:1. That, not the downstream
+term, is the additional deficit and where the work is.
+
+So it is the gate -- as a **scaling failure, not an offset**, which is exactly
+why finding 58's uniform allowance sweep could not move it: +6 bits recovers
+0.2% because the threshold is not uniformly too tight. The survivor scaling
+(1.480 against 1.624) and the cofactor scaling (1.428 against 1.635) agree that
+the loss is already present when survivors are counted.
+
+**The remaining suspect is the scale/bound derivation's response to a wider
+norm range.** Between these two runs `log2(maxnorm)` rises 203.59 -> 207.45
+(+3.86 bits) while the derived scale *falls* 1.225 -> 1.200 and the bound falls
+119 -> 117. A norm range that grows while the byte threshold shrinks is the
+shape of the observed loss; whether the derivation is wrong or merely coarse is
+not established. That is where the next session should start —
+`sieve_bound_checked` and `sieve_allowance`, at fixed q, sweeping only J.
+
+### Side result: the splitter defaults are right
+
+The +1.9% above costs **+68.8% of wall** (116.78 -> 197.09 ms/pair), so
+`--cof-rounds 2 --cof-budget 65536` is well chosen and should not change. Note
+also that with the larger budget our 2:1 yield reaches **34.94 against GGNFS's
+34.88** — exact parity, confirming finding 62 is not an artifact of splitter
+settings.
+
+## Finding 64 — VRAM sizing: area buys the bucket array, lim buys the factor base, and they cross at area ~ 6.7 x lim
+
+**Date:** 2026-08-17, C194, measured from the startup allocation report. Recorded
+because sizing a job to a card was previously guesswork and the entry count --
+the obvious axis -- is the wrong one for the largest allocation.
+
+### Geometry, lims fixed at rlim 160M / alim 240M
+
+| config | area | bucket | steady state | ms/pair | rel/pair | rel/ms |
+|---|---|---:|---:|---:|---:|---:|
+| 15e | `2^29` | 1.46 GB | 3.63 GB | 113.6 | 65.3 | **0.575** |
+| 15e `-J 24576` | 1.5x`2^29` | 2.18 GB | 4.47 GB | 159.8 | 82.4 | 0.516 |
+| 15e `-J 15` | `2^30` | 2.91 GB | 5.32 GB | 224.3 | 96.1 | 0.428 |
+| 16e | `2^31` | 5.20 GB | 8.06 GB | 477.1 | 154.8 | 0.324 |
+
+16e fits a 12 GB card with 3.9 GB spare, so the `2^31` area limit is reachable
+on a 5070 for a C194. `J` need not be a power of two -- the only constraints
+are `I*J <= 2^31` and `I*J` a multiple of the region size, so at `logI 15` any
+integer J works and the 1.5x row above is a real measurement, not an estimate.
+
+**The bucket array is linear in J at fixed I, and SUB-linear when I grows.**
+1.46 -> 2.91 GB is exactly 2x (J doubled), but 2.91 -> 5.20 is 1.79x, because
+that step raises `logI` and **`bkthresh` defaults to `1 << logI`**
+(`bench_main.cu`). Moving the bucketed range's start from 2^15 to 2^16 drops
+`Σ1/p` from 0.6184 to 0.5539, a factor 0.896 -- and 5.82 x 0.896 = 5.21 against
+the measured 5.20. Anything that reasons about "area" without separating the
+two ways of growing it will be wrong by ~11% on the 15e-versus-16e decision.
+
+### Factor-base bounds, area fixed at `2^29`
+
+| lims r/a | fb1 entries | fb0 entries | bucket | steady | ms/pair | rel/pair | rel/ms |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 80/120M | 6.84M | 4.67M | 1.37 GB | 3.27 GB | 105.8 | 54.6 | 0.516 |
+| **160/240M** | 13.16M | 8.97M | 1.46 GB | 3.63 GB | 113.6 | 65.3 | **0.575** |
+| 320/480M | 25.36M | 17.27M | 1.54 GB | 4.23 GB | 128.6 | 73.8 | 0.574 |
+
+**Doubling both lims doubles the factor base (1.93x) but moves the bucket array
++5.5%**, because bucket records go as `Σ1/p ~ ln ln p`. Entry count is the
+right axis only for the root transform.
+
+**The job's own lims look well chosen**: doubling is break-even on throughput
+(+13% relations for +13% time) and costs 0.6 GB, while halving loses 16.5% of
+the relations to save 6.9% of the time. The sensitivity is asymmetric -- **too
+small hurts, too large is merely wasteful** -- so an uncertain lim should err
+upward.
+
+### The model, and which knob costs what
+
+Separating the two terms in the rows above gives **25.4 B per factor-base
+entry** consistently (25.5 and 25.4 across the two steps), with entries
+`~ pi(lim)` on *both* sides: 13.16M against `pi(240M) ~ 13.15M`, and 8.97M
+against `pi(160M) ~ 8.97M`.
+
+An earlier draft wrote this as `1.06 x pi(lim)` and read the 1.06 as evidence
+that "the algebraic side's extra roots and the rational side's simplicity
+cancel". **That was wrong twice.** The 1.06 is entries divided by the crude
+`lim/ln(lim)`, i.e. the second-order term of the prime counting function, and
+it appears on both sides because `pi` does -- it carries no information about
+roots at all. The underlying claim survives on other grounds (a polynomial of
+any degree averages one root mod p, so both sides have ~one entry per prime),
+but these numbers are not what establishes it. Use `pi(lim)`, or
+`1.06 x lim/ln(lim)` if a closed form is wanted.
+
+    VRAM ~ bucket(max side, ~flat in lim) + 25.4 B x (entries_r + entries_a)
+           + 3 x area/8 + fixed
+
+The bucket array is sized by `max(side0, side1)` records and **not** their sum
+(`pipeline.cuh`: `est = est1 > est0 ? est1 : est0`), because the two sides run
+sequentially through one shared allocation. So raising the *smaller* side's lim
+costs factor-base bytes only, until it overtakes the other side.
+
+Differentiating both terms, the `ln L` cancels:
+
+    bucket growth / entry growth  ~  area / (6.7 x lim)
+
+At `2^29` and lim 240M that is **0.33** -- raising `alim` costs about 1.33x
+what raising `rlim` by the same amount does -- and it matches the measured 0.33
+over the 120M -> 240M step. The useful form is the crossover: the two terms are
+equal at **area ~ 6.7 x lim**, so at 15e a C194 is comfortably factor-base
+dominated and at 16e it has crossed into bucket dominated. Area is the
+expensive axis; lim only becomes expensive once the rectangle is already large.
+
+**Caveat on that crossover: it is derived treating the bucket term as linear in
+area, which is true only when the area grows through J.** When it grows through
+`logI`, `bkthresh` rises with it and the bucket term grows ~11% less than
+linearly (see above), so the crossover sits correspondingly higher. Use it as
+an axis-comparison rule at fixed `logI`, not as a prediction across sievers.
+
+## Finding 65 — the 1:1 deficit was never real: `-J 15` widens I, and at matched rectangles we are flat at 98% on four of them
+
+**Date:** 2026-08-17, RTX 5070 against `gnfs-lasieve4I14e`/`I15e` on the
+NFS@Home C194, algebraic special-q, q window `[250000000, 250004000)` — 130
+special-q / 200 `(q, rho)` pairs, both sievers over the identical window.
+
+**This retracts finding 58's 14% hole and the whole of finding 63.** They
+compared two different rectangles.
+
+### `gnfs-lasieve4I15e -J 15` does not sieve `2^15 x 2^15`
+
+The help text says `-J   specify J bits`, and every measurement in findings 58
+and 63 took that to mean the j-height doubles to `2^15`. It does not. Recovered
+from the relations themselves — invert the q-lattice, `(i,j) = M^-1 (a,b)`,
+with `M` built by the same `qlat_build` the sieve uses — each run reports the
+rectangle it *actually* covered:
+
+| run | i range | j range | actual rectangle |
+|---|---:|---:|---|
+| ours `--logI 15 --J 16384` | ±16383 | 1 .. 16381 | `2^15 x 2^14` |
+| `I15e`, no `-J` | ±16383 | 1 .. 16381 | `2^15 x 2^14` (identical) |
+| ours `--logI 15 --J 32768` | ±16383 | 1 .. 32761 | `2^15 x 2^15` |
+| **`I15e -J 15`** | **±32738** | **4 .. 16380** | **`2^16 x 2^14`** |
+
+So `-J n` sets the **i half-width** (`I = 2^(n+1)`) and leaves the j-height at
+its default `2^(Ibits-1)`. Confirmed independently on the other binary:
+`I14e` with no flag gives `2^14 x 2^13`, and `I14e -J 14` gives `2^15 x 2^13`.
+Same area as the square in each case, different shape.
+
+The mapping is not an inference. Applied to our own 2:1 output it places
+**6,743 of 6,743 relations inside the rectangle, none outside and none
+unmapped**, which is what makes it usable as an instrument. Two details are
+load-bearing: a relation reported with `b > 0` may map to the antipodal point,
+so `j < 0` is negated; and the lattice must be cached per `(q, rho)`, not per
+`q` — this polynomial averages 1.53 roots per prime, and caching on `q` alone
+hands a third of the relations the wrong basis.
+
+### At matched rectangles there is no aspect-ratio effect at all
+
+Set difference on `(a,b)`, restricted to the special-q both sievers covered:
+
+| rectangle | ours | GGNFS | ours/theirs | recall |
+|---|---:|---:|---:|---:|
+| `2^14 x 2^13` (`I14e` default) | 2,864 | 2,924 | **0.9795** | 0.9771 |
+| `2^15 x 2^13` (`I14e -J 14`) | 4,531 | 4,621 | **0.9805** | 0.9794 |
+| `2^15 x 2^14` (`I15e` default) | 6,743 | 6,883 | **0.9797** | 0.9784 |
+| `2^16 x 2^14` (`I15e -J 15`) | 10,676 | 10,910 | **0.9786** | 0.9772 |
+
+**Flat at 0.979–0.981 across a 4x span of area and every aspect ratio from 2:1
+to 4:1.** That constant ~2% is the same residual finding 62 recorded and
+finding 63 correctly identified as geometry-independent; it is all that was
+ever there. Per-`j` the share is flat too — at `2^15 x 2^14` it runs 0.976,
+0.999, 0.985, 0.987, 0.977, 0.982, 0.983, 0.992 over eighths of the rectangle.
+
+Our own sieve is internally exact across the change finding 63 was built on:
+**our `2^15 x 2^15` run contains every one of our `2^15 x 2^14` relations,
+6,743 of 6,743**, and all 2,433 extras lie in `j > 16384`. Nothing was lost in
+the shared region, so the scale moving 1.225 -> 1.200 costs nothing.
+
+### The real result: buy area with I, not J
+
+The comparison findings 58 and 63 were reaching for — equal area, different
+shape — is worth having, and it is large. Ours only, same window, same job,
+same factor base and `--maxbits` on both arms:
+
+| area | rectangle | relations | device ms/q | rel per device-second |
+|---|---|---:|---:|---:|
+| `2^27` | `2^14 x 2^13` | 2,864 | 36.66 | 390.6 |
+| `2^28` | `2^14 x 2^14` (square) | 4,056 | 60.36 | 336.0 |
+| `2^28` | **`2^15 x 2^13` (wide)** | **4,531** | 58.51 | **387.2** |
+| `2^29` | `2^15 x 2^14` | 6,743 | 104.11 | 323.9 |
+| `2^30` | `2^15 x 2^15` (square) | 9,176 | 205.39 | 223.4 |
+| `2^30` | **`2^16 x 2^14` (wide)** | **10,671** | 204.74 | **260.6** |
+
+At equal area the wide rectangle wins **+11.7% relations at `2^28`** and
+**+16.3% at `2^30`**, for **-0.3% device time** — so **+15.2% and +16.7% on
+relations per device-second**. Device time, not wall: the box was running the
+owner's `msieve` at ~4 cores, and per finding 53 wall clock is not comparable
+under load while `cudaEvent` totals stay flat within 1%.
+
+**The mechanism is printed by our own banner.** Doubling the area costs norm
+bits, but not the same number of them either way:
+
+    2^15 x 2^14   log2(maxnorm) 203.59
+    2^16 x 2^14   log2(maxnorm) 205.45   (+1.86 bits, doubling I)
+    2^15 x 2^15   log2(maxnorm) 207.45   (+3.86 bits, doubling J)
+
+`i` multiplies the **shorter** vector of the reduced q-lattice and `j` the
+longer one (`qlat_build` keeps `(a0,a1)` short by construction, and
+`norm_setup` forms `A = I/2*|a0| + J*|b0|`). Extending `i` therefore grows the
+norms at roughly half the rate extending `j` does, for the same extra positions.
+Finding 63 saw the +3.86 bits and read it as a gate pathology; it is the honest
+signal that a taller rectangle has genuinely bigger norms.
+
+### What this costs and what it does not
+
+Finding 58's throughput and energy conclusions **survive**: its `15e` row is the
+default geometry and is unaffected, and its 16e row (`2^16 x 2^15`, no `-J`) is
+also a real 2:1 rectangle. The equal-work 3.31x time / 2.74x energy stands. What
+changes is that the `-J 15` row was labelled `2^15 x 2^15` when it was
+`2^16 x 2^14`, and its "-14.4%" was our square against their wide rectangle.
+
+**"Do not deploy `-J 15` until this is understood" is withdrawn**, and so is
+"deploy 2:1 geometries only". The correct rule is about which axis buys the
+area, not about the ratio: at fixed area prefer the wider `I`.
+
+### Why the earlier eliminations pointed the wrong way
+
+Finding 63 was right in every particular and wrong in aggregate, which is worth
+recording. It eliminated the FK walk, the enumeration, the splitter and the
+list cap — all correctly. It then had one suspect left and no reason to doubt
+the comparison itself, so a real 3.86-bit norm difference became evidence for a
+scale-derivation defect. The check that would have caught it is the one this
+finding opens with: **ask each siever's output which rectangle it covered**,
+rather than trusting the flag. It is now `bench/relgeom.py`:
+
+    ./relgeom.py --band 250000000:250004000 --skew 38612712.90 \
+                 extent out.mine out.theirs          # what did each cover?
+    ./relgeom.py --band ... --skew ... \
+                 compare out.mine out.theirs J logI  # set difference by j
+
+`extent` is the one to run before any cross-siever yield claim; `compare`
+reports a nonzero "OUTSIDE the stated rectangle" count precisely when the
+geometry is wrong, which is the signature this finding chased for two sessions.
+
+The band and skew are required arguments, not defaults, because both fail
+silently: a wrong band filters every relation's candidate list to empty and the
+tool would otherwise print a clean-looking zero, and a wrong skew produces a
+different lattice reduction and therefore different `(i,j)`. The reported I is
+rounded up from observed coverage and is a **lower** bound — the widest
+column may simply have yielded nothing on a short window.
+
+## Finding 66 — 10-13% of survivors are quantisation noise, and removing them buys nothing: survivors are not a cost driver
+
+**Date:** 2026-08-17, C194, same window as finding 65.
+
+`las_scale` (`poly.c:584`) returns `floor(254/maxlog2 * 40)/40` — the 255-cell
+rule las needs because *its* cell is a byte. Ours is 16 bits with `CINIT` 4096
+(`bench_kernels.cu:360`, and the comment there already says the scale "becomes
+a free parameter rather than a constraint"). The derivation was never updated,
+so the sieve runs at ~1/16 of the resolution the cell can carry: one byte unit
+is `1/scale` = 0.82 bits at the derived 1.225.
+
+Holding the gate fixed **in bits** and raising only the scale:
+
+| geometry | scale | survivors/q | relations |
+|---|---:|---:|---:|
+| `2^15 x 2^14` | 1.225 (derived) | 71,579.6 | 6,743 |
+| `2^15 x 2^14` | 4.000 | **64,241.0** (-10.3%) | 6,740 (-0.04%) |
+| `2^15 x 2^15` | 1.200 (derived) | 105,628.1 | 9,176 |
+| `2^15 x 2^15` | 4.000 | **92,141.4** (-12.8%) | 9,171 (-0.05%) |
+
+So 10-13% of the survivor list is positions admitted purely by rounding error,
+and they yield nothing.
+
+### And it is worth nothing, measured on an idle box
+
+The obvious inference -- survivors drive resieve, trial division and the
+cofactor queue, so cutting 10% of them should show up -- is **wrong**, and the
+A/B says so unambiguously. C194, `2^15 x 2^14`, 200 pairs, alternated to guard
+against drift, host load 0.5:
+
+| | wall ms/q | survivors/q | candidates/q | relations |
+|---|---:|---:|---:|---:|
+| derived scale 1.225 | 112.24, 112.64 | 71,579.6 | 1590.68 | 6,743 |
+| scale 4.000 | 111.17, 113.68 | 64,241.0 | **1590.08** | 6,740 |
+
+**112.44 against 112.43 ms/q.** Nothing, against a run-to-run spread of ~1.3%.
+
+The stage breakdown says why, and the answer is that **the survivor count is
+not a cost driver at all**:
+
+| stage | derived | scale 4.0 |
+|---|---:|---:|
+| fill | 31.375 | 31.204 |
+| apply | 38.619 | 38.149 |
+| resieve + scatter | 10.079 | 9.998 |
+| norms + trial division | 1.885 | 1.786 |
+| classify | 0.627 | 0.557 |
+| **TD device total** | **14.044** | **13.797** |
+
+Fill and apply are ~70 ms of the 112 and are **per position**, not per
+survivor, so they cannot respond. The whole trial-division block is 14 ms and
+moves 0.25 ms -- 0.22% of wall. And `candidates/q` is flat to **0.04%**
+(1590.68 -> 1590.08), so the noise survivors never reach cofactorisation
+either: they are killed by the rank scan and survivor filter, which together
+cost 0.5 ms.
+
+**So `las_scale` deriving from a 255-value cell is harmless, not a defect.**
+The resolution is unused, and using it changes neither throughput nor yield
+(relations move 6,743 -> 6,740, i.e. -0.04%, the wrong way and inside noise).
+Recorded so the inference "fewer survivors must be faster" is not made again;
+on this pipeline the survivor list is nearly free downstream.
+
+Two notes for anyone re-running it. The runs above pass `--allowance`
+explicitly to hold the gate at the derived bits; simply raising `scale` also
+moves `sieve_allowance`'s `2/scale` slack term, which is a different
+experiment. And the binding ceiling on scale is not `CINIT` but the guard at
+`bench_main.cu:1862` (`scale * log2(lim) <= 255`, the 8-bit per-ideal
+factor-base log), which caps it near 9.1 at `alim` 240M.
+
+The 1:1/2:1 relation ratio is **1.3607 at scale 4.0 against 1.3608 at the
+derived scale**, which is the control that rules quantisation out of finding 65
+entirely.
+
+## Finding 67 — q-truncation on a 275M-relation corpus: lossless in every configuration an operator would actually run, for a 1.8% prize
+
+**Date:** 2026-08-18. Corpus: SNFS `17327^61-1` (difficulty 258.56, `rlim
+67.1M, alim 134.2M, lpbr 31, lpba 32, mfbr 61, mfba 92`), **41.5 GB /
+339,445,456 relation lines**, rational special-q. The largest dataset this
+project has replayed, and it is the one STATUS item 3 was waiting for.
+
+### The band, recovered from the corpus rather than assumed
+
+NFS@Home returns an aggregate of many workers, so the file is not q-ordered and
+its head is not a random sample (a `head -c 2G` slice reads as 100% covered at
+every band top — the file *starts* at q = 40000003). Recovered from a uniform
+random sample instead, by the property that **every** relation must contain at
+least one band prime:
+
+| band top | coverage | | band bottom | coverage |
+|---:|---:|---|---:|---:|
+| 170M | 0.98796 | | 39M | 1.00000 |
+| 174M | 0.99869 | | 40M | **1.00000** |
+| **175M** | **1.00000** | | 41M | 0.99516 |
+
+Sharp at both ends: **q in [40M, 175M), rational side**. Independently, the
+share of primes seen more than once collapses from 8.1% in 160–180M to 0.4% in
+180–200M.
+
+### Counting unique relations without deduplicating 275M of them
+
+The corpus holds one line per (relation, q) pair and **the line does not record
+q** — a relation found at two special-q produces two byte-identical lines. So
+line counts weight a relation by how often it was re-found, and deduplicating
+outright needs several GB. Instead relations are selected by a hash of their
+`(a,b)` text: selection is deterministic, so every copy of a 1-in-200 subset is
+kept and its multiplicity is exact, at 1/200 of the memory.
+
+    lines read       339,445,456   (0 malformed)
+    unique relations   1,376,424   sampled  ->  ~275.3M in the corpus
+    mean copies/uniq        1.2325 <- raw; 1.2096 once a hand-stitched
+                                      restart's re-sieved window is removed
+                                      (see the last section)
+
+### On the band as actually run, truncation loses nothing — structurally
+
+**Zero unique relations lost**, and this is provable rather than merely
+measured. Under truncation a relation is found at its largest band prime `q`;
+any unsieved factor-base prime `p > q` with `p <= lim` would also satisfy
+`p >= band_bottom`, so `p` would itself be a band prime *larger* than `q`,
+contradicting maximality. Hence no unsieved FB prime remains, the cofactor
+equals the full-base one, and the relation is found.
+
+**Truncation is lossless exactly when `band_top >= lim`.** That single
+condition explains every corpus this project has replayed: the c151's band
+ended precisely at `alim` (zero loss), and this one runs to 175M against `rlim`
+67.1M (zero loss). Neither was evidence that truncation is safe in general —
+both were the favourable case, which is what item 3 suspected and could not
+test.
+
+### The counterfactual, and why its loss column is NOT a production risk
+
+For a candidate band `[40M, B)`, count the unique relations a full-base run over
+that band would find, and ask how many a truncated run finds at no q at all.
+
+**Read the `B < lim` rows as test bands, not as configurations anyone runs.**
+The owner's point, and it is decisive: if `lim` is above the top of the band
+then truncation caps the sq-side base at `q < lim` for *every* q in the run, so
+the `lim` that was set is never the `lim` that is used — an operator would
+notice and lower it. Only two shapes occur in practice:
+
+| | truncation | loss |
+|---|---|---|
+| `lim <= band_bottom` | never binds | zero, trivially |
+| `band_bottom < lim <= band_top` (**this job**) | binds for `q < lim` | **zero, by the argument above** |
+
+and the maximality argument covers the second: any unsieved FB prime `p > q`
+has `p >= band_bottom` and `p <= lim <= band_top`, so it is in the band. So the
+honest conclusion is stronger than a measurement — **in every configuration an
+operator would actually run, q-truncation loses nothing at all.** The sweep
+below exists to show what the loss regime *would* cost and to confirm the
+boundary is exactly at `B = lim`, not to price a real option.
+
+**Unique relations LOST to truncation (%)**
+
+| `B`/lim | band top | mfb 61 (this job) | mfb 80 | mfb 92 |
+|---:|---:|---:|---:|---:|
+| 0.62 | 41.6M | **12.725** | 10.625 | 2.373 |
+| 0.70 | 47.0M | 9.641 | 8.182 | 1.689 |
+| 0.80 | 53.7M | 6.023 | 5.255 | 0.987 |
+| 0.90 | 60.4M | 2.835 | 2.525 | 0.435 |
+| 0.97 | 65.1M | 0.814 | 0.736 | 0.127 |
+| **1.00** | 67.1M | **0.000** | 0.000 | 0.000 |
+| 2.61 | 175M | 0.000 | 0.000 | 0.000 |
+
+**Duplicate finds REMOVED by truncation (%)**, same grid
+
+| `B`/lim | mfb 61 | mfb 80 | mfb 92 |
+|---:|---:|---:|---:|
+| 0.62 | 13.14 | 10.96 | 2.48 |
+| 0.80 | 9.45 | 7.99 | 1.67 |
+| 1.00 | 6.35 | 5.43 | 1.10 |
+| **2.61 (as run)** | **1.78** | 1.53 | 0.35 |
+
+Read the two together:
+
+- **On the band as run, the prize is 1.78%** of the duplicate finds. Nearly
+  nothing, for a per-q factor-base change — and that, not the loss column, is
+  the number that decides this item.
+- **Below `lim` the prize grows, but the loss grows faster** — at 0.70 it
+  removes 11.4% of finds while losing 9.6% of the relations. This is the
+  regime a *test* band lands in, which is exactly how the c147's 22.68% figure
+  arose (below), and it is worth knowing so that a narrow probe is never
+  mistaken for evidence about a production run.
+- **Generous `mfb` collapses both.** At `mfb 92` — the c183's `mfba 92`, and
+  close to the C195's `mfba 95` — loss and prize are each under 2.5%
+  everywhere. The unsieved primes simply fit in the cofactor, so truncation
+  becomes very nearly a no-op. This is the mechanism item 3 already predicted
+  from `mfb` headroom, now measured on both sides.
+
+Caveat in our favour, and it means these losses are **lower bounds**: the fit
+test is `mfb` alone. A truncated run also has to get those larger cofactors
+past the survivor threshold, which will refuse some of them.
+
+### This reconciles every corpus replayed so far
+
+The rule `loss = 0 iff band_top >= lim` is not new evidence contradicting the
+earlier replays -- it is what all four of them already said, once each band is
+compared against its own `lim` rather than against the others:
+
+| corpus | sq-side lim | band as run | `band_top` vs lim | unique relations lost |
+|---|---:|---|---|---:|
+| c147 | `alim` 33.5M | [15.00M, 15.15M] | **0.45x** | **22.68%** |
+| snfs236 (partial) | `rlim` 134.2M | [30.0M, 36.97M] | **0.28x** | loss regime |
+| c151 (complete) | `alim` 33.5M | [15.0M, 33.5M] | **1.00x** | **0** |
+| snfs2 (this) | `rlim` 67.1M | [40M, 175M) | **2.61x** | **0** |
+
+The two that lost relations are the two whose band stops short of `lim`, and
+neither is a production configuration: the c147's band is **0.15M wide**, a
+test probe, and the snfs236 corpus is explicitly a *partial* slice of its job's
+band. The two complete, realistically-shaped bands both lose exactly nothing.
+
+So the c147's 22.68% -- quoted under item 3 as the alarming number -- is a
+property of a 0.15M-wide probe, not of the design. Nothing here shows loss
+inside a band anyone would sieve.
+
+### A restart's re-sieved window, located from the corpus alone
+
+Conditioning on `k`, the number of band q a relation could have been found at,
+`E[copies | copies >= 1] = kP/(1-(1-P)^k)` solves for P directly. The **`k = 1`
+row is a control**: a relation with one possible q cannot be re-found, so our
+convention predicts exactly 1.0000 copies. It read **1.0141**.
+
+That 1.41% is duplication the special-q convention did not cause. The
+duplicated lines are byte-identical — a relation line does not record which q
+produced it — so the lines themselves cannot say why. Their *q distribution*
+can, and it is unambiguous:
+
+| q range | k=1 relations | duplicated | rate |
+|---|---:|---:|---:|
+| 40-50M | 83,308 | 0 | 0.000% |
+| **50-60M** | **77,354** | **12,735** | **16.463%** |
+| 60-70M ... 160-175M (11 buckets) | 679,164 | 0 | 0.000% |
+
+Narrowed, the duplicated relations occupy `q` in **[55,469,851, 57,129,679]**,
+and inside that window **12,735 of 12,736** single-q relations are duplicated --
+100.0%, with copies capped at exactly 2. Outside it, **0 of 827,090**.
+
+That is a **stop/restart overlap: a ~1.66M-wide q window sieved twice**, which
+the owner confirms (this run predates the `.part`/`.ckpt` mechanism, so the two
+halves were stitched by hand). It is *not* BOINC re-issuing workunits, which an
+earlier draft of this finding claimed -- that would have been spread across the
+band, and the measured rate outside the window is exactly zero.
+
+Excluding the window, the control comes out clean and P falls into line:
+
+| k | relations | mean copies | implied P |
+|---:|---:|---:|---:|
+| 1 | 889,785 | **1.0000** | -- |
+| 2 | 389,277 | 1.5450 | 0.7055 |
+| 3 | 62,085 | 2.0322 | 0.6478 |
+| 4 | 3,674 | 2.4747 | 0.6034 |
+
+**P(re-found) = 0.6968** weighted over k>=2, against 0.702 (snfs236) and 0.723
+(c151) -- three jobs, one number. Duplicate inflation is **1.2096x** with the
+window excluded, against 1.2325x raw.
+
+Two things worth keeping. **The `k = 1` stratum is a free integrity check on
+any corpus**: it must read 1.0000, and whatever it reads above that is
+duplication from outside the siever, localisable by histogramming q. And
+**item 12a's checkpoint/resume exists precisely to prevent this** -- a
+hand-stitched restart cost ~1.7M q of duplicate sieving here, which a
+byte-exact resume removes.
+
+## Finding 68 — a shipped correctness bug: non-primitive relations when q is small relative to the sieve area
+
+**Date:** 2026-08-18. Reported from the field: an SNFS job
+(`14193046087661928916151319601^7-1`, degree 6 with `F = (x^7-1)/(x-1)`,
+`alim 3.5M, rlim 6M, lpba 28, lpbr 29, mfba 53, mfbr 57`, CADO-derived
+parameters, rational special-q from q = 400000, `--logI 14`) produced hundreds
+of `error -6 reading relation N` in msieve's `-nc1`.
+
+**Reproduced exactly, root-caused, fixed, and gated.**
+
+### What error -6 is
+
+`gnfs/relation.c:161` returns -6 when `gcd(a, b) != 1` (`:167` for a zero
+rational norm). msieve is refusing **non-primitive** relations: `(a,b)` a
+multiple of a smaller pair, carrying no new information.
+
+Sieving 154,810 relations with the reported command reproduced it: **154 of
+them (0.0995%) had `gcd(a,b) != 1`**, my file's line numbers matching the
+reporter's error indices at a constant offset, and the reporter's own msieve
+binary reporting exactly 154 errors on the reproduction.
+
+### Where they come from, and why the existing filter missed them
+
+Every gcd was **the special-q itself** — 400009, 400051, 400093, ... never 2 or
+3. `k_intersect_compact` dropped positions with `gcd(i,j) != 1` and its comment
+asserted that this made `(a,b)` primitive. **It does not.** `(a,b) = M(i,j)`
+with `det M = +-q`, and a non-unimodular map can destroy primitivity — on
+exactly one sublattice, the one where `q | b` (hence `q | a`, since
+`a = rho*b` mod q on the lattice), giving `(a,b) = q*(a',b')`.
+
+No other prime can do it: `p | a` and `p | b` with `p != q` implies
+`(a/p, b/p)` is still on the q-lattice, so `(i,j) = p*(i',j')` and the gcd test
+already catches it. **So `gcd(a,b)` is 1 or q**, which is what the measured
+distribution shows and what makes `q % b` an exact test.
+
+### Why they survive the sieve — they look perfectly smooth
+
+A position with `q | a` and `q | b` satisfies `a = r*b (mod q)` for **every**
+root r of q, so it sits on the plattice line of all of them and the sieve
+subtracts `log(q)` once per root. When the algebraic polynomial splits
+completely mod q that is `deg * log(q)` — precisely the `q^deg` in
+`F(a,b) = q^deg F(a',b')`. The rational side is `G(a,b) = q*G(a',b')` and the
+special-q bias removes its one `log(q)`. Both sides then look exactly as smooth
+as the much smaller pair `(a',b')`, the position survives, and trial division
+*confirms* the factorisation — of a relation that is q times a smaller one.
+
+The prediction that follows is sharp, and it holds: `F = (x^7-1)/(x-1)` splits
+completely mod q **iff q = 1 (mod 7)**, and **154 of 154** offending relations
+had `q = 1 (mod 7)`. The reduced points are tiny — `(-5,4)`, `(-3,11)`,
+`(1,18)`, with `max |a/q| = 152`.
+
+### Why it took a small job to expose it
+
+The number of affected positions per special-q is about `I*J / q`. This job
+sieves `2^27` positions against q from 400009 — **~335 candidates per q**.
+A C194 at `2^29` against q = 250M has **~2**. The bug has been present the
+whole time and is invisible at production q; it needs q small relative to the
+sieve area, which is what a small SNFS with CADO parameters and `--logI 14`
+produces. The c147 gate band contains **zero** non-primitive relations, which
+is why every existing test passed.
+
+### The fix, and the gate that should have caught it
+
+One extra test in `k_intersect_compact`, one 64-bit modulo per two-sided
+survivor (~1 position in 400):
+
+    if (bgcd(ai, j) != 1) continue;
+    if (q > 1 && ((int64_t)i * a1 + (int64_t)j * b1) % q == 0) continue;
+
+Verified: relations 154,810 -> **154,656**, exactly the 154 removed, **zero**
+non-primitive remaining, and the reporter's msieve reports **0 errors**. The
+c147 1500-q band is **byte-identical** (`47bb45b982d6d1c7f983a02981d001ab`),
+so the change is a no-op wherever q is large relative to the area, and
+`make check` passes 72 gates.
+
+**`--check-relations` did not catch this, and that is the more important
+defect.** It verified that every factor divides, is prime and is within lpb,
+and that both norms rebuild to exactly 1 — all of which a non-primitive
+relation passes. It now also tests `gcd(a,b) == 1`, reported under its own
+name rather than folded into the composite-factor count, because a
+non-primitive relation is perfectly factored and calling it composite sends the
+reader after the cofactoriser instead of after the survivor filter. Checked
+both ways: 5 deliberately doubled relations (`F(2a,2b) = 2^6 F(a,b)`,
+`G(2a,2b) = 2 G(a,b)`, so the factorisation is exact and only primitivity is
+wrong) are rejected, and 3,000 real ones pass.
+
+**The lesson worth keeping: a relation can be arithmetically perfect and still
+be invalid.** Every check we had was about the factorisation; none was about
+whether the point should have been sieved at all.
 
 ## Not addressed in this round
 

@@ -21,6 +21,13 @@
 #ifndef BENCH_GIT_DESC
 #define BENCH_GIT_DESC "unknown"
 #endif
+/* Pricing -D's (NORM_FAST_LOG2, NORM_CANCEL_TOL=...). Empty in every shipping
+ * build. Carried into the log header because otherwise a binary built with a
+ * deliberately wrong norm stamps the same git description as a real one, and
+ * its relations would be indistinguishable from production output. */
+#ifndef BENCH_DEFS
+#define BENCH_DEFS ""
+#endif
 
 /* nvmlDevice_t is an opaque pointer, so void * is the honest local spelling,
  * and NVML_SUCCESS is 0. Only the five entry points the heartbeat needs are
@@ -43,6 +50,8 @@ static struct {
 int runlog_active(void) { return L.f != NULL; }
 
 const char *runlog_build_desc(void) { return BENCH_GIT_DESC; }
+
+const char *runlog_build_defs(void) { return BENCH_DEFS; }
 
 /* ---- open / close ------------------------------------------------------ */
 
