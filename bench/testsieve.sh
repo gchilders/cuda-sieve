@@ -285,7 +285,9 @@ if [ "$MANAGE_FB" = 1 ]; then
         cache_fb="${FB}.m${logI}"
         FB_BY_LOGI[$logI]=$cache_fb
 
-        mapfile -t actual_header < <(sed -n '1,4p' "$cache_fb" 2>/dev/null)
+        # `-n 1,4p` alone still reads the entire ~200 MB text factor base.
+        # Quit after the metadata so cache validation stays constant-time.
+        mapfile -t actual_header < <(sed -n '1,4p;4q' "$cache_fb" 2>/dev/null)
         cache_valid=1
         [ ${#actual_header[@]} -eq 4 ] || cache_valid=0
         if [ "$cache_valid" = 1 ]; then

@@ -376,8 +376,8 @@ Cards with measured band data: **RTX 5070** (WSL2), **RTX 5090**, **RTX 4090**,
   either, yield is **0.979–0.981 of GGNFS's at all four matched rectangles**
   (`2^14 × 2^13`, `2^15 × 2^13`, `2^15 × 2^14`, `2^16 × 2^14`) — flat in
   aspect ratio, flat in area, and flat in `j` within a rectangle. The earlier
-  "−14.4% at a 1:1 rectangle" was a geometry mismatch: `-J 15` widens I rather
-  than J, so it compared our square against GGNFS's wide rectangle. There is
+  "−14.4% at a 1:1 rectangle" was a geometry mismatch: `-J 15` covers our
+  `2^16 × 2^14`, so it compared our square against GGNFS's wide rectangle. There is
   no measured cost of the norm approximation (item 5).
   Throughput at that equal-work point is **3.31×** the CPU box and **2.74×** on
   energy, against the c183's 3.11× and 2.53×. The same measurement at q=20M
@@ -572,6 +572,13 @@ absent from every document in the repo.
    reduced q-lattice and `j` the longer one. Measured rel per device-second
    across the grid: `2^14 × 2^13` 390.6, `2^15 × 2^13` 387.2, `2^14 × 2^14`
    336.0, `2^15 × 2^14` 323.9, `2^16 × 2^14` 260.6, `2^15 × 2^15` 223.4.
+
+   **And it is the cheaper shape too** *(finding 64, row added 2026-08-18)*:
+   `2^16 × 2^14` sizes at **4.98 GB** against the square's 5.32 GB, because
+   `bkthresh` defaults to `1 << logI` and so a wider I shortens the bucketed
+   prime range — 2.60 GB of bucket array against 2.91 GB. Same mechanism as the
+   yield win, so there is no trade-off to weigh: at fixed area, wider is better
+   on relations, on device time, and on VRAM simultaneously.
 
    The c183's own standalone
    sieve measures 38.2 + 26.2 ms for the two sides (RESULTS.md "Reproduce",
@@ -871,9 +878,12 @@ absent from every document in the repo.
    gap is a GNFS-side problem.
 
    **The 1:1 anomaly that drove this item DOES NOT EXIST — finding 65,
-   2026-08-17.** `gnfs-lasieve4I15e -J 15` sets the i half-width, not the
-   j-height: it sieves `2^16 x 2^14`, while our `--J 32768` sieves
-   `2^15 x 2^15`. Findings 58 and 63 compared a square against a wide
+   2026-08-17.** `gnfs-lasieve4I15e -J 15` covers what we call `2^16 x 2^14`,
+   while our `--J 32768` sieves `2^15 x 2^15`. (It is a `2^15 x 2^15` square in
+   GGNFS's own axes; the two sievers order the reduced basis oppositely, so
+   their (i,j) is our (j,i) — and because their j is non-negative while our i
+   is signed, the swap also halves one axis and doubles the other rather than
+   being a plain transpose. Corrected 2026-08-18 — see finding 65.) Findings 58 and 63 compared a square against a wide
    rectangle. Recovering each run's rectangle from its own relations (invert
    the q-lattice) and re-comparing at **matched** rectangles gives ours/theirs
    = 0.9795, 0.9805, 0.9797, 0.9786 at `2^14 x 2^13`, `2^15 x 2^13`,

@@ -144,3 +144,48 @@ want to know which one you have. Note that a mismatch against `--logI` is only a
 This needs no CADO: `fbgen` is the project's own generator, gated byte-for-byte
 against CADO `makefb` revision `0574bc39d` by `../bench/fbgencheck.sh`, which
 includes a C147 case at `--maxbits 14` pinned to the manifest hash.
+
+## The geometry / VRAM-sizing workload (added 2026-08-18)
+
+**C194, GNFS, degree 5, NFS@Home.** A *third* number, and the one to reach for
+when reproducing anything about sieve-region shape or device memory: findings
+64, 65 and 66 in `../bench/RESULTS.md` are all C194, at algebraic special-q over
+the window `[250000000, 250004000]` (200 `(q, rho)` pairs). It was not in the
+repo when those findings were written, so their commands named a `c194.job` a
+fresh clone did not have; that is what this entry fixes.
+
+Its parameters are not the C183's or the C147's:
+
+```
+rlim 160000000       lpbr 32        mfbr 63        rlambda 2.4
+alim 240000000       lpba 33        mfba 95        alambda 3.55
+```
+
+| file | what it is |
+|---|---|
+| `c194.job` | GGNFS-format job: poly + bounds + lambdas + `lss: 0`. Tracked in git — it is 644 bytes |
+| `c194.roots1.m15` | algebraic factor base at `--maxbits 15`, `alim=240M` (197 MB). **Git-ignored**, manifest-pinned |
+| `c194.roots1.m16` | the same at `--maxbits 16` (197 MB). **Git-ignored**, manifest-pinned |
+
+```
+cd ../bench && make fbgen
+./fbgen --poly ../oracle/c194.job --maxbits 15 --threads 12 --out ../oracle/c194.roots1.m15
+./fbgen --poly ../oracle/c194.job --maxbits 16 --threads 12 --out ../oracle/c194.roots1.m16
+```
+
+**Two files, because `--maxbits` must equal the `--logI` you sieve at** and the
+geometry findings sieve at both 15 and 16. The per-`logI` suffix matches the
+`fbase.m15` convention `../bench/testsieve.sh` already uses. The difference
+between them is tiny — 13,160,671 ideals at m16 against 13,160,645 at m15, i.e.
+**26** extra prime-power ladder entries in `(2^15, 2^16]` (211 against 185
+prime-powers), and 322 bytes of on-disk size. That is worth knowing when
+costing a `logI` change. In VRAM those 26 entries are 26 x 25.4 B ~ 660 B by
+finding 64's per-entry rate -- that rate is device bytes per factor-base entry
+and has nothing to do with the 322 on-disk bytes, which work out to a different
+number because the text format is a different thing. Either way it rounds to
+nothing, so **essentially all of the VRAM difference between two geometries is
+the bucket array** (`../bench/RESULTS.md` finding 64).
+
+Both carry `maxbits` in the header, so `head -4 c194.roots1.m16` identifies a
+stale copy without hashing 197 MB. A mismatch against `--logI` is only a `note:`
+from `bench`, not an error.

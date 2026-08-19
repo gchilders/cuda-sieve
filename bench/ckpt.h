@@ -43,11 +43,27 @@ extern "C" {
 
 #define CKPT_VERSION 1
 
+/* ONE limit governs every derived name. Sizing the buffers differently at
+ * different call sites is worse than not checking at all: a path that fits the
+ * 2048-byte staging buffers but not a 1200-byte sidecar buffer passes the
+ * startup checks, takes the lock, sieves -- and then fails at every checkpoint,
+ * so ckpt_written never becomes 1 and a clean stop discards the .part holding
+ * the whole session. */
+#define CKPT_PATH_MAX 2048
+/* Longest suffix appended below: ".part.recover.tmp" is 17 bytes. */
+#define CKPT_SUFFIX_MAX 20
+
 typedef struct {
     char     fp[17];              /* job fingerprint, 16 hex digits + NUL      */
     uint64_t next_q, next_rho;    /* the first special-q NOT yet accounted for */
     unsigned long long rel_bytes; /* valid prefix of NAME.part                 */
     unsigned long long cand_bytes;/* valid prefix of CANDIDATES.part           */
+    /* Recovery may have to remove candidate staging output even when a BOINC
+     * relaunch omitted --candidates.  The pathname alone is not sufficient:
+     * a damaged checkpoint must never turn into an arbitrary unlink target.
+     * Record the open file's identity too and require both to match. */
+    char     cand_part[CKPT_PATH_MAX];
+    unsigned long long cand_dev, cand_ino;
     unsigned long long nrel;      /* relations in that prefix                  */
     unsigned long long nqdone;    /* special-q completed, all sessions         */
     /* Derived once from the FIRST q of the original band and held band-wide
@@ -58,16 +74,6 @@ typedef struct {
 } ckpt_t;
 
 /* ---- paths ------------------------------------------------------------- */
-
-/* ONE limit governs every derived name. Sizing the buffers differently at
- * different call sites is worse than not checking at all: a path that fits the
- * 2048-byte staging buffers but not a 1200-byte sidecar buffer passes the
- * startup checks, takes the lock, sieves -- and then fails at every checkpoint,
- * so ckpt_written never becomes 1 and a clean stop discards the .part holding
- * the whole session. */
-#define CKPT_PATH_MAX 2048
-/* Longest suffix appended below: ".part.recover.tmp" is 17 bytes. */
-#define CKPT_SUFFIX_MAX 20
 
 /* Check ONCE, where the path enters the program, that every name derived from
  * it will fit. Callers that pass this may then build .part, .part.ckpt,
@@ -209,6 +215,44 @@ static inline void ckpt_fingerprint(const poly_t *P, const bench_cfg_t *cfg,
     snprintf(out, 17, "%016llx", (unsigned long long)h);
 }
 
+/* Paths may contain whitespace, so store the candidate staging name as hex
+ * rather than relying on the checkpoint's whitespace-delimited parser. */
+static inline int ckpt_path_hex_encode(const char *path, char *out, size_t n)
+{
+    static const char hex[] = "0123456789abcdef";
+    const size_t len = strlen(path);
+    if (!n || len > (n - 1) / 2) return -1;
+    for (size_t i = 0; i < len; i++) {
+        const unsigned char c = (unsigned char)path[i];
+        out[2 * i] = hex[c >> 4];
+        out[2 * i + 1] = hex[c & 15];
+    }
+    out[2 * len] = '\0';
+    return 0;
+}
+
+static inline int ckpt_hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static inline int ckpt_path_hex_decode(const char *hex, char *out, size_t n)
+{
+    const size_t len = strlen(hex);
+    if (!len || (len & 1) || len / 2 >= n) return -1;
+    for (size_t i = 0; i < len / 2; i++) {
+        const int hi = ckpt_hex_nibble(hex[2 * i]);
+        const int lo = ckpt_hex_nibble(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0 || (hi == 0 && lo == 0)) return -1;
+        out[i] = (char)((hi << 4) | lo);
+    }
+    out[len / 2] = '\0';
+    return 0;
+}
+
 /* ---- write ------------------------------------------------------------- */
 
 /* Atomic: a full write to a temporary, fsynced, then renamed over the live
@@ -220,11 +264,15 @@ static inline int ckpt_write(const char *relations, const poly_t *P,
                              const bench_cfg_t *cfg, const ckpt_t *ck)
 {
     char path[CKPT_PATH_MAX], tmp[CKPT_PATH_MAX], text[2048];
+    char cand_hex[2 * CKPT_PATH_MAX + 1];
     FILE *f;
     /* Both go through the same guard, so ".tmp" cannot be the one suffix that
      * overflows; CKPT_SUFFIX_MAX already reserves room for it. */
     if (ckpt_ckpt_path(relations, path, sizeof path) ||
-        ckpt_path_fmt(path, tmp, sizeof tmp, ".tmp")) return -1;
+        ckpt_path_fmt(path, tmp, sizeof tmp, ".tmp") ||
+        (ck->cand_part[0] &&
+         ckpt_path_hex_encode(ck->cand_part, cand_hex, sizeof cand_hex)))
+        return -1;
     if (!(f = fopen(tmp, "w"))) { perror(tmp); return -1; }
     ckpt_job_text(P, cfg, text, sizeof text);
     fprintf(f, "# cuda-sieve resume checkpoint. Delete this file to force a"
@@ -236,6 +284,11 @@ static inline int ckpt_write(const char *relations, const poly_t *P,
     fprintf(f, "next_rho = %llu\n", (unsigned long long)ck->next_rho);
     fprintf(f, "rel_bytes = %llu\n", ck->rel_bytes);
     fprintf(f, "cand_bytes = %llu\n", ck->cand_bytes);
+    if (ck->cand_part[0]) {
+        fprintf(f, "candidate_part_hex = %s\n", cand_hex);
+        fprintf(f, "candidate_dev = %llu\n", ck->cand_dev);
+        fprintf(f, "candidate_ino = %llu\n", ck->cand_ino);
+    }
     fprintf(f, "relations = %llu\n", ck->nrel);
     fprintf(f, "nq_done = %llu\n", ck->nqdone);
     fprintf(f, "scale = %.17g\n", ck->scale);
@@ -256,9 +309,9 @@ static inline int ckpt_write(const char *relations, const poly_t *P,
  * discard a file the operator believes is being resumed. */
 static inline int ckpt_read(const char *relations, ckpt_t *ck)
 {
-    char path[CKPT_PATH_MAX], line[1024];
+    char path[CKPT_PATH_MAX], line[2 * CKPT_PATH_MAX + 64];
     FILE *f;
-    int version = 0, got = 0;
+    int version = 0, got = 0, cand_meta = 0;
     /* -2, not -1: -1 is "no sidecar", which makes the caller report that the
      * file does not exist and advise --restart. A name we could not build says
      * nothing about what is on disk, and telling an operator to discard a
@@ -272,7 +325,20 @@ static inline int ckpt_read(const char *relations, ckpt_t *ck)
     memset(ck, 0, sizeof *ck);
     while (fgets(line, sizeof line, f)) {
         char key[64]; char val[256];
+        static const char cand_path_key[] = "candidate_part_hex = ";
         if (line[0] == '#' || line[0] == '\n') continue;
+        if (!strncmp(line, cand_path_key, sizeof cand_path_key - 1)) {
+            char *encoded = line + sizeof cand_path_key - 1;
+            encoded[strcspn(encoded, "\r\n")] = '\0';
+            if (ckpt_path_hex_decode(encoded, ck->cand_part,
+                                     sizeof ck->cand_part)) {
+                fprintf(stderr, "resume: %s has a malformed candidate path\n",
+                        path);
+                fclose(f); return -2;
+            }
+            cand_meta |= 1;
+            continue;
+        }
         if (sscanf(line, "%63s = %255s", key, val) != 2) continue;
         if      (!strcmp(key, "version"))     { version = atoi(val); got |= 1; }
         /* Length-checked rather than truncated: a short or overlong
@@ -290,6 +356,12 @@ static inline int ckpt_read(const char *relations, ckpt_t *ck)
         else if (!strcmp(key, "next_rho"))    { ck->next_rho = strtoull(val, 0, 10); got |= 8; }
         else if (!strcmp(key, "rel_bytes"))   { ck->rel_bytes = strtoull(val, 0, 10); got |= 16; }
         else if (!strcmp(key, "cand_bytes"))  ck->cand_bytes = strtoull(val, 0, 10);
+        else if (!strcmp(key, "candidate_dev")) {
+            ck->cand_dev = strtoull(val, 0, 10); cand_meta |= 2;
+        }
+        else if (!strcmp(key, "candidate_ino")) {
+            ck->cand_ino = strtoull(val, 0, 10); cand_meta |= 4;
+        }
         else if (!strcmp(key, "relations"))   ck->nrel = strtoull(val, 0, 10);
         else if (!strcmp(key, "nq_done"))     ck->nqdone = strtoull(val, 0, 10);
         else if (!strcmp(key, "scale"))       { ck->scale = strtod(val, 0); got |= 32; }
@@ -309,6 +381,11 @@ static inline int ckpt_read(const char *relations, ckpt_t *ck)
     }
     if (got != 511) {
         fprintf(stderr, "resume: %s is missing required fields\n", path);
+        return -2;
+    }
+    if (cand_meta && cand_meta != 7) {
+        fprintf(stderr, "resume: %s has incomplete candidate file identity\n",
+                path);
         return -2;
     }
     if (version != CKPT_VERSION) {

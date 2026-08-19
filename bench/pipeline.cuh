@@ -58,6 +58,7 @@ static int pipe_checkpoint(const poly_t *P, const bench_cfg_t *cfg, ckpt_t *ck,
                            unsigned long long nrel, unsigned long long nqdone)
 {
     off_t ro, co = 0;
+    struct stat cst;
     if (!fr || !cfg->relations) return 0;
     /* fsync before the sidecar, never after: the checkpoint asserts these
      * bytes are on the platter, and a sidecar naming bytes that are still in
@@ -68,6 +69,17 @@ static int pipe_checkpoint(const poly_t *P, const bench_cfg_t *cfg, ckpt_t *ck,
     }
     if ((ro = ftello(fr)) < 0) { perror("relations"); return -1; }
     if (fc && (co = ftello(fc)) < 0) { perror("candidates"); return -1; }
+    if (fc) {
+        if (fstat(fileno(fc), &cst)) { perror("candidates"); return -1; }
+        if (ckpt_part_path(cfg->candidates, ck->cand_part,
+                           sizeof ck->cand_part))
+            return -1;
+        ck->cand_dev = (unsigned long long)cst.st_dev;
+        ck->cand_ino = (unsigned long long)cst.st_ino;
+    } else {
+        ck->cand_part[0] = '\0';
+        ck->cand_dev = ck->cand_ino = 0;
+    }
     ck->next_q   = next->q;
     ck->next_rho = next->rho;
     ck->rel_bytes  = (unsigned long long)ro;

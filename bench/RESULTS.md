@@ -2618,8 +2618,11 @@ range, not the energy, is the binding constraint.
 ## Finding 58 — equal-work control on the C194: 3.3x, not 4.9x, and a 14% yield hole at a 1:1 rectangle
 
 > **PARTIALLY RETRACTED 2026-08-17 — the `15e -J 15` row is not a 1:1
-> rectangle and there is no yield hole (finding 65).** `-J n` on this lasieve
-> sets the i half-width, so `-J 15` sieves `2^16 x 2^14`, not `2^15 x 2^15`.
+> rectangle *in our coordinates* and there is no yield hole (finding 65).**
+> GGNFS orders the reduced q-lattice basis longer-vector-first and we order it
+> shorter-first, so its `2^15 x 2^15` square is our `2^16 x 2^14` -- the same
+> region under swapped axes, with one halved and the other doubled because
+> their j is non-negative where our i is signed. Compare that row against our `2^16 x 2^14`.
 > The "-14.4%" compared our square against GGNFS's wide rectangle. At matched
 > rectangles we are flat at 0.979-0.981 on four of them. **Everything else in
 > this finding stands**, including the equal-work 3.31x time / 2.74x energy and
@@ -3170,12 +3173,74 @@ the obvious axis -- is the wrong one for the largest allocation.
 
 ### Geometry, lims fixed at rlim 160M / alim 240M
 
-| config | area | bucket | steady state | ms/pair | rel/pair | rel/ms |
-|---|---|---:|---:|---:|---:|---:|
-| 15e | `2^29` | 1.46 GB | 3.63 GB | 113.6 | 65.3 | **0.575** |
-| 15e `-J 24576` | 1.5x`2^29` | 2.18 GB | 4.47 GB | 159.8 | 82.4 | 0.516 |
-| 15e `-J 15` | `2^30` | 2.91 GB | 5.32 GB | 224.3 | 96.1 | 0.428 |
-| 16e | `2^31` | 5.20 GB | 8.06 GB | 477.1 | 154.8 | 0.324 |
+| config | rectangle | area | bucket | steady state | ms/pair | rel/pair | rel/ms |
+|---|---|---|---:|---:|---:|---:|---:|
+| 15e | `2^15 x 2^14` | `2^29` | 1.46 GB | 3.63 GB | 113.6 | 65.3 | **0.575** |
+| 15e `--J 24576` | `2^15 x 24576` | 1.5x`2^29` | 2.18 GB | 4.47 GB | 159.8 | 82.4 | 0.516 |
+| 15e `--J 32768` | `2^15 x 2^15` (square) | `2^30` | 2.91 GB | 5.32 GB | 224.3 | 96.1 | 0.428 |
+| **`--logI 16 --J 16384`** | **`2^16 x 2^14` (wide)** | **`2^30`** | **2.60 GB** | **4.98 GB** | 228.6 | 53.4 | 0.234 |
+| 16e | `2^16 x 2^15` | `2^31` | 5.20 GB | 8.06 GB | 477.1 | 154.8 | 0.324 |
+
+The `2^16 x 2^14` row was **added 2026-08-18** — it was the one cell finding 65
+exercised for yield and this finding never sized.
+
+**Its `rel/pair` and `rel/ms` do not compose with rows 1-3.** Those were taken
+on a lower q band; the new row is on finding 65's `[250000000, 250004000]`, and
+yield falls with q. The size of that effect is not small: the *same* square
+re-measured on finding 65's window gives **45.88 rel/pair against the 96.1 in
+its own row above**. Read down the memory columns freely -- they depend on
+geometry and lims only, not on the band -- but compare relations only within a
+band. For the `2^30` pair that means this block, measured back to back:
+
+| rectangle | bucket | steady state | ms/pair | rel/pair | rel/ms |
+|---|---:|---:|---:|---:|---:|
+| `2^15 x 2^15` (square) | 2.91 GB | 5.28 GB | 223.0 | 45.88 | 0.206 |
+| **`2^16 x 2^14` (wide)** | **2.60 GB** | **4.98 GB** | 228.6 | **53.38** | **0.234** |
+
+**+16.3% rel/pair and +13.5% rel/ms**, at -0.30 GB (5.28 against 4.98, both
+from this block; the 2026-08-17 row above records the square at 5.32). `ms/pair` here is wall
+clock, and the box was under a 14-thread `msieve` throughout, so the wide arm's
++2.5% wall is host contention rather than a real cost: finding 65 times the same
+two shapes on the device at **-0.3%**, which puts the honest throughput gain at
+**+16.7% relations per device-second** (260.6 against 223.4). Per finding 53,
+prefer the device figure whenever the host is loaded.
+
+**At equal area the wide rectangle is also the cheaper one: 4.98 GB against the
+square's 5.32 GB, and 2.60 GB of bucket array against 2.91 GB (-10.7%).** So
+buying area with `I` rather than `J` wins on *both* axes at once — +16.3%
+relations on a matched window (finding 65: 10,676 against 9,176, both
+reproduced exactly on the 2026-08-18 re-run) for -0.30 GB of VRAM — and for the
+same reason. Raising `logI` raises `bkthresh` with it, which simultaneously shortens the bucketed
+prime range and, because `i` multiplies the shorter lattice vector, grows the
+norms at half the rate (+1.86 bits against +3.86). There is no trade to make
+here; the wide shape is simply better.
+
+The factor base is **not** where the difference lives, which is worth stating
+because `--maxbits` does have to move with `logI`: the m16 file carries 26 more
+ideals than the m15 file (13,160,671 against 13,160,645 — 211 prime-powers
+against 185), i.e. under a kilobyte at 25.4 B per entry. Both `2^30` rows load
+0.83 GB of factor bases + bitmaps. **The entire geometry delta is the bucket
+array.**
+
+Re-run conditions, for the two 2026-08-18 rows: both started from an identical
+10.76 GB free, so they are comparable to each other and to the 2026-08-17 rows.
+The square re-measured at **5.28 GB** against the 5.32 GB recorded above -- a
+0.04 GB spread that is the practical accuracy of this column, not drift.
+
+**A desktop Windows box does not contaminate this measurement the way it looks
+like it should**, and it is worth knowing before someone discards a run for the
+wrong reason. `nvidia-smi` reported ~5.1 GB in use before both runs, all of it
+the Windows desktop (dwm.exe alone holds 1.35 GB, plus browsers, VS Code and
+the terminal; a WSL process such as msieve would not appear in Task Manager's
+list at all, so do not read its absence as evidence). Under WDDM those
+allocations are **evictable**: the moment `bench` asked for the bucket array,
+Windows demoted them to system RAM and the card read 10.76 GB free, snapping
+back to ~5 GB after exit. So `total - free` at sizing time reflects a nearly
+cleared card regardless of desktop load -- which is also why 16e's 8.06 GB fit
+here on 2026-08-17. **Do not close applications before sizing a job, and do not
+subtract a desktop baseline; both would be corrections for an effect that does
+not occur.** What this does *not* license is running against another CUDA
+process -- those allocations are pinned, not evictable.
 
 16e fits a 12 GB card with 3.9 GB spare, so the `2^31` area limit is reachable
 on a 5070 for a C194. `J` need not be a power of two -- the only constraints
@@ -3189,6 +3254,11 @@ that step raises `logI` and **`bkthresh` defaults to `1 << logI`**
 `Σ1/p` from 0.6184 to 0.5539, a factor 0.896 -- and 5.82 x 0.896 = 5.21 against
 the measured 5.20. Anything that reasons about "area" without separating the
 two ways of growing it will be wrong by ~11% on the 15e-versus-16e decision.
+
+**The 2026-08-18 row isolates that factor directly**, because it holds area
+fixed at `2^30` and moves `bkthresh` alone: 2.91 -> 2.60 GB is **0.893** against
+the 0.896 predicted from `Σ1/p`. The `bkthresh` effect is therefore confirmed on
+its own, not just inferred from a step that changes two things at once.
 
 ### Factor-base bounds, area fixed at `2^29`
 
@@ -3250,7 +3320,7 @@ area, which is true only when the area grows through J.** When it grows through
 linearly (see above), so the crossover sits correspondingly higher. Use it as
 an axis-comparison rule at fixed `logI`, not as a prediction across sievers.
 
-## Finding 65 — the 1:1 deficit was never real: `-J 15` widens I, and at matched rectangles we are flat at 98% on four of them
+## Finding 65 — the 1:1 deficit was never real: `I15e -J 15` is our `2^16 x 2^14`, and at matched rectangles we are flat at 98% on four of them
 
 **Date:** 2026-08-17, RTX 5070 against `gnfs-lasieve4I14e`/`I15e` on the
 NFS@Home C194, algebraic special-q, q window `[250000000, 250004000)` — 130
@@ -3274,10 +3344,15 @@ rectangle it *actually* covered:
 | ours `--logI 15 --J 32768` | ±16383 | 1 .. 32761 | `2^15 x 2^15` |
 | **`I15e -J 15`** | **±32738** | **4 .. 16380** | **`2^16 x 2^14`** |
 
-So `-J n` sets the **i half-width** (`I = 2^(n+1)`) and leaves the j-height at
-its default `2^(Ibits-1)`. Confirmed independently on the other binary:
-`I14e` with no flag gives `2^14 x 2^13`, and `I14e -J 14` gives `2^15 x 2^13`.
-Same area as the square in each case, different shape.
+So in **our** coordinates `-J n` widens the i axis and leaves j alone.
+Confirmed independently on the other binary: `I14e` with no flag gives
+`2^14 x 2^13`, and `I14e -J 14` gives `2^15 x 2^13`. Same area as the square in
+each case, different shape.
+
+**This does not mean GGNFS's flag misbehaves — see the basis-ordering section
+below, added 2026-08-18.** `-J n` really does set `J_bits` exactly as
+documented; the axis swap is ours. The operational rule is unaffected: **compare
+`I15e -J 15` against our `2^16 x 2^14`.**
 
 The mapping is not an inference. Applied to our own 2:1 output it places
 **6,743 of 6,743 relations inside the rectangle, none outside and none
@@ -3308,6 +3383,78 @@ Our own sieve is internally exact across the change finding 63 was built on:
 **our `2^15 x 2^15` run contains every one of our `2^15 x 2^14` relations,
 6,743 of 6,743**, and all 2,433 extras lie in `j > 16384`. Nothing was lost in
 the shared region, so the scale moving 1.225 -> 1.200 costs nothing.
+
+#### Why the shapes differ: basis ordering, not a GGNFS bug (2026-08-18)
+
+**Corrected.** An earlier version of this section read the `lasieve5_64` source,
+found that `-J n` sets `J_bits` in the obvious way, could not reconcile that
+with the recovered rectangles, and concluded the binary must diverge from its
+source somewhere in `asm/lasched*`/`medsched*`. **That was wrong.** GGNFS parses
+`-J` exactly as documented and sieves exactly the square its source says. The
+entire discrepancy is a coordinate convention, and it is ours as much as theirs.
+
+**The two sievers order the reduced q-lattice basis oppositely.**
+
+- `redu2.c:61` branches on `if(a0sq > a1sq)` and puts the vector with the
+  *larger* skewed norm into slot 0. GGNFS is **longer-vector-first**, so its `i`
+  multiplies the long vector and its `j` the short one.
+- `bench/poly.c:818` states the opposite as an explicit invariant -- "`(a0,a1)`
+  is the SHORTER vector" -- so our `i` multiplies the short vector and our `j`
+  the long one.
+
+Slot for slot, their `i` is our `j` and their `j` is our `i`. Folding in the
+antipodal canonicalisation `(a,b) ~ (-a,-b)` that keeps the second coordinate
+positive gives
+
+    our i = +/- (their j)        our j = |their i|
+
+which turns their *non-negative* j range of length `n_J` into our *signed* i
+range of width `2*n_J`, and their signed i range of width `n_I` into our
+non-negative j range of height `n_I/2`. In closed form:
+
+    our rectangle  =  2^(J_bits+1)  x  2^(I_bits-1)
+
+**That reproduces every geometry this project has measured, with no free
+parameters:**
+
+| GGNFS invocation | its own region | predicted ours | measured ours |
+|---|---|---|---|
+| `I14e`, no `-J` | `2^14 x 2^13` | `2^14 x 2^13` | `2^14 x 2^13` |
+| `I14e -J 14` | `2^14 x 2^14` (square) | `2^15 x 2^13` | `2^15 x 2^13` |
+| `I15e`, no `-J` | `2^15 x 2^14` | `2^15 x 2^14` | `2^15 x 2^14` |
+| `I15e -J 15` | `2^15 x 2^15` (square) | `2^16 x 2^14` | `2^16 x 2^14` |
+| `I16e`, no `-J` | `2^16 x 2^15` | `2^16 x 2^15` | `2^16 x 2^15` |
+
+**Five for five**, against an "asm override" story that explained none of them.
+The rule also predicts `I16e -J 16` -> `2^17 x 2^15`; that one is untested here,
+being past our `I*J <= 2^31` limit, so it is not counted above. The binaries were also confirmed byte-identical to the
+`lasieve5_64` build (`cmp`, all three of `I14e`/`I15e`/`I16e`), so the source
+above is the source that ran.
+
+**Where the earlier argument went wrong.** It claimed a basis difference "could
+not manufacture 97.7% agreement on the `(a,b)` pairs, which are
+basis-independent". The `(a,b)` agreement is real and basis-independent -- but
+that is the point: *both sievers swept the same region*, so of course the pairs
+agree. What differs is only the axes each one names it in. The companion
+"73.5% maximum intersection" bound made the same mistake in sharper form: it
+computed the overlap of our `2^16 x 2^14` with a square **drawn on our axes**,
+when the square in question is drawn on GGNFS's. Two clean rectangles related by
+a coordinate swap also explain the recovered bounds landing on exact powers of
+two, which had been offered as evidence *against* a basis explanation -- a swap
+is unimodular *and* axis-preserving, unlike the general shear that objection
+assumed.
+
+**A useful consequence.** Since their `j` and our `i` both multiply the short
+vector, **GGNFS's `-J` and our `--logI` are the same knob**: both extend the
+cheap axis, the one costing 1.86 bits of `log2(maxnorm)` per doubling rather
+than 3.86. The long-standing GGNFS practice of raising `-J` for more area and
+this project's "buy area with I, not J" are one result in two coordinate
+systems, not two competing pieces of advice.
+
+**Nothing downstream moves.** `I15e -J 15` is still to be compared against our
+`2^16 x 2^14`; the 0.979-0.981 parity stands; and finding 64's wide-versus-square
+result never routed through GGNFS's flag at all, being measured end to end on
+our own siever in a single basis.
 
 ### The real result: buy area with I, not J
 

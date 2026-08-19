@@ -165,10 +165,27 @@ Two knobs move device memory and they are not interchangeable
   factor-base dominated, above it bucket dominated.
 
 Measured device-in-use totals for a C194 (`rlim 160M, alim 240M`): **3.63 GB**
-at 15e, 5.32 GB at `2^30`, **8.06 GB** at 16e — so 16e fits a 12 GB card with
-3.9 GB to spare. These are what `bench` reports as *device* memory in use
-(total − free), so on a desktop they include whatever else holds VRAM; the
-~1.45 GB constant above absorbs that too.
+at `2^15 x 2^14`, 5.32 GB at the `2^15 x 2^15` square, **4.98 GB** at the
+`2^16 x 2^14` wide rectangle of the same `2^30` area, and **8.06 GB** at 16e
+(`2^16 x 2^15`) — so 16e fits a 12 GB card with 3.9 GB to spare. These are what
+`bench` reports as *device* memory in use (total − free); two runs agree to
+~0.04 GB, which is the practical accuracy.
+
+**A busy Windows desktop does not need to be cleared first.** `nvidia-smi` will
+show several GB in use by dwm.exe, browsers and editors, but under WDDM those
+allocations are evictable — asking for the bucket array demotes them to system
+RAM, and the figures above were taken with ~5 GB apparently in use and the card
+reading 10.76 GB free a moment later. Do not close applications before sizing,
+and do not subtract a desktop baseline. **Another CUDA process is different**:
+its memory is pinned, and it really does come off your budget.
+
+**The wide rectangle is cheaper as well as higher-yielding.** At equal `2^30`
+area it costs 4.98 GB against the square's 5.28 GB measured back to back (2.60
+GB of bucket array against 2.91 GB) *and* returns +16.3% relations. Buying area
+with `I` rather than `J` is not a trade — both effects come from the same place, since raising
+`logI` raises `bkthresh` with it. The factor base is not involved: `--maxbits
+16` carries only 26 more ideals than `--maxbits 15` on this job, so the whole
+geometry difference is the bucket array.
 
 **Do not size a job from an aborted startup.** The startup table lists only the
 bucket array, factor bases, bitmaps, trial-division context and cofactor queue
@@ -224,12 +241,16 @@ costs 1.86 bits of `log2(maxnorm)`; doubling J costs 3.86, because `i`
 multiplies the shorter vector of the reduced q-lattice and `j` the longer one.
 So a `J = I` row is a genuinely worse configuration than a wider rectangle of
 the same size — but it is not *broken*, and the sweep can be trusted as
-measured.
+measured. The wider shape is also **~0.3 GB cheaper** in device memory at that
+area (see "Will it fit?" above), so nothing is being traded away for the yield.
 
 An earlier version of this note said our yield at `2^15 × 2^15` was "14% low"
 against GGNFS and blamed the survivor gate. **Both claims are withdrawn**:
-`gnfs-lasieve4I15e -J 15` widens I rather than J, so that comparison was our
-square against GGNFS's `2^16 × 2^14`. At matched rectangles we run 0.979–0.981
+`gnfs-lasieve4I15e -J 15` covers what we call `2^16 × 2^14`, so that comparison
+was our square against GGNFS's wide rectangle. (GGNFS's own coordinates call
+that a `2^15 × 2^15` square: it orders the reduced basis longer-vector-first
+where we order it shorter-first, so its axes are our axes swapped. Same region,
+different names — see `bench/RESULTS.md` finding 65.) At matched rectangles we run 0.979–0.981
 of GGNFS at every aspect ratio and area tested. See `bench/STATUS.md` item 5.
 
 **Before comparing yields against another siever, confirm the rectangles
@@ -310,6 +331,11 @@ allowance, and a job fingerprint.
   Unreadable files, active locks, other filesystem errors, bad inputs,
   band/command mismatches and compute failures remain fatal because deleting
   output cannot repair them.
+  Checkpoints that include candidate output also record the candidate staging
+  pathname and file identity. This lets a relaunch that omitted `--candidates`
+  remove the matching private staging file without trusting checkpoint text as
+  authority to delete some other file. Older checkpoints without that identity
+  are preserved rather than partially discarded.
 - **`SIGINT`/`SIGTERM` stop cleanly** at the next special-q, draining the queue
   first, so a planned stop loses nothing. A second signal exits at once and
   falls back to the previous checkpoint.

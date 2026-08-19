@@ -4,10 +4,22 @@ and compare two files position by position.
 
 WHY THIS EXISTS. Findings 58 and 63 spent two sessions explaining a 14% yield
 "deficit" that was a geometry mismatch: `gnfs-lasieve4I15e -J 15` is documented
-as "specify J bits" and in fact widens I, sieving 2^16 x 2^14 where our
---J 32768 sieves 2^15 x 2^15. Nothing in either siever's output says which
-rectangle it used, so the comparison looked sound and was not. Finding 65 is
-the correction.
+as "specify J bits", does exactly that -- and still sieves what WE would call
+2^16 x 2^14, where our --J 32768 sieves 2^15 x 2^15. GGNFS orders the reduced
+q-lattice basis longer-vector-first (redu2.c:61) and we order it shorter-first
+(poly.c:818), so their (i,j) is our (j,i). That is not a plain transpose: their
+j is non-negative and our i is signed, so canonicalising (a,b) ~ (-a,-b) turns
+their j-range of length n_J into our i-range of WIDTH 2*n_J, and their signed
+i-range of width n_I into our j-range of HEIGHT n_I/2 --
+
+    our rectangle = 2^(J_bits+1) x 2^(I_bits-1)
+
+Their 2^15 x 2^15 square IS our 2^16 x 2^14 rectangle: same region, same
+relations, different axes.
+
+Nothing in either siever's output says which rectangle it used, and neither
+flag is lying -- the axes just are not the same axes. Finding 65 is the
+correction.
 
 The fix is to stop trusting flags and ask the relations. A relation (a,b) found
 under special-q (q, rho) sits at the lattice point

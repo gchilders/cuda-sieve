@@ -8,6 +8,10 @@
 # the same reason as *.fb1: oracle/c147.roots1 is 29 MB and regenerates exactly
 # from the 543-byte oracle/c147.job, which IS committed.
 *.roots1
+# Per-logI variants of the same thing: oracle/c194.roots1.m15 / .m16 are 197 MB
+# each and regenerate from the 644-byte oracle/c194.job. The bare `*.roots1`
+# glob does NOT match a suffixed name, so this line is load-bearing.
+*.roots1.m*
 
 # Captured survivor / cofactor populations. Same rule: manifest-pinned, not
 # committed. gzip and tar do not delta-compress, so committing these would add
@@ -23,6 +27,7 @@ bench/fbgen
 bench/sqgentest
 bench/dumpcmp
 bench/mkcofbatch
+bench/ckpttest
 bench/.arch.stamp
 bench/.boinc.stamp
 bench/.link.stamp

@@ -451,6 +451,7 @@ typedef struct {
     char ckpt_tmp[CKPT_PATH_MAX];
     char candidates_part[CKPT_PATH_MAX];
     char retry[CKPT_PATH_MAX], retry_tmp[CKPT_PATH_MAX];
+    int checkpoint_candidate_required, checkpoint_candidate_known;
 } resume_recovery_t;
 
 static int resume_recovery_init(resume_recovery_t *r,
@@ -523,7 +524,75 @@ static int recovery_count_write(const resume_recovery_t *r, unsigned count)
         remove(r->retry_tmp);
         return -1;
     }
+    {
+        char dir[CKPT_PATH_MAX];
+        const char *slash = strrchr(r->retry, '/');
+        int fd, sync_bad = 0, saved_errno = 0;
+        if (!slash) {
+            strcpy(dir, ".");
+        } else if (slash == r->retry) {
+            strcpy(dir, "/");
+        } else {
+            const size_t len = (size_t)(slash - r->retry);
+            memcpy(dir, r->retry, len);
+            dir[len] = '\0';
+        }
+        fd = open(dir, O_RDONLY);
+        if (fd < 0) { perror(dir); return -1; }
+        if (fsync(fd)) { sync_bad = 1; saved_errno = errno; }
+        if (close(fd) && !sync_bad) { sync_bad = 1; saved_errno = errno; }
+        if (sync_bad) {
+            errno = saved_errno;
+            perror(dir);
+            return -1;
+        }
+    }
     return 0;
+}
+
+static int same_parent_directory(const char *a, const char *b)
+{
+    const char *as = strrchr(a, '/'), *bs = strrchr(b, '/');
+    const size_t an = as ? (size_t)(as - a) : 0;
+    const size_t bn = bs ? (size_t)(bs - b) : 0;
+    if (!!as != !!bs || an != bn) return 0;
+    return an == 0 || !memcmp(a, b, an);
+}
+
+/* A checkpoint pathname is data, not authority to unlink.  It is usable only
+ * when it remains in the relations directory and still names the exact open
+ * candidate staging inode recorded at the checkpoint.  Missing is safe: there
+ * is then no candidate artifact left to discard. */
+static int resume_recovery_add_checkpoint_candidate(resume_recovery_t *r,
+                                                     const ckpt_t *ck)
+{
+    struct stat st;
+    const size_t len = strlen(ck->cand_part);
+    if (!len) return 0;             /* legacy checkpoint: identity unavailable */
+    if (!same_parent_directory(r->part, ck->cand_part) ||
+        !strcmp(r->part, ck->cand_part) || len < 5 ||
+        strcmp(ck->cand_part + len - 5, ".part")) {
+        fprintf(stderr,
+                "BOINC: checkpoint candidate staging path is not a safe peer"
+                " of %s\n", r->part);
+        return -1;
+    }
+    if (stat(ck->cand_part, &st)) {
+        if (errno == ENOENT) return 1;
+        perror(ck->cand_part);
+        return -1;
+    }
+    if (!S_ISREG(st.st_mode) ||
+        (unsigned long long)st.st_dev != ck->cand_dev ||
+        (unsigned long long)st.st_ino != ck->cand_ino ||
+        (unsigned long long)st.st_size < ck->cand_bytes) {
+        fprintf(stderr,
+                "BOINC: checkpoint candidate staging identity no longer"
+                " matches %s; refusing to delete it\n", ck->cand_part);
+        return -1;
+    }
+    memcpy(r->candidates_part, ck->cand_part, len + 1);
+    return 1;
 }
 
 /* BOINC volunteers cannot reasonably repair a task's private output files.
@@ -545,6 +614,14 @@ static int boinc_discard_bad_resume(const resume_recovery_t *r,
     int durable_status, inflight_status;
 
     if (!bench_boinc_is_managed()) return 0;
+    if (r->checkpoint_candidate_required &&
+        !r->checkpoint_candidate_known) {
+        fprintf(stderr,
+                "BOINC: this checkpoint refers to candidate output but does"
+                " not carry a verified staging-file identity; refusing to"
+                " discard only part of the saved output\n");
+        return -1;
+    }
     durable_status = recovery_count_read_one(r->retry, &durable);
     if (durable_status == -2) {
         fprintf(stderr, "BOINC: malformed resume-recovery counter %s\n",
@@ -1748,6 +1825,15 @@ static int bench_main_impl(int argc, char **argv)
                     return 1;
                 }
                 if (r == -3) return 1;       /* unreadable: ckpt_read explained */
+                if (!cfg.candidates && ck.cand_bytes &&
+                    bench_boinc_is_managed()) {
+                    const int cr =
+                        resume_recovery_add_checkpoint_candidate(&recovery,
+                                                                 &ck);
+                    if (cr < 0) return 1;
+                    recovery.checkpoint_candidate_required = 1;
+                    recovery.checkpoint_candidate_known = cr > 0;
+                }
                 if (strcmp(ck.fp, fp)) {
                     BOINC_RECOVER_OR_RETURN(
                         "the checkpoint belongs to a different job");
