@@ -300,6 +300,14 @@ entails](bench/STATUS.md#current-size-limits-and-what-lifting-them-entails).
 
 ### Will it fit? VRAM sizing
 
+**`testsieve.sh` reports measured memory per geometry** (see [Sizing a job
+first](#sizing-a-job-first-testsievesh)), which is the better number whenever
+the geometry actually runs. **The formula below is still what you need for the
+case it exists for** — deciding whether the *next size up* will fit. A geometry
+too large for the card aborts at the bucket-array admission check, before any
+memory line is printed, so `testsieve.sh` reports a bare `FAILED:` row and no
+numbers precisely when you most want them.
+
 Two knobs move device memory and they are not interchangeable
 (`bench/RESULTS.md` finding 64):
 
@@ -363,6 +371,39 @@ cd bench
     --qmin 20000000 --qmax 200000000 --points 5 \
     --target-rels 300000000 --geom 15,16384 --geom 15,32768
 ```
+
+Each geometry's block ends with its measured device memory, so the sizing
+question and the yield question are answered by the same run. On the **c183** at
+`15,16384`:
+
+```
+  memory: 3.28 GB in use of 11.94 GB, 8.66 free   <- size from this
+          setup 2.06 GB = bucket array 1.38, factor bases + bitmaps 0.44, trial division context 0.09, cofactor queue 0.15
+          (+1.22 GB of per-q buffers and CUDA context after these marks; do not size from the setup figure)
+```
+
+**Size from the headline, not the breakdown.** This is the same rule as [Do not
+size a job from an aborted startup](#will-it-fit-vram-sizing) above: the
+per-stage marks cover setup only, and per-q buffers plus CUDA's lazily reserved
+per-kernel local memory arrive afterwards. Here that is 1.22 of 3.28 GB — 37%
+of the job, and mostly real job memory rather than context. The breakdown is
+there to show **which knob moves memory**, not how much to budget: at `15,8192`
+the same job reports `bucket array 0.69` against `1.38`, while the cofactor
+queue stays at 0.15 either way.
+
+**Disagreement between samples means the card was busy.** Every sample of a
+geometry allocates identically, so the script compares them and refuses to
+quote a single figure when they differ by more than 0.05 GB. That check exists
+because each stage figure is a difference of two free-memory probes: a
+neighbour allocating or freeing between them lands in whichever stage straddled
+it — observed at 1.57 GB for a cofactor queue that is a fixed 0.15 GB
+regardless of job, geometry or cofactor width. The breakdown names the knob: at
+`15,8192` the same job reports `bucket array 0.69` against `15,16384`'s `1.38`,
+while the cofactor queue stays at 0.15 either way.
+
+That makes the formula in [Will it fit?](#will-it-fit-vram-sizing) a
+cross-check rather than the primary method — test-sieve the geometries you are
+considering and read the number off.
 
 When `--fb1` is omitted, `fbase` is the managed cache stem. Before sieving,
 the script compares its embedded polynomial, `lim`, and `maxbits` metadata with

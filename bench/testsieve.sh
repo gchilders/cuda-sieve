@@ -327,6 +327,72 @@ echo
 
 ROWS="$TMP/rows.txt"; : > "$ROWS"
 
+# Device memory for the geometry just sampled.
+#
+# WHY IT BELONGS HERE. This script answers "should I commit days to this job?",
+# and "will it fit on the card?" is half of that question. Memory is a function
+# of geometry and lims, not of q, so it is constant across a geometry's samples
+# and belongs in that block's footer rather than as a tenth column.
+#
+# THE HEADLINE IS THE STEADY-STATE TOTAL, and the breakdown is explicitly NOT a
+# sizing figure. RUNBOOK "Do not size a job from an aborted startup" has said so
+# since before this footer existed: the per-stage table covers only what is
+# allocated during setup, and per-q buffers plus CUDA's lazily-reserved
+# per-kernel local memory arrive afterwards. On the c183 at 15e that gap is
+# 1.22 of 3.28 GB -- 37% of the job, most of it real job memory rather than
+# context. An earlier version of this footer called the setup sum "this job"
+# and told the operator to plan with it, which would have under-sized every
+# job by roughly that much. The breakdown is here to show WHICH KNOB moves
+# memory (bucket array vs factor base), not how much to budget.
+#
+# Contention shows up as disagreement between samples. Each stage figure is a
+# difference of two free-memory probes, so a neighbour allocating or freeing
+# between them lands in whichever stage straddled it -- observed at 1.57 GB for
+# a cofactor queue that is a fixed 0.15 GB. The samples are all the same
+# geometry, so their totals must agree; when they do not, the card was busy and
+# neither number should be trusted.
+report_memory() {   # $@ = this geometry's bench output files
+    awk '
+      FNR == 1 { stage_done = (nstage > 0) }
+      /device memory by stage/ { inb = 1; next }
+      inb && / GB   \(/ {
+          if (stage_done) next
+          for (i = 1; i <= NF; i++) if ($i == "GB") { v = $(i-1); break }
+          lbl = ""; for (j = 1; j < i-1; j++) lbl = lbl (j > 1 ? " " : "") $j
+          # A negative delta means a neighbour FREED between the two probes.
+          # Report it rather than summing it into a smaller-looking job.
+          if (v + 0 < 0) bad = 1
+          parts = parts (nstage++ ? ", " : "") lbl " " v
+          sum += v
+          next
+      }
+      /steady state/ {
+          inb = 0
+          u = $5 + 0; card = $10; f = $12; gsub(/\(/, "", f)
+          if (nuse == 0 || u < lo) lo = u
+          if (nuse == 0 || u > hi) hi = u
+          nuse++; last_free = f
+      }
+      END {
+          if (nuse == 0) { print "  memory: not reported (no sample completed)"; exit }
+          spread = hi - lo
+          if (spread > 0.05)
+              printf "  memory: %.2f-%.2f GB in use of %s GB across %d samples --" \
+                     " THE CARD WAS BUSY, re-measure idle\n", lo, hi, card, nuse
+          else
+              printf "  memory: %.2f GB in use of %s GB, %s free   <- size from this\n",
+                     hi, card, last_free
+          if (nstage == 0 || bad || sum <= 0 || sum > hi)
+              print "          setup breakdown unavailable or inconsistent" \
+                    " (a memory probe failed, or the card was busy)"
+          else {
+              printf "          setup %.2f GB = %s\n", sum, parts
+              printf "          (+%.2f GB of per-q buffers and CUDA context after these" \
+                     " marks; do not size from the setup figure)\n", hi - sum
+          }
+      }' "$@"
+}
+
 for geom in "${GEOMS[@]}"; do
     logI=${geom%%,*}; J=${geom##*,}
     geom_fb=$FB
@@ -336,6 +402,7 @@ for geom in "${GEOMS[@]}"; do
     printf '  %-12s %-8s %-9s %-10s %-12s %-9s %-8s %-8s %-8s\n' \
            q0 pairs exp-pairs n-yield exp-rel rel/pair ms/pair rel/s board_W
     PREV="$TMP/prev.txt"
+    MEM_SRCS=()
     : > "$PREV"
     for i in $(seq 0 $((POINTS - 1))); do
         # Linear spacing. Yield falls smoothly with q, so the trapezoid rule
@@ -362,6 +429,10 @@ for geom in "${GEOMS[@]}"; do
               "$(grep -iE 'error|cannot|refus|does not fit' "$TMP/$tag.out" | head -1 | cut -c1-56)"
             continue
         fi
+        # EVERY sample, not just the first. They are the same geometry, so
+        # they must report the same memory; disagreement is the contention
+        # signal, and it is free to collect since the runs already happened.
+        grep -q 'steady state' "$TMP/$tag.out" && MEM_SRCS+=("$TMP/$tag.out")
         pairs=$(grep -oP -- '--- band of \K[0-9]+' "$TMP/$tag.out" | head -1)
         rel=$(grep -oP 'total relations\s+\K[0-9]+' "$TMP/$tag.out" | tail -1)
         # COMPLETE, not the plain 'wall clock per q'. The plain line excludes
@@ -406,6 +477,7 @@ open(rows,"a").write("%s %d %d %d %.9f %.9f %.6f %.3f\n" %
 open(prev_file,"w").write("%d %.9f\n" % (q0,nrel))
 EOF
     done
+    [ ${#MEM_SRCS[@]} -eq 0 ] || report_memory "${MEM_SRCS[@]}"
     echo
 done
 
