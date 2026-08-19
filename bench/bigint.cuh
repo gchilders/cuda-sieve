@@ -28,6 +28,9 @@
 #define CUDA_SIEVE_BIGINT_CUH
 
 #include <stdint.h>
+/* BN_MULHI64's MSVC branch calls bench_mulhi_u64; include its declaration
+ * here rather than relying on an includer having pulled platform.h in. */
+#include "platform.h"
 
 #define BN_LIMBS 8                      /* 8 x 32 = 256 bits */
 

@@ -21,13 +21,20 @@
 
 # Build products
 *.o
+# MSVC objects and executable from bench/build_windows.bat. Untracked build
+# products set the build stamp's -dirty flag (see the note further down), so
+# one Windows build would otherwise brand every later build in the same
+# checkout -- including a WSL/Linux one -- as dirty.
+*.obj
 bench/bench
+bench/bench.exe
 bench/fbtest
 bench/fbgen
 bench/sqgentest
 bench/dumpcmp
 bench/mkcofbatch
 bench/ckpttest
+bench/stoptest
 bench/.arch.stamp
 bench/.boinc.stamp
 bench/.link.stamp

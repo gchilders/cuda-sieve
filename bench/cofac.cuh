@@ -80,6 +80,11 @@
 
 #include <stdint.h>
 #include <errno.h>          /* strtoull ERANGE in the relation gate */
+/* Directly, not by luck of translation-unit ordering: this header calls
+ * bench_mul_u64_wide, bench_u128_take32, bench_seek_end and friends, and it
+ * compiled only because bench_kernels.cu happens to include platform.h first.
+ * Any new .cu that includes this one would fail on MSVC without it. */
+#include "platform.h"
 
 #define CF_OK         0   /* fully split, every prime within lpb */
 #define CF_DEAD       1   /* a prime factor exceeds 2^lpb: never a relation */
@@ -2041,6 +2046,14 @@ static uint64_t cf_bn_divmod_u64(bn_t *x, uint64_t d)
     return rem;
 }
 
+/* REQUIRES a < m and b < m. That was a free-standing nicety while this was
+ * __int128 arithmetic, which just computes the remainder whatever the inputs.
+ * It is load-bearing now: bench_div_u128_u64 is _udiv128 on MSVC x64, and
+ * _udiv128 raises a hardware divide-overflow (#DE) when the quotient does not
+ * fit 64 bits. a, b < m keeps a*b < m^2 and so the quotient below m, which is
+ * the only thing standing between this and a Windows-only crash in the
+ * primality test. cf_is_prime64 reduces its witnesses (W[i] % n) for exactly
+ * this reason; a future caller that does not must reduce first. */
 static uint64_t cf_mulmod64(uint64_t a, uint64_t b, uint64_t m)
 {
     const bench_u128_t v = bench_mul_u64_wide(a, b);
@@ -2257,28 +2270,32 @@ extern "C" int check_relations_sample(const char *path, const poly_t *poly,
     char *line = NULL, **keep = NULL;
     size_t cap = 0;
     uint32_t nok = 0, nbad = 0, nprime = 0, ncomp = 0, nonprim = 0, seen = 0, nkeep = 0;
-    long long size, end, head_end = 0;
+    int64_t size, end, head_end = 0;
     if (checked) *checked = 0;
     if (!f) { perror(path); return -1; }
     if (td_build_poly(&tp[1], poly, 1) || td_build_poly(&tp[0], poly, 0)) {
         fprintf(stderr, "resume: polynomial does not fit\n");
         fclose(f); return -1;
     }
-    if (fseek(f, 0, SEEK_END) != 0 || (size = ftell(f)) <= 0) goto done;
+    /* 64-bit throughout: `long` is 32 bits on Windows, and this gate exists
+     * for multi-gigabyte .part files. A 32-bit ftell there returns -1 and the
+     * <= 0 test below would send us straight to done:, reporting "spot-checked
+     * 0 relations" as a PASS and admitting a .part from any other job. */
+    if (bench_seek_end(f) != 0 || (size = bench_tell(f)) <= 0) goto done;
     /* `limit` is the checkpointed prefix, and everything past it is about to be
      * truncated away. Stopping here is not an optimisation: a kill -9 leaves a
      * torn final line beyond the checkpoint, and sampling it would report a
      * corrupt file and refuse a resume that is in fact perfectly sound. */
-    end = (limit && (long long)limit < size) ? (long long)limit : size;
+    end = (limit && (int64_t)limit < size) ? (int64_t)limit : size;
     rewind(f);
     while (seen < n && bench_getline(&line, &cap, f) > 0) {
         int r;
-        if (ftell(f) > end) break;      /* the line crosses the prefix end */
+        if (bench_tell(f) > end) break; /* the line crosses the prefix end */
         r = cf_check_one(line, tp, lpb0, lpb1, &nprime, &ncomp, &nonprim);
         if (r < 0) continue;
         seen++;
         if (r) nok++; else nbad++;
-        head_end = ftell(f);
+        head_end = bench_tell(f);
     }
     /* The tail matters more than the head: a truncated or mis-joined write
      * lands there, and the head of a resumed file was already checked by
@@ -2289,9 +2306,9 @@ extern "C" int check_relations_sample(const char *path, const poly_t *poly,
          * checked twice and `seen`, `nok` and `nbad` all double -- a 6-relation
          * file reporting "spot-checked 12 relations", and one bad line
          * reported as two. */
-        long long off = end > TAILWIN ? end - TAILWIN : 0;
+        int64_t off = end > TAILWIN ? end - TAILWIN : 0;
         if (off < head_end) off = head_end;
-        if (off < end && fseek(f, (long)off, SEEK_SET) == 0) {
+        if (off < end && bench_seek(f, (uint64_t)off) == 0) {
             /* Only resync to a line boundary when the window was cut mid-file;
              * head_end is already one. */
             if (off && off != head_end) {
@@ -2300,7 +2317,7 @@ extern "C" int check_relations_sample(const char *path, const poly_t *poly,
             keep = (char **)calloc(n, sizeof *keep);
             if (!keep) goto done;
             while (bench_getline(&line, &cap, f) > 0) {
-                if (ftell(f) > end) break;
+                if (bench_tell(f) > end) break;
                 if (line[0] == '#' || line[0] == '\n') continue;
                 free(keep[nkeep % n]);
                 keep[nkeep % n] = bench_strdup(line);
@@ -2440,7 +2457,22 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
     char tmp[2048];
 
     if (!f) { perror(path); return -1; }
-    fseek(f, 0, SEEK_END); sz = (size_t)ftell(f); fseek(f, 0, SEEK_SET);
+    /* 64-bit sizing, then an explicit range check before the cast to size_t.
+     * A 32-bit ftell on Windows wraps for anything past 2 GB, and a wrapped
+     * positive value would be read back as a complete file -- fread returns
+     * exactly the short count asked for, so the truncation passes the check
+     * below and the batch silently splits a prefix of its input. */
+    {
+        int64_t fsz;
+        if (bench_seek_end(f) || (fsz = bench_tell(f)) < 0 || bench_seek(f, 0)) {
+            perror(path); fclose(f); return -1;
+        }
+        if ((uint64_t)fsz > (uint64_t)(SIZE_MAX - 1)) {
+            fprintf(stderr, "cofac: %s is too large to read into memory\n", path);
+            fclose(f); return -1;
+        }
+        sz = (size_t)fsz;
+    }
     buf = (char *)malloc(sz + 1);
     if (!buf || fread(buf, 1, sz, f) != sz) { fprintf(stderr, "cofac: read failed\n"); fclose(f); free(buf); return -1; }
     buf[sz] = 0; fclose(f);
@@ -2580,7 +2612,7 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
 
     if (out) {
         snprintf(tmp, sizeof tmp, "%s.part", out);
-        fo = fopen(tmp, "w");
+        fo = fopen(tmp, "wb");   /* wire format: see run_pipeline */
         if (!fo) { perror(tmp); return -1; }
         setvbuf(fo, NULL, _IOFBF, 1 << 22);
     }

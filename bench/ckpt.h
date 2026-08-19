@@ -51,7 +51,10 @@ extern "C" {
  * startup checks, takes the lock, sieves -- and then fails at every checkpoint,
  * so ckpt_written never becomes 1 and a clean stop discards the .part holding
  * the whole session. */
-#define CKPT_PATH_MAX 2048
+/* Defined from the platform layer's limit rather than repeating the number:
+ * bench_sync_parent and friends size their buffers from BENCH_PATH_MAX, and
+ * two independent 2048s would silently disagree the first time either moved. */
+#define CKPT_PATH_MAX BENCH_PATH_MAX
 /* Longest suffix appended below: ".part.recover.tmp" is 17 bytes. */
 #define CKPT_SUFFIX_MAX 20
 
@@ -275,7 +278,11 @@ static inline int ckpt_write(const char *relations, const poly_t *P,
         (ck->cand_part[0] &&
          ckpt_path_hex_encode(ck->cand_part, cand_hex, sizeof cand_hex)))
         return -1;
-    if (!(f = fopen(tmp, "w"))) { perror(tmp); return -1; }
+    /* Binary, so a sidecar is byte-identical whichever platform wrote it.
+     * The reader below already tolerates a stray \r on every field, so this
+     * is not a fix; it keeps a checkpoint moved between a Windows and a Linux
+     * host the same file rather than a differently-encoded equivalent. */
+    if (!(f = fopen(tmp, "wb"))) { perror(tmp); return -1; }
     ckpt_job_text(P, cfg, text, sizeof text);
     fprintf(f, "# cuda-sieve resume checkpoint. Delete this file to force a"
                " fresh run.\n");
@@ -319,7 +326,7 @@ static inline int ckpt_read(const char *relations, ckpt_t *ck)
      * nothing about what is on disk, and telling an operator to discard a
      * resumable .part on that basis is the one answer that loses work. */
     if (ckpt_ckpt_path(relations, path, sizeof path)) return -2;
-    if (!(f = fopen(path, "r"))) {
+    if (!(f = fopen(path, "rb"))) {
         if (errno == ENOENT) return -1;
         perror(path);
         return -3;
@@ -424,7 +431,9 @@ again:
     fd = bench_lock_create(path);
     if (fd < 0) {
         if (errno == EEXIST) {
-            FILE *f = fopen(path, "r");
+            /* Written with a raw fd below, so it is LF-only on every
+             * platform; read it the same way. */
+            FILE *f = fopen(path, "rb");
             long other = 0;
             if (f) { if (fscanf(f, "%ld", &other) != 1) other = 0; fclose(f); }
             if (!retried && other > 0 && !bench_process_exists(other)) {

@@ -296,6 +296,9 @@ dumpcmp: dumpcmp.c $(DEFS_STAMP) $(CF_LMAX_STAMP)
 ckpttest: ckpttest.c ckpt.h bench.h platform.o $(DEFS_STAMP) $(CF_LMAX_STAMP)
 	$(CC) $(CFLAGS) -o $@ ckpttest.c platform.o -lm
 
+stoptest: stoptest.c platform.h platform.o $(DEFS_STAMP) $(CF_LMAX_STAMP)
+	$(CC) $(CFLAGS) -o $@ stoptest.c platform.o -lm
+
 # joins the two per-side --emit-cof files into cofactorisation batch input
 mkcofbatch: mkcofbatch.c $(DEFS_STAMP) $(CF_LMAX_STAMP)
 	$(CC) $(CFLAGS) -o $@ $< -lm
@@ -312,18 +315,24 @@ mkcofbatch: mkcofbatch.c $(DEFS_STAMP) $(CF_LMAX_STAMP)
 -include $(OBJS:.o=.d)
 
 clean:
-	rm -f bench fbtest fbgen sqgentest dumpcmp mkcofbatch ckpttest *.o *.d $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP) $(GIT_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP)
+	rm -f bench fbtest fbgen sqgentest dumpcmp mkcofbatch ckpttest stoptest *.o *.d $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP) $(GIT_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP)
 
-.PHONY: all clean check ckptcheck cofcheck fbgencheck sqgencheck walkcheck
+.PHONY: all clean check ckptcheck stopcheck cofcheck fbgencheck sqgencheck walkcheck
 
 # `check` depended on fbtest alone, so the whole CUDA path -- kernels, the
 # cofactoriser, the pipeline -- could fail to compile while the gates reported
 # "all gates passed". Depend on `all`.
-check: all ckptcheck cofcheck fbgencheck sqgencheck walkcheck
+check: all ckptcheck stopcheck cofcheck fbgencheck sqgencheck walkcheck
 	./fbtest --fb1 ../oracle/c183.fb1
 
 ckptcheck: ckpttest
 	./ckpttest
+
+# The clean-stop hook. A CPU gate, like ckptcheck: it needs no card and no
+# oracle input, and it guards a path -- signal disposition around the band --
+# whose regression is silent until an operator asks a real run to stop.
+stopcheck: stoptest
+	./stoptest
 
 # The lattice-walk gate, which nothing used to run. `--verify` is refused under
 # --pipeline (harness_only), and cofcheck/testsieve/every band run use

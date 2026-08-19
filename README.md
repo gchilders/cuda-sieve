@@ -203,6 +203,32 @@ build_windows.bat
 ```
 
 Leave `GPU_ARCH` unset for the same portable fat-binary targets as the Linux
-Makefile, or set it to a bare compute capability such as `86`, `89`, or `120`.
+Makefile, or set it to `native` to target the card in this machine, or to a
+bare compute capability such as `86`, `89`, or `120`. It is validated the same
+way the Makefile validates it: `sm_86` and `8.6` are rejected with an
+explanation rather than passed through to an opaque ptxas error.
+
+`CF_LMAX` (`3` or `4`, default `4`) and `DEFS` work as they do in the
+Makefile, and the build stamp is set the same way, so a Windows run log names
+the commit it was built from rather than `unknown`. Objects are compiled
+`/MT`, so `bench.exe` does not need the Visual C++ redistributable on a
+volunteer host. `build_windows.bat clean` removes the objects and the
+executable.
+
 The script builds `bench.exe`; the standalone Linux-oriented helper/test tools
 remain under the Makefile.
+
+Relations, candidate files and checkpoints are written in binary mode on both
+platforms, so a Windows build produces byte-identical relation output to a
+Linux one — the same bytes to hand to msieve or CADO, not a CRLF variant of
+them. Note that the checkpoint additionally records the staging file's
+identity (inode on POSIX, volume plus file index on Windows) to gate automatic
+recovery, and that identity is meaningful only on the host that wrote it;
+moving a `.part` and its sidecar between a Linux and a Windows machine
+mid-band is not a supported resume.
+
+One platform difference is worth knowing: on Windows a task stopped with
+`TerminateProcess` — which is how the BOINC client and most job queues stop
+one — runs no handler at all, so it cannot checkpoint on the way out. Use
+`--stop-file` to ask for a clean, checkpointed stop there. Ctrl-C, Ctrl-Break
+and closing the console window are handled.

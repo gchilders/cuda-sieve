@@ -1,5 +1,6 @@
 /* GGNFS .afb.0 loader. Format decoded in oracle/ggnfs_afb_format.txt. */
 #include "bench.h"
+#include "platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,17 +55,23 @@ static int composite_is_prime_power(uint32_t q)
 int fb_load(const char *path, fb_t *fb)
 {
     FILE *f = fopen(path, "rb");
-    long sz;
+    int64_t sz;
     uint32_t n;
     size_t got;
 
     memset(fb, 0, sizeof(*fb));
     if (!f) { fprintf(stderr, "fb_load: cannot open %s\n", path); return -1; }
-    fseek(f, 0, SEEK_END); sz = ftell(f); fseek(f, 0, SEEK_SET);
+    /* 64-bit: `long` is 32 bits on Windows, where a wrapped size would pass
+     * the header-consistency test below against a bogus bound. */
+    if (bench_seek_end(f) || (sz = bench_tell(f)) < 0 || bench_seek(f, 0)) {
+        fprintf(stderr, "fb_load: cannot size %s\n", path);
+        fclose(f); return -1;
+    }
 
     if (fread(&n, 4, 1, f) != 1) { fclose(f); return -1; }
-    if (n == 0 || (long)(4 * (1 + 2ull * n)) > sz) {
-        fprintf(stderr, "fb_load: header count %u inconsistent with size %ld\n", n, sz);
+    if (n == 0 || (int64_t)(4 * (1 + 2ull * n)) > sz) {
+        fprintf(stderr, "fb_load: header count %u inconsistent with size %lld\n",
+                n, (long long)sz);
         fclose(f); return -1;
     }
 

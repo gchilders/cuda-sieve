@@ -107,6 +107,16 @@ static int big_parse(sbig_t *a, const char *s)
     return 0;
 }
 
+/* Signed bignum arithmetic, reachable only from the root finder -- which the
+ * library build excludes, so all of it is dead there and -Wall -Wextra reports
+ * every function. The chain is big_abs_cmp/add/sub -> big_add -> ... ->
+ * zpoly_linear_comp -> all_roots_affine, so it has to be cut at the top rather
+ * than at whichever function happens to warn first.
+ *
+ * The block ends BEFORE big_mod_ui, and big_norm above stays outside it: both
+ * are reachable from the streaming special-q generator the main executable
+ * actually links. That is the only reason this is two blocks and not one. */
+#ifndef FBGEN_LIBRARY
 static int big_abs_cmp(const sbig_t *a, const sbig_t *b)
 {
     int i;
@@ -200,6 +210,8 @@ static uint32_t big_div_ui(sbig_t *a, uint32_t d)
     return (uint32_t)rem;
 }
 
+#endif /* !FBGEN_LIBRARY */
+
 /* Signed a modulo m, in [0,m). */
 static uint32_t big_mod_ui(const sbig_t *a, uint32_t m)
 {
@@ -210,6 +222,14 @@ static uint32_t big_mod_ui(const sbig_t *a, uint32_t m)
     return (uint32_t)r;
 }
 
+/* Used only by all_roots_affine/all_roots, which are themselves inside the
+ * #ifndef FBGEN_LIBRARY block below. The main executable links fbgen only for
+ * its streaming special-q generator, so in that build these are unreachable
+ * and -Wall -Wextra reports each one. big_p_val and binom_small are in here
+ * for the same reason even though they do not warn today: they are reachable
+ * only through the other three, so excluding those alone would just move the
+ * warning onto them. */
+#ifndef FBGEN_LIBRARY
 static int big_p_val(const sbig_t *a, uint32_t p)
 {
     sbig_t t = *a;
@@ -272,6 +292,8 @@ static void zpoly_linear_comp(zpoly_t *g, const zpoly_t *f, uint32_t a, uint32_t
         g->c[j] = sum;
     }
 }
+
+#endif /* !FBGEN_LIBRARY */
 
 /* ---- polynomials over F_p ------------------------------------------ */
 

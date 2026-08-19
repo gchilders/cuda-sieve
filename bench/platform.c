@@ -15,6 +15,7 @@
 #include <process.h>
 #include <windows.h>
 #else
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/types.h>
@@ -64,6 +65,17 @@ int bench_seek(FILE *f, uint64_t off)
 #endif
 }
 
+/* Seek to end. Separate from bench_seek because that one is SEEK_SET-only and
+ * takes an unsigned offset; sizing a file needs the whence, not an offset. */
+int bench_seek_end(FILE *f)
+{
+#ifdef _WIN32
+    return _fseeki64(f, 0, SEEK_END);
+#else
+    return fseeko(f, 0, SEEK_END);
+#endif
+}
+
 int bench_truncate(FILE *f, uint64_t off)
 {
     if (off > (uint64_t)INT64_MAX) { errno = EOVERFLOW; return -1; }
@@ -85,6 +97,83 @@ int bench_fstat_stream(FILE *f, bench_stat_t *st)
 #else
     return fstat(fileno(f), st);
 #endif
+}
+
+/* ---- durable file identity --------------------------------------------- */
+
+#ifdef _WIN32
+/* One place that turns a Win32 handle into an id, so the stream and path
+ * forms cannot drift. FILE_SHARE_DELETE matters: the candidate staging file
+ * is open in this process while we ask, and without it the open below fails
+ * with a sharing violation on the very file we are asking about. */
+static int bench_file_id_from_handle(HANDLE h, bench_file_id_t *id)
+{
+    BY_HANDLE_FILE_INFORMATION bhfi;
+    if (h == INVALID_HANDLE_VALUE || !GetFileInformationByHandle(h, &bhfi)) {
+        errno = EINVAL;
+        return -1;
+    }
+    id->volume = (uint64_t)bhfi.dwVolumeSerialNumber;
+    id->index  = ((uint64_t)bhfi.nFileIndexHigh << 32) |
+                 (uint64_t)bhfi.nFileIndexLow;
+    return 0;
+}
+#endif
+
+int bench_file_id_stream(FILE *f, bench_file_id_t *id)
+{
+#ifdef _WIN32
+    return bench_file_id_from_handle((HANDLE)_get_osfhandle(_fileno(f)), id);
+#else
+    struct stat st;
+    if (fstat(fileno(f), &st)) return -1;
+    id->volume = (uint64_t)st.st_dev;
+    id->index  = (uint64_t)st.st_ino;
+    return 0;
+#endif
+}
+
+int bench_file_id_path(const char *path, bench_file_id_t *id)
+{
+#ifdef _WIN32
+    /* FILE_FLAG_BACKUP_SEMANTICS so a directory can be asked too; the access
+     * mask is 0 because we want metadata only and must not disturb the
+     * writer holding the file open. Preserve ENOENT: the caller distinguishes
+     * "gone" (safe) from "cannot tell" (refuse). */
+    HANDLE h = CreateFileA(path, 0,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    int rc;
+    if (h == INVALID_HANDLE_VALUE) {
+        const DWORD e = GetLastError();
+        errno = (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND)
+                ? ENOENT : EACCES;
+        return -1;
+    }
+    rc = bench_file_id_from_handle(h, id);
+    CloseHandle(h);
+    return rc;
+#else
+    struct stat st;
+    if (stat(path, &st)) return -1;
+    id->volume = (uint64_t)st.st_dev;
+    id->index  = (uint64_t)st.st_ino;
+    return 0;
+#endif
+}
+
+/* An all-zero id is "the filesystem would not say" -- a FAT volume, or a
+ * network redirector that does not supply a file index. It is not an identity
+ * and must never be compared as one. */
+int bench_file_id_valid(const bench_file_id_t *id)
+{
+    return id->volume != 0 || id->index != 0;
+}
+
+int bench_file_id_equal(const bench_file_id_t *a, const bench_file_id_t *b)
+{
+    return bench_file_id_valid(a) && bench_file_id_valid(b) &&
+           a->volume == b->volume && a->index == b->index;
 }
 
 int bench_stat_path(const char *path, bench_stat_t *st)
@@ -149,7 +238,11 @@ int bench_sync_parent(const char *path)
     (void)path;
     return 0;
 #else
-    char dir[2048];
+    /* Sized from the longest path the callers can hand over, not a constant
+     * that happens to equal it today: every caller's buffer is CKPT_PATH_MAX,
+     * and a hardcoded 2048 would start returning ENAMETOOLONG the moment that
+     * grew. The parent is always shorter than the path itself. */
+    char dir[BENCH_PATH_MAX];
     const char *slash = strrchr(path, '/');
     int fd, rc, saved;
     if (!slash) {
@@ -238,6 +331,18 @@ int bench_localtime(const time_t *t, struct tm *out)
 #endif
 }
 
+/* UTC. runlog_stamp uses this on Windows, where MSVC's strftime has no %z and
+ * a local timestamp could not carry its offset -- an unambiguous UTC stamp
+ * beats a local one whose zone is not recorded. */
+int bench_gmtime(const time_t *t, struct tm *out)
+{
+#ifdef _WIN32
+    return gmtime_s(out, t) == 0 ? 0 : -1;
+#else
+    return gmtime_r(t, out) ? 0 : -1;
+#endif
+}
+
 int64_t bench_getline(char **line, size_t *cap, FILE *f)
 {
 #ifdef _WIN32
@@ -272,11 +377,101 @@ int64_t bench_getline(char **line, size_t *cap, FILE *f)
 #endif
 }
 
+/* Exit without running atexit handlers or flushing stdio.
+ *
+ * Called from the clean-stop callback, which is signal context on POSIX, and
+ * _exit is the async-signal-safe way out; flushing stdio from a handler is
+ * not. MSVC provides _exit with the same semantics, so there is no #ifdef
+ * here -- the one this replaces had two byte-identical branches, which told a
+ * reader the platforms differed when they do not. */
 void bench_fast_exit(int code)
 {
+    _exit(code);
+}
+
+/* ---- clean-stop hook ---------------------------------------------------- */
+
+static bench_stop_handler_t g_stop_fn = NULL;
+
 #ifdef _WIN32
-    _exit(code);
+static BOOL WINAPI bench_console_ctrl(DWORD type)
+{
+    switch (type) {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+    case CTRL_CLOSE_EVENT:
+    case CTRL_LOGOFF_EVENT:
+    case CTRL_SHUTDOWN_EVENT:
+        if (g_stop_fn) g_stop_fn();
+        /* TRUE: handled, so the CRT's own handler further down the chain does
+         * not also raise SIGINT and count the same request twice. */
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
 #else
-    _exit(code);
+static void (*g_old_int)(int)  = SIG_ERR;
+static void (*g_old_term)(int) = SIG_ERR;
+
+static void bench_on_signal(int sig)
+{
+    (void)sig;
+    if (g_stop_fn) g_stop_fn();
+}
+#endif
+
+int bench_stop_hook_install(bench_stop_handler_t fn)
+{
+    g_stop_fn = fn;
+#ifdef _WIN32
+    return SetConsoleCtrlHandler(bench_console_ctrl, TRUE) ? 0 : -1;
+#else
+    g_old_int  = signal(SIGINT,  bench_on_signal);
+    g_old_term = signal(SIGTERM, bench_on_signal);
+    return (g_old_int == SIG_ERR && g_old_term == SIG_ERR) ? -1 : 0;
+#endif
+}
+
+void bench_stop_hook_remove(void)
+{
+#ifdef _WIN32
+    SetConsoleCtrlHandler(bench_console_ctrl, FALSE);
+#else
+    if (g_old_int  != SIG_ERR) signal(SIGINT,  g_old_int);
+    if (g_old_term != SIG_ERR) signal(SIGTERM, g_old_term);
+    g_old_int = g_old_term = SIG_ERR;
+#endif
+    g_stop_fn = NULL;
+}
+
+/* ---- run-time dynamic loading ------------------------------------------ */
+
+void *bench_dlopen(const char *name)
+{
+#ifdef _WIN32
+    return (void *)LoadLibraryA(name);
+#else
+    return dlopen(name, RTLD_LAZY | RTLD_LOCAL);
+#endif
+}
+
+void bench_dlsym(void *lib, const char *name, void *slot)
+{
+#ifdef _WIN32
+    FARPROC p = GetProcAddress((HMODULE)lib, name);
+#else
+    void *p = dlsym(lib, name);
+#endif
+    memcpy(slot, &p, sizeof p);
+}
+
+void bench_dlclose(void *lib)
+{
+    if (!lib) return;
+#ifdef _WIN32
+    FreeLibrary((HMODULE)lib);
+#else
+    dlclose(lib);
 #endif
 }
