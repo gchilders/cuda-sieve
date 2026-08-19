@@ -110,6 +110,30 @@ $(shell [ "$$(cat $(ARCH_STAMP) 2>/dev/null)" = '$(NVCC_ARCH)' ] || printf '%s' 
 # would be indistinguishable from real output.
 DEFS      ?=
 
+# Widest cofactor the build carries, in 32-bit limbs: 3 = 96-bit residuals,
+# 4 = 128-bit. See "cofactor WIDTH" in bench.h.
+#
+# ITS OWN VARIABLE, NOT A DEFS VALUE, and that distinction is the point. Any
+# non-empty DEFS marks a PRICING build: bench refuses to emit relations from
+# one, because the -D's it exists for change the norm or the survivor bound and
+# a relation file would not say so. CF_LMAX is categorically different -- it
+# adds or removes a template instantiation and the cofcheck gate pins the
+# output of a 3-limb and a 4-limb run as byte-identical -- so a CF_LMAX=3
+# binary is shippable and must not be branded unshippable. Riding on DEFS made
+# `make DEFS=-DCF_LMAX=3` build a binary that refused --relations, which is how
+# this was found.
+#
+# Stamped like GPU_ARCH and DEFS, for the same reason: objects carry no record
+# of the -D's that built them, so switching the width on an existing tree would
+# report everything up to date and link the previous binary.
+CF_LMAX ?= 4
+ifeq ($(filter 3 4,$(CF_LMAX)),)
+$(error CF_LMAX must be 3 (96-bit cofactors) or 4 (128-bit) -- got "$(CF_LMAX)")
+endif
+CF_LMAX_STAMP := .cflmax.stamp
+$(shell [ "$$(cat $(CF_LMAX_STAMP) 2>/dev/null)" = '$(CF_LMAX)' ] || printf '%s' '$(CF_LMAX)' > $(CF_LMAX_STAMP))
+CF_LMAX_DEF := -DCF_LMAX=$(CF_LMAX)
+
 # Optional BOINC application build.  Keep BOINC dependencies out of the default
 # executable; HAVE_BOINC=1 adds the compile-time API gate and the libraries.
 # BOINC_CPPFLAGS should point at directories containing boinc_api.h and its
@@ -150,11 +174,11 @@ CUDART_LINK ?= static
 # gencode list above is otherwise walked serially, which is where the bulk of a
 # fat build goes; see the timing table. Harmless when GPU_ARCH picks one target.
 NVCC_FLAGS = $(NVCC_ARCH) -t 0 -O3 -std=c++17 -lineinfo -MMD -MP \
-             -Xcompiler "-O3 -Wall" $(DEFS) $(BOINC_DEFS) $(BOINC_CPPFLAGS)
+             -Xcompiler "-O3 -Wall" $(DEFS) $(CF_LMAX_DEF) $(BOINC_DEFS) $(BOINC_CPPFLAGS)
 CFLAGS     = -O3 $(HOST_TUNE) -Wall -Wextra -std=c11 -MMD -MP \
-             $(DEFS) $(BOINC_DEFS)
+             $(DEFS) $(CF_LMAX_DEF) $(BOINC_DEFS)
 CXXFLAGS   = -O3 $(HOST_TUNE) -Wall -Wextra -std=c++17 -MMD -MP \
-             $(DEFS) $(BOINC_DEFS) $(BOINC_CPPFLAGS)
+             $(DEFS) $(CF_LMAX_DEF) $(BOINC_DEFS) $(BOINC_CPPFLAGS)
 
 CU_SRCS  = bench_main.cu bench_kernels.cu
 C_SRCS   = fb_load.c verify_cpu.c poly.c primes.c rfb.c fb_cado.c
@@ -208,7 +232,7 @@ $(shell { [ -f $(DEFS_STAMP) ] && [ "$$(cat $(DEFS_STAMP))" = '$(DEFS)' ]; } || 
 # without going through $(OBJS). Those two escaped the stamp, so
 # `make DEFS=... dumpcmp` reported "up to date" and linked a binary built
 # without the define -- the exact hole the stamp exists to close.
-$(OBJS): $(DEFS_STAMP)
+$(OBJS): $(DEFS_STAMP) $(CF_LMAX_STAMP)
 
 GIT_STAMP := .git.stamp
 GIT_RAW  := $(shell git -C . describe --always --abbrev=8 2>/dev/null)
@@ -263,17 +287,17 @@ fbgen_lib.o: fbgen.c bench.h
 sqgentest: sqgentest.c fbgen_lib.o poly.o primes.o
 	$(CC) $(CFLAGS) -Wl,--gc-sections -o $@ $^ -lm
 
-dumpcmp: dumpcmp.c $(DEFS_STAMP)
+dumpcmp: dumpcmp.c $(DEFS_STAMP) $(CF_LMAX_STAMP)
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
 # CPU-only checkpoint-format gate. In particular, BOINC output paths may
 # contain whitespace after filename resolution, so candidate identity must not
 # depend on the checkpoint parser's ordinary whitespace tokenisation.
-ckpttest: ckpttest.c ckpt.h bench.h $(DEFS_STAMP)
+ckpttest: ckpttest.c ckpt.h bench.h $(DEFS_STAMP) $(CF_LMAX_STAMP)
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
 # joins the two per-side --emit-cof files into cofactorisation batch input
-mkcofbatch: mkcofbatch.c $(DEFS_STAMP)
+mkcofbatch: mkcofbatch.c $(DEFS_STAMP) $(CF_LMAX_STAMP)
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
 %.o: %.cu
@@ -288,7 +312,7 @@ mkcofbatch: mkcofbatch.c $(DEFS_STAMP)
 -include $(OBJS:.o=.d)
 
 clean:
-	rm -f bench fbtest fbgen sqgentest dumpcmp mkcofbatch ckpttest *.o *.d $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP) $(GIT_STAMP) $(DEFS_STAMP)
+	rm -f bench fbtest fbgen sqgentest dumpcmp mkcofbatch ckpttest *.o *.d $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP) $(GIT_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP)
 
 .PHONY: all clean check ckptcheck cofcheck fbgencheck sqgencheck walkcheck
 

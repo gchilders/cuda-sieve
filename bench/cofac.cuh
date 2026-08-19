@@ -16,8 +16,16 @@
  *                               Nothing at 65-80 bits: that is COF_REJECT_GAP.
  *
  * So this is not a general-purpose cofactorizer. It is a few narrow shapes,
- * and the arithmetic is sized to them: 3 limbs (96 bits) on both sides, which
- * covers 2LP and 3LP on either.
+ * and both the arithmetic WIDTH and the METHOD are sized to them PER SIDE,
+ * chosen on the host from that side's mfb and lpb (2026-08-18/19):
+ *
+ *     width   3 limbs (96 bits) up to mfb 96, 4 (128) above    -- CF_LMAX
+ *     method  rho at 2LP, ECM at 3LP                           -- cof_meth[]
+ *
+ * Both rules are in bench.h, both are printed by every run, and both exist
+ * because a real job is one shape on one side and another on the other: AS276
+ * is 2LP/3-limb rational and 3LP/4-limb algebraic. A per-JOB choice of either
+ * is wrong on one side of nearly every job.
  *
  * The rational side was 2 limbs while the special-q always sat on the
  * algebraic side. An SNFS job whose hard side is the rational one (mfbr 88)
@@ -32,8 +40,23 @@
  * "the cost is nil", but "the cost is 0.6% of wall to stop assuming which side
  * is hard". A per-side dispatch would buy that 0.6% back at the price of a
  * second instantiation to keep in step, which is what task #15 removed.
+ * (Per-side dispatch did return on 2026-08-18, but to WIDEN the hard side
+ * rather than narrow the easy one -- the argument above only ever said that
+ * narrowing side 0 was not worth it.)
  *
- * WHY POLLARD-BRENT RHO AND NOT ECM. ECM's appeal on a GPU is that its cost is
+ * WHY POLLARD-BRENT RHO AND NOT ECM. **PARTLY SUPERSEDED 2026-08-19 -- see
+ * RESULTS finding 70. With BOTH methods swept from below to saturated yield,
+ * tuned ECM is ~2x cheaper than rho on the c183 and ~2.7x on AS276, and the
+ * discriminant is the large-prime count: at 2LP rho still wins narrowly, at
+ * 3LP ECM wins 2-4x. Output is byte-identical either way. The
+ * reasoning below is still a correct account of rho's SHAPE -- its cost really
+ * is data-dependent and ECM's really is not -- but the conclusion drawn from
+ * it was wrong, because the comparison that supported it ran ECM at B1=1000
+ * (~4x above optimal for this job's ~30-bit factors) and rho at a budget below
+ * full yield. Both errors favoured rho. The bounded-budget/requeue structure
+ * described below is method-agnostic and is what ECM uses too.**
+ *
+ * The original argument, kept because the requeue design rests on it: ECM's appeal on a GPU is that its cost is
  * data-independent, which rho's emphatically is not -- rho's iteration count is
  * geometric, and a warp runs at its slowest lane. The answer here is not to
  * abandon rho but to BOUND it: every lane gets the same iteration budget per
@@ -71,7 +94,19 @@
                            * silently truncated. mz_split's stack peaks at 3
                            * for a 3-way split, which its `sp + 2 > CF_MAXFAC`
                            * guard admits exactly. Raising this to allow 4LP
-                           * means revisiting that guard, not just this line. */
+                           * means revisiting that guard, not just this line.
+                           *
+                           * NOTE this is a count of PARTS, not of limbs, and
+                           * it is unchanged by the 4-limb work below: a 4-limb
+                           * cofactor is still split into at most 3 large
+                           * primes (128/34 = 3.8, and no job asks for 4LP).
+                           * The two knobs are independent -- CF_LMAX widens
+                           * the residual, CF_MAXFAC counts what comes out. */
+
+/* The cofactor WIDTH machinery -- CF_LMAX, CF_LMIN and cf_limbs_for_mfb --
+ * lives in bench.h, because bench_main.cu has to refuse an out-of-range mfb
+ * and resolve --cof-limbs without pulling in a header full of device code.
+ * Everything that USES the width is here; only the three names are there. */
 
 #if defined(__CUDACC__)
 #define CF_FN __device__ __forceinline__
@@ -995,6 +1030,65 @@ static void cf_run_rounds(const mz<L> *d_n, mz<L> lim2, uint32_t lpb, uint32_t n
     }
 }
 
+/* lim^2 at a given width, or -1 if it does not fit.
+ *
+ * ONE copy, called by both the inline queue and the standalone --cofac path.
+ * It was written out twice, and the comment below argued that keeping it next
+ * to the instantiation is what stops it drifting from the splitter -- an
+ * argument that only holds while there is one such place. lim2 is the
+ * "prime by size" threshold and a wrong one accepts composites as prime, so
+ * the two paths disagreeing about it is exactly the failure to design out. */
+template <int L> static int cf_lim2(mz<L> *out, uint64_t lim)
+{
+    unsigned __int128 v = (unsigned __int128)lim * lim;
+    for (int i = 0; i < L; i++) { out->v[i] = (uint32_t)v; v >>= 32; }
+    if (v) {
+        fprintf(stderr, "  cofac: lim^2 does not fit %d limbs\n", L);
+        return -1;
+    }
+    return 0;
+}
+
+/* Runtime-width entry to the above.
+ *
+ * The queue stores its cofactors as RAW LIMBS, because the stride is a
+ * per-side run-time choice and `mz<3>` and `mz<4>` are different types with
+ * different strides; this is the one place that turns raw limbs back into a
+ * typed `mz<L>*`, so the reinterpret_cast lives here and nowhere else. lim^2
+ * is computed at the same width for the same reason -- a 3-limb lim2 handed to
+ * a 4-limb splitter reads one limb of garbage as the top of the "prime by
+ * size" threshold, and a wrong threshold accepts composites as primes.
+ *
+ * Returns -1 for a width this build does not contain, which is a configuration
+ * error the caller must report rather than silently narrow: narrowing is
+ * exactly the truncation the width machinery exists to prevent. */
+static int cf_run_rounds_dyn(int L, const uint32_t *d_n, uint64_t lim,
+                             uint32_t lpb, uint32_t n, uint8_t *d_status,
+                             uint64_t *d_fac, uint8_t *d_nfac,
+                             const cf_sched_t *S, const cf_work_t *W,
+                             unsigned long long *d_iters,
+                             int blocks, int threads)
+{
+#define CF_RR(LL) do {                                                        \
+        mz<LL> l2;                                                            \
+        if (cf_lim2<LL>(&l2, lim)) return -1;                                 \
+        cf_run_rounds<LL>((const mz<LL> *)d_n, l2, lpb, n, d_status, d_fac,   \
+                          d_nfac, S, W, d_iters, blocks, threads);            \
+        return 0;                                                             \
+    } while (0)
+    switch (L) {
+    case 3: CF_RR(3);
+#if CF_LMAX >= 4
+    case 4: CF_RR(4);
+#endif
+    default: break;
+    }
+#undef CF_RR
+    fprintf(stderr, "  cofac: this build has no %d-limb splitter"
+            " (CF_LMAX = %d)\n", L, CF_LMAX);
+    return -1;
+}
+
 /* ---- the cross-q device queue ------------------------------------------ *
  *
  * A special-q produces about 1,956 joint candidates. That is nothing for this
@@ -1013,16 +1107,28 @@ static void cf_run_rounds(const mz<L> *d_n, mz<L> lim2, uint32_t lpb, uint32_t n
 
 typedef struct {
     uint32_t cap, n, rcap;
-    /* Both sides are 3 limbs. Side 0 used to be mz<2>, which assumed the
-     * rational side's cofactor always fit in 64 bits -- true while the
-     * special-q sat on the algebraic side and the rational mfb was ~60, false
-     * for an SNFS job whose hard side is the rational one (mfbr 88). It also
-     * silently truncated lim0^2 for any rlim above 2^32.
+    /* The two cofactors, narrowed from the 256-bit norm residual to L0/L1
+     * limbs. RAW LIMBS, not mz<L>*: the width is a per-side run-time choice
+     * (see cf_limbs_for_mfb) and mz<3> and mz<4> are distinct types with
+     * distinct strides, so the array cannot carry one of them in its type.
+     * cf_run_rounds_dyn is the only place that casts, and k_cof_enqueue<L0,L1>
+     * is the only writer.
      *
-     * Kept uniform rather than dispatched per side: the rational queue was
-     * 0.04 ms of a 24.49 ms special-q on the c151, so the 2-limb path was
-     * buying nothing worth a second instantiation to keep in step. */
-    mz<3>    *d_c0;   mz<3>   *d_c1;      /* the two cofactors, narrowed */
+     * History worth keeping, because both defects were silent truncations of
+     * exactly this array. Side 0 used to be mz<2>, which assumed the rational
+     * cofactor always fit in 64 bits -- true while the special-q sat on the
+     * algebraic side and the rational mfb was ~60, false for an SNFS job whose
+     * hard side is the rational one (mfbr 88), and it truncated lim0^2 for any
+     * rlim above 2^32. Then both sides were pinned at mz<3>, which is 96 bits
+     * and covers a C194's mfba 95 but not a C208's algebraic side.
+     *
+     * The uniform-width argument that justified pinning both at 3 still holds
+     * for the CHEAP direction -- the rational queue was 0.04 ms of a 24.49 ms
+     * special-q on the c151, so narrowing side 0 buys nothing -- but it never
+     * justified refusing to WIDEN side 1. Hence per-side widths, defaulting to
+     * the narrowest that mfb needs. */
+    uint32_t *d_c0;   uint32_t *d_c1;
+    int      L0, L1;                      /* limbs per side, 3 or 4        */
     uint8_t  *d_st0,  *d_st1;             /* CF_* per side                */
     /* 64-BIT, NOT 32. These two and d_sp0/d_sp1 below hold *resulting primes*,
      * which are bounded by lpb rather than by lim -- so at lpb 33 (a C194 asks
@@ -1038,14 +1144,45 @@ typedef struct {
     uint8_t  *d_nsp0, *d_nsp1;
     uint32_t *d_flag, *d_off, *d_bsum, *d_idx, *d_nrel;
     uint32_t *d_sel, *d_nsel;             /* compacted job list per round  */
-    uint32_t *d_s, ns, ecm_curves; int ecm;   /* ECM stage-1 prime powers  */
+    /* Records whose residual did not fit L0/L1 limbs. Unreachable while
+     * resolve_and_check_cofactor_config holds -- cof_classify has already rejected
+     * anything above mfb, and mfb is refused above 32*L -- so this is an
+     * assertion on that chain, in the same spirit as the rcap check in
+     * cofq_flush. It is one predicated OR per record and it converts the one
+     * failure mode this whole width machinery exists to prevent, a silently
+     * truncated cofactor, from a wrong relation into a loud stop. */
+    uint32_t *d_ovf;
+    uint32_t *d_s, ns, ecm_curves;
+    /* Method PER SIDE, 0 = Pollard-Brent rho, 1 = ECM. Per side and not per
+     * job because the two sides of a real job are usually different shapes:
+     * AS276 is mfbr 64 / lpbr 33 on the rational side (2LP) and
+     * mfba 101 / lpba 35 on the algebraic (3LP), and the measured winner
+     * differs between exactly those two cases -- rho by ~1.1x at 2LP, ECM by
+     * 2-4x at 3LP (RESULTS finding 70). A per-job choice would get one of the
+     * two sides wrong on nearly every job. */
+    int meth[2];
     uint8_t  *d_s2mask; uint32_t s2vmin, s2nv;/* ECM stage-2 schedule      */
     double ms_rat, ms_alg, ms_host;
-    unsigned long long nseen, nrel, ndead, nstuck;
+    unsigned long long nseen, nrel;
+    /* Per side, per CF_* status, accumulated over flushes. `ndead`/`nstuck`
+     * used to be two scalars here that NOTHING ever wrote -- which is the
+     * whole reason a 13.7% yield loss on AS276 (finding 69) and a 0.33% one on
+     * the c183 (finding 70) were invisible for as long as they were: an
+     * exhausted rho budget leaves CF_INCOMPLETE, the record is silently not a
+     * relation, and no counter moved. A stuck count is the ONLY signal that
+     * distinguishes "this job has no more relations" from "the splitter gave
+     * up early", and those look identical in every other number the run
+     * prints. */
+    unsigned long long nst[2][4];
+    unsigned long long *d_nst;            /* 8 counters, device side       */
 } cofq_t;
 
 /* Append one special-q's joint candidates. Everything the relation will need
  * is copied in, because the per-q arrays are overwritten by the next q. */
+/* Templated on BOTH sides' widths because one launch writes both arrays and
+ * they are independent choices. Four instantiations at CF_LMAX=4, none of them
+ * expensive -- this kernel is a copy, not arithmetic. */
+template <int L0, int L1>
 __global__ void k_cof_enqueue(const bn_t *__restrict cof0, const uint8_t *__restrict bits0,
                               const bn_t *__restrict cof1, const uint8_t *__restrict bits1,
                               const int64_t *__restrict a, const int64_t *__restrict b,
@@ -1085,23 +1222,69 @@ __global__ void k_cof_enqueue(const bn_t *__restrict cof0, const uint8_t *__rest
             uint64_t sm = 0;
             bn_t v = cof0[t];
             if ((uint32_t)bits0[t] > lpb0) {
-                Q.d_c0[d].v[0] = v.v[0]; Q.d_c0[d].v[1] = v.v[1];
-                Q.d_c0[d].v[2] = v.v[2];
-                Q.d_sm0[d] = 0; Q.d_st0[d] = CF_INCOMPLETE;
+                uint32_t hi = 0;
+                #pragma unroll
+                for (int i = 0; i < L0; i++) Q.d_c0[(size_t)d * L0 + i] = v.v[i];
+                #pragma unroll
+                for (int i = L0; i < BN_LIMBS; i++) hi |= v.v[i];
+                Q.d_sm0[d] = 0;
+                if (hi) { Q.d_st0[d] = CF_OVERFLOW; atomicAdd(Q.d_ovf, 1u); }
+                else      Q.d_st0[d] = CF_INCOMPLETE;
             } else {
                 Q.d_sm0[d] = (bits0[t] > 1 && bn_fits_u64(&v, &sm)) ? sm : 0ull;
                 Q.d_st0[d] = CF_OK;
             }
             v = cof1[t];
             if ((uint32_t)bits1[t] > lpb1) {
-                Q.d_c1[d].v[0] = v.v[0]; Q.d_c1[d].v[1] = v.v[1]; Q.d_c1[d].v[2] = v.v[2];
-                Q.d_sm1[d] = 0; Q.d_st1[d] = CF_INCOMPLETE;
+                uint32_t hi = 0;
+                #pragma unroll
+                for (int i = 0; i < L1; i++) Q.d_c1[(size_t)d * L1 + i] = v.v[i];
+                #pragma unroll
+                for (int i = L1; i < BN_LIMBS; i++) hi |= v.v[i];
+                Q.d_sm1[d] = 0;
+                if (hi) { Q.d_st1[d] = CF_OVERFLOW; atomicAdd(Q.d_ovf, 1u); }
+                else      Q.d_st1[d] = CF_INCOMPLETE;
             } else {
                 Q.d_sm1[d] = (bits1[t] > 1 && bn_fits_u64(&v, &sm)) ? sm : 0ull;
                 Q.d_st1[d] = CF_OK;
             }
         }
     }
+}
+
+/* One switch over the (L0, L1) pairs so the pipeline's call site keeps a plain
+ * function call and does not have to know the widths are template arguments.
+ * The pairs this build does not contain are compiled out, which is what makes
+ * `make CF_LMAX=3` a genuinely narrower binary rather than a wider one
+ * with a disabled branch. */
+static int cof_enqueue(int blocks, int threads,
+                       const bn_t *cof0, const uint8_t *bits0,
+                       const bn_t *cof1, const uint8_t *bits1,
+                       const int64_t *a, const int64_t *b,
+                       const uint32_t *f0, const uint32_t *fn0,
+                       const uint32_t *f1, const uint32_t *fn1,
+                       uint32_t n, uint32_t base, uint32_t lpb0, uint32_t lpb1,
+                       const cofq_t *Q)
+{
+#define CF_ENQ(A, B) do {                                                     \
+        k_cof_enqueue<A, B><<<blocks, threads>>>(cof0, bits0, cof1, bits1,    \
+                                                 a, b, f0, fn0, f1, fn1,      \
+                                                 n, base, lpb0, lpb1, *Q);    \
+        return 0;                                                             \
+    } while (0)
+    switch (Q->L0 * 8 + Q->L1) {
+    case 3 * 8 + 3: CF_ENQ(3, 3);
+#if CF_LMAX >= 4
+    case 3 * 8 + 4: CF_ENQ(3, 4);
+    case 4 * 8 + 3: CF_ENQ(4, 3);
+    case 4 * 8 + 4: CF_ENQ(4, 4);
+#endif
+    default: break;
+    }
+#undef CF_ENQ
+    fprintf(stderr, "  cofac queue: this build has no %d/%d-limb enqueue"
+            " (CF_LMAX = %d)\n", Q->L0, Q->L1, CF_LMAX);
+    return -1;
 }
 
 /* The class-aware gate, on device. A record whose rational side did not split
@@ -1116,6 +1299,43 @@ __global__ void k_cof_gate(uint32_t n, uint8_t *__restrict st0, uint8_t *__restr
         if (st0[t] != CF_OK && st1[t] == CF_INCOMPLETE) st1[t] = CF_DEAD;
     }
 }
+/* Per-flush status histogram, both sides at once.
+ *
+ * Shared-memory bins first, one global atomic per bin per block: 131,072
+ * records against 8 addresses would otherwise serialise on those 8 lines, and
+ * this is pure instrumentation -- it must not show up in the stage it measures.
+ *
+ * Side 1 is counted AFTER k_cof_gate, so its CF_DEAD includes records the gate
+ * killed because side 0 failed, not only primes above lpb. CF_INCOMPLETE is
+ * unaffected: the gate only ever writes DEAD, so a stuck count is exactly the
+ * budget signal it looks like. */
+__global__ void k_cof_status_hist(uint32_t n, const uint8_t *__restrict st0,
+                                  const uint8_t *__restrict st1,
+                                  unsigned long long *__restrict out)
+{
+    /* Relies on blockDim.x >= 8 for both the zeroing and the flush below.
+     * Guaranteed: --threads is refused outside [32, 1024] and must be a
+     * multiple of 32. Stated because nothing else in this file needs a block
+     * floor, so a future launch geometry could break it silently -- bins 4..7
+     * are side 1, and they would read uninitialised shared memory and never
+     * be flushed, i.e. the instrumentation would lie rather than fail. */
+    __shared__ unsigned int bin[8];
+    if (threadIdx.x < 8) bin[threadIdx.x] = 0u;
+    __syncthreads();
+    {
+        const uint64_t stride = bench_grid_stride_x();
+        for (uint64_t tt = bench_grid_thread_x(); tt < n; tt += stride) {
+            const uint32_t t = (uint32_t)tt;
+            uint32_t a = st0[t], b = st1[t];
+            atomicAdd(&bin[(a < 4u ? a : 3u)], 1u);
+            atomicAdd(&bin[4u + (b < 4u ? b : 3u)], 1u);
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < 8 && bin[threadIdx.x])
+        atomicAdd(&out[threadIdx.x], (unsigned long long)bin[threadIdx.x]);
+}
+
 __global__ void k_rel_flags(uint32_t n, const uint8_t *__restrict st0,
                             const uint8_t *__restrict st1, uint32_t *__restrict flag)
 {
@@ -1201,7 +1421,8 @@ static void cofq_free(cofq_t *Q, cofq_out_t *O)
     cudaFree(Q->d_sp0); cudaFree(Q->d_sp1); cudaFree(Q->d_nsp0); cudaFree(Q->d_nsp1);
     cudaFree(Q->d_flag); cudaFree(Q->d_off); cudaFree(Q->d_bsum);
     cudaFree(Q->d_idx); cudaFree(Q->d_nrel);
-    cudaFree(Q->d_sel); cudaFree(Q->d_nsel); cudaFree(Q->d_s);
+    cudaFree(Q->d_sel); cudaFree(Q->d_nsel); cudaFree(Q->d_ovf); cudaFree(Q->d_nst);
+    cudaFree(Q->d_s);
     cudaFree(Q->d_s2mask);
     cudaFree(O->d_a); cudaFree(O->d_b); cudaFree(O->d_f0); cudaFree(O->d_f1);
     cudaFree(O->d_fn0); cudaFree(O->d_fn1); cudaFree(O->d_sp0); cudaFree(O->d_sp1);
@@ -1224,8 +1445,8 @@ static void cofq_free(cofq_t *Q, cofq_out_t *O)
  * no matter what the CLI asked for -- the two schedulers had diverged so that
  * only the standalone one could run ECM at all. */
 static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
-                     int ecm, uint32_t ecm_b1, uint32_t ecm_b2,
-                     uint32_t ecm_curves)
+                     int meth0, int meth1, uint32_t ecm_b1, uint32_t ecm_b2,
+                     uint32_t ecm_curves, int limbs0, int limbs1)
 {
     const uint32_t nb = (cap + TD_SCAN_BLK - 1) / TD_SCAN_BLK;
     uint32_t *h_s = NULL;
@@ -1235,8 +1456,25 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
 #define COF_INIT_CK(x) do { if (CUDA_CHECKED(x)) goto done; } while (0)
     memset(Q, 0, sizeof(*Q)); memset(O, 0, sizeof(*O));
     Q->cap = cap;
-    Q->ecm = ecm; Q->ecm_curves = ecm_curves;
-    if (ecm) {
+    Q->meth[0] = meth0; Q->meth[1] = meth1; Q->ecm_curves = ecm_curves;
+    Q->L0 = limbs0; Q->L1 = limbs1;
+    /* Refused here rather than clamped: every caller derives these from mfb,
+     * so a width outside the build is a configuration the run cannot honour,
+     * and honouring it approximately means truncating a cofactor. */
+    if (Q->L0 < CF_LMIN || Q->L0 > CF_LMAX || Q->L1 < CF_LMIN || Q->L1 > CF_LMAX) {
+        fprintf(stderr, "  cofac queue: cofactor width %d/%d limbs is outside"
+                " this build's %d..%d\n", Q->L0, Q->L1, CF_LMIN, CF_LMAX);
+        goto done;
+    }
+    /* The build range is on the line too, not just the choice. A run log that
+     * says "3 limbs" is ambiguous between "this job needs 3" and "this binary
+     * only has 3", and those are different facts when the question is whether
+     * a wider job could have run at all. It is also what lets cofcheck.sh
+     * discover which cases this build can even attempt. */
+    printf("  cofactor width: side 0 %d limbs (%d bits), side 1 %d limbs"
+           " (%d bits); this build carries %d..%d\n",
+           Q->L0, 32 * Q->L0, Q->L1, 32 * Q->L1, CF_LMIN, CF_LMAX);
+    if (meth0 || meth1) {          /* one plan serves whichever sides use ECM */
         Q->ns = cf_ecm_plan(ecm_b1, &h_s);
         if (!Q->ns) {
             fprintf(stderr, "  cofac queue: empty ECM plan for B1=%u\n", ecm_b1);
@@ -1263,6 +1501,11 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
                " (%u giant steps), %u curves per round\n", ecm_b1, Q->ns,
                ecm_b2, Q->s2nv, ecm_curves);
     }
+    {
+        static const char *nm[2] = { "rho", "ECM" };
+        printf("  cofactor method: side 0 %s, side 1 %s\n",
+               nm[Q->meth[0] ? 1 : 0], nm[Q->meth[1] ? 1 : 0]);
+    }
     /* Every enqueued record can become a relation, so the readback slots have
      * to allow for that. This was cap/4, sized from c183's ~2% relation rate --
      * which is a property of THAT job, not of the queue. The c123 turns 56% of
@@ -1272,8 +1515,8 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
      * against a 12 GB card, and removes the failure mode instead of retuning
      * the threshold for one more job. */
     Q->rcap = cap;
-    COF_INIT_CK(cudaMalloc(&Q->d_c0, (size_t)cap * sizeof(mz<3>)));
-    COF_INIT_CK(cudaMalloc(&Q->d_c1, (size_t)cap * sizeof(mz<3>)));
+    COF_INIT_CK(cudaMalloc(&Q->d_c0, (size_t)cap * Q->L0 * 4));
+    COF_INIT_CK(cudaMalloc(&Q->d_c1, (size_t)cap * Q->L1 * 4));
     COF_INIT_CK(cudaMalloc(&Q->d_st0, cap));
     COF_INIT_CK(cudaMalloc(&Q->d_st1, cap));
     COF_INIT_CK(cudaMalloc(&Q->d_sm0, (size_t)cap * 8));
@@ -1295,6 +1538,10 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
     COF_INIT_CK(cudaMalloc(&Q->d_nrel, 4));
     COF_INIT_CK(cudaMalloc(&Q->d_sel, (size_t)cap * 4));
     COF_INIT_CK(cudaMalloc(&Q->d_nsel, 4));
+    COF_INIT_CK(cudaMalloc(&Q->d_ovf, 4));
+    COF_INIT_CK(cudaMemset(Q->d_ovf, 0, 4));
+    COF_INIT_CK(cudaMalloc(&Q->d_nst, 8 * sizeof(unsigned long long)));
+    COF_INIT_CK(cudaMemset(Q->d_nst, 0, 8 * sizeof(unsigned long long)));
     COF_INIT_CK(cudaMalloc(&O->d_a, (size_t)Q->rcap * 8));
     COF_INIT_CK(cudaMalloc(&O->d_b, (size_t)Q->rcap * 8));
     COF_INIT_CK(cudaMalloc(&O->d_f0, (size_t)Q->rcap * TD_FMAX * 4));
@@ -1379,24 +1626,20 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
 {
     const uint32_t n = Q->n;
     const uint32_t nb = (n + TD_SCAN_BLK - 1) / TD_SCAN_BLK;
-    mz<3> l0, l1;
-    uint32_t nr = 0;
+    uint32_t nr = 0, novf = 0;
     cudaEvent_t e0 = NULL, e1 = NULL, e2 = NULL;
     float t0 = 0, t1 = 0;
     double h0;
     int rc = -1;
     if (!n) return 0;
 #define COF_FLUSH_CK(x) do { if (CUDA_CHECKED(x)) goto done; } while (0)
-    /* 3 limbs, not 2. lim0^2 needs more than 64 bits once rlim exceeds 2^32.
-     * No job here is close -- the largest rlim so far is 134200000, about
-     * 2^27, giving lim0^2 ~ 2^54 -- so this is headroom, not a live fix. It is
-     * worth having anyway because the old truncation was silent and lim2 is
-     * the "prime by size" threshold: a wrong one accepts composites as prime,
-     * which surfaces only as relations that fail to reconstruct. */
-    { unsigned __int128 v = (unsigned __int128)lim0 * lim0;
-      for (int i = 0; i < 3; i++) { l0.v[i] = (uint32_t)v; v >>= 32; } }
-    { unsigned __int128 v = (unsigned __int128)lim1 * lim1;
-      for (int i = 0; i < 3; i++) { l1.v[i] = (uint32_t)v; v >>= 32; } }
+    /* lim^2 is computed inside cf_run_rounds_dyn now, at the side's own width.
+     * It used to be built here at a fixed 3 limbs, which was already the fix
+     * for a 2-limb version that truncated lim0^2 for any rlim above 2^32 --
+     * the same bug one width up. Keeping it next to the instantiation is what
+     * stops it drifting from the splitter again: lim2 is the "prime by size"
+     * threshold, and a wrong one accepts composites as prime, which surfaces
+     * only as relations that fail to reconstruct. */
 
     /* Compact before every round. The scan is three small kernels over 131,072
      * slots -- microseconds against a stage that runs for tens of milliseconds --
@@ -1404,26 +1647,33 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
      * is a function of the status array alone and the output stays reproducible
      * byte for byte. */
     cf_work_t W;
-    cf_sched_t S;
+    cf_sched_t S, S1;
     W.d_flag = Q->d_flag; W.d_off = Q->d_off; W.d_bsum = Q->d_bsum;
     W.d_sel = Q->d_sel;   W.d_nsel = Q->d_nsel;
-    S.method = Q->ecm; S.rounds = rounds; S.budget = budget;
+    S.method = Q->meth[0]; S.rounds = rounds; S.budget = budget;
     S.curves = Q->ecm_curves; S.d_s = Q->d_s; S.ns = Q->ns;
     S.d_s2mask = Q->d_s2mask; S.s2vmin = Q->s2vmin; S.s2nv = Q->s2nv;
+    S1 = S; S1.method = Q->meth[1];   /* differs only in method */
 
     COF_FLUSH_CK(cudaEventCreate(&e0));
     COF_FLUSH_CK(cudaEventCreate(&e1));
     COF_FLUSH_CK(cudaEventCreate(&e2));
     COF_FLUSH_CK(cudaEventRecord(e0));
-    cf_run_rounds<3>(Q->d_c0, l0, lpb0, n, Q->d_st0, Q->d_sp0, Q->d_nsp0,
-                     &S, &W, NULL, blocks, threads);
+    if (cf_run_rounds_dyn(Q->L0, Q->d_c0, lim0, lpb0, n, Q->d_st0,
+                          Q->d_sp0, Q->d_nsp0, &S, &W, NULL, blocks, threads))
+        goto done;
     /* The class-aware gate: a record whose rational side did not split is dead
-     * whatever the algebraic side does, so its 3-limb job is never started. */
+     * whatever the algebraic side does, so its side-1 job is never started. */
     k_cof_gate<<<blocks, threads>>>(n, Q->d_st0, Q->d_st1);
     COF_FLUSH_CK(cudaEventRecord(e1));
-    cf_run_rounds<3>(Q->d_c1, l1, lpb1, n, Q->d_st1, Q->d_sp1, Q->d_nsp1,
-                     &S, &W, NULL, blocks, threads);
+    if (cf_run_rounds_dyn(Q->L1, Q->d_c1, lim1, lpb1, n, Q->d_st1,
+                          Q->d_sp1, Q->d_nsp1, &S1, &W, NULL, blocks, threads))
+        goto done;
     COF_FLUSH_CK(cudaEventRecord(e2));
+
+    /* Instrumentation, not accounting: recorded after e2 so it cannot land in
+     * the per-side timings this same flush reports. */
+    k_cof_status_hist<<<blocks, threads>>>(n, Q->d_st0, Q->d_st1, Q->d_nst);
 
     k_rel_flags<<<blocks, threads>>>(n, Q->d_st0, Q->d_st1, Q->d_flag);
     k_scan_pass1<<<nb, TD_SCAN_BLK>>>(Q->d_flag, n, Q->d_off, Q->d_bsum);
@@ -1437,6 +1687,19 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     Q->ms_rat += t0; Q->ms_alg += t1;
 
     COF_FLUSH_CK(cudaMemcpy(&nr, Q->d_nrel, 4, cudaMemcpyDeviceToHost));
+    /* The width invariant, asserted rather than trusted: cof_classify rejects
+     * a residual above mfb and resolve_and_check_cofactor_config refuses an mfb above
+     * 32*L, so a record that did not fit its side's limbs means one of those
+     * two is wrong. Stop -- the alternative is a relation built from a
+     * truncated cofactor, which reconstructs to the wrong norm and is far
+     * harder to trace back here. */
+    COF_FLUSH_CK(cudaMemcpy(&novf, Q->d_ovf, 4, cudaMemcpyDeviceToHost));
+    if (novf) {
+        fprintf(stderr, "  cofac queue: %u residual(s) exceeded the %d/%d-limb"
+                " cofactor width; mfb and the width are out of step\n",
+                novf, Q->L0, Q->L1);
+        goto done;
+    }
     /* Unreachable while rcap == cap, which it now is: every relation comes from
      * a distinct queued record, so nr <= n <= cap. It was reachable under the
      * old rcap = cap/4, which assumed relations were at most a quarter of
@@ -1451,6 +1714,13 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
         goto done;
     }
     Q->nseen += n; Q->nrel += nr;
+    {   /* cumulative on the device, so this is a snapshot of the total rather
+         * than a per-flush delta -- assign, do not add. */
+        unsigned long long h[8];
+        if (!CUDA_CHECKED(cudaMemcpy(h, Q->d_nst, sizeof h, cudaMemcpyDeviceToHost)))
+            for (int sd = 0; sd < 2; sd++)
+                for (int k = 0; k < 4; k++) Q->nst[sd][k] = h[sd * 4 + k];
+    }
     if (!nr) { Q->n = 0; rc = 0; goto done; }
 
     k_rel_pack<<<blocks, threads>>>(nr, Q->d_idx, *Q, O->d_a, O->d_b,
@@ -1502,6 +1772,17 @@ done:
  * algorithm measurable before it is wired into the band loop.
  */
 
+/* OR of every limb from HI upward -- "is there anything above the low HI
+ * limbs". Written as a loop over L rather than as a named limb so that raising
+ * CF_LMAX cannot leave a limb unexamined by a fit test; the two places that
+ * asked `v[2]` directly were both correct only at exactly 3 limbs. */
+template <int L, int HI> CF_HD uint32_t cf_hi_limbs(const mz<L> *x)
+{
+    uint32_t o = 0;
+    for (int i = HI; i < L; i++) o |= x->v[i];   /* L - HI is 1 or 2 */
+    return o;
+}
+
 /* Decimal to L limbs. Returns 0 if it does not fit. */
 template <int L>
 static int cf_from_dec(mz<L> *r, const char *s, int *needs_split)
@@ -1548,11 +1829,7 @@ static int cf_run_side(mz<L> *h_n, uint32_t nj, uint64_t lim, uint32_t lpb,
     if (!nj) { *ms_out = 0; return 0; }
     memset(&W, 0, sizeof(W));
 
-    {   /* lim^2, in L limbs */
-        unsigned __int128 v = (unsigned __int128)lim * lim;
-        for (int i = 0; i < L; i++) { lim2.v[i] = (uint32_t)v; v >>= 32; }
-        if (v) { fprintf(stderr, "  cofac: lim^2 does not fit %d limbs\n", L); return -1; }
-    }
+    if (cf_lim2<L>(&lim2, lim)) return -1;
     CK(cudaMalloc(&d_n, (size_t)nj * sizeof(mz<L>)));
     CK(cudaMalloc(&d_status, nj));
     CK(cudaMalloc(&d_nfac, nj));
@@ -1576,10 +1853,10 @@ static int cf_run_side(mz<L> *h_n, uint32_t nj, uint64_t lim, uint32_t lpb,
     cf_run_rounds<L>(d_n, lim2, lpb, nj, d_status, d_fac, d_nfac,
                      S, &W, d_iters, blocks, threads);
     /* Release before returning. run_cofac calls this twice -- once per side,
-     * both mz<3> -- on the same device, so a
-     * bare `return -1` here left the second call short by everything the first
-     * had allocated: on the 1.96M-record corpus, hundreds of MB, and the
-     * second side then fails for a reason that has nothing to do with itself. */
+     * possibly at different widths -- on the same device, so a bare `return -1`
+     * here left the second call short by everything the first had allocated: on
+     * the 1.96M-record corpus, hundreds of MB, and the second side then fails
+     * for a reason that has nothing to do with itself. */
     if (cudaGetLastError() != cudaSuccess) {
         fprintf(stderr, "  cofac: launch failed\n");
         cudaFree(d_n); cudaFree(d_status); cudaFree(d_nfac); cudaFree(d_fac);
@@ -1593,9 +1870,10 @@ static int cf_run_side(mz<L> *h_n, uint32_t nj, uint64_t lim, uint32_t lpb,
     CK(cudaEventSynchronize(e1));
     cudaEventElapsedTime(&ms, e0, e1);
     *ms_out = ms;
-    /* Keyed on L, this said "side 3-limb queue" twice once both sides became
-     * mz<3> -- the same information loss the summary block below was fixed
-     * for. run_cofac calls rational first, then algebraic. */
+    /* Named by SIDE, not keyed on L. Keyed on L it said "side 3-limb queue"
+     * twice as soon as both sides became 3 limbs -- the same information loss
+     * the summary block below was fixed for, and it would come straight back
+     * now that 4/4 is a legal shape. run_cofac calls rational first. */
     if (verbose) printf("  %s queue: %u jobs, %d rounds, %.1f ms\n",
                         side_name ? side_name : "cofactor", nj, S->rounds, ms);
 
@@ -1640,6 +1918,68 @@ static int cf_run_side(mz<L> *h_n, uint32_t nj, uint64_t lim, uint32_t lpb,
     return 0;
 }
 
+
+/* Run one side at a runtime width, narrowing from the parse's CF_LMAX-wide
+ * array. The parse cannot know how wide a decimal cofactor is until it has
+ * read it, so it always runs at the widest width this build has and the
+ * narrowing happens here -- one pass over a host array on a diagnostic path,
+ * against duplicating the whole parser per width.
+ *
+ * The high-limb check is not decoration. Narrowing is precisely the silent
+ * truncation the width machinery exists to remove, so a value that does not
+ * fit the requested width fails the batch instead of being cut down to it. */
+template <int L>
+static int cf_run_side_at(const mz<CF_LMAX> *h_n, uint32_t nj, uint64_t lim,
+                          uint32_t lpb, uint8_t *h_status, uint64_t *h_fac,
+                          uint8_t *h_nfac, int blocks, int threads, int verbose,
+                          double *ms_out, const cf_sched_t *S,
+                          const char *side_name)
+{
+    mz<L> *nn = (mz<L> *)malloc((size_t)(nj ? nj : 1) * sizeof(mz<L>));
+    int r;
+    if (!nn) {
+        fprintf(stderr, "  cofac: out of memory narrowing to %d limbs\n", L);
+        return -1;
+    }
+    for (uint32_t k = 0; k < nj; k++) {
+        /* cf_hi_limbs, not a hand-rolled loop: the helper exists precisely so
+         * that a fit test is written once as a loop over the width, and a
+         * second copy here would be the one place a new limb went unexamined
+         * if CF_LMAX ever moves again. */
+        if (cf_hi_limbs<CF_LMAX, L>(&h_n[k])) {
+            fprintf(stderr, "  cofac: %s record %u does not fit %d limbs\n",
+                    side_name ? side_name : "cofactor", k, L);
+            free(nn); return -1;
+        }
+        for (int i = 0; i < L; i++) nn[k].v[i] = h_n[k].v[i];
+    }
+    r = cf_run_side<L>(nn, nj, lim, lpb, h_status, h_fac, h_nfac,
+                       blocks, threads, verbose, ms_out, S, side_name);
+    free(nn);
+    return r;
+}
+
+static int cf_run_side_dyn(int L, const mz<CF_LMAX> *h_n, uint32_t nj,
+                           uint64_t lim, uint32_t lpb, uint8_t *h_status,
+                           uint64_t *h_fac, uint8_t *h_nfac, int blocks,
+                           int threads, int verbose, double *ms_out,
+                           const cf_sched_t *S, const char *side_name)
+{
+    switch (L) {
+    case 3: return cf_run_side_at<3>(h_n, nj, lim, lpb, h_status, h_fac,
+                                     h_nfac, blocks, threads, verbose, ms_out,
+                                     S, side_name);
+#if CF_LMAX >= 4
+    case 4: return cf_run_side_at<4>(h_n, nj, lim, lpb, h_status, h_fac,
+                                     h_nfac, blocks, threads, verbose, ms_out,
+                                     S, side_name);
+#endif
+    default: break;
+    }
+    fprintf(stderr, "  cofac: this build has no %d-limb splitter"
+            " (CF_LMAX = %d)\n", L, CF_LMAX);
+    return -1;
+}
 
 /* ---- post-cofactor reconstruction gate --------------------------------- *
  *
@@ -2063,8 +2403,8 @@ static int cf_rec_build(cf_rec_t *r, const char *f0, const uint64_t *e0, int n0,
 extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
                          uint32_t lpb0, uint32_t lim1, uint32_t lpb1,
                          int rounds, uint32_t budget, int blocks, int threads,
-                         int ecm, uint32_t ecm_b1, uint32_t ecm_b2,
-                         uint32_t ecm_curves)
+                         int meth0, int meth1, uint32_t ecm_b1, uint32_t ecm_b2,
+                         uint32_t ecm_curves, int limbs0, int limbs1)
 {
     FILE *f = fopen(path, "rb");
     uint32_t *h_s = NULL, *d_s = NULL, ns = 0;
@@ -2075,7 +2415,9 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
     size_t sz = 0;
     uint32_t nrec = 0, n0 = 0, n1 = 0;
     cf_rest_t *rest = NULL;
-    mz<3> *j0 = NULL; mz<3> *j1 = NULL;
+    /* Parsed at the build's widest width; cf_run_side_dyn narrows to the
+     * width each side actually runs at. */
+    mz<CF_LMAX> *j0 = NULL; mz<CF_LMAX> *j1 = NULL;
     uint32_t *i0 = NULL, *i1 = NULL;
     uint64_t *fac0 = NULL, *fac1 = NULL;   /* resulting primes: lpb-bounded */
     uint8_t *st0 = NULL, *st1 = NULL, *nf0 = NULL, *nf1 = NULL;
@@ -2107,8 +2449,8 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
     if (!nrec) { free(buf); return -1; }
 
     rest = (cf_rest_t *)malloc((size_t)nrec * sizeof(cf_rest_t));
-    j0 = (mz<3> *)malloc((size_t)nrec * sizeof(mz<3>));
-    j1 = (mz<3> *)malloc((size_t)nrec * sizeof(mz<3>));
+    j0 = (mz<CF_LMAX> *)malloc((size_t)nrec * sizeof(mz<CF_LMAX>));
+    j1 = (mz<CF_LMAX> *)malloc((size_t)nrec * sizeof(mz<CF_LMAX>));
     i0 = (uint32_t *)malloc((size_t)nrec * 4);
     i1 = (uint32_t *)malloc((size_t)nrec * 4);
     small0 = (uint64_t *)malloc((size_t)nrec * 8);
@@ -2134,10 +2476,11 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
                 char *c2 = c1 ? strchr(c1 + 1, ':') : NULL;
                 char *c3 = c2 ? strchr(c2 + 1, ':') : NULL;
                 char *c4 = c3 ? strchr(c3 + 1, ':') : NULL;
-                mz<3> v0, v1; int ns0 = 0, ns1 = 0;
+                mz<CF_LMAX> v0, v1; int ns0 = 0, ns1 = 0;
                 if (!c1 || !c2 || !c3 || !c4) { fprintf(stderr, "cofac: line %u malformed\n", r); return -1; }
                 *c1 = 0; *c2 = 0; *c3 = 0; *c4 = 0;
-                if (!cf_from_dec<3>(&v0, p, &ns0) || !cf_from_dec<3>(&v1, c1 + 1, &ns1)) {
+                if (!cf_from_dec<CF_LMAX>(&v0, p, &ns0) ||
+                    !cf_from_dec<CF_LMAX>(&v1, c1 + 1, &ns1)) {
                     fprintf(stderr, "cofac: line %u cofactor does not fit\n", r); return -1;
                 }
                 rest[r].ab = c2 + 1; rest[r].f0 = c3 + 1; rest[r].f1 = c4 + 1;
@@ -2146,13 +2489,17 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
                  * prime, and it is part of the relation. Dropping it emits a
                  * factorisation whose product is not the norm. */
                 /* Two limbs: an unsplit residual within lpb is a prime of
-                 * the relation, and at lpb > 32 it does not fit in one. The
-                 * third limb is checked rather than assumed zero -- it is
-                 * zero only because the residual is within lpb <= 64, which
-                 * is an invariant of the caller and not of this line. */
-                small0[r] = (ns0 || v0.v[2] || (v0.v[0] <= 1u && !v0.v[1]))
+                 * the relation, and at lpb > 32 it does not fit in one. Every
+                 * limb above the low two is checked rather than assumed zero
+                 * -- they are zero only because the residual is within
+                 * lpb <= 64, which is an invariant of the caller and not of
+                 * this line. cf_hi_limbs walks all of them, so widening
+                 * CF_LMAX cannot leave a limb unexamined here. */
+                small0[r] = (ns0 || cf_hi_limbs<CF_LMAX, 2>(&v0)
+                             || (v0.v[0] <= 1u && !v0.v[1]))
                     ? 0ull : (((uint64_t)v0.v[1] << 32) | v0.v[0]);
-                small1[r] = (ns1 || v1.v[2] || (v1.v[0] <= 1u && !v1.v[1]))
+                small1[r] = (ns1 || cf_hi_limbs<CF_LMAX, 2>(&v1)
+                             || (v1.v[0] <= 1u && !v1.v[1]))
                     ? 0ull : (((uint64_t)v1.v[1] << 32) | v1.v[0]);
                 if (ns0) { j0[n0] = v0; i0[n0] = r; n0++; }
                 if (ns1) { j1[n1] = v1; i1[n1] = r; n1++; alg_job[r] = 1; }
@@ -2166,7 +2513,7 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
 
     st0 = (uint8_t *)malloc(n0 ? n0 : 1); nf0 = (uint8_t *)calloc(n0 ? n0 : 1, 1);
     fac0 = (uint64_t *)malloc((size_t)(n0 ? n0 : 1) * CF_MAXFAC * 8);
-    if (ecm) {
+    if (meth0 || meth1) {
         ns = cf_ecm_plan(ecm_b1, &h_s);
         if (!ns) { fprintf(stderr, "  cofac: empty ECM plan for B1=%u\n", ecm_b1); return -1; }
         CK(cudaMalloc(&d_s, (size_t)ns * 4));
@@ -2191,11 +2538,11 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
                " %u curves per round, %d rounds\n", ecm_b1, ns, ecm_b2,
                s2nv, ecm_curves, rounds);
     }
-    sched.method = ecm; sched.rounds = rounds; sched.budget = budget;
+    sched.method = meth0; sched.rounds = rounds; sched.budget = budget;
     sched.curves = ecm_curves; sched.d_s = d_s; sched.ns = ns;
     sched.d_s2mask = d_s2mask; sched.s2vmin = s2vmin; sched.s2nv = s2nv;
-    if (cf_run_side<3>(j0, n0, lim0, lpb0, st0, fac0, nf0,
-                       blocks, threads, 1, &ms0, &sched, "rational")) return -1;
+    if (cf_run_side_dyn(limbs0, j0, n0, lim0, lpb0, st0, fac0, nf0,
+                        blocks, threads, 1, &ms0, &sched, "rational")) return -1;
     for (uint32_t k = 0; k < n0; k++) {
         if (st0[k] == CF_OK) continue;
         side0ok[i0[k]] = 0;
@@ -2216,8 +2563,9 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
     }
     st1 = (uint8_t *)malloc(n1 ? n1 : 1); nf1 = (uint8_t *)calloc(n1 ? n1 : 1, 1);
     fac1 = (uint64_t *)malloc((size_t)(n1 ? n1 : 1) * CF_MAXFAC * 8);
-    if (cf_run_side<3>(j1, n1, lim1, lpb1, st1, fac1, nf1,
-                       blocks, threads, 1, &ms1, &sched, "algebraic")) return -1;
+    sched.method = meth1;                 /* per side; see cofq_t.meth */
+    if (cf_run_side_dyn(limbs1, j1, n1, lim1, lpb1, st1, fac1, nf1,
+                        blocks, threads, 1, &ms1, &sched, "algebraic")) return -1;
     for (uint32_t k = 0; k < n1; k++) {
         if (st1[k] == CF_DEAD) dead1++;
         else if (st1[k] == CF_INCOMPLETE) stuck1++;

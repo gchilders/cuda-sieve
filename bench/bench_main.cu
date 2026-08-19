@@ -174,6 +174,16 @@ static void usage(void)
 "  --rlim N / --alim N  factor base bounds, side 0 / side 1\n"
 "  --lpb N / --lpb0 N   large-prime bound in bits  [32 side 1, 31 side 0]\n"
 "  --mfb N / --mfb0 N   max cofactor bits          [92 side 1, 60 side 0]\n"
+"  --cof-ecm / --cof-rho   force one method on BOTH sides. The default is\n"
+"                   per-side and automatic: rho for a 2LP side, ECM for a 3LP\n"
+"                   one (ceil(mfb/lpb) >= 3). Measured: rho wins ~1.1x at 2LP,\n"
+"                   ECM wins 2-4x at 3LP. A typical job is one of each.\n"
+"  --ecm-b1 N / --ecm-b2 N / --ecm-curves N   [derived from lpb: B1 200 at\n"
+"                   lpb<=33, 300 at 34-35, 500 at 36+; B2 = 30*B1; 12 curves]\n"
+"  --cof-limbs N / --cof-limbs0 N   cofactor width in 32-bit limbs\n"
+"                   [narrowest that mfb needs: 3 up to 96 bits, 4 above].\n"
+"                   Force it UP to time the same job at both widths; forcing\n"
+"                   it below what mfb needs is refused.\n"
 "  --allowance B / --allowance0 B   survivor cofactor BITS, overriding the\n"
 "                   derived default. The default is mfb + the slack our own\n"
 "                   byte-quantised survivor test needs (~1.5 bits), NOT the\n"
@@ -294,14 +304,17 @@ static int validate_qsel_or_report(qsel_t *sel, const poly_t *P, int side,
 }
 
 /* Cofactoriser bounds. The representation is FIXED-WIDTH on purpose -- a
- * resulting prime is one uint64 and both cofactors are mz<3> -- so a bound
- * outside that design does not degrade, it silently truncates, and a relation
- * that has lost the top of a factor stops reconstructing its own norm. Refuse.
+ * resulting prime is one uint64 and a cofactor is an mz<L> for one of the two
+ * or three L this build carries -- so a bound outside that design does not
+ * degrade, it silently truncates, and a relation that has lost the top of a
+ * factor stops reconstructing its own norm. Refuse.
  *
- * The widths moved on 2026-08-17: split factors and unsplit prime residuals
+ * The widths moved twice. 2026-08-17: split factors and unsplit prime residuals
  * were a single uint32, which capped lpb at 32. They are 64-bit now, which is
  * why the bound below is 64 and why an NFS@Home C194 (lpba 33, mfba 95) runs.
- * The COFACTOR width did not move: mfb is still bounded by mz<3>.
+ * 2026-08-18: the COFACTOR width became a per-side run-time choice between 3
+ * and 4 limbs, so mfb is bounded by 32*CF_LMAX rather than by a constant, and
+ * this function is where the choice is resolved as well as checked.
  *
  * This MUST run after the .job file has been read. It used to sit inline in
  * main() ahead of poly_load, so it only ever saw command-line values -- and
@@ -309,9 +322,15 @@ static int validate_qsel_or_report(qsel_t *sel, const poly_t *P, int side,
  * cases (mfba 120 from a job file, or a 4LP mfb/lpb ratio) were exactly the
  * ones it could not see. The RUNBOOK's own SNFS recipe takes mfbr and lpbr
  * from the file. */
-static int check_cofactor_bounds(const bench_cfg_t *cfg, uint32_t alim,
-                                 uint32_t rlim, int cof_rounds,
-                                 uint32_t cof_budget)
+/* NAMED FOR WHAT IT DOES: it RESOLVES as well as checks. It fills in
+ * cof_limbs0/cof_limbs, cof_meth0/cof_meth1 and the ECM parameters, and both
+ * cofq_init() and run_cofac() read those, so this must run before either. A
+ * reordering does not misbehave silently -- an unresolved width is 0 and
+ * cofq_init refuses it by name -- but the old `check_` prefix suggested the
+ * call was merely diagnostic and droppable, which it is not. */
+static int resolve_and_check_cofactor_config(bench_cfg_t *cfg, uint32_t alim,
+                                             uint32_t rlim, int cof_rounds,
+                                             uint32_t cof_budget)
 {
     const uint32_t lpb1 = cfg->lpb ? cfg->lpb : 32;
     const uint32_t mfb1 = cfg->mfb ? cfg->mfb : 92;
@@ -327,23 +346,89 @@ static int check_cofactor_bounds(const bench_cfg_t *cfg, uint32_t alim,
                 " 64-bit word, so lpb > 64 truncates it\n", lpb1, cfg->lpb0);
         bad = 1;
     }
-    if (mfb1 > 96) {
-        fprintf(stderr, "side-1 mfb %u: the cofactor is 3 limbs, so a residual"
-                " above 96 bits loses its high limbs\n", mfb1);
-        bad = 1;
+    /* THE COFACTOR WIDTH. Each side runs at the narrowest instantiation that
+     * holds its mfb -- 3 limbs (96 bits) up to a C194's mfba 95, 4 limbs (128)
+     * for a C208 -- unless --cof-limbs/--cof-limbs0 forces it wider. Forcing
+     * is only ever upward: a width below what mfb needs is the silent
+     * truncation this check exists to refuse, so it is refused whether it
+     * comes from a job file or from the command line.
+     *
+     * Resolved HERE rather than at the queue, because this is the one function
+     * that has seen the .job file's mfb as well as the command line, and
+     * because the width has to be refusable rather than clamped. */
+    {
+        const int w1 = cf_limbs_for_mfb(mfb1);
+        const int w0 = cf_limbs_for_mfb(cfg->mfb0);
+        if (!w1) {
+            fprintf(stderr, "side-1 mfb %u: the widest cofactor this build has"
+                    " is %d limbs (%d bits), so a residual above that loses its"
+                    " high limbs -- rebuild with a larger CF_LMAX\n",
+                    mfb1, CF_LMAX, 32 * CF_LMAX);
+            bad = 1;
+        }
+        if (!w0) {
+            fprintf(stderr, "side-0 mfb %u: the widest cofactor this build has"
+                    " is %d limbs (%d bits), so a residual above that loses its"
+                    " high limbs -- rebuild with a larger CF_LMAX\n",
+                    cfg->mfb0, CF_LMAX, 32 * CF_LMAX);
+            bad = 1;
+        }
+        if (cfg->cof_limbs && cfg->cof_limbs < w1) {
+            fprintf(stderr, "--cof-limbs %d is narrower than side-1 mfb %u"
+                    " needs (%d limbs)\n", cfg->cof_limbs, mfb1, w1);
+            bad = 1;
+        }
+        if (cfg->cof_limbs0 && cfg->cof_limbs0 < w0) {
+            fprintf(stderr, "--cof-limbs0 %d is narrower than side-0 mfb %u"
+                    " needs (%d limbs)\n", cfg->cof_limbs0, cfg->mfb0, w0);
+            bad = 1;
+        }
+        if (!cfg->cof_limbs)  cfg->cof_limbs  = w1;
+        if (!cfg->cof_limbs0) cfg->cof_limbs0 = w0;
     }
-    if (cfg->mfb0 > 96) {
-        fprintf(stderr, "side-0 mfb %u: the cofactor is 3 limbs, so a residual"
-                " above 96 bits loses its high limbs\n", cfg->mfb0);
-        bad = 1;
+    /* THE METHOD, per side. Same shape as the width resolution above and for
+     * the same reason: this is the one function that has seen both the .job
+     * file and the command line. AUTO picks rho for a 2LP side and ECM for a
+     * 3LP one; --cof-ecm / --cof-rho force both sides, which is what an A/B
+     * measurement needs and what reproduces the pre-2026-08-19 default. */
+    {
+        const int a1 = cof_auto_method(mfb1, lpb1);
+        const int a0 = cof_auto_method(cfg->mfb0, cfg->lpb0);
+        cfg->cof_meth1 = (cfg->cof_ecm == COF_METHOD_AUTO) ? a1 : cfg->cof_ecm;
+        cfg->cof_meth0 = (cfg->cof_ecm == COF_METHOD_AUTO) ? a0 : cfg->cof_ecm;
+        /* ECM parameters follow the lpb of whichever side actually runs ECM;
+         * when both do, the wider one, since a B1 too small loses relations
+         * and one too large only costs time. */
+        if (!cfg->ecm_b1_set) {
+            unsigned lp = 0;
+            if (cfg->cof_meth1 == COF_METHOD_ECM && lpb1 > lp) lp = lpb1;
+            if (cfg->cof_meth0 == COF_METHOD_ECM && cfg->lpb0 > lp) lp = cfg->lpb0;
+            cfg->ecm_b1 = cof_auto_b1(lp ? lp : lpb1);
+        }
+        /* Keyed on _set, not on the value: --ecm-b2 0 means "no stage 2" and
+         * --ecm-curves 0 must stay a refusal, so neither may be filled in
+         * merely because it is zero. */
+        /* 30*B1, CLAMPED INTO THE VALIDATOR'S OWN RANGE. A derived value must
+         * never be able to fail the check that follows it: B1 below 30 is
+         * outside the D=30 continuation's domain, and 30*B1 above 10^7 exceeds
+         * the B2 ceiling -- so an unclamped rule turned `--ecm-b1 2` and every
+         * `--ecm-b1` above 333,333 into a hard refusal citing an --ecm-b2 the
+         * user never passed. Two thirds of --ecm-b1's own documented range was
+         * unusable. Clamp, do not refuse: the user asked for a B1, not a B2. */
+        if (!cfg->ecm_b2_set) {
+            if (cfg->ecm_b1 < 30u)               cfg->ecm_b2 = 0u;
+            else if (cfg->ecm_b1 > 10000000u / 30u) cfg->ecm_b2 = 10000000u;
+            else                                 cfg->ecm_b2 = 30u * cfg->ecm_b1;
+        }
+        if (!cfg->ecm_curves_set) cfg->ecm_curves = 12u;
     }
     /* ceil(mfb/lpb) parts must fit in CF_MAXFAC. 3LP is what an SNFS job with
      * mfbr 88 / lpbr 31 asks for and is supported; 4LP is not, and it would
      * present as CF_OVERFLOW on the records that need it -- a partial yield
      * loss, not a failure -- so it is refused up front. */
     {
-        const uint32_t p1 = (mfb1 + lpb1 - 1) / lpb1;
-        const uint32_t p0 = (cfg->mfb0 + cfg->lpb0 - 1) / cfg->lpb0;
+        const uint32_t p1 = cof_parts(mfb1, lpb1);
+        const uint32_t p0 = cof_parts(cfg->mfb0, cfg->lpb0);
         if (p1 > 3 || p0 > 3) {
             fprintf(stderr, "mfb/lpb asks for %u parts on side 1 and %u on"
                     " side 0; the splitter handles at most 3\n", p1, p0);
@@ -377,10 +462,11 @@ static int check_cofactor_bounds(const bench_cfg_t *cfg, uint32_t alim,
         fprintf(stderr, "pipeline cof-rounds %d: must be 1..24\n", cfg->cof_rounds);
         bad = 1;
     }
-    if (!cfg->cof_ecm) {
-        if (cfg->ecm_b2) {
-            fprintf(stderr, "--ecm-b2 requires --cof-ecm\n"); bad = 1;
-        }
+    /* Validate each method's knobs whenever ANY side uses it. Keyed on the
+     * pair and not on a single flag: the common auto case is rho on one side
+     * and ECM on the other, so an either/or here would skip the rho budget
+     * checks on exactly the jobs that still run rho. */
+    if (cfg->cof_meth0 == COF_METHOD_RHO || cfg->cof_meth1 == COF_METHOD_RHO) {
         if (!cof_budget || (uint64_t)cof_budget << (cof_rounds - 1) > 0xFFFFFFFFull) {
             fprintf(stderr, "--cof-budget %u with %d rounds overflows uint32"
                     " (or is zero)\n", cof_budget, cof_rounds);
@@ -392,7 +478,8 @@ static int check_cofactor_bounds(const bench_cfg_t *cfg, uint32_t alim,
                     " uint32 (or is zero)\n", cfg->cof_budget, cfg->cof_rounds);
             bad = 1;
         }
-    } else {
+    }
+    if (cfg->cof_meth0 == COF_METHOD_ECM || cfg->cof_meth1 == COF_METHOD_ECM) {
         if (!cfg->ecm_curves) {
             fprintf(stderr, "--ecm-curves 0 attempts no curves\n"); bad = 1;
         }
@@ -407,6 +494,15 @@ static int check_cofactor_bounds(const bench_cfg_t *cfg, uint32_t alim,
                     " 10000000 with B1 >= 30\n", cfg->ecm_b2);
             bad = 1;
         }
+    } else if (cfg->ecm_b2_set) {
+        /* Keyed on _set ALONE. Gating this on --cof-rho as well meant a
+         * 2LP/2LP job that resolved to rho automatically accepted --ecm-b2 and
+         * silently ignored it, which is the failure the diagnostic exists to
+         * prevent. _set is already 1 only when the user typed the flag, so a
+         * derived value can never reach here. */
+        fprintf(stderr, "--ecm-b2 has no effect: both sides resolved to rho"
+                " (2 large primes each)\n");
+        bad = 1;
     }
     return bad;
 }
@@ -716,11 +812,30 @@ static int bench_main_impl(int argc, char **argv)
     cfg.pipeline = 0; cfg.sq_side = 1;
     cfg.scale0 = 1.925; cfg.allowance0 = 68.1;
     cfg.lim0 = 0; cfg.lpb0 = 31; cfg.mfb0 = 60;
+    cfg.cof_limbs0 = 0; cfg.cof_limbs = 0;   /* 0 = derive from mfb */
     cfg.relations = NULL; cfg.candidates = NULL;
     cfg.qlist = NULL; cfg.nq_max = 0; cfg.verbose_q = 0; cfg.td_verify = 1;
     cfg.qmin = 0; cfg.qmax = 0; cfg.target_rels = 0;
-    cfg.cofactor = 0; cfg.cof_rounds = 2; cfg.cof_budget = 65536;
-    cfg.cof_ecm = 0; cfg.ecm_b1 = 1000; cfg.ecm_b2 = 0; cfg.ecm_curves = 16;
+    /* 4 rounds, not 2. ECM is the default method on a 3LP side now and its
+     * escalation is CURVES-per-round, so 2 rounds is 24 curves and reaches
+     * only 4,050 of AS276's 4,089 relations; 4 rounds is 48 and reaches all.
+     *
+     * IT IS NOT FREE FOR A RHO SIDE, and an earlier version of this comment
+     * wrongly said it was. rho escalates by DOUBLING (`budget << r`), so a
+     * lane that stays stuck costs 65536+131072 = 196,608 iterations at 2
+     * rounds and 983,040 at 4 -- 5x. Only already-resolved records fall
+     * through for free. The net is still positive on every job measured
+     * (c183 17.21 -> 14.30 ms/q, C194 15.48 -> 13.95) because the ECM side
+     * saves more than the rho side loses, but the two escalations are
+     * genuinely different knobs sharing one number, and raising --cof-rounds
+     * to tune ECM multiplies a rho side's budget exponentially. If that ever
+     * bites, the fix is a separate curve-escalation count, not a bigger
+     * shared one. */
+    cfg.cofactor = 0; cfg.cof_rounds = 4; cfg.cof_budget = 65536;
+    cfg.cof_ecm = COF_METHOD_AUTO;  /* per side, by LP count; --cof-ecm/--cof-rho force */
+    cfg.ecm_b1 = 0; cfg.ecm_b2 = 0; cfg.ecm_curves = 0;   /* 0 = derive */
+    cfg.cof_meth0 = cfg.cof_meth1 = COF_METHOD_RHO;
+    cfg.ecm_b1_set = cfg.ecm_b2_set = cfg.ecm_curves_set = 0;
     cfg.fb_maxbits = 0;
     cfg.resume = 0; cfg.restart = 0; cfg.stopfile = NULL;
     /* 300 s is ~864 records over a three-day band, which is why runlog.h needs
@@ -899,7 +1014,8 @@ static int bench_main_impl(int argc, char **argv)
         else if (!strcmp(argv[i], "--cofactor")) cfg.cofactor = 1;
         else if (!strcmp(argv[i], "--cof-rounds") && i + 1 < argc) { cof_rounds = atoi(argv[++i]); cfg.cof_rounds = cof_rounds; }
         else if (!strcmp(argv[i], "--cof-budget") && i + 1 < argc) { cof_budget = (uint32_t)strtoul(argv[++i], 0, 10); cfg.cof_budget = cof_budget; }
-        else if (!strcmp(argv[i], "--cof-ecm")) cfg.cof_ecm = 1;
+        else if (!strcmp(argv[i], "--cof-ecm")) cfg.cof_ecm = COF_METHOD_ECM;
+        else if (!strcmp(argv[i], "--cof-rho")) cfg.cof_ecm = COF_METHOD_RHO;
         /* Deriving is now unconditional, so this is accepted and ignored
          * rather than rejected: it appears in RUNBOOK.md and in scripts, and
          * breaking those to make a point about a flag that now describes the
@@ -909,7 +1025,15 @@ static int bench_main_impl(int argc, char **argv)
                             " ignored; drop it\n");
         else if (!strcmp(argv[i], "--blocking-sync")) blocking_sync = 1;
         else if (!strcmp(argv[i], "--lpb0") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 64) { fprintf(stderr, "--lpb0 %ld out of range 1..64\n", v); return 1; } cfg.lpb0 = (uint32_t)v; lpb0_set = 1; }
-        else if (!strcmp(argv[i], "--mfb0") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 96) { fprintf(stderr, "--mfb0 %ld out of range 1..96\n", v); return 1; } cfg.mfb0 = (uint32_t)v; mfb0_set = 1; }
+        else if (!strcmp(argv[i], "--mfb0") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 32 * CF_LMAX) { fprintf(stderr, "--mfb0 %ld out of range 1..%d\n", v, 32 * CF_LMAX); return 1; } cfg.mfb0 = (uint32_t)v; mfb0_set = 1; }
+        /* Cofactor width in 32-bit limbs, per side. Only useful FORCED UPWARD
+         * -- the default already picks the narrowest width mfb needs -- and
+         * that is the point: it is what lets the same job be timed at 3 limbs
+         * and at 4, which is the only way to price the width separately from
+         * the job that motivated it. Narrower than mfb needs is refused in
+         * resolve_and_check_cofactor_config, where the .job file's mfb is finally known. */
+        else if (!strcmp(argv[i], "--cof-limbs0") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < CF_LMIN || v > CF_LMAX) { fprintf(stderr, "--cof-limbs0 %ld out of range %d..%d for this build\n", v, CF_LMIN, CF_LMAX); return 1; } cfg.cof_limbs0 = (int)v; }
+        else if (!strcmp(argv[i], "--cof-limbs") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < CF_LMIN || v > CF_LMAX) { fprintf(stderr, "--cof-limbs %ld out of range %d..%d for this build\n", v, CF_LMIN, CF_LMAX); return 1; } cfg.cof_limbs = (int)v; }
         /* Range-checked like --lpb0/--mfb0 above, and for the same reason. An
          * unchecked --lambda1 0.01 gives allowance 0.32, bound 1, and a band
          * that runs for hours and emits nothing with no diagnostic.
@@ -940,9 +1064,9 @@ static int bench_main_impl(int argc, char **argv)
         else if (!strcmp(argv[i], "--check-relations") && i + 1 < argc) {
             if (bench_boinc_resolve_path("--check-relations", argv[++i], &check_rel)) return 1;
         }
-        else if (!strcmp(argv[i], "--ecm-b1") && i + 1 < argc) cfg.ecm_b1 = (uint32_t)strtoul(argv[++i], 0, 10);
-        else if (!strcmp(argv[i], "--ecm-b2") && i + 1 < argc) cfg.ecm_b2 = (uint32_t)strtoul(argv[++i], 0, 10);
-        else if (!strcmp(argv[i], "--ecm-curves") && i + 1 < argc) cfg.ecm_curves = (uint32_t)strtoul(argv[++i], 0, 10);
+        else if (!strcmp(argv[i], "--ecm-b1") && i + 1 < argc) { cfg.ecm_b1 = (uint32_t)strtoul(argv[++i], 0, 10); cfg.ecm_b1_set = 1; }
+        else if (!strcmp(argv[i], "--ecm-b2") && i + 1 < argc) { cfg.ecm_b2 = (uint32_t)strtoul(argv[++i], 0, 10); cfg.ecm_b2_set = 1; }
+        else if (!strcmp(argv[i], "--ecm-curves") && i + 1 < argc) { cfg.ecm_curves = (uint32_t)strtoul(argv[++i], 0, 10); cfg.ecm_curves_set = 1; }
         else if (!strcmp(argv[i], "--qlist") && i + 1 < argc) {
             if (bench_boinc_resolve_path("--qlist", argv[++i], &cfg.qlist)) return 1;
         }
@@ -1032,7 +1156,7 @@ static int bench_main_impl(int argc, char **argv)
             cfg.log_every_s = v;
         }
         else if (!strcmp(argv[i], "--lpb") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 64) { fprintf(stderr, "--lpb %ld out of range 1..64\n", v); return 1; } cfg.lpb = (uint32_t)v; lpb_set = 1; }
-        else if (!strcmp(argv[i], "--mfb") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 96) { fprintf(stderr, "--mfb %ld out of range 1..96\n", v); return 1; } cfg.mfb = (uint32_t)v; mfb_set = 1; }
+        else if (!strcmp(argv[i], "--mfb") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 32 * CF_LMAX) { fprintf(stderr, "--mfb %ld out of range 1..%d\n", v, 32 * CF_LMAX); return 1; } cfg.mfb = (uint32_t)v; mfb_set = 1; }
         else if (!strcmp(argv[i], "--cofgate") && i + 1 < argc) {
             if (bench_boinc_resolve_path("--cofgate", argv[++i], &cfg.cofgate)) return 1;
         }
@@ -1275,7 +1399,8 @@ static int bench_main_impl(int argc, char **argv)
     /* HERE, not before poly_load: lpb/mfb/lim may all have come from the .job
      * file just read, and validating only the command line was validating the
      * half that the argument parser had already range-checked. */
-    if (check_cofactor_bounds(&cfg, alim, rlim, cof_rounds, cof_budget)) return 1;
+    if (resolve_and_check_cofactor_config(&cfg, alim, rlim, cof_rounds,
+                                          cof_budget)) return 1;
 
     /* --check-relations is pure host code -- it re-derives both norms from the
      * polynomial and divides. It cannot run before this point because lpb0/lpb
@@ -1565,9 +1690,9 @@ static int bench_main_impl(int argc, char **argv)
         return run_cofac(cofac_in, cfg.relations, cfg.lim0, cfg.lpb0,
                          cfg.lim, cfg.lpb, cof_rounds, cof_budget,
                          cfg.blocks ? cfg.blocks : 48 * 6, cfg.threads,
-                         cfg.cof_ecm, cfg.ecm_b1 ? cfg.ecm_b1 : 1000,
-                         cfg.ecm_b2,
-                         cfg.ecm_curves ? cfg.ecm_curves : 16) ? 1 : 0;
+                         cfg.cof_meth0, cfg.cof_meth1, cfg.ecm_b1,
+                         cfg.ecm_b2, cfg.ecm_curves,
+                         cfg.cof_limbs0, cfg.cof_limbs) ? 1 : 0;
     }
 
     /* Only the pipeline reads these, so outside it they were silent no-ops --

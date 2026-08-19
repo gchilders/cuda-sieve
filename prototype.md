@@ -4233,11 +4233,20 @@ stands and is now measured where it matters.
 narrow: split factors are emitted as one uint32 limb, the rational cofactor is
 `mz<2>`, the algebraic `mz<3>`. `--lpb 33` therefore emitted relations whose
 factors no longer reconstruct the norm, and a negative value through `atoi`
-became an enormous unsigned bound. All of it now refuses: lpb <= 32, rational
-mfb <= 64, algebraic mfb <= 96, plus `lim^2 > 2^lpb` (without which the
+became an enormous unsigned bound. All of it now refuses: ~~lpb <= 32, rational
+mfb <= 64, algebraic mfb <= 96~~, plus `lim^2 > 2^lpb` (without which the
 prime-by-size shortcut in `mz_split` is unsound), rounds in 1..24, and
 `budget << (rounds-1)` checked against uint32 rather than left to shift past the
 width.
+
+*(**Superseded**: all three width bounds have since moved, and this was the
+last place in the tree still quoting the old ones. `lpb <= 64` since
+2026-08-17, when split factors and unsplit prime residuals became `uint64`.
+Both sides' `mfb <= 128` since 2026-08-18, when the cofactor width became a
+per-side run-time choice between `mz<3>` and `mz<4>` — 96 in a `make CF_LMAX=3`
+build. The other four refusals in this list are unchanged. The current bounds
+are canonical in RUNBOOK "Current hard size limits" and STATUS "Four-limb
+cofactors"; do not read them from here.)*
 
 ### The even-cofactor invariant was a warning, and a warning was not enough
 

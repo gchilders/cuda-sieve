@@ -56,17 +56,46 @@ echo
 echo "[cofactor] golden test, q = 120000053"
 
 expect_rel "trial division only"            7
-expect_rel "rho, inline queue"             37 --cofactor --cof-rounds 2 --cof-budget 65536
+# --cof-rho on every case that names rho. Since 2026-08-19 the method is chosen
+# per side and this job's algebraic side is 3LP, so without the flag these run
+# ECM there -- a rho regression would leave the pinned count intact and the
+# suite green, which is the opposite of what a golden case is for.
+expect_rel "rho, inline queue"             37 --cofactor --cof-rho --cof-rounds 2 --cof-budget 65536
 expect_rel "ECM, inline queue"             37 --cofactor --cof-ecm --ecm-b1 2000 --ecm-curves 48
-expect_rel "ECM stage 2 control, disabled" 36 --cofactor --cof-ecm --ecm-b1 1000 --ecm-b2 0 --ecm-curves 16
-expect_rel "ECM stage 2, inline queue"     37 --cofactor --cof-ecm --ecm-b1 1000 --ecm-b2 10000 --ecm-curves 16
+# --cof-rounds 2 pinned: the default became 4 on 2026-08-19, and at 4 rounds
+# stage 1 alone (64 curves) finds the relation this control exists to show
+# stage 2 finding. The case tests stage 2, so it must hold the curve budget
+# still.
+expect_rel "ECM stage 2 control, disabled" 36 --cofactor --cof-ecm --cof-rounds 2 --ecm-b1 1000 --ecm-b2 0 --ecm-curves 16
+expect_rel "ECM stage 2, inline queue"     37 --cofactor --cof-ecm --cof-rounds 2 --ecm-b1 1000 --ecm-b2 10000 --ecm-curves 16
 # The method switch must actually REACH the queue. B1 = 2 with one curve can
 # split essentially nothing, so this must fall back to the trial-division count;
 # 37 here would mean rho ran despite --cof-ecm, which is exactly the defect the
 # review found (the queue's ECM fields were left at their memset zero).
 expect_rel "ECM honoured, not silently rho"  7 --cofactor --cof-ecm --ecm-b1 2 --ecm-curves 1
 expect_refused "zero ECM curves"               --cofactor --cof-ecm --ecm-curves 0
-expect_refused "stage 2 without ECM"            --cofactor --ecm-b2 10000
+# B2 is DERIVED (30*B1) when --ecm-b2 is absent, so --ecm-b1 alone now runs
+# stage 2 where it used to run stage 1 only. Deliberate, and pinned here
+# because it silently changes the cost and yield of any script passing B1 alone.
+got=$(run --cofactor --cof-ecm --ecm-b1 2000 --relations $TMP/b2d.txt \
+      | grep -c 'ECM B1 = 2000, .*B2 = 60000' || true)
+if [ "$got" = "1" ]; then
+    printf 'PASS   %-34s B2 = 30*B1\n' "B2 derived from B1"
+else
+    printf 'FAIL   %-34s no derived B2 line\n' "B2 derived from B1"; fail=1
+fi
+# ...and a B1 near the top of its own documented range must not self-refuse by
+# deriving a B2 past the B2 ceiling. --ecm-b1 accepts up to 1000000.
+if run --cofactor --cof-ecm --ecm-b1 400000 --nq 1 --relations $TMP/b1hi.txt \
+   >/dev/null 2>&1; then
+    printf 'PASS   %-34s accepted\n' "large B1 with derived B2"
+else
+    printf 'FAIL   %-34s refused itself\n' "large B1 with derived B2"; fail=1
+fi
+# --ecm-b2 without --cof-ecm is NO LONGER an error: since 2026-08-19 the method
+# is chosen per side, and this job's algebraic side is 3LP, so ECM is selected
+# automatically and the flag is live. Forcing rho is what makes it a no-op.
+expect_refused "stage 2 with rho forced"        --cofactor --cof-rho --ecm-b2 10000
 expect_refused "stage 2 below B1"               --cofactor --cof-ecm --ecm-b1 1000 --ecm-b2 1000
 
 # ---- job-file parameters -------------------------------------------------
@@ -176,7 +205,7 @@ fi
 # nothing below it.
 expect_refused "lpb above the 64-bit word"    --cofactor --lpb 65
 # --lpb 65 is rejected by the ARGUMENT PARSER, which is not the check that
-# matters. check_cofactor_bounds() exists for the values that arrive from a
+# matters. resolve_and_check_cofactor_config() exists for the values that arrive from a
 # .job FILE, where nothing range-checks them -- its own comment says so. That
 # branch needs a job file to reach it.
 { cat $POLY; printf 'rlim: 134200000\nalim: 134200000\nlpbr: 31\nlpba: 65\nmfbr: 60\nmfba: 92\n'; } > $TMP/lpb65.job
@@ -192,7 +221,11 @@ fi
 # would silently stop exercising the widening if the gate or the job ever
 # moved. Through `run`, so it carries $PIN like every other count-pinned case:
 # 59 has to be a function of the widening, not of the allowance policy.
-got=$(run --cofactor --cof-rounds 2 --cof-budget 65536 --lpb 33 \
+# --cof-rho: this case pins a count, and at lpb 33 / mfb 92 the automatic
+# method would pick ECM (3 parts), which finds 60 rather than rho's 59. Both
+# are correct -- ECM is a strict superset here (finding 70) -- but a golden
+# count has to name its method or it moves the next time a default does.
+got=$(run --cofactor --cof-rho --cof-rounds 2 --cof-budget 65536 --lpb 33 \
           --relations $TMP/l33.txt | grep 'total relations' | tail -1 | awk '{print $NF}')
 # length > 8 hex digits is the whole test: any 8-digit value is below 2^32 by
 # definition. `|| echo 0` because a failed run above leaves no file, and a bare
@@ -218,7 +251,108 @@ if ./bench --check-relations $TMP/l33.txt --poly $POLY --lpb 32 --lpb0 31 2>&1 \
 else
     printf 'FAIL   %-34s lpb 32 accepted a 33-bit factor\n' "lpb bound is enforced"; fail=1
 fi
-expect_refused "mfb above the 3-limb cofactor" --cofactor --mfb 97
+
+# ---- automatic per-side METHOD --------------------------------------------
+# rho for a 2LP side, ECM for a 3LP one. This job is mfbr 60 / lpbr 31 (2 parts)
+# and mfba 92 / lpba 32 (3 parts), so it must resolve to rho / ECM -- the same
+# mixed shape a real job has, and the reason the choice is per side at all.
+got=$(run --cofactor --relations $TMP/m.txt | grep -c 'cofactor method: side 0 rho, side 1 ECM' || true)
+if [ "$got" = "1" ]; then
+    printf 'PASS   %-34s rho / ECM\n' "auto method, 2LP and 3LP sides"
+else
+    printf 'FAIL   %-34s did not resolve to rho / ECM\n' "auto method, 2LP and 3LP sides"; fail=1
+fi
+# Forcing must override the automatic choice in both directions.
+got=$(run --cofactor --cof-rho --relations $TMP/m.txt | grep -c 'side 0 rho, side 1 rho' || true)
+got2=$(run --cofactor --cof-ecm --relations $TMP/m.txt | grep -c 'side 0 ECM, side 1 ECM' || true)
+if [ "$got" = "1" ] && [ "$got2" = "1" ]; then
+    printf 'PASS   %-34s both directions\n' "--cof-rho / --cof-ecm override"
+else
+    printf 'FAIL   %-34s rho=%s ecm=%s\n' "--cof-rho / --cof-ecm override" "$got" "$got2"; fail=1
+fi
+
+# ---- cofactor WIDTH (3 limbs vs 4) ----------------------------------------
+# The width is now a per-side run-time choice: 3 limbs (96 bits) covers this
+# job and a C194, 4 limbs (128) is what a C208's algebraic mfb needs. Which
+# widths a build carries is a compile-time knob (CF_LMAX), so the cases below
+# ask the binary what it has rather than assuming, and the boundary case is
+# computed from the answer instead of being pinned at 97.
+LMAX=$(run --cofactor --cof-rounds 1 --cof-budget 4096 --relations $TMP/w.txt \
+       | sed -n 's/.*this build carries [0-9]*\.\.\([0-9]*\).*/\1/p' | head -1)
+case "$LMAX" in
+    3|4) printf 'PASS   %-34s %s limbs\n' "build reports its widest cofactor" "$LMAX" ;;
+    *)   printf 'FAIL   %-34s no width line in the output\n' "build reports its widest cofactor"
+         fail=1; LMAX=3 ;;
+esac
+expect_refused "mfb above the widest cofactor" --cofactor --mfb $((32 * LMAX + 1))
+
+if [ "$LMAX" -ge 4 ]; then
+    # THE case for the 4-limb work, and the only one that can be run without a
+    # C208 in hand: rho and ECM are Montgomery-domain algorithms whose sequence
+    # is y <- y^2 + c in the TRUE domain regardless of R = 2^(32L), so widening
+    # a side must change the cost and nothing else. Byte-identical output, not
+    # an equal count -- an equal count would still pass if the widening
+    # reordered or substituted factors. Same argument, and the same evidence,
+    # as the 2 -> 3 limb widening of the rational side.
+    run --cofactor --cof-rho --cof-rounds 2 --cof-budget 65536 --relations $TMP/w3.txt >/dev/null
+    run --cofactor --cof-rho --cof-rounds 2 --cof-budget 65536 --cof-limbs 4 --cof-limbs0 4 \
+        --relations $TMP/w4.txt >/dev/null
+    if [ -s $TMP/w3.txt ] && cmp -s $TMP/w3.txt $TMP/w4.txt; then
+        printf 'PASS   %-34s identical to the 3-limb run\n' "rho at 4 limbs"
+    else
+        printf 'FAIL   %-34s output differs from the 3-limb run\n' "rho at 4 limbs"; fail=1
+    fi
+    # 4/3, the asymmetric shape a C208 actually asks for: only the hard side
+    # widens. It exercises the mixed instantiation of k_cof_enqueue, which the
+    # symmetric case above does not.
+    run --cofactor --cof-rho --cof-rounds 2 --cof-budget 65536 --cof-limbs 4 \
+        --relations $TMP/w43.txt >/dev/null
+    if [ -s $TMP/w43.txt ] && cmp -s $TMP/w3.txt $TMP/w43.txt; then
+        printf 'PASS   %-34s identical to the 3-limb run\n' "4/3 split width"
+    else
+        printf 'FAIL   %-34s output differs from the 3-limb run\n' "4/3 split width"; fail=1
+    fi
+    run --cofactor --cof-ecm --ecm-b1 1000 --ecm-b2 10000 --ecm-curves 16 \
+        --relations $TMP/e3.txt >/dev/null
+    run --cofactor --cof-ecm --ecm-b1 1000 --ecm-b2 10000 --ecm-curves 16 \
+        --cof-limbs 4 --relations $TMP/e4.txt >/dev/null
+    if [ -s $TMP/e3.txt ] && cmp -s $TMP/e3.txt $TMP/e4.txt; then
+        printf 'PASS   %-34s identical to the 3-limb run\n' "ECM at 4 limbs"
+    else
+        printf 'FAIL   %-34s output differs from the 3-limb run\n' "ECM at 4 limbs"; fail=1
+    fi
+
+    # The cases above force the width; this one DERIVES it, which is the path
+    # every real job takes. `lpb 33, mfb 99` is the smallest shape on this
+    # polynomial that genuinely needs 4 limbs -- CF_MAXFAC caps the split at 3
+    # parts, so mfb cannot exceed 3*lpb, and at lpb 32 that is exactly the
+    # 96 bits 3 limbs already hold. It is the c183 standing in for a C208's
+    # asymmetry: side 1 wide, side 0 narrow, chosen by nobody.
+    out=$(run --cofactor --cof-rounds 2 --cof-budget 65536 --lpb 33 --mfb 99 \
+              --relations $TMP/w99.txt || true)
+    got=$(printf '%s' "$out" | grep -c 'side 0 3 limbs (96 bits), side 1 4 limbs (128 bits)' || true)
+    n99=$(printf '%s' "$out" | grep 'total relations' | tail -1 | awk '{print $NF}')
+    # Not pinned to a number: mfb 99 admits candidates the pinned lpb-33 case
+    # (mfb 92) never saw, so the count is a property of the wider gate and not
+    # of the width. What must hold is that the width was DERIVED as 4/3, that
+    # relations came out, and that every one of them reconstructs its norm --
+    # which is the assertion a truncated high limb would fail.
+    if [ "$got" = "1" ] && [ "${n99:-0}" -ge 59 ] && \
+       ./bench --check-relations $TMP/w99.txt --poly $POLY --lpb 33 --lpb0 31 2>&1 \
+       | grep -q 'PASS'; then
+        printf 'PASS   %-34s 4/3 derived, %s relations, all reconstruct\n' \
+               "lpb 33 / mfb 99 needs 4 limbs" "$n99"
+    else
+        printf 'FAIL   %-34s width line %s, %s relations\n' \
+               "lpb 33 / mfb 99 needs 4 limbs" "$got" "$n99"; fail=1
+    fi
+    # ...and the same shape with the width forced back down must be REFUSED,
+    # or "derived 4" above proves only that a default was printed.
+    expect_refused "cof-limbs below what mfb needs" --cofactor --lpb 33 --mfb 99 --cof-limbs 3
+else
+    printf 'SKIP   %-34s build is 3-limb only\n' "4-limb width cases"
+fi
+
 expect_refused "zero rho budget"              --cofactor --cof-budget 0
 expect_refused "rho rounds overflowing shift" --cofactor --cof-rounds 40
 expect_refused "lambda in the typo window"    --cofactor --lambda1 0.01

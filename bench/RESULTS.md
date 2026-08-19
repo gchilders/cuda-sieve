@@ -4070,3 +4070,204 @@ sieving, run neither.
 ./bench --region 14 --apply-mode plain           # isolates smem atomic cost
 ./bench --region 15 --cells 8                    # prices the unsafe byte cell
 ```
+
+## Finding 69 — the C208 validated against a 1.5B-relation GGNFS corpus: 99.97% recall, 1.6% genuinely new — and the default rho budget was silently losing 13.7% of it
+
+**Date:** 2026-08-19, RTX 5070 against the AS276 (C208) production corpus in
+`~/code/ggnfs-distributed/AS276/` — 283,364 work units, ~1.5B relations,
+`gnfs-lasieve4I16e -J 16`, already filtered and known good. Our side is the
+first run of the 4-limb cofactor path (finding: STATUS "Four-limb cofactors").
+
+AS276 is `lpbr 33 / lpba 35`, `mfbr 64 / mfba 101` — the first job whose
+algebraic side does not fit 96 bits, and so the first real exercise of `mz<4>`.
+
+### The comparison is exact, not approximate
+
+Their work units are contiguous, non-overlapping 1000-wide q blocks:
+**file index `N` = `floor((q - 80000000)/1000)`**, verified at N = 0, 1, 30, 60
+and 283364. So `wu-38370f06-000000.dat.zst` is the *complete* GGNFS output for
+`q in [80000023, 80000939]` — 30 special-q, 4,564 relations — and nothing for
+those q lives anywhere else. Confirmed by probing 60 neighbouring work units
+for 40 of our relations: zero hits.
+
+`relgeom.py extent` recovers both rectangles from the relations themselves:
+
+| run | i range | j range | rectangle |
+|---|---:|---:|---|
+| theirs, `I16e -J 16` | ±65477 | 1 .. 32761 | `2^17 x 2^15` |
+| ours, `--logI 17 --J 16384` | ±65449 | 1 .. 16375 | `2^17 x 2^14` |
+| ours, `--logI 16 --J 32768` | ±32721 | 1 .. 32761 | `2^16 x 2^15` |
+
+confirming finding 65's rule `our rectangle = 2^(J_bits+1) x 2^(I_bits-1)` at
+`n = 16`. **Their shape is `A = 32`, which we still refuse**, so both of our
+runs are nested sub-rectangles — one halving `j`, the other halving `i`. Two
+independent nestings, which is what makes the agreement below meaningful.
+
+### The rho budget was the whole story
+
+At the **default** `--cof-rounds 2 --cof-budget 65536`, in the identical
+`2^17 x 2^14` region over the identical 30 special-q:
+
+| | relations | of theirs, missed |
+|---|---:|---:|
+| default budget | 3,205 | **389 of 2,846 (13.7%)** |
+| `--cof-rounds 6 --cof-budget 262144` | 3,823 | **2 of 2,846 (0.07%)** |
+
+**+19.3% relations from the budget alone**, and the missing 13.7% was not
+geometry, not the gate, and not the width — it was `mz_split` running out of
+rho iterations and returning `CF_INCOMPLETE`. That is exactly what a 4-limb job
+should do to a budget tuned on 3-limb ones: rho's expected iteration count
+scales as the square root of the factor sought, so a 35-bit large prime costs
+`sqrt(2^(35-30)) = 5.7x` what a 30-bit one does. The default was calibrated on
+the c183's `lpba 32`.
+
+**This is the operational finding of the 4-limb work.** The width change is
+correct and cheap; the *schedule* around it is what needed retuning, and a run
+at the old default would have looked like a 14% yield hole in the siever.
+
+### Agreement with GGNFS, at the retuned budget
+
+Second nesting (`2^16 x 2^15`, the default-`16e` shape), same 30 q, all
+4,089 of our relations passing `--check-relations` (every factor divides, is
+prime, is within `lpb`, both norms rebuild to exactly 1):
+
+| | count |
+|---|---:|
+| in both | 3,044 |
+| theirs only | **1** |
+| ours only | 1,045 |
+
+**Recall 3,044 / 3,045 = 99.97%**, flat across all eight `j` bands (our share
+1.26 to 1.44, no geometry artifact).
+
+The 1,045 "ours only" are *mostly not new*. A relation carries every band prime
+dividing its norm, so GGNFS may have found the same `(a,b)` under a different
+special-q. Using the exact WU mapping above to look each one up in the work
+unit that would have produced it:
+
+| | count |
+|---:|---:|
+| re-found elsewhere in their corpus | **981** |
+| had a re-find opportunity, absent anyway | 10 |
+| no other q in their swept range `[80000023, 363364957]` — cannot be anywhere | 54 |
+
+So **64 of our 4,089 relations (1.6%) exist nowhere in their 1.5B corpus**, and
+all 64 reconstruct both norms exactly.
+
+### What this establishes
+
+- The 4-limb cofactor path is **correct on a real 4-limb job**, cross-validated
+  against an independently filtered production corpus rather than against
+  ourselves.
+- The two sievers agree to **~2% in both directions** — 0.03% of theirs missed,
+  1.6% of ours novel — which is the same geometry-independent residual finding
+  65 measured on the C194 at 0.979. Neither siever is a subset of the other,
+  and that was never the expectation once relations can be re-found under
+  several q.
+- **`--cof-rounds`/`--cof-budget` must be re-derived per job class**, not
+  inherited. See RUNBOOK "Cofactor width".
+
+**No timing is claimed here.** An ECM job had the GPU throughout; only counts
+and set membership are reported, and both are timing-independent.
+
+## Finding 70 — ECM beats rho ~2-4x at 3LP and LOSES at 2LP; the crossover is the large-prime count, not lpb. (Supersedes this finding's own first version.)
+
+**Date:** 2026-08-19, RTX 5070, GPU idle (the box's ECM job suspended with
+`kill -STOP`). Prompted by "might ECM beat rho at lpb 35?"
+
+### Correction to the first version of this finding
+
+The first version reported **15.3x** (c183) and **17.8x** (AS276) for ECM. Those
+numbers were wrong, and wrong by the *same methodological error this finding was
+written to expose*: I tuned one method and not the other. rho was priced at the
+first budget I happened to try that saturated yield (`b=262144`, `b=2097152`),
+never swept **downward**. Swept properly, rho saturates far cheaper:
+
+| job | rho as first reported | rho actually swept | same relations |
+|---|---:|---:|---|
+| c183 `lpb 32 / mfb 92` | 239.09 ms/q (`b=262144`) | **30.83** (`b=8192`) | 9,394 |
+| AS276 `lpb 35 / mfb 101` | 2,197.49 ms/q (`b=2097152`) | **332.63** (`b=16384`) | 4,089 |
+
+rho's cost is nearly linear in the budget once the budget is past saturation, so
+an over-large budget is pure waste and makes any comparison against it
+meaningless. **Both methods must be swept from below.** Corrected:
+
+| job | rho (cheapest saturating) | ECM (cheapest saturating) | ECM speedup |
+|---|---:|---:|---:|
+| c183 `lpb 32 / mfb 92`, 200 q | 30.83 ms/q (`r6 b=8192`) | **15.38** (`B1=250 c12 r4`) | **2.00x** |
+| AS276 `lpb 35 / mfb 101`, 30 q | 332.63 ms/q (`r6 b=16384`) | **123.22** (`B1=300 c12 r4`) | **2.70x** |
+
+Real, reproducible, and byte-identical output — but 2-3x, not 15-18x.
+
+### The crossover is 2LP vs 3LP
+
+Sweep on the c183 polynomial, 25 q, `--lpb` and `--mfb` varied together at
+shapes an operator would actually run (2LP at `mfb = 2*lpb` for `lpb <= 30`;
+3LP at `mfb = 3*lpb - 3` above, since three exact-`lpb` factors out of a
+`3*lpb`-bit composite is vanishingly rare). Cheapest configuration of each
+method reaching **saturated relation yield**, both swept from below:
+
+| lpb | shape | mfb | rel | ECM best | rho best | winner |
+|---:|---|---:|---:|---:|---:|---|
+| 29 | 2LP | 58 | 237 | 2.61 (`B1=70`) | **2.42** | **rho 1.08x** |
+| 30 | 2LP | 60 | 373 | 3.21 (`B1=200`) | **2.81** | **rho 1.14x** |
+| 31 | 3LP | 90 | 724 | **12.61** (`B1=200`) | 28.15 | ECM 2.23x |
+| 32 | 3LP | 93 | 1,171 | **19.71** (`B1=200`) | 42.62 | ECM 2.16x |
+| 33 | 3LP | 96 | 1,828 | **29.26** (`B1=200`) | 93.34 | ECM 3.19x |
+| 34 | 3LP | 99 | 2,686 | **135.00** (`B1=300`) | 367.49 | ECM 2.72x |
+| 35 | 3LP | 102 | 3,837 | **213.66** (`B1=300`) | 880.36 | ECM 4.12x |
+| 36 | 3LP | 105 | 5,498 | **394.30** (`B1=500`) | 1,225.73 | ECM 3.11x |
+
+**The discriminant is the number of large primes, not lpb.** At 2LP rho wins
+narrowly and the gap is inside run-to-run noise; the moment the shape becomes
+3LP, ECM wins by 2-4x and stays there. That is mechanism, not coincidence: 2LP
+needs one split of a semiprime with `~lpb`-bit factors, which rho does in
+`~sqrt(2^lpb)` iterations on a cost that is *data-dependent* (easy lanes exit
+early). 3LP needs two successive splits of a much larger composite, and rho pays
+`sqrt` of the whole thing twice while ECM's `B1` barely moves.
+
+Optimal `B1` tracks the factor size gently — 200 at `lpb 31-33`, 300 at 34-35,
+500 at 36 — and 12 curves over 4 rounds covers the whole range.
+
+### `stuck == 0` is NOT the saturation criterion
+
+Worth stating because it cost a whole sweep. A record left `CF_INCOMPLETE` is of
+*unknown* status, and at 3LP most of them are composites whose factors **all**
+exceed `lpb` — never relations, but only provable dead by factoring them. At
+`lpb 29 / mfb 87` (an unrealistic shape) rho needed `b=1048576` and 382 ms/q to
+reach `stuck == 0` while relation yield had saturated at `b=65536` and 84 ms/q.
+**Sweep to saturated yield, and read the stuck count as "unknown", not "lost".**
+
+### The old "rho beats ECM 2.32x" was still an untuned-B1 artifact
+
+That part of the first version survives. On the c183, `B1=1000 B2=10000 c16`
+costs 36.85 ms/q against `B1=250`'s 15.38 for the same 9,394 relations — 2.4x,
+and `B1=1000` is ~4x above optimal for this job's ~30-bit factors. The original
+comparison also priced rho below full yield (the shipped default `r2/b65536`
+returns 9,363, not 9,394). Correcting both still inverts the conclusion, just to
+2x rather than 15x.
+
+### Applied 2026-08-19
+
+Shipped as the default: method chosen **per side** from `ceil(mfb/lpb)`, rho at
+2LP and ECM at 3LP, `B1` derived from `lpb`, and the requeue round default
+raised 2 -> 4 because ECM escalates in curves per round and 2 rounds reached
+only 4,050 of AS276's 4,089. Zero flags, against the previous default:
+
+| job | stage ms/q | wall ms/q | relations |
+|---|---|---|---|
+| c183 | 17.21 -> **14.30** | 113.35 -> **109.86** | 9,363 -> **9,394** |
+| C194 | 15.48 -> **13.95** | 116.30 -> **109.36** | unchanged |
+| AS276 | — | — | 3,443 -> **4,089** |
+
+Cheaper and higher-yielding on all three, and on AS276 the automatic choice
+(124.07 ms/q) matches the hand-tuned optimum (123.22) without being told
+anything. `--cof-rho` / `--cof-ecm` force one method on both sides.
+
+Three defects surfaced while wiring it, all from `0` being an existing sentinel
+that the new "0 means derive" logic overrode: `--ecm-b2 0` (documented as
+"disable stage 2") was silently re-enabled, `--ecm-curves 0` stopped being
+refused, and an explicit small `--ecm-b1` synthesised an illegal `B2 = 30*B1`.
+Fixed with explicit `_set` flags rather than value tests. All three were caught
+by `cofcheck.sh`, which is what that suite is for.
+

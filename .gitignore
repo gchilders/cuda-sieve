@@ -33,6 +33,7 @@ bench/.boinc.stamp
 bench/.link.stamp
 bench/.git.stamp
 bench/.defs.stamp
+bench/.cflmax.stamp
 *.d
 
 # All per-job working state lives under work/: poly, factor base, relations,
