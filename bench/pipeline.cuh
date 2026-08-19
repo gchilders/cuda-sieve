@@ -1234,9 +1234,11 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
      * special-q and flushes ~67 q worth at a time. With it resident, only the
      * ~2% of records that become relations are read back, and the 295 MB
      * candidate file and its ~3 ms/q of host emission are gone. */
-    if (cfg->cofactor && cofq_init(&Q, &QO, CQ_FLUSH, cfg->cof_ecm,
-                                   cfg->ecm_b1, cfg->ecm_b2,
-                                   cfg->ecm_curves)) { rc = -1; goto done; }
+    if (cfg->cofactor && cofq_init(&Q, &QO, CQ_FLUSH,
+                                   cfg->cof_meth0, cfg->cof_meth1,
+                                   cfg->ecm_b1, cfg->ecm_b2, cfg->ecm_curves,
+                                   cfg->cof_limbs0, cfg->cof_limbs))
+        { rc = -1; goto done; }
     if (cfg->cofactor) VRAM_MARK("cofactor queue");
 #undef VRAM_MARK
 
@@ -1521,10 +1523,11 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                             nacc, Q.cap);
                 rc = -1; break;
             }
-            k_cof_enqueue<<<blocks, cfg->threads>>>(
-                C.d_ccof[0], C.d_cbits[0], C.d_ccof[1], C.d_cbits[1],
-                C.d_ca, C.d_cb, C.d_cfac[0], C.d_cfn[0], C.d_cfac[1], C.d_cfn[1],
-                nacc, Q.n, cfg->lpb0, cfg->lpb, Q);
+            if (cof_enqueue(blocks, cfg->threads,
+                            C.d_ccof[0], C.d_cbits[0], C.d_ccof[1], C.d_cbits[1],
+                            C.d_ca, C.d_cb,
+                            C.d_cfac[0], C.d_cfn[0], C.d_cfac[1], C.d_cfn[1],
+                            nacc, Q.n, cfg->lpb0, cfg->lpb, &Q)) { rc = -1; break; }
             if (CUDA_CHECKED(cudaDeviceSynchronize()) ||
                 CUDA_CHECKED(cudaGetLastError())) { rc = -1; break; }
             Q.n += nacc;
@@ -2144,6 +2147,74 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
             printf("  %-34s %8llu  (of which %llu needed no splitting)\n",
                    "records enqueued", (unsigned long long)Q.nseen,
                    (unsigned long long)acc_rel);
+            /* Per-side outcome, and in particular the STUCK count.
+             *
+             * This exists because its absence hid two real yield losses: 13.7%
+             * on AS276 and 0.33% on the c183 (RESULTS findings 69 and 70). A
+             * record whose splitter ran out of budget is left CF_INCOMPLETE,
+             * quietly fails to become a relation, and is indistinguishable in
+             * every other printed number from a job that simply had no more
+             * relations to give. Only a corpus comparison found it. Now the
+             * run says so itself. */
+            {
+                const unsigned long long st0 = Q.nst[0][CF_INCOMPLETE];
+                const unsigned long long st1 = Q.nst[1][CF_INCOMPLETE];
+                const unsigned long long stuck = st0 + st1;
+                for (int sd = 0; sd < 2; sd++) {
+                    char lbl[40];
+                    snprintf(lbl, sizeof lbl, "  side %d: split / dead / stuck", sd);
+                    printf("  %-34s %8llu / %llu / %llu\n", lbl,
+                           Q.nst[sd][CF_OK], Q.nst[sd][CF_DEAD],
+                           Q.nst[sd][CF_INCOMPLETE]);
+                    /* Two producers, so the label names neither: mz_split
+                     * sets CF_OVERFLOW when a split yields more than
+                     * CF_MAXFAC parts, and k_cof_enqueue sets it when a
+                     * residual is wider than the side's limbs. Saying
+                     * "CF_MAXFAC" would point an operator at the splitter's
+                     * stack guard when the actual cause was mfb vs CF_LMAX. */
+                    if (Q.nst[sd][CF_OVERFLOW])
+                        printf("  %-34s %8llu\n",
+                               "    OVERFLOW (parts, or cofactor width)",
+                               Q.nst[sd][CF_OVERFLOW]);
+                }
+                /* Warned, not merely printed, because the band otherwise
+                 * exits 0 looking healthy.
+                 *
+                 * "Unresolved", NOT "lost". A stuck record's status is
+                 * UNKNOWN, and the two populations behind it are very
+                 * different: it may be a cofactor that would have split into a
+                 * relation, or a composite whose factors ALL exceed lpb --
+                 * which can never be a relation, but which the splitter can
+                 * only prove dead by factoring it anyway. At a tight mfb/lpb
+                 * ratio the second population dominates, so a large stuck
+                 * count is not by itself a large yield loss. Measuring which
+                 * is which costs a run at a bigger budget, which is exactly
+                 * what this line is telling the operator to do. */
+                /* A RATE, not any nonzero count. A correctly tuned 3LP band
+                 * still leaves plenty of records unresolved -- AS276 at its
+                 * saturated-yield configuration sits at 20.9% -- because most
+                 * of them are composites whose factors all exceed lpb, which
+                 * can only be proven dead by factoring them. Warning on
+                 * `stuck > 0` would therefore fire on nearly every healthy
+                 * production band, and under BOINC stderr is uploaded per work
+                 * unit. The counts above are always printed; this fires only
+                 * when the rate is high enough to be worth a look.
+                 *
+                 * A third is a heuristic with two data points behind it, not a
+                 * derived bound: AS276 sits at 20.9% when correctly tuned and
+                 * 55% when its budget was five times too small. Nothing inside
+                 * a single run distinguishes the two, which is why the message
+                 * names the actual test rather than asserting a fault. */
+                if (Q.nseen && stuck * 3ull > Q.nseen)
+                    runlog_warn("  %llu of %llu records (%.1f%%) left unresolved by"
+                                " the splitting budget. That is high; a healthy 3LP"
+                                " band runs ~20%%. These are cofactors of UNKNOWN"
+                                " status, so some may have been relations -- re-run"
+                                " a short band at a higher --cof-budget /"
+                                " --cof-rounds and see whether the yield moves.",
+                                stuck, Q.nseen,
+                                100.0 * (double)stuck / (double)Q.nseen);
+            }
             /* Q.nrel is EVERY relation: the queue is the single emitter, so
              * it already holds the ones trial division completed. */
             printf("  %-34s %8.2f\n", "ALL RELATIONS/q", (double)Q.nrel / N);

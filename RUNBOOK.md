@@ -115,7 +115,8 @@ The production binary currently refuses:
 
 - a sieve rectangle with more than `2^31` positions;
 - `lpbr` or `lpba` above 64;
-- `mfbr` or `mfba` above 96;
+- `mfbr` or `mfba` above 128 (above 96 in a `CF_LMAX=3` build — see
+  [Cofactorisation](#cofactorisation-width-and-method-both-per-side) below);
 - a ratio `ceil(mfb/lpb)` above 3 on either side; or
 - `lim^2 <= 2^lpb` on either side, which makes the "prime by size" test in the
   splitter unsound (it binds around `lpb 55` at an `alim` of 240M).
@@ -127,22 +128,185 @@ current 32-bit exclusive position endpoint and is therefore refused.
 **`lpb` above 32 is supported as of 2026-08-17** — an NFS@Home C194 asks for
 `lpba 33` with `mfba 95`, and that runs today. What it did *not* require is any
 change to the cofactor arithmetic: `mfb <= 96` still means three limbs, and
-`ceil(96/33) = 3` still fits the splitter. An `lpb 35 / mfb 101` side is the
-different problem, because 101 bits needs a four-limb kernel.
+`ceil(96/33) = 3` still fits the splitter.
 
 LPB and MFB should not be conflated. LPB is the bound on each resulting prime;
 raising it above 32 widened the split-prime, emission, and validation paths to
-64 bits (done 2026-08-17). MFB is the maximum composite residual sent to cofactorisation and sets
-the arithmetic width: up to 64 bits can use two 32-bit limbs, up to 96 three,
-and up to 128 four. Thus `lpb 33` with `mfb 64/95` does not require
-four-limb rho or ECM, and is exactly the configuration that now runs.
+64 bits (done 2026-08-17). MFB is the maximum composite residual sent to
+cofactorisation and sets the arithmetic width: up to 64 bits can use two 32-bit
+limbs, up to 96 three, and up to 128 four. Thus `lpb 33` with `mfb 64/95` does
+not require four-limb rho or ECM, and is exactly the configuration the C194
+runs.
 
-For the current status, proposed per-side fixed-width kernel dispatch, A=32
-memory/slabbing options, and why the end metric is time to a filterable matrix
-rather than raw relations/s, see [Current size limits, and what lifting them
+### Cofactorisation: width and method, both per side
+
+**Four-limb cofactors landed 2026-08-18.** The width is now chosen **per side**,
+at run time, as the narrowest instantiation that holds that side's `mfb`:
+
+| `mfb` | limbs | bits | example |
+|---|---|---|---|
+| ≤ 96 | 3 | 96 | SNFS `mfbr 88`; C194 `mfba 95`; AS276 `mfbr 64` |
+| 97–128 | 4 | 128 | AS276 `mfba 101` |
+
+**AS276** (the C208, `~/code/ggnfs-distributed/AS276.job`: `lpbr 33 / lpba 35`,
+`mfbr 64 / mfba 101`) therefore runs **4/3** — wide on the hard side, narrow on
+the easy one — without any flag. Nothing needs setting for it to be picked, and the choice is
+printed at the head of every cofactoring run:
+
+    cofactor width: side 0 3 limbs (96 bits), side 1 4 limbs (128 bits); this build carries 3..4
+
+Two knobs exist, and neither is tuning advice:
+
+- **`--cof-limbs N` / `--cof-limbs0 N`** force a side wider than its `mfb`
+  needs. This exists so the *same* job can be timed at 3 limbs and at 4 —
+  otherwise the only jobs that exercise the 4-limb splitter are ones no 3-limb
+  run can be compared against. Forcing a side *narrower* than its `mfb` needs
+  is refused, because that is exactly the silent truncation the width machinery
+  removes.
+- **`make CF_LMAX=3`** builds a binary carrying only the 3-limb splitter,
+  reproducing the pre-2026-08-18 executable. The default carries both and picks
+  per job. This is the knob for the "separate executables" option; it takes
+  `bench_kernels.o`'s device code from 8.99 MB to 4.02 MB and roughly halves the
+  ptxas work on `k_cofac` and its ECM variants. A `CF_LMAX=3` binary is
+  **shippable** — its relations are byte-identical to a `CF_LMAX=4` binary's, and
+  it is a first-class Make variable rather than a `DEFS` value precisely so that
+  it is not branded a pricing build and refused `--relations`.
+
+#### Method: ECM for 3LP, rho for 2LP — AUTOMATIC since 2026-08-19
+
+**This is the default; nothing needs passing.** The method is chosen **per
+side** from `ceil(mfb/lpb)`: 2 parts (2LP) runs rho, 3 parts (3LP) runs ECM.
+Per side because a real job is usually one of each — AS276 is 2LP rational and
+3LP algebraic, so a per-job choice is wrong on one side of nearly every job.
+Every run prints what it picked:
+
+    cofactor method: side 0 rho, side 1 ECM
+
+ECM parameters are derived from the lpb of whichever side runs ECM: **B1 = 200**
+at `lpb <= 33`, **300** at 34–35, **500** at 36+; `B2 = 30 * B1`; 12 curves;
+4 rounds. Override any of them with `--ecm-b1 / --ecm-b2 / --ecm-curves /
+--cof-rounds`.
+
+Measured effect of the default change, zero flags, against the previous
+default (rho on both sides, `--cof-rounds 2 --cof-budget 65536`):
+
+| job | stage ms/q | wall ms/q | relations |
+|---|---|---|---|
+| c183 | 17.21 → **14.30** | 113.35 → **109.86** | 9,363 → **9,394** |
+| C194 | 15.48 → **13.95** | 116.30 → **109.36** | unchanged |
+| AS276 | — | — | 3,443 → **4,089** |
+
+Cheaper *and* higher-yielding on all three. AS276's +18.8% is the old rho
+budget having been far too small for a 3LP side at `lpb 35` — see finding 69.
+
+To force one method on both sides, for A/B work or to reproduce the old
+behaviour:
+
+```sh
+--cof-rho     # rho on both sides (the pre-2026-08-19 default)
+--cof-ecm     # ECM on both sides
+```
+
+The `B1 = 1000-2000` values in `cofcheck.sh` are correctness fixtures, not
+tuning advice — `B1=1000` costs 2.4x what `B1=250` does for the same relations.
+
+#### Sweep the budget from BELOW, both methods
+
+The single most expensive mistake available here, and it has now been made
+twice in this repo's history in both directions. rho's cost is nearly linear in
+its budget once past saturation, so pricing it at the first budget that happens
+to saturate overstates it wildly — on AS276 that was 332 ms/q reported as
+2,197. Always walk the budget **up** from a value that clearly under-yields, and
+take the first one where the relation count stops moving.
+
+Do **not** use `stuck == 0` as the criterion. A stuck record's status is
+unknown, and at 3LP most are composites whose factors all exceed `lpb` — never
+relations, but only provable dead by factoring them. Yield saturates long before
+the stuck count does.
+
+#### If you force rho (`--cof-rho`), its budget is NOT inherited across width classes
+
+Historical but load-bearing: this is how the 4-limb work's one real defect was
+found, and it is still what happens to anyone who forces rho on a 3LP side.
+Measured on
+AS276 against the GGNFS corpus (RESULTS finding 69), same region, same 30
+special-q:
+
+| setting | relations | of GGNFS's, missed |
+|---|---:|---:|
+| `--cof-rounds 2 --cof-budget 65536` (the default until 2026-08-19) | 3,205 | 389 of 2,846 (**13.7%**) |
+| `--cof-rounds 6 --cof-budget 262144` | 3,823 | 2 of 2,846 (0.07%) |
+
+**+19.3% relations from the budget alone.** The default was calibrated on the
+c183's `lpba 32`. Pollard-Brent rho's expected iteration count grows as the
+square root of the factor being sought, so a 35-bit large prime costs
+`sqrt(2^5) = 5.7x` what a 30-bit one does; an unchanged budget simply returns
+`CF_INCOMPLETE` and the relation is lost. It does not fail, warn, or look
+wrong — it looks like a 14% yield hole in the siever.
+
+Rule of thumb: scale the budget by `2^((lpb - 30)/2)` off the c183 default, and
+confirm on a short band against a known corpus if one exists. The automatic
+method avoids this entirely on a 3LP side by not using rho there.
+
+#### What the fourth limb costs — MEASURED, decision made
+
+Both jobs, 200 q and 100 q, all width combinations byte-identical:
+
+| job | 3/3 | 3/4 (the wide-algebraic shape) | wall cost |
+|---|---:|---:|---:|
+| c183 | 16.88 ms/q stage, 112.17 wall | 26.38, **121.99** | **+8.8%** |
+| C194 | 15.48, 116.30 | 24.18, **125.82** | **+8.2%** |
+
+A side's queue costs **×1.72** at four limbs. **The automatic per-side width is
+what ships**, because 8–9% of wall is too much to give away for the simplicity
+of always running wide, and the selector costs nothing at run time. Forcing a
+width with `--cof-limbs` is for A/B work only.
+
+To reproduce, add `--cof-limbs 4 --cof-limbs0 4` to any run and `cmp` the
+relation file against the unforced one — it must be byte-identical.
+
+#### Running AS276 (the C208)
+
+```sh
+cd work/as276
+../../bench/fbgen --poly AS276.job --maxbits 16 --threads 12 --out as276.roots1.m16
+../../bench/bench --pipeline --poly AS276.job --fb1 as276.roots1.m16 \
+    --logI 16 --J 32768 --qrange 80000023: --nq 200 --cofactor \
+    --relations as276.rels.txt --log as276.log
+```
+
+No width or method flags: the job resolves to **3 limbs rational / 4 algebraic**
+and **rho rational / ECM algebraic** on its own, which is the measured optimum.
+`--maxbits` should track `--logI`.
+
+That is `A = 31`. NFS@Home sieve this job at `I16e -J 16`, which in our
+coordinates is `2^17 x 2^15` — `A = 32`, still refused (finding 65's rule:
+our rectangle = `2^(J_bits+1) x 2^(I_bits-1)`). So a like-for-like throughput
+comparison against their geometry is not available until the area blocker
+moves; `--logI 17 --J 16384` gives the same area with their full `i` range if
+you want the other nesting.
+
+Note the ceiling that actually binds first is **not** the width. `CF_MAXFAC`
+caps a split at 3 large primes, so `mfb <= 3 * lpb` regardless — and at
+`lpb 32` that is 96 bits, exactly what 3 limbs already hold. **A side only
+needs 4 limbs once its `lpb` is 33 or more.** Widening past 128 bits would mean
+4LP, which is a different change (`CF_MAXFAC` and `mz_split`'s stack guard),
+not another limb.
+
+For the current status, A=32 memory/slabbing options, and why the end metric is
+time to a filterable matrix rather than raw relations/s, see [Current size
+limits, and what lifting them
 entails](bench/STATUS.md#current-size-limits-and-what-lifting-them-entails).
 
 ### Will it fit? VRAM sizing
+
+**`testsieve.sh` reports measured memory per geometry** (see [Sizing a job
+first](#sizing-a-job-first-testsievesh)), which is the better number whenever
+the geometry actually runs. **The formula below is still what you need for the
+case it exists for** — deciding whether the *next size up* will fit. A geometry
+too large for the card aborts at the bucket-array admission check, before any
+memory line is printed, so `testsieve.sh` reports a bare `FAILED:` row and no
+numbers precisely when you most want them.
 
 Two knobs move device memory and they are not interchangeable
 (`bench/RESULTS.md` finding 64):
@@ -207,6 +371,39 @@ cd bench
     --qmin 20000000 --qmax 200000000 --points 5 \
     --target-rels 300000000 --geom 15,16384 --geom 15,32768
 ```
+
+Each geometry's block ends with its measured device memory, so the sizing
+question and the yield question are answered by the same run. On the **c183** at
+`15,16384`:
+
+```
+  memory: 3.28 GB in use of 11.94 GB, 8.66 free   <- size from this
+          setup 2.06 GB = bucket array 1.38, factor bases + bitmaps 0.44, trial division context 0.09, cofactor queue 0.15
+          (+1.22 GB of per-q buffers and CUDA context after these marks; do not size from the setup figure)
+```
+
+**Size from the headline, not the breakdown.** This is the same rule as [Do not
+size a job from an aborted startup](#will-it-fit-vram-sizing) above: the
+per-stage marks cover setup only, and per-q buffers plus CUDA's lazily reserved
+per-kernel local memory arrive afterwards. Here that is 1.22 of 3.28 GB — 37%
+of the job, and mostly real job memory rather than context. The breakdown is
+there to show **which knob moves memory**, not how much to budget: at `15,8192`
+the same job reports `bucket array 0.69` against `1.38`, while the cofactor
+queue stays at 0.15 either way.
+
+**Disagreement between samples means the card was busy.** Every sample of a
+geometry allocates identically, so the script compares them and refuses to
+quote a single figure when they differ by more than 0.05 GB. That check exists
+because each stage figure is a difference of two free-memory probes: a
+neighbour allocating or freeing between them lands in whichever stage straddled
+it — observed at 1.57 GB for a cofactor queue that is a fixed 0.15 GB
+regardless of job, geometry or cofactor width. The breakdown names the knob: at
+`15,8192` the same job reports `bucket array 0.69` against `15,16384`'s `1.38`,
+while the cofactor queue stays at 0.15 either way.
+
+That makes the formula in [Will it fit?](#will-it-fit-vram-sizing) a
+cross-check rather than the primary method — test-sieve the geometries you are
+considering and read the number off.
 
 When `--fb1` is omitted, `fbase` is the managed cache stem. Before sieving,
 the script compares its embedded polynomial, `lim`, and `maxbits` metadata with
@@ -837,6 +1034,13 @@ tightening is free for us and expensive for GGNFS. **We are paying in time, not
 in relations.** Why the two bounds differ at matched nominal bits is not
 understood yet; see the tasks. Until it is, tune `--allowance` by measuring
 this tool, not by translating a lambda that worked in GGNFS.
+
+**Corroborated on a second job and a real corpus (2026-08-19).** Against
+AS276's own 1.5B-relation GGNFS output, over identical special-q and an
+identical rectangle, we recover **3,044 of their 3,045** relations and emit
+**64 of 4,089 (1.6%) that exist nowhere in their corpus** — all reconstructing
+their norms exactly. Same direction, same rough size: a looser gate, paid for
+in time rather than in relations. RESULTS finding 69.
 
 3LP is real and load-bearing here — over a 178-q band at q = 20M, large primes
 per relation on the rational side came out 0LP 1,261 / 1LP 3,803 / 2LP 4,009 /

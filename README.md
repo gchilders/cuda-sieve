@@ -11,8 +11,12 @@ limitations and unfinished experiments in [`bench/STATUS.md`](bench/STATUS.md)
 are part of its release status.
 
 The current production path is limited to a `2^31`-position sieve area,
-`lpb <= 64`, `mfb <= 96`, and at most three large primes per side. These are
-checked limits, not suggested settings. The separate representation, memory,
+`lpb <= 64`, `mfb <= 128`, and at most three large primes per side. These are
+checked limits, not suggested settings. Cofactor arithmetic width and
+factorisation method are both chosen **per side, automatically**, from that
+side's `mfb` and `lpb`: 3 limbs (96-bit residuals) or 4 (128-bit), and
+Pollard-Brent rho for a two-large-prime side or ECM for a three-large-prime
+one. The separate representation, memory,
 cofactor-performance, and filtering implications of lifting them are laid out
 in [Current size limits, and what lifting them entails](bench/STATUS.md#current-size-limits-and-what-lifting-them-entails).
 
@@ -47,6 +51,12 @@ through 12.0, which takes a few minutes because `ptxas` is slow on the newest
 target. `make -C bench GPU_ARCH=native` builds only for the card in this machine
 — much faster on an Ampere or Ada host, and the resulting binary will not run
 anywhere else.
+
+`make -C bench CF_LMAX=3` builds a narrower binary carrying only the 3-limb
+cofactor kernels: `mfb` is then capped at 96 rather than 128, the device code
+halves (8.99 MB to 4.02 MB), and `ptxas` has roughly half as much to do. Its
+relations are byte-identical to a full build's on any job both can run, so it
+is a shippable variant rather than a debug one.
 
 For a real job, generate its algebraic factor base and run the complete
 pipeline:

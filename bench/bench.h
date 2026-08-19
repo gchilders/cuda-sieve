@@ -365,6 +365,88 @@ int  bench_boinc_resolve_path(const char *option, const char *logical_name,
 void bench_boinc_fraction_done(double fraction_done);
 int  bench_boinc_finish(int status);
 
+/* ---- cofactor WIDTH, in 32-bit limbs ------------------------------------ *
+ *
+ * The splitter is templated on the limb count and every job so far has run at
+ * 3 limbs on both sides: 96 bits covers an SNFS `mfbr 88` and a C194's
+ * `mfba 95` with a bit to spare. A C208 does not fit -- its algebraic mfb runs
+ * past 96 -- so the width has to become a per-side choice rather than a
+ * constant, and the interesting configuration is 4 limbs on the hard side and
+ * 3 on the easy one ("4/3").
+ *
+ * CF_LMAX is the widest the BUILD contains. It is a compile-time knob and not
+ * merely a maximum because instantiating the splitter twice doubles the ptxas
+ * work on k_cofac and every ECM variant of it, and because "one narrow
+ * executable, one wide executable" is one of the deployment options on the
+ * table. `make CF_LMAX=3` reproduces the pre-2026-08-18 binary exactly;
+ * the default carries both widths so a single binary can pick per job.
+ *
+ * The width actually used per side is chosen at run time from mfb (see
+ * cf_limbs_for_mfb) and can be forced upward with --cof-limbs0/--cof-limbs,
+ * which is what makes a 3-vs-4 comparison on the SAME job possible.
+ */
+#ifndef CF_LMAX
+#define CF_LMAX 4
+#endif
+#if CF_LMAX != 3 && CF_LMAX != 4
+#error "CF_LMAX must be 3 (96-bit cofactors) or 4 (128-bit)"
+#endif
+#define CF_LMIN 3
+
+/* Narrowest width that can hold an mfb-bit residual, or 0 if this build has
+ * none. Not `(mfb + 31) / 32` clamped up: below 96 bits there is no narrower
+ * instantiation to fall to, so the answer is CF_LMIN and the caller does not
+ * get to think it has a 1- or 2-limb path. */
+static inline int cf_limbs_for_mfb(uint32_t mfb)
+{
+    if (mfb <= 32u * CF_LMIN) return CF_LMIN;
+    if (mfb <= 32u * CF_LMAX) return CF_LMAX;
+    return 0;
+}
+
+
+/* ---- cofactorisation METHOD, per side ----------------------------------- *
+ *
+ * Measured (RESULTS finding 70), cheapest configuration of each method that
+ * reaches saturated relation yield, both swept from below:
+ *
+ *   2LP  (mfb ~ 2*lpb)      rho 2.4-2.8 ms/q vs ECM 2.6-3.2   -> rho, by ~1.1x
+ *   3LP  (mfb ~ 3*lpb - 3)  ECM 12.6-394     vs rho 28-1226   -> ECM, by 2-4x
+ *
+ * The discriminant is the LARGE-PRIME COUNT, not lpb: at 2LP one split of a
+ * semiprime costs rho ~sqrt(2^lpb) on a data-dependent cost, so easy lanes
+ * exit early; at 3LP two successive splits of a much larger composite make rho
+ * pay that square root twice while ECM's B1 barely moves.
+ *
+ * Per side, because a real job is usually one of each -- AS276 is 2LP rational
+ * and 3LP algebraic -- so a per-job choice is wrong on one side of nearly
+ * every job.
+ */
+#define COF_METHOD_AUTO (-1)   /* per side, by the rule below       */
+#define COF_METHOD_RHO    0    /* --cof-rho:  force rho, both sides */
+#define COF_METHOD_ECM    1    /* --cof-ecm:  force ECM, both sides */
+
+/* Large primes this side asks for: ceil(mfb / lpb). */
+static inline unsigned cof_parts(unsigned mfb, unsigned lpb)
+{
+    return lpb ? (mfb + lpb - 1u) / lpb : 0u;
+}
+
+static inline int cof_auto_method(unsigned mfb, unsigned lpb)
+{
+    return cof_parts(mfb, lpb) >= 3u ? COF_METHOD_ECM : COF_METHOD_RHO;
+}
+
+/* B1 for a side's lpb, from the measured optima: 200 at lpb 31-33, 300 at
+ * 34-35, 500 at 36 and above. Flat below 31 because 2LP runs rho anyway and
+ * never consults this. B2 = 30*B1 and 12 curves held across the whole range. */
+static inline uint32_t cof_auto_b1(unsigned lpb)
+{
+    if (lpb >= 36u) return 500u;
+    if (lpb >= 34u) return 300u;
+    return 200u;
+}
+
 /* ---- GPU entry points ------------------------------------------------- */
 
 typedef struct {
@@ -431,7 +513,11 @@ typedef struct {
     int      cof_rounds;    /* rho requeue rounds                               */
     uint32_t cof_budget;    /* rho iterations in the first round                */
     uint64_t target_rels;   /* stop the band once this many relations exist     */
-    int      cof_ecm;       /* use ECM instead of rho                           */
+    /* TRI-STATE, not a boolean: COF_METHOD_AUTO (-1) is the default and means
+     * "decide per side by LP count", so `if (cfg->cof_ecm)` is TRUE for AUTO
+     * and would force ECM on both sides. Read cof_meth0/cof_meth1 instead --
+     * this field is only the user's override. */
+    int      cof_ecm;       /* COF_METHOD_AUTO / _RHO / _ECM                    */
     uint32_t ecm_b1;        /* ECM stage-1 bound                                */
     uint32_t ecm_b2;        /* ECM stage-2 bound (0 disables stage 2)            */
     uint32_t ecm_curves;    /* ECM curves attempted per round                   */
@@ -439,6 +525,19 @@ typedef struct {
     int      td_verify;     /* run the factors x cofactor == norm reconstruction */
     double   scale0, allowance0;
     uint32_t lim0, lpb0, mfb0;
+    /* Cofactor width per side, in 32-bit limbs; 0 = derive from mfb. Forcing
+     * it upward is how a 3-limb and a 4-limb run are compared on the SAME job
+     * -- otherwise the only jobs that exercise 4 limbs are the ones no 3-limb
+     * run can be measured against. See CF_LMAX above. */
+    int      cof_limbs0, cof_limbs;
+    /* Resolved cofactorisation method per side, 0 = rho, 1 = ECM. Filled in by
+     * resolve_and_check_cofactor_config from cof_method below; see cof_auto_method. */
+    int      cof_meth0, cof_meth1;
+    /* "The user asked for this", as distinct from "it is still zero". Needed
+     * because 0 is already MEANINGFUL for these: --ecm-b2 0 is the documented
+     * way to DISABLE stage 2, and --ecm-curves 0 must stay an error. Deriving
+     * a default from "is it zero" silently overrode both. */
+    int      ecm_b1_set, ecm_b2_set, ecm_curves_set;
     const char *relations;  /* complete relations, needing no cofactorisation   */
     const char *candidates; /* the cofactorisation batch                        */
     uint32_t lim;           /* factor-base bound for this side (rlim / alim)    */
@@ -641,8 +740,8 @@ int check_relations_sample(const char *path, const poly_t *poly, uint32_t lpb0,
 
 int run_cofac(const char *path, const char *out, uint32_t lim0, uint32_t lpb0,
               uint32_t lim1, uint32_t lpb1, int rounds, uint32_t budget,
-              int blocks, int threads, int ecm, uint32_t ecm_b1,
-              uint32_t ecm_b2, uint32_t ecm_curves);
+              int blocks, int threads, int meth0, int meth1, uint32_t ecm_b1,
+              uint32_t ecm_b2, uint32_t ecm_curves, int limbs0, int limbs1);
 
 int run_bench(const fb_t *fb, const fb_t *small, const qlat_t *L,
               const poly_t *P, const bench_cfg_t *cfg);

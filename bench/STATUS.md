@@ -83,14 +83,15 @@ should not be read as evidence that the rest is close.
 
 ## Current size limits, and what lifting them entails
 
-This is a design assessment, not implemented work. The production path still
-refuses inputs outside the limits below; there is no unsafe override.
+This is a design assessment; the cofactor-width half of it was built on
+2026-08-18 and is marked as such below. The production path still refuses
+inputs outside the limits below; there is no unsafe override.
 
 | quantity | current limit | immediate reason |
 |---|---:|---|
 | sieve area `I*J` | `2^31` positions | the exclusive end `xmax` and the hot plattice walks use `uint32_t` |
 | `lpb` | 64 | a resulting prime is stored in one `uint64_t` (was 32 until 2026-08-17) |
-| `mfb` | 96 | the production cofactor queue narrows residuals to `mz<3>`, three 32-bit limbs |
+| `mfb` | 128 | the cofactor queue narrows residuals to `mz<4>`; 96 in a `CF_LMAX=3` build |
 | large primes per side | 3 | `ceil(mfb/lpb) <= 3` is checked before the run |
 
 The area and cofactor limits are independent even though an A=32 job such as
@@ -146,24 +147,31 @@ raising the other:
   `mfb <= 96`. **Done 2026-08-17** — see "64-bit large primes" below.
 - Raising `mfb` above 96 requires `mz<4>` arithmetic even when the actual
   maximum is only 101 bits. Rho, ECM, probable-prime testing, GCD, and exact
-  division all pay the wider modular-arithmetic cost.
+  division all pay the wider modular-arithmetic cost. **Built 2026-08-18** —
+  see "Four-limb cofactors" below.
 
 The useful dispatch is fixed-width kernels selected on the host, independently
 for each side:
 
-| side's `mfb` | cofactor type |
-|---:|---|
-| `<= 64` | `mz<2>` |
-| `<= 96` | `mz<3>` |
-| `<= 128` | `mz<4>` |
+| side's `mfb` | cofactor type | status |
+|---:|---|---|
+| `<= 64` | `mz<2>` | **not built, and deliberately so** — see below |
+| `<= 96` | `mz<3>` | built |
+| `<= 128` | `mz<4>` | built 2026-08-18 |
 
-The underlying `mz<L>` arithmetic is already templated. What is hardcoded
-today is the production queue/storage and its launches at `mz<3>`. Runtime
+The underlying `mz<L>` arithmetic was already templated; what was hardcoded was
+the production queue/storage and its launches at `mz<3>`. Runtime
 variable-length loops inside a kernel are not the intended design: they would
-lose compile-time unrolling and likely increase register pressure. Per-side
-host dispatch captures the obvious win because current jobs do not use 3LP on
-both sides. The criterion is nevertheless the bit bound, not the label: a 2LP
-side with `mfb=65` still needs three limbs.
+lose compile-time unrolling and likely increase register pressure. The
+criterion is the bit bound, not the label: a 2LP side with `mfb=65` still needs
+three limbs.
+
+The `mz<2>` tier is left out on purpose. `CF_LMIN` is 3, so a side with
+`mfb <= 64` runs three limbs and pays for a limb it does not use. That is the
+same trade the rational queue already made when it went from two limbs to
+three: the stage nearly doubled (+83%) and wall clock moved +0.64%, because
+that queue is ~1% of a special-q. Reinstating a narrow tier means a third
+instantiation to keep in step for a fraction of a percent.
 
 ### 64-bit large primes — BUILT AND VERIFIED 2026-08-17
 
@@ -191,8 +199,8 @@ load-bearing rather than decorative. All three are now cases in `cofcheck.sh`.
 On a 400-q c147 band at `lpb 33`, 8,810 of 2,075,496 emitted factors exceed
 `2^32`, the largest `0x1ffd77b3b`.
 
-What this does **not** cover is `mfb > 96`, which is the separate four-limb
-problem below.
+What this does **not** cover is `mfb > 96`, which is the four-limb change
+described next.
 
 This makes `lpb=33` with `mfb=64/95` a materially smaller extension than
 `lpb=35` with `mfb=64/101`: the former needed 64-bit factor outputs but retains
@@ -212,6 +220,232 @@ from 172.65 to 173.75 ms/q (**+0.64%**). Narrow arithmetic matters greatly to
 the stage that uses it, but the easy side was only about 1% of wall time. That
 makes per-side dispatch sensible work while the queue is already being changed,
 not a high-value standalone optimisation.
+
+### Four-limb cofactors — BUILT 2026-08-18, NOT YET TIMED
+
+`mfb` up to 128 is supported, and the width is chosen **per side** at run time
+as the narrowest instantiation that holds that side's `mfb`. Everything up to
+and including a C194's `mfba 95` still gets 3/3 and is unchanged.
+
+**AS276 (`~/code/ggnfs-distributed/AS276.job`, the C208) is the motivating job
+and it resolves to 4/3 with no flag.** Its parameters, and what each one does
+here:
+
+| | value | consequence |
+|---|---|---|
+| `lpbr / mfbr` | 33 / 64 | 2 parts, **3 limbs** — 64 bits, but `CF_LMIN` is 3 |
+| `lpba / mfba` | 35 / 101 | 3 parts, **4 limbs** — 101 bits does not fit 96 |
+| `rlim / alim` | 181.6M / 268.4M | `lim^2` ~ 2^54.7 / 2^56, both well above `2^lpb` |
+| derived allowance | 102.63 bits (side 1) | sits just above `mfba 101`, as it should |
+| `log2(maxnorm)` | 205.02 at `logI 15, J 16384` | inside `bn_t`'s 256-bit budget, 51 bits spare |
+
+Two things fall out of that table. The **rational** side is the exact case an
+`mz<2>` tier would serve — `mfbr 64` is 64 bits carried in 96 — and it is still
+not worth building, for the reason given above: that queue is ~1% of a
+special-q. And `lpb >= 33` is **necessary but not sufficient** for a fourth
+limb; AS276's rational side has `lpbr 33` and still runs 3 limbs, because
+`mfbr` is what decides.
+
+**AS276 was sieved end to end on 2026-08-18** at `logI 15, J 16384`, factor
+base from `fbgen --maxbits 15` (44 s, 230 MB). Three special-q, `--cofactor`:
+
+- width line reports `side 0 3 limbs (96 bits), side 1 4 limbs (128 bits)` —
+  derived, no flag;
+- 134 relations, 44.67 rel/q, 39.00 of them from cofactorisation;
+- **134 of 134 rebuild both norms exactly** through `--check-relations`;
+- 130 emitted factors exceed `2^32`, the largest `2^34.96` — hard against the
+  `lpba 35` ceiling.
+
+That is the end-to-end proof the golden test cannot give: a genuine 4-limb
+population, split by the 4-limb kernel, emitted through the 64-bit output path,
+and verified against the norms. **No timing was taken** — the ECM job had the
+GPU, and a 3-q band amortises the final queue flush over nothing.
+
+**Cross-validated 2026-08-19 against the 1.5B-relation GGNFS corpus for this
+job** (`~/code/ggnfs-distributed/AS276/`, already filtered): over the identical
+30 special-q and an identical sub-rectangle, **recall 3,044 / 3,045 = 99.97%**,
+with 64 of our 4,089 relations existing nowhere in their corpus and all 64
+reconstructing exactly. Full method and the re-find analysis in RESULTS finding
+69. This is the strongest correctness evidence the 4-limb path has: an
+independent siever, an independently filtered corpus, and set membership rather
+than self-comparison.
+
+**It also surfaced the one thing the width change actually broke, which is not
+the width.** At `--cof-rounds 2 --cof-budget 65536` (the default until
+2026-08-19) the same run
+lost **389 of GGNFS's 2,846 relations (13.7%)**; `6 / 262144` recovered all but
+2, for **+19.3% relations**. Rho's iteration count scales as the square root of
+the factor sought, so a 35-bit large prime costs 5.7x a 30-bit one, and the
+default was calibrated on the c183's `lpba 32`. An exhausted budget returns
+`CF_INCOMPLETE` and the relation is silently dropped — it presents as a yield
+hole in the siever, not as a cofactoriser problem. **The schedule around the
+splitter needs re-deriving per width class; the splitter itself did not.**
+
+Note `A = 29` there, not the `A = 32` NFS@Home's own geometry for this job
+would want; the area limit is a separate, still-open blocker and does not stop
+the job being sieved at a smaller rectangle.
+
+What moved:
+
+- `CF_LMAX` / `CF_LMIN` / `cf_limbs_for_mfb` in `bench.h` — the build's width
+  range and the mfb → limbs rule. `CF_LMAX` defaults to 4;
+  `make CF_LMAX=3` compiles the 3-limb splitter alone.
+- `cofq_t.d_c0/d_c1` are **raw limb arrays plus `L0`/`L1`**, not `mz<3> *`. The
+  stride is a run-time choice and `mz<3>`/`mz<4>` are distinct types, so the
+  array cannot carry one of them in its type. `cf_run_rounds_dyn` is the only
+  place that casts back.
+- `k_cof_enqueue` is templated on `<L0, L1>` (four cheap instantiations) and
+  the standalone `--cofac` batch parses at `CF_LMAX` and narrows per side.
+- `--cof-limbs N` / `--cof-limbs0 N` force a side **wider** than its `mfb`
+  needs. Narrower is refused, in `resolve_and_check_cofactor_config`, which is the one
+  place that has seen both the `.job` file and the command line.
+
+The width invariant is asserted rather than trusted. `cof_classify` rejects a
+residual above `mfb` and `resolve_and_check_cofactor_config` refuses an `mfb` above
+`32*L`, so nothing can reach the queue too wide for its side — and if it does,
+`k_cof_enqueue` marks it `CF_OVERFLOW`, counts it, and `cofq_flush` stops the
+run. The failure mode being closed is a *silently truncated* cofactor, which
+does not crash: it emits a relation that reconstructs to the wrong norm. Both
+previous versions of this array (2 limbs, then 3) had exactly that bug.
+
+**The ceiling that binds first is not the width.** `CF_MAXFAC` caps a split at
+3 large primes, so `mfb <= 3*lpb` regardless, and at `lpb 32` that is 96 bits —
+precisely what 3 limbs already held. A side needs 4 limbs only once its `lpb`
+reaches 33. Going past 128 bits means 4LP, which is `CF_MAXFAC` and
+`mz_split`'s `sp + 2 > CF_MAXFAC` stack guard, not another limb.
+
+#### What the correctness gate can and cannot prove without a C208
+
+`cofcheck.sh` gained a width block. The load-bearing case is **byte-identical
+output between a 3-limb and a 4-limb run of the same job**. That is a real
+proof, not a smoke test: rho and ECM are Montgomery-domain algorithms whose
+iteration is `y <- y^2 + c` in the *true* domain regardless of `R = 2^(32L)`
+(`c = c0*R`, `y0 = 2*R`), and `gcd(qR^k, n) = gcd(q, n)` because `n` is odd. So
+widening a side must change the cost and nothing else. The 2 → 3 limb widening
+of the rational side produced the same md5, which is the precedent.
+
+Cases added: the build reports its own width range; `mfb` above `32*CF_LMAX` is
+refused; rho at 4/4, rho at 4/3, and ECM-with-stage-2 at 4/3 are each
+byte-identical to the 3/3 run; `lpb 33 / mfb 99` **derives** 4/3 with nobody
+choosing it, emits relations, and every one reconstructs; and that same shape
+with `--cof-limbs 3` is refused.
+
+**All 45 cases pass on 2026-08-18**, `sm_120`, including the four new ones. The
+`lpb 33 / mfb 99` case derives 4/3 with nobody choosing it and emits 64
+relations that all reconstruct, so the 4-limb splitter is not merely compiled —
+it has produced verified relations.
+
+What no gate here can reach is a genuine 4-limb *population*. `lpb 33 / mfb 99`
+on the c183 admits a few candidates above 96 bits; a C208 is made of them —
+which is what AS276 and its GGNFS corpus were used for (finding 69).
+
+#### The three deployment options — RESOLVED 2026-08-19
+
+All three questions this section used to pose are answered; the numbers are in
+finding 70 and the decisions are made.
+
+- **Dynamic per-side selector — CHOSEN, and it is what ships.** Forcing the
+  wide shape on a job that does not need it costs **+8.8% of wall on the c183
+  and +8.2% on the C194** (a widened queue is ×1.72), which is too much to
+  give away for the simplicity of always running wide. The selector costs
+  nothing at run time — one host-side switch per flush.
+- **"Always 4/3" — rejected**, on those same numbers.
+- **Separate executables — rejected as a performance measure**, kept as a
+  packaging option. The 3-limb kernels are register-identical in both builds
+  (78 / 86 / 122, verified against a `CF_LMAX=3` compile), so a wide build does
+  not slow the narrow path. What `make CF_LMAX=3` does buy is **binary size**:
+  `.nv_fatbin` 8.99 MB → 4.02 MB, and about half the `ptxas` time. That is an
+  argument about BOINC distribution, not about sieving.
+
+#### Register cost of the fourth limb — measured 2026-08-18, no GPU needed
+
+The register question was the one genuinely new risk: ECM stage 2 holds
+`mpt<L> baby[CF_ECM_NBABY]` plus four more points, which at `L = 4` is 64
+registers of live state before any working value. `ptxas -v` answers it without
+touching the card. `sm_120`, `-O3`, all six `k_cofac` instantiations:
+
+| `k_cofac<L, method, stage2>` | registers | stack frame | spills | reg-limited warps/SM |
+|---|---:|---:|---:|---:|
+| `<3, rho, ->` | 78 | 96 B | **0** | 25 |
+| `<4, rho, ->` | 94 | 112 B | **0** | 21 |
+| `<3, ECM, no s2>` | 86 | 96 B | **0** | 25 |
+| `<4, ECM, no s2>` | 112 | 112 B | **0** | 18 |
+| `<3, ECM, s2>` | 122 | 368 B | **0** | 16 |
+| `<4, ECM, s2>` | 154 | 448 B | **0** | 12 |
+
+(warps/SM from 65,536 registers per SM and 8-register granularity; it is an
+upper bound from registers alone, not a measured occupancy.)
+
+**Nothing spills at any width**, which was the failure mode that would have made
+the 4-limb ECM path far worse than the CIOS ratio predicts. It does not happen.
+
+What the table does show is that **the cost compounds on the ECM stage-2 path
+and only there.** Rho loses 25 → 21 warps (−16%) on top of ~1.8x arithmetic;
+ECM with stage 2 loses 16 → 12 (−25%) on top of the same arithmetic.
+
+**That worry did not materialise.** Measured a day later, ECM at 4 limbs is
+2.7x *cheaper* than rho on AS276 at matched yield and is now the default on a
+3LP side (finding 70) — the occupancy penalty is real but far smaller than
+rho's `sqrt(p)` growth over the same width step. `CF_ECM_NBABY` is still the
+knob to reach for if 4-limb ECM ever does look disproportionate; it has not
+needed touching.
+
+The 3-limb instantiations are **identical in both builds** — 78 / 86 / 122
+registers, measured on a `CF_LMAX=3` compile of the same source. They are
+separate template instantiations and ptxas allocates registers per kernel, so a
+wide build does not make the narrow kernel slower. That closes "separate
+executables" as a *performance* option; it survives only as the binary-size
+argument above.
+
+### Cofactor width and method — MEASURED 2026-08-19, GPU idle
+
+Both questions the width work opened are now answered. The box's ECM job was
+suspended (`kill -STOP`) so these are contention-free.
+
+**1. What the fourth limb costs on work that does not need it.** c183, 200 q,
+and C194, 100 q, forced wide with `--cof-limbs`. **All four width combinations
+emit byte-identical relation files** (c183 md5 `17d8f1d8…`, 9,363 relations),
+so this is a pure width price on unchanged work:
+
+| job | side0/side1 | rational q | algebraic q | stage ms/q | wall ms/q |
+|---|---|---:|---:|---:|---:|
+| c183 | 3/3 | 2.86 | 13.90 | 16.88 | 112.17 |
+| c183 | 4/3 | 4.93 | 14.18 | 19.22 | 116.37 |
+| c183 | **3/4** (the C208 shape) | 2.85 | 23.46 | 26.38 | **121.99** |
+| c183 | 4/4 | 4.89 | 23.74 | 28.72 | 124.38 |
+| C194 | 3/3 | 3.32 | 12.10 | 15.48 | 116.30 |
+| C194 | **3/4** | 3.26 | 20.87 | 24.18 | **125.82** |
+
+A side's queue costs **x1.72** at four limbs (rational 2.86 -> 4.93; algebraic
+13.90 -> 23.46 and 12.10 -> 20.87), against the 1.8-2x the CIOS ratio
+predicted. Wall cost of running the C208 shape on a job that does not need it:
+**+8.8% (c183), +8.2% (C194)**.
+
+**Verdict: keep the dynamic selector.** 8-9% of wall is too much to give away
+for the simplicity of "always 4/3", and the selector costs nothing at run time
+(a host-side switch per flush). Separate executables remain unjustified —
+the 3-limb kernels are register-identical in both builds. **This is the
+decision the width work was blocking, and it is now made.**
+
+**2. rho vs ECM. SHIPPED as the default 2026-08-19** — chosen per side from
+`ceil(mfb/lpb)`, rho at 2LP and ECM at 3LP, with ECM's `B1` derived from `lpb`
+and the requeue round default raised 2 -> 4 (ECM escalates in curves per
+round). Zero-flag effect: c183 17.21 -> 14.30 ms/q *and* 9,363 -> 9,394
+relations; C194 15.48 -> 13.95; AS276 3,443 -> 4,089 relations. `--cof-rho` /
+`--cof-ecm` force one method on both sides. Two gate cases pin the automatic
+choice and the overrides.
+
+The measurement behind it: **ECM wins 2-4x at 3LP and loses narrowly at 2LP** — the
+discriminant is the large-prime count, not `lpb`. Measured cheapest-saturating
+config for each, both swept from below: c183 `lpb 32/mfb 92` 30.83 -> 15.38
+ms/q (2.00x), AS276 `lpb 35/mfb 101` 332.63 -> 123.22 (2.70x). Full sweep over
+`lpb 29-36` in RESULTS finding 70; guidance in RUNBOOK "Method: ECM for 3LP,
+rho for 2LP". Making it the default is a shipped-behaviour change and has
+**not** been made.
+
+*(An earlier version of finding 70 reported 15-18x. That was wrong: rho had
+been priced at an over-large budget rather than swept from below — the same
+one-sided-tuning error the finding was written to expose. Corrected in place.)*
 
 ### Performance accounting
 
@@ -233,6 +467,13 @@ On the current measured profile, cofactorisation is 14.37 of 98.26 ms/q
 | 2x | 112.6 | 14.6% |
 | 3x | 127.0 | 29.3% |
 | 5x | 155.7 | 58.5% |
+
+**Measured against this table 2026-08-19:** the widened queue came in at
+**x1.72**, inside the 1.8-2x row, and whole-pipeline cost moved **+8.8%**
+(c183) and **+8.2%** (C194) — close to the 11.7% the 1.8x row predicts, and
+lower because only ONE side widens on a real job. The 5x row never applied: it
+priced rho's `sqrt` growth into the width, and the fix for that was to stop
+using rho on the side that suffers it.
 
 That table is an Amdahl illustration, not a projection for AS276. The larger
 job has a different area, cofactor distribution, stage mix, and yield. The 5x
@@ -264,11 +505,14 @@ required surplus.
 | A=32 whole-area endpoint/walk support | not started | about 1 week |
 | A=32 stateful slabbing for 12 GB | not started | about 2–3 weeks |
 | 64-bit large-prime outputs and gates | **done 2026-08-17** | — |
-| per-side `mz<2>` / `mz<3>` / `mz<4>` dispatch | arithmetic templates exist; queue/launch work not started | about 1--2 weeks with LPB widening |
-| target cofactor corpus, rho/ECM crossover, and filter test | not captured or measured | required before a performance claim |
+| per-side `mz<3>` / `mz<4>` dispatch | **done 2026-08-18**, gated and timed (+8-9% wall when forced wide) | — |
+| per-side rho/ECM dispatch, default | **done 2026-08-19**, gated and timed (finding 70) | — |
+| cofactor outcome reporting (`split / dead / stuck`) | **done 2026-08-19** | — |
+| C208 validated against a 1.5B-relation GGNFS corpus | **done 2026-08-19**, 99.97% recall (finding 69) | — |
+| filter test on a real corpus | not captured | required before a performance claim |
 
-Together, a robust slabbed and width-dispatched implementation is roughly a
-**3–5 focused engineering-week** change, not counting delays obtaining the
+Together, a robust slabbed implementation on top of the width dispatch is
+roughly a **3–5 focused engineering-week** change, not counting delays obtaining the
 target workload or GPU access. A whole-area path restricted to >=24 GB cards
 would be appreciably smaller. These are source-review estimates, not measured
 schedules.
@@ -1055,12 +1299,16 @@ absent from every document in the repo.
    than the report threshold. **Do not "fix" it by tightening the default** —
    the current gate finds every relation GGNFS finds (verified, zero misses
    over 2,531), so any trade of yield for speed must be made deliberately.
-8. **A = 32 sieve areas and MFB widening**, for jobs like AS276. **One of the
-   three blockers is gone**: `lpb` now goes to 64 (2026-08-17), so the
-   large-prime half of this item is done and a C194's `lpba 33 / mfba 95` runs
-   today. What remains is the `2^32` exclusive position endpoint, the 14–16 GB
-   whole-area footprint, and `mfb > 96`, which needs `mz<4>` and costs roughly
-   1.8–2× on the cofactor stage.
+8. **A = 32 sieve areas and MFB widening**, for jobs like AS276. **Two of the
+   three blockers are gone**: `lpb` now goes to 64 (2026-08-17), so a C194's
+   `lpba 33 / mfba 95` runs today; and `mfb` now goes to 128 (2026-08-18) on a
+   per-side 3-or-4-limb dispatch, so a C208's 4/3 shape runs without a flag.
+   AS276 has since been sieved end to end and validated against its own GGNFS
+   corpus at 99.97% recall (finding 69), and the width measured at **×1.72 on
+   the widened queue, +8-9% of wall** (finding 70) — the 1.8-2× projection was
+   close. What remains is the `2^32` exclusive position endpoint and the
+   14-16 GB whole-area footprint, which is what stops a like-for-like
+   comparison against NFS@Home's own `I16e -J 16` geometry for this job.
 
    **Neither remaining blocker binds a C195 at NFS@Home's geometry.** They
    sieve `2^15 × 2^14` and would prefer `2^15 × 2^15` — `2^30`, half the
