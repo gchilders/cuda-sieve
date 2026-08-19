@@ -40,7 +40,7 @@ static volatile sig_atomic_t g_pipe_stop = 0;
 static void pipe_on_signal(int sig)
 {
     (void)sig;
-    if (++g_pipe_stop >= 2) _exit(130);
+    if (++g_pipe_stop >= 2) bench_fast_exit(130);
 }
 
 /* Record a resume point.
@@ -57,20 +57,20 @@ static int pipe_checkpoint(const poly_t *P, const bench_cfg_t *cfg, ckpt_t *ck,
                            FILE *fr, FILE *fc, const qsel_t *next,
                            unsigned long long nrel, unsigned long long nqdone)
 {
-    off_t ro, co = 0;
-    struct stat cst;
+    int64_t ro, co = 0;
+    bench_stat_t cst;
     if (!fr || !cfg->relations) return 0;
     /* fsync before the sidecar, never after: the checkpoint asserts these
      * bytes are on the platter, and a sidecar naming bytes that are still in
      * the page cache is worse than no sidecar at all. */
-    if (fflush(fr) || fsync(fileno(fr))) { perror("relations"); return -1; }
-    if (fc && (fflush(fc) || fsync(fileno(fc)))) {
+    if (fflush(fr) || bench_sync_stream(fr)) { perror("relations"); return -1; }
+    if (fc && (fflush(fc) || bench_sync_stream(fc))) {
         perror("candidates"); return -1;
     }
-    if ((ro = ftello(fr)) < 0) { perror("relations"); return -1; }
-    if (fc && (co = ftello(fc)) < 0) { perror("candidates"); return -1; }
+    if ((ro = bench_tell(fr)) < 0) { perror("relations"); return -1; }
+    if (fc && (co = bench_tell(fc)) < 0) { perror("candidates"); return -1; }
     if (fc) {
-        if (fstat(fileno(fc), &cst)) { perror("candidates"); return -1; }
+        if (bench_fstat_stream(fc, &cst)) { perror("candidates"); return -1; }
         if (ckpt_part_path(cfg->candidates, ck->cand_part,
                            sizeof ck->cand_part))
             return -1;
@@ -1029,10 +1029,10 @@ static int pipe_finalize_outputs(FILE **frp, FILE **fcp,
     if (commit && !bad) {
         int relations_claimed = 0;
         if (cfg->relations) {
-            if (rename(rtmp, cfg->relations)) { perror("rename relations"); bad = 1; }
+            if (bench_atomic_replace(rtmp, cfg->relations)) { perror("rename relations"); bad = 1; }
             else relations_claimed = 1;
         }
-        if (!bad && cfg->candidates && rename(ctmp, cfg->candidates)) {
+        if (!bad && cfg->candidates && bench_atomic_replace(ctmp, cfg->candidates)) {
             perror("rename candidates");
             bad = 1;
             /* Put the relations file back under its staging name. Claiming one
@@ -1041,7 +1041,7 @@ static int pipe_finalize_outputs(FILE **frp, FILE **fcp,
              * discard below cannot reach it -- rtmp no longer exists. Under
              * BOINC that is a compute error raised for a workunit whose result
              * file is present and complete. */
-            if (relations_claimed && rename(cfg->relations, rtmp))
+            if (relations_claimed && bench_atomic_replace(cfg->relations, rtmp))
                 perror("rename relations back to staging");
         }
     }
@@ -1269,8 +1269,8 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
              * what makes a torn final line from a kill -9 a non-problem: the
              * partial write is discarded rather than parsed. */
             if (!(fr = fopen(rtmp, "r+"))) { perror(rtmp); rc = -1; goto done; }
-            if (ftruncate(fileno(fr), (off_t)cfg->resume_rel_bytes) ||
-                fseeko(fr, (off_t)cfg->resume_rel_bytes, SEEK_SET)) {
+            if (bench_truncate(fr, cfg->resume_rel_bytes) ||
+                bench_seek(fr, cfg->resume_rel_bytes)) {
                 perror(rtmp); rc = -1; goto done;
             }
         } else if (!(fr = fopen(rtmp, "w"))) {
@@ -1280,8 +1280,8 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     if (cfg->candidates) {
         if (cfg->resume) {
             if (!(fc = fopen(ctmp, "r+"))) { perror(ctmp); rc = -1; goto done; }
-            if (ftruncate(fileno(fc), (off_t)cfg->resume_cand_bytes) ||
-                fseeko(fc, (off_t)cfg->resume_cand_bytes, SEEK_SET)) {
+            if (bench_truncate(fc, cfg->resume_cand_bytes) ||
+                bench_seek(fc, cfg->resume_cand_bytes)) {
                 perror(ctmp); rc = -1; goto done;
             }
         } else if (!(fc = fopen(ctmp, "w"))) {
@@ -1316,7 +1316,7 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
      * have silently moved from 30 s to 300 s because log_every_s defaults to
      * 300 whether or not a log exists. The run log (--log) is a separate,
      * richer stream on its own clock. */
-    const int reporting_to_tty = isatty(1);
+    const int reporting_to_tty = bench_stdout_is_tty();
     const double report_ms = reporting_to_tty ? 30000.0 : 300000.0;
 #ifdef HAVE_BOINC
     double t_boinc_report = t_band - 1000.0; /* report after the first q */
@@ -1410,7 +1410,7 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
          * The stop file is for unattended runs, where there is no terminal to
          * press ^C in and a job queue needs a way to ask for the card back. */
         if (fr && !g_pipe_stop && cfg->stopfile && (qi & 63) == 0 &&
-            access(cfg->stopfile, F_OK) == 0) {
+            bench_path_exists(cfg->stopfile)) {
             printf("\n  stop file %s exists\n", cfg->stopfile);
             g_pipe_stop = 1;
         }
@@ -1806,7 +1806,13 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                     snprintf(gpu, sizeof gpu, "gpu=%u%%", util);
                 if (runlog_gpu_watts(&watts) == 0)
                     snprintf(pwr, sizeof pwr, "board=%.1fW", watts);
+#ifdef _WIN32
+                /* Unix load average has no direct Win32/MSVC equivalent.
+                 * Keep the status field but mark it unavailable on Windows. */
+                load[0] = -1.0;
+#else
                 if (getloadavg(load, 3) < 1) load[0] = -1.0;
+#endif
                 if (rps > 0.0 && isfinite(eta))
                     snprintf(eta_s, sizeof eta_s, "eta=%.2fh", eta / 3600.0);
                 runlog_record(

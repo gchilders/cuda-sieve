@@ -12,6 +12,7 @@
  *                              regions the same way.
  */
 #include "bench.h"
+#include "platform.h"
 #include "plattice.cuh"
 #include "bigint.cuh"
 #include "td.cuh"
@@ -29,9 +30,7 @@
  * be billed rather than assumed small. */
 static double host_ms(void)
 {
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return t.tv_sec * 1e3 + t.tv_nsec * 1e-6;
+    return bench_monotonic_ms();
 }
 
 static void report_slice_build_error(void)
@@ -2319,7 +2318,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                                           cudaMemcpyDeviceToHost));
                             unsigned long long occ = 0;
                             for (uint32_t z = 0; z < nsumword; z++)
-                                occ += __builtin_popcount(hs[z]);
+                                occ += bench_popcount32(hs[z]);
                             printf("  %-26s %8llu  (%.2f%% occupied)\n",
                                    "summary bits set", occ, 100.0 * occ / (double)nsum);
                             free(hs);

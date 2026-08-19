@@ -179,3 +179,20 @@ Original material in this repository is dedicated to the public domain under
 [CC0 1.0 Universal](LICENSE), including its as-is warranty and liability
 disclaimers. A few files derived from CADO-NFS remain under
 LGPL-2.1-or-later; see [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+
+### Native Windows build (MSVC)
+
+The production executable can also be built natively on Windows with Visual
+Studio `cl.exe` as nvcc's host compiler. From an **x64 Native Tools Command
+Prompt for Visual Studio** with the CUDA Toolkit on `PATH`:
+
+```bat
+cd bench
+set GPU_ARCH=120
+build_windows.bat
+```
+
+Leave `GPU_ARCH` unset for the same portable fat-binary targets as the Linux
+Makefile, or set it to a bare compute capability such as `86`, `89`, or `120`.
+The script builds `bench.exe`; the standalone Linux-oriented helper/test tools
+remain under the Makefile.

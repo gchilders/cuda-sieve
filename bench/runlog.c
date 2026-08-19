@@ -3,9 +3,12 @@
 /* The Makefile builds the C sources as -std=c11, which is strict ISO C and
  * hides clock_gettime, localtime_r and dlopen behind the feature-test macro.
  * Declared here rather than by loosening the standard for every C object. */
+#ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L
+#endif
 
 #include "runlog.h"
+#include "platform.h"
 
 #include <stdio.h>
 #include <stdarg.h>
@@ -13,7 +16,11 @@
 #include <string.h>
 #include <time.h>
 #include <errno.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <dlfcn.h>
+#endif
 
 /* Build stamp. The Makefile defines this from `git describe --dirty`; the
  * fallback keeps a hand-built or exported tree compiling and says plainly that
@@ -60,10 +67,7 @@ const char *runlog_build_defs(void) { return BENCH_DEFS; }
  * the length of the step on a run that is otherwise healthy. */
 static double runlog_now_ms(void)
 {
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts))
-        return (double)time(NULL) * 1000.0;
-    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+    return bench_monotonic_ms();
 }
 
 int runlog_open(const char *path, double period_s)
@@ -90,7 +94,11 @@ void runlog_close(void)
     if (L.f) { fclose(L.f); L.f = NULL; }
     if (L.lib) {
         if (L.nvml_shutdown) L.nvml_shutdown();
+#ifdef _WIN32
+        FreeLibrary((HMODULE)L.lib);
+#else
         dlclose(L.lib);
+#endif
         L.lib = NULL;
     }
     L.dev = NULL;
@@ -116,12 +124,17 @@ static void runlog_stamp(char *out, size_t n)
 {
     const time_t t = time(NULL);
     struct tm tmv;
-    /* Local time WITH the UTC offset. A bare local timestamp cannot be lined
-     * up against a reading taken on another machine, or against this one
-     * either side of a DST change -- and a multi-day band crosses one twice a
-     * year. */
-    if (!localtime_r(&t, &tmv) || !strftime(out, n, "%Y-%m-%dT%H:%M:%S%z", &tmv))
+    /* POSIX strftime supplies %z; MSVC does not. Use UTC on Windows so the
+     * timestamp remains unambiguous without having to synthesize an offset. */
+#ifdef _WIN32
+    if (gmtime_s(&tmv, &t) ||
+        !strftime(out, n, "%Y-%m-%dT%H:%M:%SZ", &tmv))
         snprintf(out, n, "%lld", (long long)t);
+#else
+    if (bench_localtime(&t, &tmv) ||
+        !strftime(out, n, "%Y-%m-%dT%H:%M:%S%z", &tmv))
+        snprintf(out, n, "%lld", (long long)t);
+#endif
 }
 
 /* A failed write is reported once and then the log is closed: the usual cause
@@ -226,6 +239,7 @@ void runlog_warn(const char *fmt, ...)
 
 /* ---- NVML, resolved at run time ---------------------------------------- */
 
+#ifndef _WIN32
 /* dlsym returns void *, and converting that to a function pointer is not
  * something ISO C guarantees. memcpy through the object representation is the
  * portable spelling and compiles to the same nothing. */
@@ -267,6 +281,44 @@ int runlog_gpu_bind(const char *pci_bus_id)
     L.lib = lib;
     return 0;
 }
+
+#else
+static void bind_sym(void *lib, const char *name, void *slot)
+{
+    FARPROC p = GetProcAddress((HMODULE)lib, name);
+    memcpy(slot, &p, sizeof p);
+}
+
+int runlog_gpu_bind(const char *pci_bus_id)
+{
+    int (*nvml_init)(void) = NULL;
+    int (*nvml_byid)(const char *, void **) = NULL;
+    HMODULE lib;
+
+    if (L.lib || !pci_bus_id) return -1;
+    lib = LoadLibraryA("nvml.dll");
+    if (!lib) return -1;
+
+    bind_sym((void *)lib, "nvmlInit_v2", &nvml_init);
+    bind_sym((void *)lib, "nvmlDeviceGetHandleByPciBusId_v2", &nvml_byid);
+    bind_sym((void *)lib, "nvmlShutdown", &L.nvml_shutdown);
+    bind_sym((void *)lib, "nvmlDeviceGetUtilizationRates", &L.nvml_util);
+    bind_sym((void *)lib, "nvmlDeviceGetPowerUsage", &L.nvml_power);
+
+    if (!nvml_init || !nvml_byid || nvml_init() != 0 ||
+        nvml_byid(pci_bus_id, &L.dev) != 0 || !L.dev) {
+        if (nvml_init && L.nvml_shutdown) L.nvml_shutdown();
+        FreeLibrary(lib);
+        L.dev = NULL;
+        L.nvml_shutdown = NULL;
+        L.nvml_util = NULL;
+        L.nvml_power = NULL;
+        return -1;
+    }
+    L.lib = (void *)lib;
+    return 0;
+}
+#endif
 
 int runlog_gpu_util(unsigned int *pct)
 {

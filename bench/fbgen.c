@@ -17,7 +17,9 @@
 
 #include <errno.h>
 #include <limits.h>
+#ifndef FBGEN_LIBRARY
 #include <pthread.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,6 +54,7 @@ typedef struct {
     size_t n, cap;
 } entry_vec_t;
 
+#ifndef FBGEN_LIBRARY
 static void die_oom(void)
 {
     fprintf(stderr, "fbgen: out of memory\n");
@@ -71,6 +74,8 @@ static void *xrealloc(void *p, size_t n)
     if (!p) die_oom();
     return p;
 }
+
+#endif
 
 /* ---- fixed-width signed integers ----------------------------------- */
 
@@ -568,6 +573,7 @@ void sqgen_free(sqgen_t *G)
     free(G);
 }
 
+#ifndef FBGEN_LIBRARY
 static uint32_t zpoly_eval_mod(const zpoly_t *f, uint32_t x, uint32_t m)
 {
     uint64_t r = 0;
@@ -782,12 +788,7 @@ static void print_poly(FILE *out, const poly_t *P)
     fputc('\n', out);
 }
 
-#ifdef FBGEN_LIBRARY
-#define FBGEN_MAYBE_UNUSED __attribute__((unused))
-#else
-#define FBGEN_MAYBE_UNUSED
-#endif
-static int FBGEN_MAYBE_UNUSED generate(FILE *out, const poly_t *P, uint32_t lim,
+static int generate(FILE *out, const poly_t *P, uint32_t lim,
                                         int maxbits, int nthr)
 {
     zpoly_t f;
@@ -849,7 +850,8 @@ cleanup:
                 np, lim, nthr, nthr == 1 ? "" : "s");
     return rc;
 }
-#undef FBGEN_MAYBE_UNUSED
+
+#endif
 
 #ifndef FBGEN_LIBRARY
 static void usage(FILE *f)

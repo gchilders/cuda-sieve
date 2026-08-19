@@ -1393,10 +1393,10 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
      * worth having anyway because the old truncation was silent and lim2 is
      * the "prime by size" threshold: a wrong one accepts composites as prime,
      * which surfaces only as relations that fail to reconstruct. */
-    { unsigned __int128 v = (unsigned __int128)lim0 * lim0;
-      for (int i = 0; i < 3; i++) { l0.v[i] = (uint32_t)v; v >>= 32; } }
-    { unsigned __int128 v = (unsigned __int128)lim1 * lim1;
-      for (int i = 0; i < 3; i++) { l1.v[i] = (uint32_t)v; v >>= 32; } }
+    { bench_u128_t v = bench_mul_u64_wide(lim0, lim0);
+      for (int i = 0; i < 3; i++) l0.v[i] = bench_u128_take32(&v); }
+    { bench_u128_t v = bench_mul_u64_wide(lim1, lim1);
+      for (int i = 0; i < 3; i++) l1.v[i] = bench_u128_take32(&v); }
 
     /* Compact before every round. The scan is three small kernels over 131,072
      * slots -- microseconds against a stage that runs for tens of milliseconds --
@@ -1549,9 +1549,12 @@ static int cf_run_side(mz<L> *h_n, uint32_t nj, uint64_t lim, uint32_t lpb,
     memset(&W, 0, sizeof(W));
 
     {   /* lim^2, in L limbs */
-        unsigned __int128 v = (unsigned __int128)lim * lim;
-        for (int i = 0; i < L; i++) { lim2.v[i] = (uint32_t)v; v >>= 32; }
-        if (v) { fprintf(stderr, "  cofac: lim^2 does not fit %d limbs\n", L); return -1; }
+        bench_u128_t v = bench_mul_u64_wide(lim, lim);
+        for (int i = 0; i < L; i++) lim2.v[i] = bench_u128_take32(&v);
+        if (bench_u128_nonzero(v)) {
+            fprintf(stderr, "  cofac: lim^2 does not fit %d limbs\n", L);
+            return -1;
+        }
     }
     CK(cudaMalloc(&d_n, (size_t)nj * sizeof(mz<L>)));
     CK(cudaMalloc(&d_status, nj));
@@ -1688,21 +1691,22 @@ static int cf_norm_exact(bn_t *out, const tdpoly_t *P, int64_t a, int64_t b)
  * do not fit the limb they are stored in. */
 static uint64_t cf_bn_divmod_u64(bn_t *x, uint64_t d)
 {
-    unsigned __int128 rem = 0;
+    uint64_t rem = 0;
     for (int i = BN_LIMBS - 2; i >= 0; i -= 2) {
         const uint64_t lo = ((uint64_t)x->v[i + 1] << 32) | x->v[i];
-        const unsigned __int128 cur = (rem << 64) | lo;
-        const uint64_t q = (uint64_t)(cur / d);
-        rem = cur % d;
+        const uint64_t q = bench_div_u128_u64(rem, lo, d, &rem);
         x->v[i] = (uint32_t)q;
         x->v[i + 1] = (uint32_t)(q >> 32);
     }
-    return (uint64_t)rem;
+    return rem;
 }
 
 static uint64_t cf_mulmod64(uint64_t a, uint64_t b, uint64_t m)
 {
-    return (uint64_t)((unsigned __int128)a * b % m);
+    const bench_u128_t v = bench_mul_u64_wide(a, b);
+    uint64_t rem = 0;
+    (void)bench_div_u128_u64(v.hi, v.lo, m, &rem);
+    return rem;
 }
 
 /* Miller-Rabin over the seven bases that are DETERMINISTIC for every n < 2^64
@@ -1867,7 +1871,7 @@ static int cf_check_relations(const char *path, const poly_t *poly,
         fprintf(stderr, "check-relations: polynomial does not fit\n");
         fclose(f); return -1;
     }
-    while (getline(&line, &cap, f) > 0) {
+    while (bench_getline(&line, &cap, f) > 0) {
         const int r = cf_check_one(line, tp, lpb0, lpb1, &nprime, &ncomp, &nonprim);
         /* r == 1 only: r == 2 is "reconstructs but is not primitive", which
          * this gate must fail. */
@@ -1927,7 +1931,7 @@ extern "C" int check_relations_sample(const char *path, const poly_t *poly,
      * corrupt file and refuse a resume that is in fact perfectly sound. */
     end = (limit && (long long)limit < size) ? (long long)limit : size;
     rewind(f);
-    while (seen < n && getline(&line, &cap, f) > 0) {
+    while (seen < n && bench_getline(&line, &cap, f) > 0) {
         int r;
         if (ftell(f) > end) break;      /* the line crosses the prefix end */
         r = cf_check_one(line, tp, lpb0, lpb1, &nprime, &ncomp, &nonprim);
@@ -1951,15 +1955,15 @@ extern "C" int check_relations_sample(const char *path, const poly_t *poly,
             /* Only resync to a line boundary when the window was cut mid-file;
              * head_end is already one. */
             if (off && off != head_end) {
-                if (getline(&line, &cap, f) <= 0) goto done;
+                if (bench_getline(&line, &cap, f) <= 0) goto done;
             }
             keep = (char **)calloc(n, sizeof *keep);
             if (!keep) goto done;
-            while (getline(&line, &cap, f) > 0) {
+            while (bench_getline(&line, &cap, f) > 0) {
                 if (ftell(f) > end) break;
                 if (line[0] == '#' || line[0] == '\n') continue;
                 free(keep[nkeep % n]);
-                keep[nkeep % n] = strdup(line);
+                keep[nkeep % n] = bench_strdup(line);
                 nkeep++;
             }
             {   /* replay in file order; the ring holds the last min(n, nkeep) */
@@ -2301,7 +2305,7 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
     if (fo) {
         int bad = ferror(fo);
         if (fclose(fo) || bad) { fprintf(stderr, "cofac: write failed\n"); remove(tmp); return -1; }
-        if (rename(tmp, out)) { perror("rename"); remove(tmp); return -1; }
+        if (bench_atomic_replace(tmp, out)) { perror("rename"); remove(tmp); return -1; }
     }
     if (novf) fprintf(stderr, "  ** %u records produced more than %d factors\n", novf, CF_MAXFAC);
 

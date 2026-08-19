@@ -25,17 +25,19 @@
 #define BENCH_CKPT_H
 
 #include "bench.h"
+#include "platform.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
 #include <errno.h>
+#include <signal.h>
+#ifndef _WIN32
 #include <unistd.h>
 #include <fcntl.h>
-#include <signal.h>
 #include <sys/types.h>
-#include <sys/stat.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -295,10 +297,10 @@ static inline int ckpt_write(const char *relations, const poly_t *P,
     fprintf(f, "scale0 = %.17g\n", ck->scale0);
     fprintf(f, "allowance = %.17g\n", ck->allowance);
     fprintf(f, "allowance0 = %.17g\n", ck->allowance0);
-    if (fflush(f) || fsync(fileno(f)) || fclose(f)) {
+    if (fflush(f) || bench_sync_stream(f) || fclose(f)) {
         perror(tmp); remove(tmp); return -1;
     }
-    if (rename(tmp, path)) { perror(path); remove(tmp); return -1; }
+    if (bench_atomic_replace(tmp, path)) { perror(path); remove(tmp); return -1; }
     return 0;
 }
 
@@ -419,14 +421,13 @@ static inline int ckpt_lock(const char *relations, char *path, size_t n)
     char buf[64];
     if (ckpt_lock_path(relations, path, n)) return -1;
 again:
-    fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    fd = bench_lock_create(path);
     if (fd < 0) {
         if (errno == EEXIST) {
             FILE *f = fopen(path, "r");
             long other = 0;
             if (f) { if (fscanf(f, "%ld", &other) != 1) other = 0; fclose(f); }
-            if (!retried && other > 0 && kill((pid_t)other, 0) &&
-                errno == ESRCH) {
+            if (!retried && other > 0 && !bench_process_exists(other)) {
                 fprintf(stderr, "  %s is stale (pid %ld is gone); taking it"
                         " over\n", path, other);
                 remove(path);
@@ -441,9 +442,9 @@ again:
         } else perror(path);
         return -1;
     }
-    snprintf(buf, sizeof buf, "%ld\n", (long)getpid());
-    if (write(fd, buf, strlen(buf)) < 0) { /* advisory only */ }
-    close(fd);
+    snprintf(buf, sizeof buf, "%ld\n", bench_getpid());
+    if (bench_fd_write(fd, buf, strlen(buf)) < 0) { /* advisory only */ }
+    bench_fd_close(fd);
     return 0;
 }
 

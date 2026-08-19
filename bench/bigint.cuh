@@ -157,6 +157,8 @@ BN_FN int bn_top(const bn_t *x)
 /* 64x64 -> high 64. The GPU has an instruction; the host has __int128. */
 #if defined(__CUDA_ARCH__)
 #define BN_MULHI64(a, b) __umul64hi((a), (b))
+#elif defined(_MSC_VER)
+#define BN_MULHI64(a, b) bench_mulhi_u64((a), (b))
 #else
 #define BN_MULHI64(a, b) \
     ((uint64_t)(((unsigned __int128)(a) * (unsigned __int128)(b)) >> 64))
