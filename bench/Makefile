@@ -26,6 +26,7 @@ CXX       ?= g++
 # Below that nothing is possible anyway: CUDA 13 dropped Volta, so nvcc 13.2
 # rejects sm_70 outright.
 GPU_ARCH_all := -gencode arch=compute_120,code=sm_120 \
+                -gencode arch=compute_90,code=sm_90 \
                 -gencode arch=compute_89,code=sm_89 \
                 -gencode arch=compute_86,code=sm_86 \
                 -gencode arch=compute_80,code=sm_80 \

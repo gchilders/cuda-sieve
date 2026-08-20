@@ -45,7 +45,7 @@ exit /b 1
 :arch_all
 rem Same fat-binary set as the Makefile's default, including the compute_80
 rem PTX floor so a newer card than this list still runs.
-set "NVCC_ARCH=-gencode arch=compute_120,code=sm_120 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_80,code=sm_80 -gencode arch=compute_80,code=compute_80"
+set "NVCC_ARCH=-gencode arch=compute_120,code=sm_120 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_80,code=sm_80 -gencode arch=compute_80,code=compute_80"
 goto :arch_done
 
 :arch_native
