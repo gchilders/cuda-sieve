@@ -1,8 +1,10 @@
 /* runlog.c -- implementation of the run log described in runlog.h. */
 
 /* The Makefile builds the C sources as -std=c11, which is strict ISO C and
- * hides clock_gettime, localtime_r and dlopen behind the feature-test macro.
- * Declared here rather than by loosening the standard for every C object. */
+ * hides clock_gettime and localtime_r behind the feature-test macro. Declared
+ * here rather than by loosening the standard for every C object. The loader
+ * and time conversions themselves now live in platform.c, so this file needs
+ * neither <dlfcn.h> nor <windows.h>. */
 #ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L
 #endif
@@ -16,11 +18,6 @@
 #include <string.h>
 #include <time.h>
 #include <errno.h>
-#ifdef _WIN32
-#include <windows.h>
-#else
-#include <dlfcn.h>
-#endif
 
 /* Build stamp. The Makefile defines this from `git describe --dirty`; the
  * fallback keeps a hand-built or exported tree compiling and says plainly that
@@ -73,7 +70,11 @@ static double runlog_now_ms(void)
 int runlog_open(const char *path, double period_s)
 {
     if (!path) return 0;
-    L.f = fopen(path, "a");
+    /* "ab": the run log is machine-parsed (relgeom.py, the oracle sweep
+     * scripts), so it stays LF-only whichever platform produced it. Every
+     * record is explicitly flushed below, so nothing here depends on the
+     * line buffering that MSVC would silently turn into full buffering. */
+    L.f = fopen(path, "ab");
     if (!L.f) {
         fprintf(stderr, "  warning: cannot open run log %s (%s); continuing"
                 " without it\n", path, strerror(errno));
@@ -81,8 +82,21 @@ int runlog_open(const char *path, double period_s)
         return -1;
     }
     /* Line buffered: a kill -9 loses at most the record being written, never a
-     * block of complete ones sitting in a 4 KB buffer. */
-    setvbuf(L.f, NULL, _IOLBF, 0);
+     * block of complete ones sitting in a 4 KB buffer.
+     *
+     * The size is explicit because it has to be. glibc reads a 0 here as "pick
+     * a default", but MSVC requires 2 <= size <= INT_MAX whenever the buffer
+     * pointer is NULL, and a 0 reaches the CRT's invalid-parameter handler --
+     * which does not return. It terminates the process through __fastfail,
+     * reported as 0xC0000409, the SAME status Windows uses for a stack-buffer
+     * overrun. So the failure presented as memory corruption in code that has
+     * none: bench.exe died here, right after opening the log and before
+     * writing a single record, on every Windows run that passed --log.
+     *
+     * MSVC also treats _IOLBF as full buffering, so the guarantee in the
+     * paragraph above rests on the explicit fflush after every record in
+     * runlog_vwrite and runlog_note rather than on the mode. */
+    setvbuf(L.f, NULL, _IOLBF, 4096);
     L.period_ms = period_s > 0.0 ? period_s * 1000.0 : 300000.0;
     L.t_open = runlog_now_ms();
     L.t_next = L.t_open + L.period_ms;
@@ -94,11 +108,7 @@ void runlog_close(void)
     if (L.f) { fclose(L.f); L.f = NULL; }
     if (L.lib) {
         if (L.nvml_shutdown) L.nvml_shutdown();
-#ifdef _WIN32
-        FreeLibrary((HMODULE)L.lib);
-#else
-        dlclose(L.lib);
-#endif
+        bench_dlclose(L.lib);
         L.lib = NULL;
     }
     L.dev = NULL;
@@ -127,7 +137,7 @@ static void runlog_stamp(char *out, size_t n)
     /* POSIX strftime supplies %z; MSVC does not. Use UTC on Windows so the
      * timestamp remains unambiguous without having to synthesize an offset. */
 #ifdef _WIN32
-    if (gmtime_s(&tmv, &t) ||
+    if (bench_gmtime(&t, &tmv) ||
         !strftime(out, n, "%Y-%m-%dT%H:%M:%SZ", &tmv))
         snprintf(out, n, "%lld", (long long)t);
 #else
@@ -239,86 +249,70 @@ void runlog_warn(const char *fmt, ...)
 
 /* ---- NVML, resolved at run time ---------------------------------------- */
 
-#ifndef _WIN32
-/* dlsym returns void *, and converting that to a function pointer is not
- * something ISO C guarantees. memcpy through the object representation is the
- * portable spelling and compiles to the same nothing. */
-static void bind_sym(void *lib, const char *name, void *slot)
-{
-    void *p = dlsym(lib, name);
-    memcpy(slot, &p, sizeof p);
-}
+/* Candidate NVML library names, tried in order.
+ *
+ * POSIX: the versioned soname, not "libnvidia-ml.so" -- the unversioned link
+ * is part of the toolkit's development package, which a volunteer host or a
+ * container carrying only the driver need not have.
+ *
+ * Windows: nvml.dll is normally in the system directory, but some driver
+ * packages install it only under the NVSMI directory, which is not on the
+ * default search path. Without the second candidate those hosts silently log
+ * gpu=n/a board=n/a. */
+static const char *const nvml_names[] = {
+#ifdef _WIN32
+    "nvml.dll",
+    "C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvml.dll",
+#else
+    "libnvidia-ml.so.1",
+#endif
+    NULL
+};
 
+/* ONE implementation for both platforms. dlopen/dlsym/dlclose differ only in
+ * spelling, and that spelling now lives in the platform layer -- this was two
+ * near-identical 33-line copies that had to be kept in step by hand, and every
+ * new NVML entry point had to be added to both. */
 int runlog_gpu_bind(const char *pci_bus_id)
 {
     int (*nvml_init)(void) = NULL;
     int (*nvml_byid)(const char *, void **) = NULL;
-    void *lib;
+    void *lib = NULL;
+    int inited = 0, i;
 
     if (L.lib || !pci_bus_id) return -1;
-    /* The versioned soname, not "libnvidia-ml.so": the unversioned link is
-     * part of the toolkit's development package, which a volunteer host or a
-     * container carrying only the driver need not have. */
-    lib = dlopen("libnvidia-ml.so.1", RTLD_LAZY | RTLD_LOCAL);
+    for (i = 0; nvml_names[i] && !lib; i++)
+        lib = bench_dlopen(nvml_names[i]);
     if (!lib) return -1;
 
-    bind_sym(lib, "nvmlInit_v2", &nvml_init);
-    bind_sym(lib, "nvmlDeviceGetHandleByPciBusId_v2", &nvml_byid);
-    bind_sym(lib, "nvmlShutdown", &L.nvml_shutdown);
-    bind_sym(lib, "nvmlDeviceGetUtilizationRates", &L.nvml_util);
-    bind_sym(lib, "nvmlDeviceGetPowerUsage", &L.nvml_power);
+    bench_dlsym(lib, "nvmlInit_v2", &nvml_init);
+    bench_dlsym(lib, "nvmlDeviceGetHandleByPciBusId_v2", &nvml_byid);
+    bench_dlsym(lib, "nvmlShutdown", &L.nvml_shutdown);
+    bench_dlsym(lib, "nvmlDeviceGetUtilizationRates", &L.nvml_util);
+    bench_dlsym(lib, "nvmlDeviceGetPowerUsage", &L.nvml_power);
 
-    if (!nvml_init || !nvml_byid || nvml_init() != 0 ||
-        nvml_byid(pci_bus_id, &L.dev) != 0 || !L.dev) {
-        if (nvml_init && L.nvml_shutdown) L.nvml_shutdown();
-        dlclose(lib);
-        L.dev = NULL;
-        L.nvml_shutdown = NULL;
-        L.nvml_util = NULL;
-        L.nvml_power = NULL;
-        return -1;
-    }
+    /* `inited` tracks whether nvmlInit_v2 actually RAN, which is not the same
+     * as whether it resolved. The previous condition was "if (nvml_init &&
+     * L.nvml_shutdown)", so a library where nvmlDeviceGetHandleByPciBusId_v2
+     * failed to resolve short-circuited before nvml_init() was ever called and
+     * then called nvmlShutdown against a library that was never initialised. */
+    if (!nvml_init || !nvml_byid) goto fail;
+    if (nvml_init() != 0) goto fail;
+    inited = 1;
+    if (nvml_byid(pci_bus_id, &L.dev) != 0 || !L.dev) goto fail;
+
     L.lib = lib;
     return 0;
+
+fail:
+    if (inited && L.nvml_shutdown) L.nvml_shutdown();
+    bench_dlclose(lib);
+    L.dev = NULL;
+    L.nvml_shutdown = NULL;
+    L.nvml_util = NULL;
+    L.nvml_power = NULL;
+    return -1;
 }
-
-#else
-static void bind_sym(void *lib, const char *name, void *slot)
-{
-    FARPROC p = GetProcAddress((HMODULE)lib, name);
-    memcpy(slot, &p, sizeof p);
-}
-
-int runlog_gpu_bind(const char *pci_bus_id)
-{
-    int (*nvml_init)(void) = NULL;
-    int (*nvml_byid)(const char *, void **) = NULL;
-    HMODULE lib;
-
-    if (L.lib || !pci_bus_id) return -1;
-    lib = LoadLibraryA("nvml.dll");
-    if (!lib) return -1;
-
-    bind_sym((void *)lib, "nvmlInit_v2", &nvml_init);
-    bind_sym((void *)lib, "nvmlDeviceGetHandleByPciBusId_v2", &nvml_byid);
-    bind_sym((void *)lib, "nvmlShutdown", &L.nvml_shutdown);
-    bind_sym((void *)lib, "nvmlDeviceGetUtilizationRates", &L.nvml_util);
-    bind_sym((void *)lib, "nvmlDeviceGetPowerUsage", &L.nvml_power);
-
-    if (!nvml_init || !nvml_byid || nvml_init() != 0 ||
-        nvml_byid(pci_bus_id, &L.dev) != 0 || !L.dev) {
-        if (nvml_init && L.nvml_shutdown) L.nvml_shutdown();
-        FreeLibrary(lib);
-        L.dev = NULL;
-        L.nvml_shutdown = NULL;
-        L.nvml_util = NULL;
-        L.nvml_power = NULL;
-        return -1;
-    }
-    L.lib = (void *)lib;
-    return 0;
-}
-#endif
 
 int runlog_gpu_util(unsigned int *pct)
 {

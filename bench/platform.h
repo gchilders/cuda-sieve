@@ -12,6 +12,12 @@
 extern "C" {
 #endif
 
+/* The longest path this layer will handle. ckpt.h's CKPT_PATH_MAX is defined
+ * from this, so the two cannot drift: raising it there raises the buffers
+ * here. Kept in the platform header because platform.c must not include
+ * ckpt.h -- the dependency runs the other way. */
+#define BENCH_PATH_MAX 2048
+
 #ifdef _WIN32
 typedef struct _stat64 bench_stat_t;
 #else
@@ -25,8 +31,29 @@ double bench_monotonic_ms(void);
 int bench_sync_stream(FILE *f);
 int64_t bench_tell(FILE *f);
 int bench_seek(FILE *f, uint64_t off);
+int bench_seek_end(FILE *f);
 int bench_truncate(FILE *f, uint64_t off);
 int bench_fstat_stream(FILE *f, bench_stat_t *st);
+
+/* Durable file identity -- the "is this still the same file?" test.
+ *
+ * NOT st_dev/st_ino from bench_stat_t: MSVC's _stat64 reports st_ino as a
+ * hardcoded 0 and st_dev as a bare drive index, so a (dev, ino) comparison on
+ * Windows silently reduces to "some file on the same drive" and matches any
+ * peer. Windows keeps the real answer behind GetFileInformationByHandle, so
+ * the identity has to come from a handle rather than a stat buffer.
+ *
+ * On POSIX these are exactly st_dev and st_ino, so a Linux checkpoint written
+ * before this existed still compares equal. `volume` and `index` are opaque:
+ * compare them, never interpret them. An all-zero id means the filesystem
+ * would not supply one -- bench_file_id_valid() is false for it, and a caller
+ * gating a destructive action MUST treat that as "unknown", never as a
+ * match. */
+typedef struct { uint64_t volume, index; } bench_file_id_t;
+int bench_file_id_stream(FILE *f, bench_file_id_t *id);
+int bench_file_id_path(const char *path, bench_file_id_t *id);
+int bench_file_id_valid(const bench_file_id_t *id);
+int bench_file_id_equal(const bench_file_id_t *a, const bench_file_id_t *b);
 int bench_stat_path(const char *path, bench_stat_t *st);
 int bench_is_regular_mode(unsigned short mode);
 int bench_stdout_is_tty(void);
@@ -39,8 +66,48 @@ long bench_getpid(void);
 int bench_fd_write(int fd, const void *buf, size_t n);
 int bench_fd_close(int fd);
 int bench_localtime(const time_t *t, struct tm *out);
+int bench_gmtime(const time_t *t, struct tm *out);
 int64_t bench_getline(char **line, size_t *cap, FILE *f);
 void bench_fast_exit(int code);
+
+/* Clean-stop request hook.
+ *
+ * The caller wants one thing -- "the operator asked this run to stop" -- and
+ * the two platforms deliver it through unrelated mechanisms, so the mechanism
+ * belongs here rather than at the call site.
+ *
+ * POSIX: SIGINT and SIGTERM, with the previous dispositions saved and put
+ * back by bench_stop_hook_remove().
+ *
+ * Windows: a console control handler. signal(SIGTERM, ...) compiles and
+ * succeeds under MSVC but the Win32 CRT never raises SIGTERM -- only raise()
+ * can -- so the SIGTERM registration this replaces was dead code, and ^C was
+ * the only thing that ever reached it. The handler covers CTRL_C_EVENT,
+ * CTRL_BREAK_EVENT and the CTRL_CLOSE/LOGOFF/SHUTDOWN events.
+ *
+ * WHAT WINDOWS STILL CANNOT DO: TerminateProcess -- which is how most job
+ * queues, and the BOINC client, stop a task -- runs no handler at all. There
+ * is no way to intercept it, so on Windows --stop-file is the only reliable
+ * way to ask for a checkpointed stop. The close/logoff/shutdown events also
+ * grant only a few seconds before the process dies, which may not be long
+ * enough to drain a cofactor queue.
+ *
+ * The callback runs on a separate thread on Windows and in signal context on
+ * POSIX. It must touch nothing but a volatile sig_atomic_t flag. */
+/* Run-time dynamic loading, for the optional NVML binding in runlog.c.
+ *
+ * bench_dlsym writes THROUGH a slot rather than returning the address: neither
+ * dlsym's void * nor GetProcAddress's FARPROC converts to a function pointer
+ * in a way ISO C guarantees, and memcpy into the target slot is the portable
+ * spelling that compiles to nothing. Pass the address of the function pointer
+ * you want filled. A name that does not resolve leaves the slot NULL. */
+void *bench_dlopen(const char *name);
+void  bench_dlsym(void *lib, const char *name, void *slot);
+void  bench_dlclose(void *lib);
+
+typedef void (*bench_stop_handler_t)(void);
+int  bench_stop_hook_install(bench_stop_handler_t fn);
+void bench_stop_hook_remove(void);
 
 #ifdef __cplusplus
 }
@@ -137,6 +204,25 @@ static inline int bench_u128_nonzero(bench_u128_t v)
     return v.lo != 0 || v.hi != 0;
 }
 
+/* Keep the builtin where the compiler has one. This replaced a direct
+ * __builtin_popcount, and an unconditional SWAR body costs the Linux build
+ * ~12 ALU ops per word where it had been a single POPCNT -- a portability
+ * shim is not a reason to give that up on the platform that already had it.
+ * __builtin_popcount is not an unconditional instruction: GCC and clang emit
+ * POPCNT when the target allows it (the Makefile builds -march=native) and
+ * call their own fallback otherwise, which is exactly the right behaviour.
+ *
+ * MSVC deliberately keeps the SWAR body. Its __popcnt intrinsic compiles to
+ * the instruction unconditionally, with no fallback, so a binary built with
+ * it faults on any CPU without SSE4.2 -- and unlike -march=native there is no
+ * compile-time target here that rules that out. This path was never the
+ * regression; it is the one the shim was written for. */
+#if defined(__GNUC__) || defined(__clang__)
+static inline unsigned bench_popcount32(uint32_t x)
+{
+    return (unsigned)__builtin_popcount(x);
+}
+#else
 static inline unsigned bench_popcount32(uint32_t x)
 {
     x = x - ((x >> 1) & 0x55555555u);
@@ -144,6 +230,7 @@ static inline unsigned bench_popcount32(uint32_t x)
     x = (x + (x >> 4)) & 0x0f0f0f0fu;
     return (unsigned)((x * 0x01010101u) >> 24);
 }
+#endif
 
 static inline char *bench_strdup(const char *s)
 {

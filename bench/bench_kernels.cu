@@ -1564,7 +1564,7 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
             rc = -1;
 
         if (cfg->emit_cof) {
-            FILE *fo = cfg->emit_cof ? fopen(cfg->emit_cof, "w") : NULL;
+            FILE *fo = cfg->emit_cof ? fopen(cfg->emit_cof, "wb") : NULL;
             uint32_t *hfac = (uint32_t *)malloc((size_t)n * TD_FMAX * 4);
             uint32_t *hfn = (uint32_t *)malloc((size_t)n * 4);
             uint32_t checked = 0, bad = 0, overflowed = 0, maxfac = 0;
@@ -2261,7 +2261,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                             uint32_t *hx = (uint32_t *)malloc((size_t)hn * 4);
                             int64_t *ha = (int64_t *)malloc((size_t)hn * 8);
                             int64_t *hb = (int64_t *)malloc((size_t)hn * 8);
-                            FILE *fo = fopen(cfg->emit, "w");
+                            FILE *fo = fopen(cfg->emit, "wb");
                             CK(cudaMemcpy(hx, d_x, (size_t)hn * 4, cudaMemcpyDeviceToHost));
                             CK(cudaMemcpy(ha, d_a, (size_t)hn * 8, cudaMemcpyDeviceToHost));
                             CK(cudaMemcpy(hb, d_b, (size_t)hn * 8, cudaMemcpyDeviceToHost));

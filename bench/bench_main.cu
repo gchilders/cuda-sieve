@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <limits.h>
+#include <ctype.h>
 
 static int parse_u64_arg(const char *flag, const char *arg, uint64_t *out)
 {
@@ -578,7 +579,12 @@ static int resume_recovery_init(resume_recovery_t *r,
  * that the process died while recording one additional attempt. */
 static int recovery_count_read_one(const char *path, unsigned *count)
 {
-    FILE *f = fopen(path, "r");
+    /* Binary both ends: the format is "%u\n" and the parse below insists on
+     * that exact '\n'. A text-mode write on Windows puts "\r\n" on disk, and
+     * the same file read anywhere without translation then scans as three
+     * fields with newline == '\r' -- reported malformed, which for the
+     * durable counter is fatal. */
+    FILE *f = fopen(path, "rb");
     unsigned n;
     char newline, extra;
     int fields, close_bad;
@@ -603,7 +609,7 @@ static int recovery_count_read_one(const char *path, unsigned *count)
 
 static int recovery_count_write(const resume_recovery_t *r, unsigned count)
 {
-    FILE *f = fopen(r->retry_tmp, "w");
+    FILE *f = fopen(r->retry_tmp, "wb");
     int bad = 0, saved_errno = 0;
     if (!f) { perror(r->retry_tmp); return -1; }
     if (fprintf(f, "%u\n", count) < 0) { bad = 1; saved_errno = errno; }
@@ -638,17 +644,43 @@ static const char *last_path_separator(const char *path)
     return slash;
 }
 
+/* Compare two directory prefixes.
+ *
+ * On Windows both separators are legal within one path, and the two operands
+ * reach the caller from different sources -- r->part is built from the
+ * operator's --relations argument, ck->cand_part is read back out of the
+ * checkpoint -- so "C:\\work\\out" and "C:/work/out" are one directory spelled
+ * two ways. last_path_separator already accepts either; _strnicmp over the
+ * raw bytes did not, which turned a difference in spelling into a refused
+ * resume.
+ *
+ * This stays a textual test: it does not resolve "..", symlinks, junctions or
+ * 8.3 short names, so it can still call two spellings of one directory
+ * different. That is the safe direction -- it withholds a delete rather than
+ * authorising one -- and the identity check in the caller, not this function,
+ * is what actually establishes the file. */
+static int path_prefix_equal(const char *a, const char *b, size_t n)
+{
+#ifdef _WIN32
+    for (size_t i = 0; i < n; i++) {
+        unsigned char ca = (unsigned char)a[i], cb = (unsigned char)b[i];
+        if (ca == '/') ca = '\\';
+        if (cb == '/') cb = '\\';
+        if (tolower(ca) != tolower(cb)) return 0;
+    }
+    return 1;
+#else
+    return !memcmp(a, b, n);
+#endif
+}
+
 static int same_parent_directory(const char *a, const char *b)
 {
     const char *as = last_path_separator(a), *bs = last_path_separator(b);
     const size_t an = as ? (size_t)(as - a) : 0;
     const size_t bn = bs ? (size_t)(bs - b) : 0;
     if (!!as != !!bs || an != bn) return 0;
-#ifdef _WIN32
-    return an == 0 || _strnicmp(a, b, an) == 0;
-#else
-    return an == 0 || !memcmp(a, b, an);
-#endif
+    return an == 0 || path_prefix_equal(a, b, an);
 }
 
 /* A checkpoint pathname is data, not authority to unlink.  It is usable only
@@ -659,6 +691,9 @@ static int resume_recovery_add_checkpoint_candidate(resume_recovery_t *r,
                                                      const ckpt_t *ck)
 {
     bench_stat_t st;
+    bench_file_id_t id;
+    const bench_file_id_t want = { (uint64_t)ck->cand_dev,
+                                   (uint64_t)ck->cand_ino };
     const size_t len = strlen(ck->cand_part);
     if (!len) return 0;             /* legacy checkpoint: identity unavailable */
     if (!same_parent_directory(r->part, ck->cand_part) ||
@@ -674,9 +709,19 @@ static int resume_recovery_add_checkpoint_candidate(resume_recovery_t *r,
         perror(ck->cand_part);
         return -1;
     }
+    /* Identity comes from bench_file_id_path, not from the stat above. The
+     * stat still answers "regular file, and at least as long as the bytes the
+     * checkpoint claims"; it cannot answer "the same file", because st_ino is
+     * always 0 on Windows and every peer .part on the drive would compare
+     * equal. bench_file_id_equal is false for an unavailable (0/0) identity on
+     * either side, so "cannot tell" refuses rather than deletes. */
+    if (bench_file_id_path(ck->cand_part, &id)) {
+        if (errno == ENOENT) return 1;
+        perror(ck->cand_part);
+        return -1;
+    }
     if (!bench_is_regular_mode((unsigned short)st.st_mode) ||
-        (unsigned long long)st.st_dev != ck->cand_dev ||
-        (unsigned long long)st.st_ino != ck->cand_ino ||
+        !bench_file_id_equal(&id, &want) ||
         (unsigned long long)st.st_size < ck->cand_bytes) {
         fprintf(stderr,
                 "BOINC: checkpoint candidate staging identity no longer"
@@ -1189,6 +1234,12 @@ static int bench_main_impl(int argc, char **argv)
     if (!fbbound && cfg.side == 1 && !cfg.pipeline)
         fbbound = (q > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (uint32_t)q;
 
+    /* Shift in the destination width, not the source width. These are all
+     * provably in range -- logI is bounded to [2,20] and log_region to [1,30]
+     * above, so a 32-bit shift could not overflow -- but MSVC's C4334 fires on
+     * the pattern rather than on the proof, and a Windows build that always
+     * emits three warnings is a Windows build whose warnings get ignored.
+     * `(uint64_t)1 << n` says what was meant and costs nothing. */
     /* Bound log_region before ANY 1u << log_region: the shift is undefined for
      * >= 32 and UBSan flags --region 32 on the old ordering. */
     if (cfg.log_region < 1 || cfg.log_region > 30) {
@@ -1206,7 +1257,7 @@ static int bench_main_impl(int argc, char **argv)
             return 1;
         }
     }
-    if ((uint64_t)(1u << cfg.logI) * cfg.J > 0x80000000ull) {
+    if (((uint64_t)1 << cfg.logI) * cfg.J > 0x80000000ull) {
         fprintf(stderr, "I*J must fit in 31 bits (uint32 positions)\n"); return 1;
     }
     /* Two limits that used to be silent. A 2 B or 4 B record carries the
@@ -1276,7 +1327,7 @@ static int bench_main_impl(int argc, char **argv)
                 " hangs and a partial warp double-counts\n");
         return 1;
     }
-    if ((uint64_t)(1u << cfg.logI) * cfg.J % (1u << cfg.log_region)) {
+    if (((uint64_t)1 << cfg.logI) * cfg.J % ((uint64_t)1 << cfg.log_region)) {
         fprintf(stderr, "I*J must divide evenly into 2^%d regions\n", cfg.log_region);
         return 1;
     }
@@ -1853,7 +1904,7 @@ static int bench_main_impl(int argc, char **argv)
                 if (br_ > 0) goto resume_artifacts_ready;              \
             } while (0)
 
-            /* A hard kill can land after fopen(NAME.part, "w") creates the
+            /* A hard kill can land after fopen(NAME.part, "wb") creates the
              * staging file but before the first cofactor flush writes a
              * checkpoint. There is no resume ambiguity when that file is
              * empty: it contains no relation and restarting from the band's

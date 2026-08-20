@@ -1,0 +1,23 @@
+# Line endings.
+#
+# Default: let git normalise text in the repository to LF and check it out
+# per-platform. The exceptions below are files whose ending is functional
+# rather than cosmetic.
+* text=auto
+
+# cmd.exe is not reliably LF-tolerant -- goto labels and multi-line blocks in
+# an LF-only .bat are a known source of "the system cannot find the batch
+# label" -- so batch files stay CRLF on every platform.
+*.bat text eol=crlf
+
+# Shell scripts and makefiles stay LF even when checked out on Windows;
+# a CRLF shebang line is not a shebang.
+*.sh text eol=lf
+Makefile text eol=lf
+
+# Relation and factor-base data are a wire format shared with msieve/CADO and
+# GGNFS, and the sieve now writes them in binary mode on both platforms.
+# Never let git rewrite their endings.
+*.fb1 -text
+*.afb -text
+*.dat -text

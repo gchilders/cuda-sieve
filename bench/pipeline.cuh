@@ -37,9 +37,13 @@
  * flushing stdio from a handler is not. */
 static volatile sig_atomic_t g_pipe_stop = 0;
 
-static void pipe_on_signal(int sig)
+/* Called from signal context on POSIX and from the console-control thread on
+ * Windows, so it touches nothing but the flag. The ++ is not atomic against
+ * the sieve thread on Windows, which makes the second-request escape hatch
+ * best-effort there rather than exact -- a lost increment costs one extra
+ * request, never a missed stop. */
+static void pipe_request_stop(void)
 {
-    (void)sig;
     if (++g_pipe_stop >= 2) bench_fast_exit(130);
 }
 
@@ -57,8 +61,9 @@ static int pipe_checkpoint(const poly_t *P, const bench_cfg_t *cfg, ckpt_t *ck,
                            FILE *fr, FILE *fc, const qsel_t *next,
                            unsigned long long nrel, unsigned long long nqdone)
 {
+    static int warned_no_id = 0;
     int64_t ro, co = 0;
-    bench_stat_t cst;
+    bench_file_id_t cid;
     if (!fr || !cfg->relations) return 0;
     /* fsync before the sidecar, never after: the checkpoint asserts these
      * bytes are on the platter, and a sidecar naming bytes that are still in
@@ -70,12 +75,28 @@ static int pipe_checkpoint(const poly_t *P, const bench_cfg_t *cfg, ckpt_t *ck,
     if ((ro = bench_tell(fr)) < 0) { perror("relations"); return -1; }
     if (fc && (co = bench_tell(fc)) < 0) { perror("candidates"); return -1; }
     if (fc) {
-        if (bench_fstat_stream(fc, &cst)) { perror("candidates"); return -1; }
+        /* Identity from the open handle, not from a stat buffer: st_ino is a
+         * hardcoded 0 under MSVC, so the (dev, ino) this used to record would
+         * later match any peer .part on the same drive -- and the recorded
+         * identity is what stands between a checkpoint pathname and an
+         * unlink. On POSIX these are still st_dev/st_ino, so an existing
+         * Linux checkpoint compares equal exactly as before. */
+        if (bench_file_id_stream(fc, &cid)) { perror("candidates"); return -1; }
         if (ckpt_part_path(cfg->candidates, ck->cand_part,
                            sizeof ck->cand_part))
             return -1;
-        ck->cand_dev = (unsigned long long)cst.st_dev;
-        ck->cand_ino = (unsigned long long)cst.st_ino;
+        /* A filesystem that will not supply an identity leaves this 0/0, which
+         * the reader treats as "unknown" and refuses to delete on. Recording
+         * it is still right: the alternative is failing the checkpoint over a
+         * field that only ever gates a discard. */
+        if (!bench_file_id_valid(&cid) && !warned_no_id) {
+            warned_no_id = 1;   /* once: this runs at every checkpoint */
+            fprintf(stderr, "  warning: %s is on a filesystem that supplies no"
+                    " file identity; automatic recovery will not be able to"
+                    " discard it\n", ck->cand_part);
+        }
+        ck->cand_dev = (unsigned long long)cid.volume;
+        ck->cand_ino = (unsigned long long)cid.index;
     } else {
         ck->cand_part[0] = '\0';
         ck->cand_dev = ck->cand_ino = 0;
@@ -221,7 +242,7 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
         goto done;
     }
     {
-        const size_t smem = (size_t)(1u << cfg->log_region) * 2 +
+        const size_t smem = ((size_t)1 << cfg->log_region) * 2 +
                             (size_t)S->nslice_pow2 * sizeof(*hlogp);
         if (smem > 101376u) {
             fprintf(stderr, "  apply needs %zu B of shared memory for %u"
@@ -1118,7 +1139,7 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
      * two keeps a .part that no rerun can consume and that the startup check
      * then refuses, wedging an unattended queue. */
     int stopped = 0, ckpt_armed = 0, ckpt_written = 0, ckpt_warned = 0;
-    void (*old_int)(int) = SIG_ERR, (*old_term)(int) = SIG_ERR;
+    int stop_hooked = 0;
 
     /* This must precede pipe_est_records(): that helper divides by every
      * modulus, so a zero modulus in an unvalidated object is already too late
@@ -1265,28 +1286,37 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         fprintf(stderr, "run_pipeline: output path too long for its .part name\n");
         rc = -1; goto done;
     }
+    /* Binary mode, on every staging open, on both platforms. Three things
+     * depend on it and all three fail quietly in text mode on Windows:
+     * relations are a wire format shipped to msieve/CADO, and a CRLF copy is
+     * not the same file the Linux build produces; every reader of these two
+     * paths opens "rb", so a line stored as "\r\n" reaches the parser with a
+     * stray \r and is counted a bad relation by the resume gate; and the
+     * checkpoint records bench_tell() on this stream to compare against a
+     * physical stat size, which a translating stream makes a different
+     * number, so bench_truncate() would cut mid-line on resume. */
     if (cfg->relations) {
         if (cfg->resume) {
             /* Truncate to the checkpointed prefix before appending. This is
              * what makes a torn final line from a kill -9 a non-problem: the
              * partial write is discarded rather than parsed. */
-            if (!(fr = fopen(rtmp, "r+"))) { perror(rtmp); rc = -1; goto done; }
+            if (!(fr = fopen(rtmp, "r+b"))) { perror(rtmp); rc = -1; goto done; }
             if (bench_truncate(fr, cfg->resume_rel_bytes) ||
                 bench_seek(fr, cfg->resume_rel_bytes)) {
                 perror(rtmp); rc = -1; goto done;
             }
-        } else if (!(fr = fopen(rtmp, "w"))) {
+        } else if (!(fr = fopen(rtmp, "wb"))) {
             perror(rtmp); rc = -1; goto done;
         }
     }
     if (cfg->candidates) {
         if (cfg->resume) {
-            if (!(fc = fopen(ctmp, "r+"))) { perror(ctmp); rc = -1; goto done; }
+            if (!(fc = fopen(ctmp, "r+b"))) { perror(ctmp); rc = -1; goto done; }
             if (bench_truncate(fc, cfg->resume_cand_bytes) ||
                 bench_seek(fc, cfg->resume_cand_bytes)) {
                 perror(ctmp); rc = -1; goto done;
             }
-        } else if (!(fc = fopen(ctmp, "w"))) {
+        } else if (!(fc = fopen(ctmp, "wb"))) {
             perror(ctmp); rc = -1; goto done;
         }
     }
@@ -1297,8 +1327,11 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         ck.scale = cfg->scale; ck.scale0 = cfg->scale0;
         ck.allowance = cfg->allowance; ck.allowance0 = cfg->allowance0;
         ckpt_armed = 1;
-        old_int  = signal(SIGINT,  pipe_on_signal);
-        old_term = signal(SIGTERM, pipe_on_signal);
+        /* See bench_stop_hook_install: on Windows this is a console control
+         * handler, because signal(SIGTERM) is never delivered there. A task
+         * stopped with TerminateProcess still runs nothing at all, so
+         * --stop-file remains the only reliable managed stop on Windows. */
+        stop_hooked = bench_stop_hook_install(pipe_request_stop) == 0;
         g_pipe_stop = 0;
     }
 
@@ -2233,8 +2266,7 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
 
 #undef PIPE_CK
 done:
-    if (old_int  != SIG_ERR) signal(SIGINT,  old_int);
-    if (old_term != SIG_ERR) signal(SIGTERM, old_term);
+    if (stop_hooked) bench_stop_hook_remove();
     /* CUDA failures can jump here from any stage. Normal completion already
      * finalized exactly once above; an early jump closes and discards here --
      * but still honours a written checkpoint, since a .part that a sidecar
