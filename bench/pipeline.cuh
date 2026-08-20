@@ -137,6 +137,9 @@ static void pipe_try_checkpoint(const poly_t *P, const bench_cfg_t *cfg,
 typedef struct {
     uint32_t *primes, *roots;
     plat_t   *plat;
+    /* Present only in the slabbed specialization. fill advances walk_cur into
+     * walk_next; resieve replays walk_cur, then the host swaps the pointers. */
+    uint32_t *walk_cur, *walk_next;
     uint32_t *survbits;
     uint16_t *slice, *slice_logp;
     uint32_t *sp, *srt, *sg;
@@ -148,11 +151,13 @@ typedef struct {
     uint32_t *hsp, *hsrt, *hsg; uint16_t *hslp;
     uint32_t *d_surv, *d_nsurv, *d_nproj;
     unsigned long long *d_nlost;
+    cudaEvent_t ev[4];
 } pside_t;
 
 static void pside_free(pside_t *S)
 {
     cudaFree(S->primes); cudaFree(S->roots); cudaFree(S->plat);
+    cudaFree(S->walk_cur); cudaFree(S->walk_next);
     cudaFree(S->survbits); cudaFree(S->slice); cudaFree(S->slice_logp);
     cudaFree(S->sp); cudaFree(S->srt); cudaFree(S->sg); cudaFree(S->slp);
     cudaFree(S->d_surv); cudaFree(S->d_nsurv);
@@ -161,6 +166,7 @@ static void pside_free(pside_t *S)
     if (S->hsrt) cudaFreeHost(S->hsrt);
     if (S->hsg)  cudaFreeHost(S->hsg);
     if (S->hslp) cudaFreeHost(S->hslp);
+    for (int k = 0; k < 4; k++) if (S->ev[k]) cudaEventDestroy(S->ev[k]);
     memset(S, 0, sizeof(*S));
 }
 
@@ -203,12 +209,12 @@ static double pipe_progress_fraction(const bench_cfg_t *cfg, int streaming,
 /* Everything that does NOT depend on the special-q: the factor base upload,
  * the slice tables, and the pinned staging. Hoisted out of the per-q path so a
  * band of q measures sieving rather than allocation churn. */
+template <bool SLABBED>
 static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
                           const bench_cfg_t *cfg, uint32_t bound,
-                          pside_t *S)
+                          uint32_t xmax_alloc, pside_t *S)
 {
-    const uint32_t xmax = (1u << cfg->logI) * cfg->J;
-    const uint32_t nbitword = xmax >> 5;
+    const uint32_t nbitword = xmax_alloc >> 5;
     const uint32_t maxsurv = 1u << 22;
     uint16_t *hslice = NULL, *hlogp = NULL;
     int rc = -1;
@@ -231,6 +237,10 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
     SIDE_INIT_CK(cudaMalloc(&S->primes, (size_t)fb->n * 4));
     SIDE_INIT_CK(cudaMalloc(&S->roots,  (size_t)fb->n * 4));
     SIDE_INIT_CK(cudaMalloc(&S->plat,   (size_t)fb->n * sizeof(plat_t)));
+    if constexpr (SLABBED) {
+        SIDE_INIT_CK(cudaMalloc(&S->walk_cur,  (size_t)fb->n * 4));
+        SIDE_INIT_CK(cudaMalloc(&S->walk_next, (size_t)fb->n * 4));
+    }
     SIDE_INIT_CK(cudaMalloc(&S->survbits, (size_t)nbitword * 4));
     SIDE_INIT_CK(cudaMemcpy(S->primes, fb->primes, (size_t)fb->n * 4,
                             cudaMemcpyHostToDevice));
@@ -282,6 +292,7 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
     SIDE_INIT_CK(cudaMalloc(&S->d_nsurv, 4));
     SIDE_INIT_CK(cudaMalloc(&S->d_nproj, 4));
     SIDE_INIT_CK(cudaMalloc(&S->d_nlost, 8));
+    for (int k = 0; k < 4; k++) SIDE_INIT_CK(cudaEventCreate(&S->ev[k]));
     (void)nbitword;
     rc = 0;
 
@@ -292,31 +303,19 @@ done:
     return rc;
 }
 
-/* The per-q work for one side: transform, small-sieve tables, norm setup,
- * fill, apply. The bucket array is passed in and REUSED between sides -- at
- * 1.38 GB it is the largest allocation in the process and nothing needs it
- * after apply. */
-static int pipe_side_perq(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
-                          const poly_t *POLY, const bench_cfg_t *cfg,
-                          int side, double scale,
-                          uint8_t *d_bucket, uint32_t *d_cursor, uint32_t cap,
-                          uint32_t *d_overflow, int blocks, int fblocks,
-                          int fthreads,
-                          pside_t *S, float t_stage[3], double *t_host)
+/* Per-special-q work that is independent of the slab: transform the small
+ * line-sieve tables, set up the norm over the FULL J range, and transform the
+ * bucketed factor base once.  In SLABBED mode k_transform also seeds the first
+ * slab's continuation walk. */
+template <bool SLABBED>
+static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
+                               const qlat_t *L, const poly_t *POLY,
+                               const bench_cfg_t *cfg, int side, double scale,
+                               int blocks, pside_t *S, float *t_transform,
+                               double *t_host)
 {
-    const uint32_t xmax = (1u << cfg->logI) * cfg->J;
-    const int log_region = cfg->log_region;
-    const uint32_t nregion = xmax >> log_region;
-    const uint32_t nbitword = xmax >> 5;
-    const uint32_t ncell = 1u << log_region;
-    const uint32_t maxsurv = 1u << 22;
-    const size_t smem = (size_t)ncell * 2 +
-                        (size_t)S->nslice_pow2 * sizeof(uint16_t);
-    const int athr = cfg->apply_threads ? cfg->apply_threads : 512;
-    cudaEvent_t e0 = NULL, e1 = NULL, e2 = NULL, e3 = NULL;
     uint32_t *idx = NULL, *tp = NULL, *trt = NULL, *tg = NULL;
     uint16_t *tlp = NULL;
-    float t_t = 0, t_f = 0, t_a = 0;
     double h0 = host_ms();
     int rc = -1;
 
@@ -344,7 +343,7 @@ static int pipe_side_perq(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
             tlp = (uint16_t *)malloc((size_t)k * sizeof(*tlp));
             if (!idx || !tp || !trt || !tg || !tlp) {
                 fprintf(stderr,
-                        "pipe_side_perq: out of memory sorting %u small-sieve entries\n",
+                        "pipe_side_prepare_q: out of memory sorting %u small-sieve entries\n",
                         k);
                 goto done;
             }
@@ -419,71 +418,86 @@ static int pipe_side_perq(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     }
 
     *t_host = host_ms() - h0;
-    PERQ_CK(cudaEventCreate(&e0));
-    PERQ_CK(cudaEventCreate(&e1));
-    PERQ_CK(cudaEventCreate(&e2));
-    PERQ_CK(cudaEventCreate(&e3));
     /* k_transform writes these unconditionally; NULL is an illegal access */
     PERQ_CK(cudaMemset(S->d_nproj, 0, 4));
     PERQ_CK(cudaMemset(S->d_nlost, 0, 8));
 
-    PERQ_CK(cudaEventRecord(e0));
-    k_transform<<<blocks, cfg->threads>>>(S->primes, S->roots, S->plat, fb->n,
+    PERQ_CK(cudaEventRecord(S->ev[0]));
+    k_transform<SLABBED><<<blocks, cfg->threads>>>(S->primes, S->roots, S->plat, fb->n,
         cfg->logI, cfg->J, L->a0, L->a1, L->b0, L->b1,
-        S->d_nproj, S->d_nlost);
-    PERQ_CK(cudaEventRecord(e1));
-    PERQ_CK(cudaMemset(d_cursor, 0, (size_t)nregion * 4));
-    PERQ_CK(cudaMemset(d_overflow, 0, 4));
-    k_fill_atomic<4><<<fblocks, fthreads>>>(S->plat, S->slice, fb->n, xmax,
-        cfg->logI, log_region, d_cursor, d_bucket, cap, d_overflow);
-    PERQ_CK(cudaEventRecord(e2));
-    PERQ_CK(cudaMemset(S->d_nsurv, 0, 4));
-    PERQ_CK(cudaMemset(S->survbits, 0, (size_t)nbitword * 4));
-    PERQ_CK(cudaFuncSetAttribute(k_apply<16, 1, NORM_HORNER>,
+        S->d_nproj, S->d_nlost, S->walk_cur);
+    PERQ_CK(cudaEventRecord(S->ev[1]));
+    PERQ_CK(cudaEventSynchronize(S->ev[1]));
+    PERQ_CK(cudaGetLastError());
+    *t_transform = time_kernel(S->ev[0], S->ev[1]);
+    rc = 0;
+
+done:
+    free(idx); free(tp); free(trt); free(tg); free(tlp);
+#undef PERQ_CK
+    return rc;
+}
+
+/* Area-dependent work for one side and one slab. The bucket array is passed
+ * in and REUSED between sides. SLABBED=false compiles to the pre-slab fill and
+ * apply kernels; no walk-state read/write or global-j adjustment survives. */
+template <bool SLABBED>
+static int pipe_side_sieve_slab(const fb_t *fb, const bench_cfg_t *cfg,
+                                int side, uint32_t xmax, uint32_t j_base,
+                                uint8_t *d_bucket, uint32_t *d_cursor,
+                                uint32_t cap, uint32_t *d_overflow,
+                                int fblocks, int fthreads, pside_t *S,
+                                float *t_fill, float *t_apply)
+{
+    const int log_region = cfg->log_region;
+    const uint32_t nregion = xmax >> log_region;
+    const uint32_t nbitword = xmax >> 5;
+    const uint32_t ncell = 1u << log_region;
+    const uint32_t maxsurv = 1u << 22;
+    const size_t smem = (size_t)ncell * 2 +
+                        (size_t)S->nslice_pow2 * sizeof(uint16_t);
+    const int athr = cfg->apply_threads ? cfg->apply_threads : 512;
+    int rc = -1;
+
+#define SLAB_CK(x) do { if (CUDA_CHECKED(x)) goto done; } while (0)
+    /* Preserve the pre-slab timing boundary: fill includes clearing the bucket
+     * cursors/overflow counter, just as pipe_side_perq did. */
+    SLAB_CK(cudaEventRecord(S->ev[1]));
+    SLAB_CK(cudaMemset(d_cursor, 0, (size_t)nregion * 4));
+    SLAB_CK(cudaMemset(d_overflow, 0, 4));
+    k_fill_atomic<4, SLABBED><<<fblocks, fthreads>>>(
+        S->plat, S->slice, fb->n, xmax, cfg->logI, log_region,
+        d_cursor, d_bucket, cap, d_overflow, S->walk_cur, S->walk_next);
+    SLAB_CK(cudaEventRecord(S->ev[2]));
+    SLAB_CK(cudaMemset(S->d_nsurv, 0, 4));
+    SLAB_CK(cudaMemset(S->survbits, 0, (size_t)nbitword * 4));
+    SLAB_CK(cudaFuncSetAttribute(k_apply<16, 1, NORM_HORNER, SLABBED>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
-    k_apply<16, 1, NORM_HORNER><<<nregion, athr, smem>>>(
+    k_apply<16, 1, NORM_HORNER, SLABBED><<<nregion, athr, smem>>>(
         (const uint32_t *)d_bucket, d_cursor, cap, cfg->logI, log_region,
         S->slice_logp, S->nslice_pow2, S->N, S->CINIT, S->CINIT - S->BOUND,
         S->tconst, NULL, S->d_surv, S->d_nsurv, maxsurv, NULL, 0xFFFFFFFFu,
         S->sp, S->srt, S->sg, S->slp, S->nsmall, S->nblk, S->nwrp,
-        0xFFFFFFFFu, NULL, S->survbits, cfg->not_both_even);
-    PERQ_CK(cudaEventRecord(e3));
-    PERQ_CK(cudaEventSynchronize(e3));
-    PERQ_CK(cudaGetLastError());
-    t_t = time_kernel(e0, e1);
-    t_f = time_kernel(e1, e2);
-    t_a = time_kernel(e2, e3);
-    PERQ_CK(cudaMemcpy(&S->nsurv, S->d_nsurv, 4, cudaMemcpyDeviceToHost));
+        0xFFFFFFFFu, NULL, S->survbits, cfg->not_both_even, j_base);
+    SLAB_CK(cudaEventRecord(S->ev[3]));
+    SLAB_CK(cudaEventSynchronize(S->ev[3]));
+    SLAB_CK(cudaGetLastError());
+    *t_fill  = time_kernel(S->ev[1], S->ev[2]);
+    *t_apply = time_kernel(S->ev[2], S->ev[3]);
+    SLAB_CK(cudaMemcpy(&S->nsurv, S->d_nsurv, 4, cudaMemcpyDeviceToHost));
     {
         uint32_t hov = 0;
-        PERQ_CK(cudaMemcpy(&hov, d_overflow, 4, cudaMemcpyDeviceToHost));
+        SLAB_CK(cudaMemcpy(&hov, d_overflow, 4, cudaMemcpyDeviceToHost));
         if (hov) {
             runlog_warn("  side %d: bucket array OVERFLOWED by %u records",
                         side, hov);
             goto done;
         }
     }
-    if (cfg->verbose_q)
-        printf("  side %d: transform %.3f + fill %.3f + apply %.3f = %7.3f ms,"
-               " %8u survivors (bound %u)\n",
-               side, t_t, t_f, t_a, t_t + t_f + t_a,
-               S->nsurv, S->BOUND);
-    t_stage[0] = t_t;
-    t_stage[1] = t_f;
-    t_stage[2] = t_a;
     rc = 0;
 
 done:
-    free(idx);
-    free(tp);
-    free(trt);
-    free(tg);
-    free(tlp);
-    if (e0 && CUDA_CHECKED(cudaEventDestroy(e0)) && rc == 0) rc = -1;
-    if (e1 && CUDA_CHECKED(cudaEventDestroy(e1)) && rc == 0) rc = -1;
-    if (e2 && CUDA_CHECKED(cudaEventDestroy(e2)) && rc == 0) rc = -1;
-    if (e3 && CUDA_CHECKED(cudaEventDestroy(e3)) && rc == 0) rc = -1;
-#undef PERQ_CK
+#undef SLAB_CK
     return rc;
 }
 
@@ -712,6 +726,33 @@ static int pipe_td_small(pipe_td_t *C, int side, const fb_t *fbs,
     return 0;
 }
 
+/* Build the two direct-test tables once per special-q.  In slabbed mode their
+ * congruence constants are then translated between slabs by the tiny
+ * pipe_td_advance_small() kernel, keeping the billions-of-tests inner loop
+ * unchanged. */
+static int pipe_td_prepare_q(pipe_td_t *C, const fb_t *fbs1,
+                             const fb_t *fbs0, const qlat_t *L,
+                             const bench_cfg_t *cfg, pipe_tm_t *tm)
+{
+    const double h0 = host_ms();
+    if (pipe_td_small(C, 1, fbs1, L, cfg->logI) ||
+        pipe_td_small(C, 0, fbs0, L, cfg->logI)) return -1;
+    tm->hostq += host_ms() - h0;
+    return 0;
+}
+
+static int pipe_td_advance_small(pipe_td_t *C, uint32_t delta_j,
+                                 int blocks, int threads)
+{
+    if (!delta_j) return 0;
+    for (int s = 0; s < 2; s++) {
+        if (!C->nsm[s]) continue;
+        k_tdsmall_advance<<<blocks, threads>>>(C->d_sm[s], C->nsm[s], delta_j);
+        CK(cudaGetLastError());
+    }
+    return 0;
+}
+
 /* ---- the first-q validation phase -------------------------------------- *
  *
  * Reconstruction: the recorded factors times the residual cofactor must
@@ -721,9 +762,10 @@ static int pipe_td_small(pipe_td_t *C, int side, const fb_t *fbs,
  * production path records. It reads back 61 MB per side and rebuilds a 224-bit
  * norm per candidate on the host, so it is a separate phase whose cost is
  * reported on its own and excluded from the band average. */
+template <bool SLABBED>
 static int pipe_td_verify(pipe_td_t *C, int side, uint32_t n, int logI,
                           uint32_t sq, const bench_cfg_t *cfg,
-                          int blocks, int threads)
+                          int blocks, int threads, uint32_t j_base)
 {
     uint32_t *d_fac = NULL, *d_faccnt = NULL;
     uint32_t *hfac = NULL, *hfn = NULL;
@@ -737,12 +779,13 @@ static int pipe_td_verify(pipe_td_t *C, int side, uint32_t n, int logI,
 #define VERIFY_CK(x) do { if (CUDA_CHECKED(x)) { rc = -1; goto out; } } while (0)
     VERIFY_CK(cudaMalloc(&d_fac, (size_t)n * TD_FMAX * 4));
     VERIFY_CK(cudaMalloc(&d_faccnt, (size_t)n * 4));
-    k_td<1, 1, 0><<<blocks, threads>>>(C->d_a, C->d_b, C->d_x, NULL, n, logI,
+    k_td<1, 1, 0, SLABBED><<<blocks, threads>>>(C->d_a, C->d_b, C->d_x, NULL, n, logI,
                                        C->d_poly[side], sq,
                                        C->d_plist[side], C->d_pcnt[side], PIPE_K,
                                        C->d_sm[side], C->nsm[side],
                                        C->d_cof[side], C->d_cofbits[side],
-                                       C->d_flags, NULL, d_fac, d_faccnt, TD_FMAX);
+                                       C->d_flags, NULL, d_fac, d_faccnt, TD_FMAX,
+                                       j_base);
     if (CUDA_CHECKED(cudaDeviceSynchronize()) ||
         CUDA_CHECKED(cudaGetLastError())) {
         fprintf(stderr, "  verify: recording pass failed\n");
@@ -814,12 +857,13 @@ out:
 
 /* ---- one special-q of trial division, both sides ----------------------- */
 
+template <bool SLABBED>
 static int pipe_td_perq(pipe_td_t *C, const fb_t *fb1, const fb_t *fbs1,
                         const fb_t *fb0, const fb_t *fbs0,
                         const qlat_t *L, const bench_cfg_t *cfg,
                         const pside_t *S1, const pside_t *S0,
                         const uint32_t *d_two, uint32_t xmax,
-                        int blocks, int threads, int verify,
+                        uint32_t j_base, int blocks, int threads, int verify,
                         uint32_t *n_out, uint32_t *nacc_out, pipe_tm_t *tm,
                         double *t_verify, int want_host, int accumulate_stats)
 {
@@ -831,63 +875,72 @@ static int pipe_td_perq(pipe_td_t *C, const fb_t *fb1, const fb_t *fbs1,
     cudaEvent_t *E = C->ev;
     uint32_t n = 0, nacc = 0, nab, hflags = 0;
     unsigned long long hovf = 0;
+    const uint32_t nbitword = xmax >> 5;
+    const uint32_t ngroup = nbitword / TD_GROUP_W;
+    const uint32_t nb = (ngroup + TD_SCAN_BLK - 1) / TD_SCAN_BLK;
     double h0;
 
     fb[0] = fb0; fb[1] = fb1;
     S[0] = S0; S[1] = S1;
+    (void)fbs0; (void)fbs1;
+
+    if (!ngroup || nbitword % TD_GROUP_W) {
+        fprintf(stderr,
+                "  pipeline: slab area %u has %u bitmap words; trial division"
+                " requires a nonzero multiple of %u\n",
+                xmax, nbitword, (unsigned)TD_GROUP_W);
+        return -1;
+    }
 
     /* ---- phase 1: rank over the two-sided bitmap (shared) ---- */
     CK(cudaEventRecord(E[0]));
-    k_group_counts<<<blocks, threads>>>(d_two, C->ngroup, C->d_cnt);
-    k_scan_pass1<<<C->nb, TD_SCAN_BLK>>>(C->d_cnt, C->ngroup, C->d_gbase, C->d_bsum);
-    k_scan_pass2<<<1, 1024>>>(C->d_bsum, C->nb);
-    k_scan_pass3<<<C->nb, TD_SCAN_BLK>>>(C->d_gbase, C->ngroup, C->d_bsum);
+    k_group_counts<<<blocks, threads>>>(d_two, ngroup, C->d_cnt);
+    k_scan_pass1<<<nb, TD_SCAN_BLK>>>(C->d_cnt, ngroup, C->d_gbase, C->d_bsum);
+    k_scan_pass2<<<1, 1024>>>(C->d_bsum, nb);
+    k_scan_pass3<<<nb, TD_SCAN_BLK>>>(C->d_gbase, ngroup, C->d_bsum);
     CK(cudaEventRecord(E[1]));
     CK(cudaEventSynchronize(E[1])); CK(cudaGetLastError());
     {
         uint32_t base = 0, cnt = 0;
-        CK(cudaMemcpy(&base, C->d_gbase + C->ngroup - 1, 4, cudaMemcpyDeviceToHost));
-        CK(cudaMemcpy(&cnt, C->d_cnt + C->ngroup - 1, 4, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(&base, C->d_gbase + ngroup - 1, 4, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(&cnt, C->d_cnt + ngroup - 1, 4, cudaMemcpyDeviceToHost));
         n = base + cnt;
     }
     *n_out = n; *nacc_out = 0;
-    if (!n) { fprintf(stderr, "  pipeline: no survivors at this q\n"); return -1; }
+    /* A partial tail slab can legitimately contain no survivors.  That is not
+     * a failed q; simply leave its candidate count at zero and continue. */
+    if (!n) return 0;
     if (pipe_td_grow(C, n)) return -1;
-
-    /* the per-q, per-side host tables; the only host work left in the TD path */
-    h0 = host_ms();
-    if (pipe_td_small(C, 1, fbs1, L, cfg->logI) ||
-        pipe_td_small(C, 0, fbs0, L, cfg->logI)) return -1;
-    tm->hostq += host_ms() - h0;
 
     /* ---- phase 2: emit, summary, then both sides ---- */
     CK(cudaMemset(C->d_flags, 0, 4));
     CK(cudaMemset(C->d_ovf, 0, 8));
     CK(cudaEventRecord(E[2]));
-    k_emit_ranked<<<blocks, threads>>>(d_two, C->d_gbase, C->nbitword, cfg->logI,
+    k_emit_ranked<SLABBED><<<blocks, threads>>>(d_two, C->d_gbase, nbitword, cfg->logI,
                                        L->a0, L->a1, L->b0, L->b1,
-                                       C->d_x, C->d_a, C->d_b, n);
+                                       C->d_x, C->d_a, C->d_b, n, j_base);
     CK(cudaEventRecord(E[3]));
     /* 1 summary bit per 2 bitmap words == per 64 positions, the setting the
      * resieve sweep selected. */
-    k_build_summary_g<<<blocks, threads>>>(d_two, C->nbitword, 2u, C->d_sum);
+    k_build_summary_g<<<blocks, threads>>>(d_two, nbitword, 2u, C->d_sum);
     CK(cudaEventRecord(E[4]));
 
     for (int si = 0; si < 2; si++) {
         const int side = si ? 0 : 1;          /* side 1 first, as before */
         const int e = si ? 7 : 4;
         CK(cudaMemsetAsync(C->d_pcnt[side], 0, (size_t)n * 4));
-        k_resieve_scatter<4><<<blocks, threads>>>(
+        k_resieve_scatter<4, SLABBED><<<blocks, threads>>>(
             S[side]->plat, S[side]->primes, NULL, fb[side]->n, xmax, cfg->logI,
             C->d_sum, d_two, C->d_gbase, C->d_plist[side], C->d_pcnt[side],
-            PIPE_K, C->d_ovf, 6);
+            PIPE_K, C->d_ovf, 6, S[side]->walk_cur);
         CK(cudaEventRecord(E[e + 1]));
-        k_td<1, 0, 0><<<blocks, threads>>>(
+        k_td<1, 0, 0, SLABBED><<<blocks, threads>>>(
             C->d_a, C->d_b, C->d_x, NULL, n, cfg->logI, C->d_poly[side],
             side == cfg->sq_side ? (uint32_t)L->q : 0u,
             C->d_plist[side], C->d_pcnt[side], PIPE_K,
             C->d_sm[side], C->nsm[side],
-            C->d_cof[side], C->d_cofbits[side], C->d_flags, NULL, NULL, NULL, 0);
+            C->d_cof[side], C->d_cofbits[side], C->d_flags, NULL, NULL, NULL, 0,
+            j_base);
         CK(cudaEventRecord(E[e + 2]));
         k_classify<<<blocks, threads>>>(C->d_cof[side], C->d_cofbits[side],
                                         C->d_b, n, lpb[side], mfb[side],
@@ -943,14 +996,14 @@ static int pipe_td_perq(pipe_td_t *C, const fb_t *fb1, const fb_t *fbs1,
          * divide, and the gate still passed 15,174 of 15,174 -- but the verify
          * pass and the pass it is checking must be given the same q on the
          * same side, or the agreement is luck rather than evidence. */
-        if (pipe_td_verify(C, 1, n, cfg->logI,
+        if (pipe_td_verify<SLABBED>(C, 1, n, cfg->logI,
                            cfg->sq_side == 1 ? (uint32_t)L->q : 0u,
-                           cfg, blocks, threads) ||
-            pipe_td_verify(C, 0, n, cfg->logI,
+                           cfg, blocks, threads, j_base) ||
+            pipe_td_verify<SLABBED>(C, 0, n, cfg->logI,
                            cfg->sq_side == 0 ? (uint32_t)L->q : 0u,
-                           cfg, blocks, threads)) return -1;
-        *t_verify = host_ms() - v0;
-        printf("  --- validation took %.1f ms ---\n\n", *t_verify);
+                           cfg, blocks, threads, j_base)) return -1;
+        *t_verify += host_ms() - v0;
+        printf("  --- validation slab took %.1f ms ---\n\n", host_ms() - v0);
     }
 
     /* ---- phase 3: record the joint candidates only ---- */
@@ -960,13 +1013,13 @@ static int pipe_td_perq(pipe_td_t *C, const fb_t *fb1, const fb_t *fbs1,
                                      C->d_ca, C->d_cb);
     for (int si = 0; si < 2; si++) {
         const int side = si ? 0 : 1;
-        k_td<1, 1, 1><<<blocks, threads>>>(
+        k_td<1, 1, 1, SLABBED><<<blocks, threads>>>(
             C->d_a, C->d_b, C->d_x, C->d_sel, nacc, cfg->logI, C->d_poly[side],
             side == cfg->sq_side ? (uint32_t)L->q : 0u,
             C->d_plist[side], C->d_pcnt[side], PIPE_K,
             C->d_sm[side], C->nsm[side],
             C->d_ccof[side], C->d_cbits[side], C->d_flags, NULL,
-            C->d_cfac[side], C->d_cfn[side], TD_FMAX);
+            C->d_cfac[side], C->d_cfn[side], TD_FMAX, j_base);
     }
     CK(cudaEventRecord(E[13]));
     CK(cudaEventSynchronize(E[13])); CK(cudaGetLastError());
@@ -1083,14 +1136,17 @@ static int pipe_finalize_outputs(FILE **frp, FILE **fcp,
 
 /* ---- the whole per-q pipeline ------------------------------------------ */
 
-extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
-                            const fb_t *fb0, const fb_t *fbs0,
-                            const qsel_t *qlist, uint32_t nq, sqgen_t *qgen,
-                            const poly_t *POLY, const bench_cfg_t *cfg)
+template <bool SLABBED>
+static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
+                             const fb_t *fb0, const fb_t *fbs0,
+                             const qsel_t *qlist, uint32_t nq, sqgen_t *qgen,
+                             const poly_t *POLY, const bench_cfg_t *cfg,
+                             const slab_plan_t *slab_plan)
 {
-    const uint32_t xmax = (1u << cfg->logI) * cfg->J;
-    const uint32_t nregion = xmax >> cfg->log_region;
-    const uint32_t nbitword = xmax >> 5;
+    const uint32_t I = 1u << cfg->logI;
+    const uint32_t xmax_alloc = I * slab_plan->jmax;
+    const uint32_t nregion_alloc = xmax_alloc >> cfg->log_region;
+    const uint32_t nbitword_alloc = xmax_alloc >> 5;
     const int blocks = cfg->blocks ? cfg->blocks : 48 * 6;
     /* Fill's grid is absolute, not per-SM -- see FILL_BLOCKS_DEFAULT. */
     const int fblocks = cfg->fill_blocks ? cfg->fill_blocks : FILL_BLOCKS_DEFAULT;
@@ -1116,7 +1172,7 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
      * derived, not accumulated separately, so the printed total and its three
      * children cannot drift apart. */
     double acc_tr = 0, acc_fi = 0, acc_ap = 0;
-    double acc_td = 0, t_verify = 0, td0 = 0, jn0 = 0, cf0 = 0, cofac_tail = 0;
+    double acc_td = 0, t_verify = 0, cofac_tail = 0;
     unsigned long long acc_surv = 0, acc_cand = 0, acc_rel = 0;
     FILE *fr = NULL, *fc = NULL;
     char rtmp[CKPT_PATH_MAX] = "", ctmp[CKPT_PATH_MAX] = "";
@@ -1174,16 +1230,16 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     else
         printf("\n=== pipeline: both sides in one process, %u special-q ===\n", nq);
 
-    est1 = pipe_est_records(fb1, xmax);
-    est0 = pipe_est_records(fb0, xmax);
+    est1 = pipe_est_records(fb1, xmax_alloc);
+    est0 = pipe_est_records(fb0, xmax_alloc);
     est = est1 > est0 ? est1 : est0;
-    cap = (uint32_t)(est / nregion) + 256;
+    cap = (uint32_t)(est / nregion_alloc) + 256;
     {
         size_t freeB = 0, totalB = 0;
-        need = (size_t)nregion * cap * 4;
+        need = (size_t)nregion_alloc * cap * 4;
         PIPE_CK(cudaMemGetInfo(&freeB, &totalB));
         printf("  bucket array %u x %u x 4 B = %.2f GB, shared by both sides"
-               " (%.2f GB free)\n", nregion, cap, need / 1073741824.0,
+               " (%.2f GB free)\n", nregion_alloc, cap, need / 1073741824.0,
                freeB / 1073741824.0);
         if (need + 512u * 1024 * 1024 > freeB) {
             fprintf(stderr, "  pipeline: bucket array does not fit\n");
@@ -1192,7 +1248,7 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         }
         PIPE_CK(cudaMalloc(&d_bucket, need));
     }
-    PIPE_CK(cudaMalloc(&d_cursor, (size_t)nregion * 4));
+    PIPE_CK(cudaMalloc(&d_cursor, (size_t)nregion_alloc * 4));
     PIPE_CK(cudaMalloc(&d_overflow, 4));
 
     /* ---- one-time setup, hoisted out of the q loop ---- */
@@ -1225,10 +1281,11 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
             vram_reporting = 0;
         }
     }
-    if (pipe_side_init(fb1, fbs1, cfg, bound1, &S1) ||
-        pipe_side_init(fb0, fbs0, cfg, bound0, &S0)) { rc = -1; goto done; }
+    if (pipe_side_init<SLABBED>(fb1, fbs1, cfg, bound1, xmax_alloc, &S1) ||
+        pipe_side_init<SLABBED>(fb0, fbs0, cfg, bound0, xmax_alloc, &S0))
+        { rc = -1; goto done; }
     VRAM_MARK("factor bases + bitmaps");
-    PIPE_CK(cudaMalloc(&d_two, (size_t)nbitword * 4));
+    PIPE_CK(cudaMalloc(&d_two, (size_t)nbitword_alloc * 4));
     PIPE_CK(cudaMalloc(&d_n, 4));
     PIPE_CK(cudaMalloc(&d_pre, 8));
     /* Untimed warm-up, n = 0 so it touches nothing. Everything above this line
@@ -1244,11 +1301,11 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
      * and apply still pay their own first-launch cost inside q0. They are the
      * reps-stable stages and the cost is one-time either way, but a band short
      * enough to care should be treated as a warm-up run, not a measurement. */
-    k_transform<<<blocks, cfg->threads>>>(S1.primes, S1.roots, S1.plat, 0u,
-        cfg->logI, cfg->J, 1, 0, 0, 1, S1.d_nproj, S1.d_nlost);
+    k_transform<SLABBED><<<blocks, cfg->threads>>>(S1.primes, S1.roots, S1.plat, 0u,
+        cfg->logI, cfg->J, 1, 0, 0, 1, S1.d_nproj, S1.d_nlost, S1.walk_cur);
     PIPE_CK(cudaDeviceSynchronize());
     PIPE_CK(cudaGetLastError());
-    if (pipe_td_init(&C, fbs1, fbs0, POLY, nbitword)) { rc = -1; goto done; }
+    if (pipe_td_init(&C, fbs1, fbs0, POLY, nbitword_alloc)) { rc = -1; goto done; }
     VRAM_MARK("trial division context");
     /* The cross-q cofactor queue. Per-q the candidate count is ~1,956, which
      * would run the rho kernel at 3% occupancy; the queue accumulates across
@@ -1366,6 +1423,7 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         float ts1[3] = {0,0,0}, ts0[3] = {0,0,0}, tis = 0;
         double th1 = 0, th0 = 0, qwall = host_ms(), tv = 0;
         uint32_t hn = 0, nacc = 0, ncand = 0, nrel = 0;
+        uint64_t side_surv1 = 0, side_surv0 = 0;
         /* The host loop exists to write files. With inline cofactorisation and
          * no candidate file, nothing reads the host mirrors, so neither the
          * copies nor the loop have to happen.
@@ -1481,163 +1539,206 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                    (unsigned long long)cur->q,
                    (unsigned long long)cur->rho);
 
-        if (pipe_side_perq(fb1, fbs1, &Lq, POLY, cfg, 1, cfg->scale,
-                           d_bucket, d_cursor, cap, d_overflow,
-                           blocks, fblocks, fthreads, &S1, ts1, &th1) ||
-            pipe_side_perq(fb0, fbs0, &Lq, POLY, cfg, 0, cfg->scale0,
-                           d_bucket, d_cursor, cap, d_overflow,
-                           blocks, fblocks, fthreads, &S0, ts0, &th0)) { rc = -1; break; }
-
-        PIPE_CK(cudaMemset(d_n, 0, 4));
-        PIPE_CK(cudaMemset(d_pre, 0, 8));
-        PIPE_CK(cudaMemset(d_two, 0, (size_t)nbitword * 4));
-        PIPE_CK(cudaEventRecord(ea));
-        /* The compacted (x,a,b) output is not used: k_emit_ranked rebuilds it
-         * in RANK order, which the resieve scatter needs and this kernel's
-         * atomic order cannot give. Passing cap 0 keeps the survivor count --
-         * an independent second count of the same bitmap, cross-checked below
-         * against the rank scan -- without the writes. */
-        k_intersect_compact<1><<<blocks, cfg->threads>>>(
-            S1.survbits, S0.survbits, nbitword, cfg->logI,
-            Lq.a0, Lq.a1, Lq.b0, Lq.b1, (int64_t)Lq.q,
-            NULL, NULL, NULL, 0u, d_n, d_pre, d_two, NULL);
-        PIPE_CK(cudaEventRecord(eb));
-        PIPE_CK(cudaEventSynchronize(eb));
-        PIPE_CK(cudaGetLastError());
-        tis = time_kernel(ea, eb);
-        PIPE_CK(cudaMemcpy(&hn, d_n, 4, cudaMemcpyDeviceToHost));
-
-        td0 = host_ms();
-        {
-            uint32_t n = 0;
-            if (pipe_td_perq(&C, fb1, fbs1, fb0, fbs0, &Lq, cfg, &S1, &S0,
-                             d_two, xmax, blocks, cfg->threads, qi == 0,
-                             &n, &nacc, &tm, &tv, want_host,
-                             !want_host)) { rc = -1; break; }
-            if (n != hn) {
-                fprintf(stderr, "  q=%llu: intersect counted %u survivors,"
-                        " rank scan %u\n", (unsigned long long)cur->q, hn, n);
-                rc = -1; break;
-            }
-            t_verify += tv;
-            acc_td += host_ms() - td0 - tv;   /* the gate is not the siever */
+        if (pipe_side_prepare_q<SLABBED>(fb1, fbs1, &Lq, POLY, cfg, 1,
+                                              cfg->scale, blocks, &S1,
+                                              &ts1[0], &th1) ||
+            pipe_side_prepare_q<SLABBED>(fb0, fbs0, &Lq, POLY, cfg, 0,
+                                              cfg->scale0, blocks, &S0,
+                                              &ts0[0], &th0) ||
+            pipe_td_prepare_q(&C, fbs1, fbs0, &Lq, cfg, &tm)) {
+            rc = -1; break;
         }
 
-        cf0 = host_ms();
-        /* Inline cofactorisation: the joint candidates stay on device and are
-         * appended to the queue instead of being formatted into a file. The
-         * relations trial division already completed are still emitted here --
-         * they need no splitting and would only take a queue slot. */
-        if (cfg->cofactor && nacc) {
-            /* Flush BEFORE a q that will not fit rather than splitting it.
-             * Splitting means enqueuing part of a q, flushing, and enqueuing
-             * the rest -- and the obvious way to write that re-enqueues the
-             * whole q after the flush, which counts its first rows twice. A
-             * special-q is ~1,956 records against a 131,072 slot queue, so
-             * never splitting one costs at most 1.5% of a flush's occupancy. */
-            if (Q.n + nacc > Q.cap) {
-                if (cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
-                               cfg->cof_rounds, cfg->cof_budget, blocks,
-                               cfg->threads, fr)) { rc = -1; break; }
-                /* THE resume point. The queue is now empty and this q's
-                 * candidates have not been enqueued yet, so the file holds
-                 * every completed q and nothing partial -- see
-                 * pipe_checkpoint. This is the only such instant in the loop,
-                 * which is why the checkpoint is written here and not on a
-                 * timer. */
-                if (fr)
-                    pipe_try_checkpoint(POLY, cfg, &ck, fr, fc, cur,
-                                        base_rel + Q.nrel, base_nq + nqdone,
-                                        &ckpt_written, &ckpt_warned);
-            }
-            if (nacc > Q.cap) {
-                runlog_warn("  q=%llu: %u candidates exceeds the %u-slot"
-                            " cofactor queue", (unsigned long long)cur->q,
-                            nacc, Q.cap);
+        /* Only the area-dependent part lives inside this loop. For
+         * SLABBED=false slab_plan has exactly one entry and if constexpr
+         * removes every continuation-state operation from device code. */
+        for (uint32_t slab = 0; slab < slab_plan->nslab; slab++) {
+            const uint32_t j_base = slab_jbase_at(slab_plan, slab);
+            const uint32_t J_here = slab_rows_at(slab_plan, cfg->J, slab);
+            const uint32_t xmax = I * J_here;
+            const uint32_t nbitword = xmax >> 5;
+            float sf1 = 0, sa1 = 0, sf0 = 0, sa0 = 0;
+            float isect_s = 0;
+            uint32_t hn_s = 0, nacc_s = 0;
+            double td_start, tv_before, cf_start, join_start;
+
+            if (!J_here) { rc = -1; break; }
+            if (pipe_side_sieve_slab<SLABBED>(fb1, cfg, 1, xmax, j_base,
+                                               d_bucket, d_cursor, cap,
+                                               d_overflow, fblocks, fthreads,
+                                               &S1, &sf1, &sa1) ||
+                pipe_side_sieve_slab<SLABBED>(fb0, cfg, 0, xmax, j_base,
+                                               d_bucket, d_cursor, cap,
+                                               d_overflow, fblocks, fthreads,
+                                               &S0, &sf0, &sa0)) {
                 rc = -1; break;
             }
-            if (cof_enqueue(blocks, cfg->threads,
-                            C.d_ccof[0], C.d_cbits[0], C.d_ccof[1], C.d_cbits[1],
-                            C.d_ca, C.d_cb,
-                            C.d_cfac[0], C.d_cfn[0], C.d_cfac[1], C.d_cfn[1],
-                            nacc, Q.n, cfg->lpb0, cfg->lpb, &Q)) { rc = -1; break; }
-            if (CUDA_CHECKED(cudaDeviceSynchronize()) ||
-                CUDA_CHECKED(cudaGetLastError())) { rc = -1; break; }
-            Q.n += nacc;
-        }
-        tm.cofac += host_ms() - cf0;
-        jn0 = host_ms();
-        /* want_host is constant for the whole run, so it gates the loop rather
-         * than being retested per candidate. Hoisting it also makes visible
-         * what the inline path skips -- including the TD_FMAX overflow check
-         * below, which is why that check is repeated after the band. */
-        for (uint32_t k = 0; want_host && k < nacc; k++) {
-            int64_t a = C.h_ca[k], b = C.h_cb[k];
-            const uint32_t c0 = C.h_cfn[0][k], c1 = C.h_cfn[1][k];
-            const uint32_t *f0 = C.h_cfac[0] + (size_t)k * TD_FMAX;
-            const uint32_t *f1 = C.h_cfac[1] + (size_t)k * TD_FMAX;
-            const int b0 = C.h_cbits[0][k], b1 = C.h_cbits[1][k];
-            char buf[80];
-            /* A truncated factor list leaves factors undivided and every
-             * consumer reads faccnt entries, so it fails the run rather than
-             * being emitted. Checked on every q, over exactly the records that
-             * get written. */
-            if (c0 > TD_FMAX || c1 > TD_FMAX) {
-                fprintf(stderr, "  q=%llu: a candidate has %u/%u factors,"
-                        " more than the %d recorded; raise TD_FMAX\n",
-                        (unsigned long long)cur->q, c0, c1, TD_FMAX);
-                rc = -1; break;
-            }
-            /* Canonical order: the resieve scatters through an atomicAdd on
-             * the survivor's slot counter, so the list order varies run to run
-             * and sorting is what makes the emitted batch reproducible. */
-            std::sort((uint32_t *)f0, (uint32_t *)f0 + c0);
-            std::sort((uint32_t *)f1, (uint32_t *)f1 + c1);
-            if (b < 0) { a = -a; b = -b; }
-            if (b0 <= (int)cfg->lpb0 && b1 <= (int)cfg->lpb) {
-                nrel++;
-                /* Under --cofactor the queue holds EVERY joint candidate,
-                 * including the ones trial division already completed -- they
-                 * come back from it with both sides CF_OK and no split primes.
-                 * Emitting them here as well would duplicate them, so the
-                 * queue is the single emitter. */
-                if (fr && !cfg->cofactor) {
-                    fprintf(fr, "%lld,%lld:", (long long)a, (long long)b);
-                    for (uint32_t z = 0; z < c0; z++)
-                        fprintf(fr, "%s%x", z ? "," : "", f0[z]);
-                    if (b0 > 1)
-                        fprintf(fr, "%s%llx", c0 ? "," : "",
-                                (unsigned long long)strtoull(
-                                    bn_to_dec(&C.h_ccof[0][k], buf), NULL, 10));
-                    fputc(':', fr);
-                    for (uint32_t z = 0; z < c1; z++)
-                        fprintf(fr, "%s%x", z ? "," : "", f1[z]);
-                    if (b1 > 1)
-                        fprintf(fr, "%s%llx", c1 ? "," : "",
-                                (unsigned long long)strtoull(
-                                    bn_to_dec(&C.h_ccof[1][k], buf), NULL, 10));
-                    fputc('\n', fr);
+            ts1[1] += sf1; ts1[2] += sa1;
+            ts0[1] += sf0; ts0[2] += sa0;
+            side_surv1 += S1.nsurv; side_surv0 += S0.nsurv;
+
+            PIPE_CK(cudaMemset(d_n, 0, 4));
+            PIPE_CK(cudaMemset(d_pre, 0, 8));
+            PIPE_CK(cudaMemset(d_two, 0, (size_t)nbitword * 4));
+            PIPE_CK(cudaEventRecord(ea));
+            k_intersect_compact<1, SLABBED><<<blocks, cfg->threads>>>(
+                S1.survbits, S0.survbits, nbitword, cfg->logI,
+                Lq.a0, Lq.a1, Lq.b0, Lq.b1, (int64_t)Lq.q,
+                NULL, NULL, NULL, 0u, d_n, d_pre, d_two, NULL, j_base);
+            PIPE_CK(cudaEventRecord(eb));
+            PIPE_CK(cudaEventSynchronize(eb));
+            PIPE_CK(cudaGetLastError());
+            isect_s = time_kernel(ea, eb);
+            tis += isect_s;
+            PIPE_CK(cudaMemcpy(&hn_s, d_n, 4, cudaMemcpyDeviceToHost));
+
+            td_start = host_ms();
+            tv_before = tv;
+            {
+                uint32_t n = 0;
+                if (pipe_td_perq<SLABBED>(&C, fb1, fbs1, fb0, fbs0,
+                                          &Lq, cfg, &S1, &S0, d_two, xmax,
+                                          j_base, blocks, cfg->threads,
+                                          qi == 0 && cfg->td_verify,
+                                          &n, &nacc_s, &tm, &tv, want_host,
+                                          !want_host)) {
+                    rc = -1; break;
                 }
-                continue;
+                if (n != hn_s) {
+                    fprintf(stderr,
+                            "  q=%llu slab %u: intersect counted %u survivors,"
+                            " rank scan %u\n",
+                            (unsigned long long)cur->q, slab, hn_s, n);
+                    rc = -1; break;
+                }
+                acc_td += host_ms() - td_start - (tv - tv_before);
             }
-            ncand++;
-            if (cfg->cofactor) continue;   /* the queue has it */
-            if (fc) {
-                fprintf(fc, "%s%s,", b0 > (int)cfg->lpb0 ? "-" : "",
-                        bn_to_dec(&C.h_ccof[0][k], buf));
-                fprintf(fc, "%s%s:%lld,%lld:", b1 > (int)cfg->lpb ? "-" : "",
-                        bn_to_dec(&C.h_ccof[1][k], buf), (long long)a, (long long)b);
-                for (uint32_t z = 0; z < c0; z++)
-                    fprintf(fc, "%s%x", z ? "," : "", f0[z]);
-                fputc(':', fc);
-                for (uint32_t z = 0; z < c1; z++)
-                    fprintf(fc, "%s%x", z ? "," : "", f1[z]);
-                fputc('\n', fc);
+            hn += hn_s;
+            nacc += nacc_s;
+
+            cf_start = host_ms();
+            /* A queue flush is safe inside a q, but it is NOT a new resume
+             * point once an earlier slab of this q has been emitted. Resume
+             * truncates to the previous whole-q checkpoint, so a crash still
+             * replays the q atomically. */
+            if (cfg->cofactor && nacc_s) {
+                if (Q.n + nacc_s > Q.cap) {
+                    if (cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0,
+                                   cfg->lim, cfg->lpb, cfg->cof_rounds,
+                                   cfg->cof_budget, blocks, cfg->threads, fr)) {
+                        rc = -1; break;
+                    }
+                    if (fr && slab == 0)
+                        pipe_try_checkpoint(POLY, cfg, &ck, fr, fc, cur,
+                                            base_rel + Q.nrel,
+                                            base_nq + nqdone,
+                                            &ckpt_written, &ckpt_warned);
+                }
+                if (nacc_s > Q.cap) {
+                    runlog_warn("  q=%llu slab %u: %u candidates exceeds the"
+                                " %u-slot cofactor queue",
+                                (unsigned long long)cur->q, slab, nacc_s, Q.cap);
+                    rc = -1; break;
+                }
+                if (cof_enqueue(blocks, cfg->threads,
+                                C.d_ccof[0], C.d_cbits[0],
+                                C.d_ccof[1], C.d_cbits[1], C.d_ca, C.d_cb,
+                                C.d_cfac[0], C.d_cfn[0],
+                                C.d_cfac[1], C.d_cfn[1],
+                                nacc_s, Q.n, cfg->lpb0, cfg->lpb, &Q)) {
+                    rc = -1; break;
+                }
+                if (CUDA_CHECKED(cudaDeviceSynchronize()) ||
+                    CUDA_CHECKED(cudaGetLastError())) { rc = -1; break; }
+                Q.n += nacc_s;
+            }
+            tm.cofac += host_ms() - cf_start;
+
+            join_start = host_ms();
+            for (uint32_t k = 0; want_host && k < nacc_s; k++) {
+                int64_t a = C.h_ca[k], b = C.h_cb[k];
+                const uint32_t c0 = C.h_cfn[0][k], c1 = C.h_cfn[1][k];
+                const uint32_t *f0 = C.h_cfac[0] + (size_t)k * TD_FMAX;
+                const uint32_t *f1 = C.h_cfac[1] + (size_t)k * TD_FMAX;
+                const int b0 = C.h_cbits[0][k], b1 = C.h_cbits[1][k];
+                char buf[80];
+                if (c0 > TD_FMAX || c1 > TD_FMAX) {
+                    fprintf(stderr, "  q=%llu: a candidate has %u/%u factors,"
+                            " more than the %d recorded; raise TD_FMAX\n",
+                            (unsigned long long)cur->q, c0, c1, TD_FMAX);
+                    rc = -1; break;
+                }
+                std::sort((uint32_t *)f0, (uint32_t *)f0 + c0);
+                std::sort((uint32_t *)f1, (uint32_t *)f1 + c1);
+                if (b < 0) { a = -a; b = -b; }
+                if (b0 <= (int)cfg->lpb0 && b1 <= (int)cfg->lpb) {
+                    nrel++;
+                    if (fr && !cfg->cofactor) {
+                        fprintf(fr, "%lld,%lld:", (long long)a, (long long)b);
+                        for (uint32_t z = 0; z < c0; z++)
+                            fprintf(fr, "%s%x", z ? "," : "", f0[z]);
+                        if (b0 > 1)
+                            fprintf(fr, "%s%llx", c0 ? "," : "",
+                                    (unsigned long long)strtoull(
+                                        bn_to_dec(&C.h_ccof[0][k], buf), NULL, 10));
+                        fputc(':', fr);
+                        for (uint32_t z = 0; z < c1; z++)
+                            fprintf(fr, "%s%x", z ? "," : "", f1[z]);
+                        if (b1 > 1)
+                            fprintf(fr, "%s%llx", c1 ? "," : "",
+                                    (unsigned long long)strtoull(
+                                        bn_to_dec(&C.h_ccof[1][k], buf), NULL, 10));
+                        fputc('\n', fr);
+                    }
+                    continue;
+                }
+                ncand++;
+                if (cfg->cofactor) continue;
+                if (fc) {
+                    fprintf(fc, "%s%s,", b0 > (int)cfg->lpb0 ? "-" : "",
+                            bn_to_dec(&C.h_ccof[0][k], buf));
+                    fprintf(fc, "%s%s:%lld,%lld:",
+                            b1 > (int)cfg->lpb ? "-" : "",
+                            bn_to_dec(&C.h_ccof[1][k], buf),
+                            (long long)a, (long long)b);
+                    for (uint32_t z = 0; z < c0; z++)
+                        fprintf(fc, "%s%x", z ? "," : "", f0[z]);
+                    fputc(':', fc);
+                    for (uint32_t z = 0; z < c1; z++)
+                        fprintf(fc, "%s%x", z ? "," : "", f1[z]);
+                    fputc('\n', fc);
+                }
+            }
+            tm.join += host_ms() - join_start;
+            if (rc) break;
+
+            if constexpr (SLABBED) {
+                if (slab + 1 < slab_plan->nslab) {
+                    if (pipe_td_advance_small(&C, J_here, blocks,
+                                              cfg->threads)) {
+                        rc = -1; break;
+                    }
+                    std::swap(S1.walk_cur, S1.walk_next);
+                    std::swap(S0.walk_cur, S0.walk_next);
+                }
             }
         }
         if (rc) break;
 
-        tm.join += host_ms() - jn0;
+        if (cfg->verbose_q) {
+            printf("  side 1: transform %.3f + fill %.3f + apply %.3f = %7.3f ms,"
+                   " %8llu survivors (bound %u)%s\n",
+                   ts1[0], ts1[1], ts1[2], ts1[0] + ts1[1] + ts1[2],
+                   (unsigned long long)side_surv1, S1.BOUND,
+                   SLABBED ? " [slabbed]" : "");
+            printf("  side 0: transform %.3f + fill %.3f + apply %.3f = %7.3f ms,"
+                   " %8llu survivors (bound %u)%s\n",
+                   ts0[0], ts0[1], ts0[2], ts0[0] + ts0[1] + ts0[2],
+                   (unsigned long long)side_surv0, S0.BOUND,
+                   SLABBED ? " [slabbed]" : "");
+        }
+
+        t_verify += tv;
         acc_tr += ts1[0] + ts0[0];
         acc_fi += ts1[1] + ts0[1];
         acc_ap += ts1[2] + ts0[2];
@@ -1935,7 +2036,7 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
      * cofactorisation, which is why it is carried separately and added back
      * rather than folded into the per-q average. */
     if (rc == 0 && cfg->cofactor && Q.n) {
-        cf0 = host_ms();
+        const double cf0 = host_ms();
         if (cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
                        cfg->cof_rounds, cfg->cof_budget, blocks, cfg->threads, fr))
             rc = -1;
@@ -2283,6 +2384,52 @@ done:
     if (ea) cudaEventDestroy(ea);
     if (eb) cudaEventDestroy(eb);
     return rc;
+}
+
+/* Largest PRIME that actually reaches the direct-test table. Proper prime
+ * powers live in the small FB too, but td_fill_small deliberately skips them;
+ * including one here would only make the slab planner needlessly pessimistic. */
+static uint32_t pipe_max_td_prime(const fb_t *fb)
+{
+    uint32_t pmax = 0;
+    if (!fb) return 0;
+    for (uint32_t k = 0; k < fb->n; k++)
+        if (!FB_ISPOW(fb, k) && fb->primes[k] > pmax) pmax = fb->primes[k];
+    return pmax;
+}
+
+extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
+                            const fb_t *fb0, const fb_t *fbs0,
+                            const qsel_t *qlist, uint32_t nq, sqgen_t *qgen,
+                            const poly_t *POLY, const bench_cfg_t *cfg)
+{
+    slab_plan_t plan;
+    uint32_t pmax1 = pipe_max_td_prime(fbs1);
+    uint32_t pmax0 = pipe_max_td_prime(fbs0);
+    uint32_t pmax = pmax1 > pmax0 ? pmax1 : pmax0;
+
+    if (slab_make_plan(cfg->logI, cfg->J, pmax, cfg->slab_j, &plan)) {
+        fprintf(stderr,
+                "  pipeline: cannot make a safe slab plan for logI=%d J=%u"
+                " (largest direct-test prime %u, requested --slab-j %u)\n",
+                cfg->logI, cfg->J, pmax, cfg->slab_j);
+        return -1;
+    }
+    if (cfg->cofgate && !cfg->td_verify) {
+        fprintf(stderr, "  --cofgate requires TD verification; remove"
+                        " --no-td-verify\n");
+        return -1;
+    }
+
+    if (plan.enabled) {
+        printf("  j-slabbing: %u slab%s, up to %u rows/slab"
+               " (<=2^31 local positions)\n",
+               plan.nslab, plan.nslab == 1 ? "" : "s", plan.jmax);
+        return run_pipeline_impl<true>(fb1, fbs1, fb0, fbs0, qlist, nq, qgen,
+                                       POLY, cfg, &plan);
+    }
+    return run_pipeline_impl<false>(fb1, fbs1, fb0, fbs0, qlist, nq, qgen,
+                                    POLY, cfg, &plan);
 }
 
 #endif  /* CUDA_SIEVE_PIPELINE_CUH */

@@ -75,13 +75,15 @@ static int cuda_check_impl(cudaError_t err, const char *expr,
  * accumulates the number of positions thereby dropped so the loss is a printed
  * number rather than a silence. With the default bkthresh = I >= J it is
  * exactly zero: g > 1 needs q | (rows), and every bucketed q exceeds J. */
+template <bool SLABBED>
 __global__ void k_transform(const uint32_t *__restrict primes,
                             const uint32_t *__restrict roots,
                             plat_t *__restrict out,
                             uint32_t n, int logI, uint32_t J,
                             int64_t a0, int64_t a1, int64_t b0, int64_t b1,
                             uint32_t *__restrict nproj,
-                            unsigned long long *__restrict nlost)
+                            unsigned long long *__restrict nlost,
+                            uint32_t *__restrict walk_cur)
 {
     const uint64_t stride = bench_grid_stride_x();
     for (uint64_t kk = bench_grid_thread_x(); kk < n; kk += stride) {
@@ -92,10 +94,13 @@ __global__ void k_transform(const uint32_t *__restrict primes,
             plat_t P; P.inc_warp = 0xFFFFFFFFu; P.inc_step = PL_VERTICAL;
             P.bound_warp = 0; P.bound_step = 0;
             out[k] = P;
+            if constexpr (SLABBED) walk_cur[k] = 0xffffffffu;
             atomicAdd(nproj, 1u);
-            atomicAdd(nlost, (unsigned long long)((J / g) * ((1u << logI) / m)));
+            atomicAdd(nlost, (unsigned long long)(J / g) * ((1u << logI) / m));
         } else {
-            out[k] = pl_make(m, rt, logI);
+            const plat_t P = pl_make(m, rt, logI);
+            out[k] = P;
+            if constexpr (SLABBED) walk_cur[k] = pl_first(&P, logI);
         }
     }
 }
@@ -104,14 +109,16 @@ __global__ void k_transform(const uint32_t *__restrict primes,
 
 /* One atomicAdd per record into a 2^log_nbuckets-way split. This is the
  * baseline the design doc says to beat. */
-template <int RECBYTES>
+template <int RECBYTES, bool SLABBED = false>
 __global__ void k_fill_atomic(const plat_t *__restrict plat,
                               const uint16_t *__restrict slice,
                               uint32_t n, uint32_t xmax, int logI,
                               int log_region,
                               uint32_t *__restrict cursor,
                               uint8_t *__restrict out, uint32_t cap,
-                              uint32_t *__restrict overflow)
+                              uint32_t *__restrict overflow,
+                              const uint32_t *__restrict walk_cur,
+                              uint32_t *__restrict walk_next)
 {
     const uint32_t Imask = (1u << logI) - 1;
     const uint32_t offmask = (1u << log_region) - 1;
@@ -120,12 +127,18 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
     for (uint64_t kk = bench_grid_thread_x(); kk < n; kk += stride) {
         const uint32_t k = (uint32_t)kk;
         plat_t P = plat[k];
-        if (P.inc_warp == 0xFFFFFFFFu) continue;
+        if (P.inc_warp == 0xFFFFFFFFu) {
+            if constexpr (SLABBED) walk_next[k] = walk_cur[k];
+            continue;
+        }
         /* one read per prime, not per record: the slice hint is what the apply
          * kernel turns back into log p (and what resieve would use to recover
          * the prime itself), exactly as CADO's shorthint does */
         const uint32_t sl = slice[k];
-        for (uint32_t x = pl_first(&P, logI); x < xmax; x = pl_next(x, &P, Imask)) {
+        uint32_t x;
+        if constexpr (SLABBED) x = walk_cur[k];
+        else                   x = pl_first(&P, logI);
+        for (; x < xmax; x = pl_next(x, &P, Imask)) {
             uint32_t b = x >> log_region;
             uint32_t slot = atomicAdd(&cursor[b], 1u);
             if (slot >= cap) { atomicAdd(overflow, 1u); continue; }
@@ -139,6 +152,7 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
                 *(uint64_t *)(out + at) = (uint64_t)(x & offmask) | ((uint64_t)sl << 32);
             }
         }
+        if constexpr (SLABBED) walk_next[k] = x - xmax;
     }
 }
 
@@ -183,18 +197,20 @@ __device__ __forceinline__ uint32_t ss_first(uint32_t p, uint32_t rt,
     return (uint32_t)(c < 0 ? c + (int32_t)p : c);
 }
 
-template <int CELLBITS, int ATOMIC>
+template <int CELLBITS, int ATOMIC, bool SLABBED = false>
 __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_region,
                             const uint32_t *__restrict sp,
                             const uint32_t *__restrict srt,
                             const uint32_t *__restrict sg,
                             const uint16_t *__restrict slp,
                             uint32_t nsmall, uint32_t nblk, uint32_t nwrp,
-                            uint32_t tid, uint32_t nth)
+                            uint32_t tid, uint32_t nth, uint32_t j_base)
 {
     const uint32_t width = 1u << log_region;
     const uint32_t x0    = region << log_region;
-    const uint32_t j     = x0 >> logI;
+    const uint32_t jlocal = x0 >> logI;
+    uint32_t j = jlocal;
+    if constexpr (SLABBED) j += j_base;
     const int32_t  ilo   = (int32_t)(x0 & ((1u << logI) - 1)) - (int32_t)(1u << (logI - 1));
     const uint32_t warp = tid >> 5, lane = tid & 31, nwarps = nth >> 5;
 
@@ -242,7 +258,7 @@ __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_regi
  * price what correctness costs, since a byte cell overflows into its
  * neighbour (accumulated logs do exceed 255) and cannot be used for real.
  */
-template <int CELLBITS, int ATOMIC, int NORMMODE>
+template <int CELLBITS, int ATOMIC, int NORMMODE, bool SLABBED = false>
 __global__ void k_apply(const uint32_t *__restrict buckets,
                         const uint32_t *__restrict cnt, uint32_t cap,
                         int logI, int log_region,
@@ -256,7 +272,8 @@ __global__ void k_apply(const uint32_t *__restrict buckets,
                         const uint32_t *__restrict sg, const uint16_t *__restrict slp,
                         uint32_t nsmall, uint32_t nblk, uint32_t nwrp,
                         uint32_t probe_x, uint32_t *__restrict probe_out,
-                        uint32_t *__restrict survbits, int not_both_even)
+                        uint32_t *__restrict survbits, int not_both_even,
+                        uint32_t j_base)
 {
     extern __shared__ uint32_t sm[];
     const uint32_t ncell  = 1u << log_region;
@@ -283,7 +300,9 @@ __global__ void k_apply(const uint32_t *__restrict buckets,
             } else {
                 const uint32_t x = xbase + w * CPW + c;
                 const int32_t  ii = (int32_t)(x & Imask) - Ihalf;
-                const uint32_t jj = x >> logI;
+                const uint32_t jlocal = x >> logI;
+                uint32_t jj = jlocal;
+                if constexpr (SLABBED) jj += j_base;
                 const float fi = (float)ii;
                 const float fj = (float)jj;
                 const float u = fmaf(N.ua, fi, N.ub * fj);
@@ -368,8 +387,8 @@ report spurious cell mismatches. Pricing builds only, never for relations."
 
     /* ---- small primes: line-sieved straight into the same shared region ---- */
     if (nsmall)
-        sieve_small<CELLBITS, ATOMIC>(S, b, logI, log_region, sp, srt, sg, slp,
-                                      nsmall, nblk, nwrp, tid, nth);
+        sieve_small<CELLBITS, ATOMIC, SLABBED>(S, b, logI, log_region, sp, srt, sg, slp,
+                                               nsmall, nblk, nwrp, tid, nth, j_base);
 
     /* ---- apply ---- */
     uint32_t n = cnt[b];
@@ -407,7 +426,10 @@ report spurious cell mismatches. Pricing builds only, never for relations."
              * relation is a duplicate of (a/2, b/2); las marks these 255 so
              * they can never survive. Off by default so that every survivor
              * count recorded before 2026-08-03 still reproduces. */
-            const int botheven = ((x & 1u) == 0u) && (((x >> logI) & 1u) == 0u);
+            const uint32_t jlocal = x >> logI;
+            uint32_t jpar = jlocal;
+            if constexpr (SLABBED) jpar += j_base;
+            const int botheven = ((x & 1u) == 0u) && ((jpar & 1u) == 0u);
             if (v >= THRESH && !(not_both_even && botheven)) {
                 uint32_t at = atomicAdd(nsurv, 1u);
                 if (at < maxsurv) surv[at] = x;
@@ -917,7 +939,7 @@ __global__ void k_purge_prime(const uint32_t *__restrict recs,
     }
 }
 
-template <int AGG>
+template <int AGG, bool SLABBED = false>
 __global__ void k_intersect_compact(const uint32_t *__restrict A,
                                     const uint32_t *__restrict B,
                                     uint32_t nword, uint32_t logI,
@@ -930,7 +952,8 @@ __global__ void k_intersect_compact(const uint32_t *__restrict A,
                                     uint32_t *__restrict nout,
                                     unsigned long long *__restrict npre,
                                     uint32_t *__restrict twosided,
-                                    unsigned long long *__restrict nqb)
+                                    unsigned long long *__restrict nqb,
+                                    uint32_t j_base)
 {
     const uint32_t Imask = (1u << logI) - 1;
     const int32_t  Ihalf = (int32_t)(1u << (logI - 1));
@@ -961,7 +984,9 @@ __global__ void k_intersect_compact(const uint32_t *__restrict A,
             m &= m - 1;
             uint32_t x = (w << 5) + k;
             int32_t  i = (int32_t)(x & Imask) - Ihalf;
-            uint32_t j = x >> logI;
+            uint32_t jlocal = x >> logI;
+            uint32_t j = jlocal;
+            if constexpr (SLABBED) j += j_base;
             uint32_t ai = (uint32_t)(i < 0 ? -i : i);
             if (bgcd(ai, j) != 1) continue;
             /* the second test: q | b makes (a,b) = q*(a',b'). One 64-bit
@@ -1007,7 +1032,9 @@ __global__ void k_intersect_compact(const uint32_t *__restrict A,
             keep &= keep - 1;
             uint32_t x = (w << 5) + k;
             int32_t  i = (int32_t)(x & Imask) - Ihalf;
-            uint32_t j = x >> logI;
+            uint32_t jlocal = x >> logI;
+            uint32_t j = jlocal;
+            if constexpr (SLABBED) j += j_base;
             if (slot < cap) {
                 out_x[slot] = x;
                 out_a[slot] = (int64_t)i * a0 + (int64_t)j * b0;
@@ -1274,9 +1301,9 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     ms_emit = 1e30f;
     for (int rep = 0; rep < 3; rep++) {
         cudaEventRecord(t0);
-        k_emit_ranked<<<blocks, threads>>>(d_two, d_gbase, nbitword, cfg->logI,
+        k_emit_ranked<false><<<blocks, threads>>>(d_two, d_gbase, nbitword, cfg->logI,
                                            L->a0, L->a1, L->b0, L->b1,
-                                           d_x, d_a, d_b, n);
+                                           d_x, d_a, d_b, n, 0u);
         cudaEventRecord(t1);
         CK(cudaEventSynchronize(t1)); CK(cudaGetLastError());
         { float t = time_kernel(t0, t1); if (t < ms_emit) ms_emit = t; }
@@ -1332,18 +1359,18 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                 CK(cudaMemset(d_ovf, 0, 8));
                 cudaEventRecord(t0);
                 switch (U) {
-                case 1: k_resieve_scatter<1><<<blocks, threads>>>(
+                case 1: k_resieve_scatter<1, false><<<blocks, threads>>>(
                             d_plat, d_primes, NULL, fb->n, xmax, cfg->logI,
-                            d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, log_gran); break;
-                case 2: k_resieve_scatter<2><<<blocks, threads>>>(
+                            d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, log_gran, NULL); break;
+                case 2: k_resieve_scatter<2, false><<<blocks, threads>>>(
                             d_plat, d_primes, NULL, fb->n, xmax, cfg->logI,
-                            d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, log_gran); break;
-                case 4: k_resieve_scatter<4><<<blocks, threads>>>(
+                            d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, log_gran, NULL); break;
+                case 4: k_resieve_scatter<4, false><<<blocks, threads>>>(
                             d_plat, d_primes, NULL, fb->n, xmax, cfg->logI,
-                            d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, log_gran); break;
-                default: k_resieve_scatter<8><<<blocks, threads>>>(
+                            d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, log_gran, NULL); break;
+                default: k_resieve_scatter<8, false><<<blocks, threads>>>(
                             d_plat, d_primes, NULL, fb->n, xmax, cfg->logI,
-                            d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, log_gran); break;
+                            d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, log_gran, NULL); break;
                 }
                 cudaEventRecord(t1);
                 CK(cudaEventSynchronize(t1)); CK(cudaGetLastError());
@@ -1394,9 +1421,9 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
         k_build_summary_g<<<blocks, threads>>>(d_two, nbitword, 2u, d_sum);
         CK(cudaMemset(d_pcnt, 0, (size_t)n * 4));
         CK(cudaMemset(d_ovf, 0, 8));
-        k_resieve_scatter<4><<<blocks, threads>>>(
+        k_resieve_scatter<4, false><<<blocks, threads>>>(
             d_plat, d_primes, NULL, fb->n, xmax, cfg->logI,
-            d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, 6);
+            d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, 6, NULL);
         CK(cudaDeviceSynchronize()); CK(cudaGetLastError());
         CK(cudaMemcpy(&hovf, d_ovf, 8, cudaMemcpyDeviceToHost));
     }
@@ -1420,11 +1447,11 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
      * full pass overwrites its output. */
     for (int rep = 0; rep < 3; rep++) {
         cudaEventRecord(t0);
-        k_td<1, 0, 0><<<blocks, threads>>>(d_a, d_b, d_x, NULL, n, cfg->logI, d_poly,
+        k_td<1, 0, 0, false><<<blocks, threads>>>(d_a, d_b, d_x, NULL, n, cfg->logI, d_poly,
                                            cfg->side == 1 ? (uint32_t)L->q : 0u,
                                            d_plist, d_pcnt, K, d_sm, 0u,
                                            d_cof, d_cofbits, d_flags, NULL,
-                                           NULL, NULL, 0);
+                                           NULL, NULL, 0, 0u);
         cudaEventRecord(t1);
         CK(cudaEventSynchronize(t1)); CK(cudaGetLastError());
         { float t = time_kernel(t0, t1); if (t < ms_td_nosm) ms_td_nosm = t; }
@@ -1435,11 +1462,11 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     CK(cudaMemset(d_ovf, 0, 8));
     for (int rep = 0; rep < 3; rep++) {
         cudaEventRecord(t0);
-        k_td<0, 0, 0><<<blocks, threads>>>(d_a, d_b, d_x, NULL, n, cfg->logI, d_poly,
+        k_td<0, 0, 0, false><<<blocks, threads>>>(d_a, d_b, d_x, NULL, n, cfg->logI, d_poly,
                                            cfg->side == 1 ? (uint32_t)L->q : 0u,
                                            d_plist, d_pcnt, K, d_sm, nsm,
                                            d_cof, d_cofbits, d_flags, d_ovf,
-                                           NULL, NULL, 0);
+                                           NULL, NULL, 0, 0u);
         cudaEventRecord(t1);
         CK(cudaEventSynchronize(t1)); CK(cudaGetLastError());
         { float t = time_kernel(t0, t1); if (t < ms_td_nodiv) ms_td_nodiv = t; }
@@ -1450,11 +1477,11 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     for (int rep = 0; rep < 3; rep++) {
         CK(cudaMemset(d_flags, 0, 4));
         cudaEventRecord(t0);
-        k_td<1, 0, 0><<<blocks, threads>>>(d_a, d_b, d_x, NULL, n, cfg->logI, d_poly,
+        k_td<1, 0, 0, false><<<blocks, threads>>>(d_a, d_b, d_x, NULL, n, cfg->logI, d_poly,
                                            cfg->side == 1 ? (uint32_t)L->q : 0u,
                                            d_plist, d_pcnt, K, d_sm, nsm,
                                            d_cof, d_cofbits, d_flags, NULL,
-                                           NULL, NULL, 0);
+                                           NULL, NULL, 0, 0u);
         cudaEventRecord(t1);
         CK(cudaEventSynchronize(t1)); CK(cudaGetLastError());
         { float t = time_kernel(t0, t1); if (t < ms_td) ms_td = t; }
@@ -1494,11 +1521,11 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     if (cfg->emit_cof) {
         CK(cudaMalloc(&d_fac, (size_t)n * TD_FMAX * 4));
         CK(cudaMalloc(&d_faccnt, (size_t)n * 4));
-        k_td<1, 1, 0><<<blocks, threads>>>(d_a, d_b, d_x, NULL, n, cfg->logI, d_poly,
+        k_td<1, 1, 0, false><<<blocks, threads>>>(d_a, d_b, d_x, NULL, n, cfg->logI, d_poly,
                                            cfg->side == 1 ? (uint32_t)L->q : 0u,
                                            d_plist, d_pcnt, K, d_sm, nsm,
                                            d_cof, d_cofbits, d_flags, NULL,
-                                           d_fac, d_faccnt, TD_FMAX);
+                                           d_fac, d_faccnt, TD_FMAX, 0u);
         CK(cudaDeviceSynchronize()); CK(cudaGetLastError());
     }
 
@@ -1884,15 +1911,15 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
      * different people compared that number across GPUs before anyone noticed
      * it was measuring startup. The memsets follow the warm-up because nproj
      * and nlost are accumulators divided by reps. */
-    k_transform<<<blocks, cfg->threads>>>(D.primes, D.roots, D.plat, fb->n,
-        cfg->logI, cfg->J, L->a0, L->a1, L->b0, L->b1, D.nproj, D.nlost);
+    k_transform<false><<<blocks, cfg->threads>>>(D.primes, D.roots, D.plat, fb->n,
+        cfg->logI, cfg->J, L->a0, L->a1, L->b0, L->b1, D.nproj, D.nlost, NULL);
     CK(cudaDeviceSynchronize());
     CK(cudaMemset(D.nproj, 0, 4));
     CK(cudaMemset(D.nlost, 0, 8));
     cudaEventRecord(e0);
     for (int rep = 0; rep < cfg->reps; rep++)
-        k_transform<<<blocks, cfg->threads>>>(D.primes, D.roots, D.plat, fb->n,
-            cfg->logI, cfg->J, L->a0, L->a1, L->b0, L->b1, D.nproj, D.nlost);
+        k_transform<false><<<blocks, cfg->threads>>>(D.primes, D.roots, D.plat, fb->n,
+            cfg->logI, cfg->J, L->a0, L->a1, L->b0, L->b1, D.nproj, D.nlost, NULL);
     cudaEventRecord(e1);
     CK(cudaEventSynchronize(e1));
     CK(cudaGetLastError());
@@ -1930,14 +1957,14 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
         for (int rep = 0; rep < cfg->reps; rep++) {
             CK(cudaMemset(D.cursor, 0, (size_t)nregion * 4));
             if (cfg->record_bytes == 2)
-                k_fill_atomic<2><<<fblocks, fthreads>>>(D.plat, D.slice, fb->n, xmax,
-                    cfg->logI, log_region, D.cursor, D.out, cap, D.overflow);
+                k_fill_atomic<2, false><<<fblocks, fthreads>>>(D.plat, D.slice, fb->n, xmax,
+                    cfg->logI, log_region, D.cursor, D.out, cap, D.overflow, NULL, NULL);
             else if (cfg->record_bytes == 4)
-                k_fill_atomic<4><<<fblocks, fthreads>>>(D.plat, D.slice, fb->n, xmax,
-                    cfg->logI, log_region, D.cursor, D.out, cap, D.overflow);
+                k_fill_atomic<4, false><<<fblocks, fthreads>>>(D.plat, D.slice, fb->n, xmax,
+                    cfg->logI, log_region, D.cursor, D.out, cap, D.overflow, NULL, NULL);
             else
-                k_fill_atomic<8><<<fblocks, fthreads>>>(D.plat, D.slice, fb->n, xmax,
-                    cfg->logI, log_region, D.cursor, D.out, cap, D.overflow);
+                k_fill_atomic<8, false><<<fblocks, fthreads>>>(D.plat, D.slice, fb->n, xmax,
+                    cfg->logI, log_region, D.cursor, D.out, cap, D.overflow, NULL, NULL);
         }
         cudaEventRecord(e3);
         CK(cudaEventSynchronize(e3));
@@ -2123,21 +2150,21 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
 
 #define LAUNCH_APPLY(CBV, AT, NM)                                              \
             do {                                                               \
-                CK(cudaFuncSetAttribute(k_apply<CBV, AT, NM>,                  \
+                CK(cudaFuncSetAttribute(k_apply<CBV, AT, NM, false>,                  \
                     cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));  \
                 cudaEventRecord(e3);                                           \
                 for (int rep = 0; rep < cfg->reps; rep++) {                    \
                     CK(cudaMemset(D.nsurv, 0, 4));                             \
                     if (D.survbits)                                            \
                         CK(cudaMemset(D.survbits, 0, (size_t)nbitword * 4));   \
-                    k_apply<CBV, AT, NM><<<nregion, athr, smem>>>(             \
+                    k_apply<CBV, AT, NM, false><<<nregion, athr, smem>>>(             \
                         (const uint32_t *)D.out, D.cursor, cap,                \
                         cfg->logI, log_region, D.slice_logp, nslice_pow2,      \
                         N, CINIT, CINIT - BOUND, tconst, D.dumpbuf,            \
                         D.surv, D.nsurv, maxsurv,                              \
                         D.dbg, dbgreg, D.sp, D.srt, D.sg, D.slp,             \
                         nsmall, nblk, nwrp, probe_x, D.probe,                  \
-                        D.survbits, cfg->not_both_even);                       \
+                        D.survbits, cfg->not_both_even, 0u);                   \
                 }                                                              \
                 cudaEventRecord(e4);                                           \
                 CK(cudaEventSynchronize(e4));                                  \
@@ -2220,10 +2247,10 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                             CK(cudaMemset(d_pre, 0, 8));
                             CK(cudaMemset(d_qb, 0, 8));
                             cudaEventRecord(e3);
-                            k_intersect_compact<1><<<blocks, cfg->threads>>>(
+                            k_intersect_compact<1, false><<<blocks, cfg->threads>>>(
                                 D.survbits, dother, nbitword, cfg->logI,
                                 L->a0, L->a1, L->b0, L->b1, (int64_t)L->q,
-                                d_x, d_a, d_b, icap, d_n, d_pre, d_two, d_qb);
+                                d_x, d_a, d_b, icap, d_n, d_pre, d_two, d_qb, 0u);
                             cudaEventRecord(e4);
                             CK(cudaEventSynchronize(e4));
                             CK(cudaGetLastError());

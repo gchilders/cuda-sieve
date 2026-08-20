@@ -214,6 +214,59 @@ int verify_walk(int logI, uint32_t J, int nprimes)
     return (int)checked;
 }
 
+/* Forced-slab equivalence gate. The monolithic walk is valid here because the
+ * test geometries are deliberately small; it is the oracle for the continuation
+ * state used by I17+ where a monolithic uint32 position no longer exists. */
+int verify_walk_slabs(int logI, uint32_t J, uint32_t slab_J, int nprimes)
+{
+    const uint32_t I = 1u << logI, Imask = I - 1u;
+    const uint32_t xmax = I * J;
+    uint32_t p, checked = 0;
+    if (!slab_J || slab_J >= J || (uint64_t)I * J > 0x80000000ull) return -1;
+
+    for (p = I + 1; checked < (uint32_t)nprimes && p < 40u * I; p += 2) {
+        uint32_t d, isprime = 1;
+        for (d = 3; (uint64_t)d * d <= p; d += 2)
+            if (p % d == 0) { isprime = 0; break; }
+        if (!isprime) continue;
+        for (uint32_t k = 0; k < 5; k++) {
+            const uint32_t r = (uint32_t)(((uint64_t)p * k) / 5);
+            const plat_t P = pl_make(p, r, logI);
+            uint32_t mono = pl_first(&P, logI);
+            uint32_t cur = mono;
+            uint64_t base_x = 0;
+            for (uint32_t jb = 0; jb < J; jb += slab_J) {
+                const uint32_t rows = J - jb < slab_J ? J - jb : slab_J;
+                const uint32_t sx = I * rows;
+                uint32_t x = cur;
+                while (x < sx) {
+                    const uint64_t gx = base_x + x;
+                    if (mono >= xmax || gx != mono) {
+                        fprintf(stderr,
+                            "verify_walk_slabs MISMATCH p=%u r=%u logI=%d J=%u"
+                            " slabJ=%u: slab=%llu mono=%u\n",
+                            p, r, logI, J, slab_J,
+                            (unsigned long long)gx, mono);
+                        return -1;
+                    }
+                    mono = pl_next(mono, &P, Imask);
+                    x = pl_next(x, &P, Imask);
+                }
+                cur = x - sx;
+                base_x += sx;
+            }
+            if (mono < xmax) {
+                fprintf(stderr,
+                    "verify_walk_slabs SHORT p=%u r=%u logI=%d J=%u slabJ=%u"
+                    " next=%u xmax=%u\n", p, r, logI, J, slab_J, mono, xmax);
+                return -1;
+            }
+        }
+        checked++;
+    }
+    return (int)checked;
+}
+
 /* Ground truth for the apply kernel: replay one region's bucket records into a
  * 16-bit cell array exactly as k_apply should, and apply the same threshold.
  * Reproduces the GPU's *sign convention* too -- init to CINIT - T, add, test

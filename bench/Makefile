@@ -325,14 +325,14 @@ mkcofbatch: mkcofbatch.c $(DEFS_STAMP) $(CF_LMAX_STAMP)
 -include $(OBJS:.o=.d)
 
 clean:
-	rm -f bench fbtest fbgen sqgentest dumpcmp mkcofbatch ckpttest stoptest *.o *.d $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP) $(GIT_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP)
+	rm -f bench fbtest fbgen sqgentest dumpcmp mkcofbatch ckpttest stoptest slabtest *.o *.d $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP) $(GIT_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP)
 
-.PHONY: all clean check ckptcheck stopcheck cofcheck fbgencheck sqgencheck walkcheck
+.PHONY: all clean check ckptcheck stopcheck cofcheck fbgencheck sqgencheck walkcheck slabcheck
 
 # `check` depended on fbtest alone, so the whole CUDA path -- kernels, the
 # cofactoriser, the pipeline -- could fail to compile while the gates reported
 # "all gates passed". Depend on `all`.
-check: all ckptcheck stopcheck cofcheck fbgencheck sqgencheck walkcheck
+check: all ckptcheck stopcheck cofcheck fbgencheck sqgencheck walkcheck slabcheck
 	./fbtest --fb1 ../oracle/c183.fb1
 
 ckptcheck: ckpttest
@@ -366,6 +366,16 @@ walkcheck: bench
 	   printf '%s\n' "$$out" | tail -20 | sed 's/^/  | /'; \
 	   echo "  walkcheck FAILED (exit $$st)"; exit 1; \
 	 fi
+
+
+slabtest: slabtest.o $(C_OBJS)
+	$(CXX) $(CXXFLAGS) -o $@ $^ -lm
+
+# CPU-only arithmetic/scheduling gate for j-slabbing.  It covers automatic and
+# forced plans, partial tails, congruence phase translation, and the exact
+# w<2^31 range used by the existing reciprocal in the hot direct-TD loop.
+slabcheck: slabtest
+	./slabtest
 
 fbgencheck: fbgen
 	./fbgencheck.sh

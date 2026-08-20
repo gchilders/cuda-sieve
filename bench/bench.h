@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <math.h>
+#include "slab.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -339,6 +340,7 @@ float norm_target_host(const norm_t *N, int32_t i, uint32_t j);
  * lattice points {x in [0,I*J) : i == r*j mod p}, for small p. Returns the
  * number of primes checked; aborts on mismatch. */
 int  verify_walk(int logI, uint32_t J, int nprimes);
+int  verify_walk_slabs(int logI, uint32_t J, uint32_t slab_J, int nprimes);
 
 /* Count updates the walk produces for the given FB, single-threaded.
  * This is the ground truth the GPU fill must reproduce exactly. */
@@ -452,6 +454,7 @@ static inline uint32_t cof_auto_b1(unsigned lpb)
 typedef struct {
     int      logI;          /* 15 for I15e */
     uint32_t J;             /* 16384 for I15e */
+    uint32_t slab_j;        /* 0 = auto; otherwise force rows/slab (pipeline) */
     int      log_region;    /* bucket region = 2^log_region positions */
     int      record_bytes;  /* 2, 4 or 8 */
     int      fill_mode;     /* see FILL_* below */

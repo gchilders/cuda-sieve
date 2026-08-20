@@ -126,6 +126,8 @@ static void usage(void)
 "  --cadofb PATH    legacy alias for --fb1 (CADO files remain compatible)\n"
 "  --logI N         log2 of sieve width I      [15]   (gnfs-lasieve4I14e -> 14)\n"
 "  --J N            sieve height J             [2^(logI-1), CADO's convention]\n"
+"  --slab-j N       pipeline: force at most N j rows per slab; 0/omitted =\n"
+"                   automatic. Geometry <= 2^31 locations stays unslabbed\n"
 "  --relations F    write complete relations here (GGNFS/msieve format)\n"
 "  --cofactor       split the cofactors INLINE, in a cross-q device queue;\n"
 "                   --relations then holds every relation, not just TD's\n"
@@ -222,6 +224,8 @@ static void usage(void)
 "                   both norms rebuild to 1, every prime within its lpb\n"
 "  --cofgate FILE   gate the cofactors against CADO's own (a b cof0 cof1);\n"
 "                   under --pipeline this runs in the first-q validation\n"
+"  --no-td-verify   skip the first-q dense TD reconstruction gate. Saves peak\n"
+"                   memory in production; incompatible with --cofgate\n"
 "  --verbose-q      print a line per special-q instead of a band summary\n"
 "\n"
 "RUNTIME\n"
@@ -539,6 +543,29 @@ static int verify_walk_cases(void)
     }
     printf("[verify] OK: %u cases x 24 primes x 5 roots enumerated"
            " identically, 4:1 through 1:2\n", nwalk);
+
+    /* Force awkward slab boundaries while the whole rectangle still fits the
+     * legacy 31-bit oracle.  The continued local walk, translated back to
+     * global x, must be bit-for-bit the same sequence as one uninterrupted
+     * pl_first/pl_next walk.  Prime-ish heights guarantee a short tail slab. */
+    static const struct { int logI; uint32_t J, slabJ; } slab_cases[] = {
+        { 8,  512, 127 },
+        { 9,  512, 129 },
+        { 10,1024, 257 },
+        { 12,2048, 511 },
+    };
+    const unsigned nslab = sizeof slab_cases / sizeof slab_cases[0];
+    for (unsigned w = 0; w < nslab; w++) {
+        const int nc = verify_walk_slabs(slab_cases[w].logI, slab_cases[w].J,
+                                         slab_cases[w].slabJ, 24);
+        if (nc != 24) {
+            printf("[verify] SLAB FAILED at logI=%d J=%u slabJ=%u: %d of 24 primes\n",
+                   slab_cases[w].logI, slab_cases[w].J, slab_cases[w].slabJ, nc);
+            return 1;
+        }
+    }
+    printf("[verify] OK: %u forced-slab walk cases, including partial tails\n",
+           nslab);
     return 0;
 }
 
@@ -832,7 +859,7 @@ static int bench_main_impl(int argc, char **argv)
      * level lost by 2.7x (RESULTS.md finding 1) and 2^15 regions lost to 2^14
      * (finding 8); leaving those as defaults meant the commands in RESULTS
      * reproduced a path nobody would ship. */
-    cfg.logI = 15; cfg.J = 16384; cfg.log_region = 14;
+    cfg.logI = 15; cfg.J = 16384; cfg.slab_j = 0; cfg.log_region = 14;
     cfg.record_bytes = 4; cfg.fill_mode = FILL_ATOMIC;
     cfg.threads = 256; cfg.blocks = 0; cfg.fill_blocks = 0; cfg.fill_threads = 0;
     cfg.reps = 3; cfg.verify = 0;
@@ -910,6 +937,10 @@ static int bench_main_impl(int argc, char **argv)
         }
         else if (!strcmp(argv[i], "--logI") && i + 1 < argc) cfg.logI = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--J") && i + 1 < argc) { cfg.J = (uint32_t)strtoul(argv[++i], 0, 10); J_set = 1; }
+        else if (!strcmp(argv[i], "--slab-j") && i + 1 < argc) {
+            if (parse_u32_range_arg("--slab-j", argv[++i], 0u, UINT32_MAX,
+                                    &cfg.slab_j)) return 1;
+        }
         else if (!strcmp(argv[i], "--region") && i + 1 < argc) cfg.log_region = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--bkthresh") && i + 1 < argc) bkthresh = (uint32_t)strtoul(argv[++i], 0, 10);
         else if (!strcmp(argv[i], "--fbbound") && i + 1 < argc) { fbbound = (uint32_t)strtoul(argv[++i], 0, 10); fbbound_set = 1; }
@@ -1035,6 +1066,7 @@ static int bench_main_impl(int argc, char **argv)
         else if (!strcmp(argv[i], "--ab-resieve")) cfg.ab_resieve = 1;
         else if (!strcmp(argv[i], "--resieve-sweep")) cfg.resieve_sweep = 1;
         else if (!strcmp(argv[i], "--pipeline")) cfg.pipeline = 1;
+        else if (!strcmp(argv[i], "--no-td-verify")) cfg.td_verify = 0;
         /* strtol, not atoi: atoi("rational") is 0, which is a LEGAL value here,
          * so a typo would silently configure the wrong side instead of being
          * rejected. Every other numeric flag in this parser avoids atoi for
@@ -1221,6 +1253,10 @@ static int bench_main_impl(int argc, char **argv)
     /* logI bounds FIRST: every default below shifts by it (bkthresh, the area
      * check, the probe range), and an out-of-range shift is undefined. */
     if (cfg.logI < 2 || cfg.logI > 20) { usage(); return 1; }
+    /* Resolve J before any area/probe validation.  Keeping the old default
+     * assignment after polynomial loading meant --logI 17 was validated with
+     * logI 17 but the stale I15 J=16384, then silently changed to 65536 later. */
+    if (!J_set) cfg.J = 1u << (cfg.logI - 1);
     if (!maxbits_set) maxbits = cfg.logI;
     cfg.fb_maxbits = maxbits;      /* the resume fingerprint reads it from cfg */
     if (maxbits < 1 || maxbits > 31) {
@@ -1257,8 +1293,10 @@ static int bench_main_impl(int argc, char **argv)
             return 1;
         }
     }
-    if (((uint64_t)1 << cfg.logI) * cfg.J > 0x80000000ull) {
-        fprintf(stderr, "I*J must fit in 31 bits (uint32 positions)\n"); return 1;
+    if (!cfg.pipeline && ((uint64_t)1 << cfg.logI) * cfg.J > 0x80000000ull) {
+        fprintf(stderr, "I*J must fit in 31 bits outside --pipeline; the pipeline"
+                " uses j-slabs for larger rectangles\n");
+        return 1;
     }
     /* Two limits that used to be silent. A 2 B or 4 B record carries the
      * in-region offset in 16 bits, so a region above 2^16 wraps and every
@@ -1336,10 +1374,12 @@ static int bench_main_impl(int argc, char **argv)
                 " only a 16-bit offset field\n", cfg.log_region, cfg.record_bytes);
         return 1;
     }
-    if (cfg.log_region > cfg.logI && cfg.small_sieve) {
-        fprintf(stderr, "--region %d > --logI %d: the fused small sieve assumes"
-                " a region lies within one j-row.\n  Use --no-smallsieve, or a"
-                " region <= 2^%d.\n", cfg.log_region, cfg.logI, cfg.logI);
+    if (cfg.log_region > cfg.logI && (cfg.small_sieve || cfg.pipeline)) {
+        fprintf(stderr, "--region %d > --logI %d: %s assumes a region lies"
+                " within one j-row.\n  Use a region <= 2^%d%s.\n",
+                cfg.log_region, cfg.logI,
+                cfg.pipeline ? "the slabbed pipeline" : "the fused small sieve",
+                cfg.logI, cfg.pipeline ? "" : ", or --no-smallsieve");
         return 1;
     }
     /* Scale is free with 16-bit cells (see k_apply), but not unbounded: the
@@ -1438,10 +1478,6 @@ static int bench_main_impl(int argc, char **argv)
                    " only; the allowance is derived below\n",
                    POLY.rlambda, job_allowance_bits(POLY.rlambda, rlim));
     }
-
-    /* CADO's convention, and the only value we have ever wanted. Deriving it
-     * removes one more flag whose right answer is a function of another. */
-    if (!J_set && cfg.logI > 1) cfg.J = 1u << (cfg.logI - 1);
 
     /* HERE, not before poly_load: lpb/mfb/lim may all have come from the .job
      * file just read, and validating only the command line was validating the
@@ -1749,7 +1785,8 @@ static int bench_main_impl(int argc, char **argv)
     if (!cfg.pipeline) {
         static const char *pipeline_only[] = {
             "--target-rels", "--lambda0", "--lambda1", "--sq-side",
-            "--restart", "--stop-file", "--log", "--log-every", NULL
+            "--restart", "--stop-file", "--log", "--log-every",
+            "--slab-j", "--no-td-verify", NULL
         };
         int nbad = 0;
         for (int i = 1; i < argc; i++)
