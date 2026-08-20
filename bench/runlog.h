@@ -12,8 +12,9 @@
  *
  * So each record carries GPU-accounted/wall, GPU utilisation, board watts and
  * the host load average alongside the progress numbers. The first three come
- * from NVML, dlopen'd at run time: there is no build dependency, and a host
- * without the library logs "n/a" in those columns rather than failing.
+ * from NVML, loaded dynamically at run time: there is no build dependency,
+ * and a host without the library logs "n/a" in those columns rather than
+ * failing.
  *
  * THE HEADER IS THE OTHER HALF. RESULTS.md has had to grow a warning that
  * findings 48/54 are the c147 while 43/44 are the c183, and finding 55 exists

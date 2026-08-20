@@ -181,7 +181,7 @@ CXXFLAGS   = -O3 $(HOST_TUNE) -Wall -Wextra -std=c++17 -MMD -MP \
              $(DEFS) $(CF_LMAX_DEF) $(BOINC_DEFS) $(BOINC_CPPFLAGS)
 
 CU_SRCS  = bench_main.cu bench_kernels.cu
-C_SRCS   = fb_load.c verify_cpu.c poly.c primes.c rfb.c fb_cado.c
+C_SRCS   = fb_load.c verify_cpu.c poly.c primes.c rfb.c fb_cado.c platform.c
 CPP_SRCS = boinc_support.cpp
 
 CU_OBJS  = $(CU_SRCS:.cu=.o)
@@ -293,8 +293,8 @@ dumpcmp: dumpcmp.c $(DEFS_STAMP) $(CF_LMAX_STAMP)
 # CPU-only checkpoint-format gate. In particular, BOINC output paths may
 # contain whitespace after filename resolution, so candidate identity must not
 # depend on the checkpoint parser's ordinary whitespace tokenisation.
-ckpttest: ckpttest.c ckpt.h bench.h $(DEFS_STAMP) $(CF_LMAX_STAMP)
-	$(CC) $(CFLAGS) -o $@ $< -lm
+ckpttest: ckpttest.c ckpt.h bench.h platform.o $(DEFS_STAMP) $(CF_LMAX_STAMP)
+	$(CC) $(CFLAGS) -o $@ ckpttest.c platform.o -lm
 
 # joins the two per-side --emit-cof files into cofactorisation batch input
 mkcofbatch: mkcofbatch.c $(DEFS_STAMP) $(CF_LMAX_STAMP)

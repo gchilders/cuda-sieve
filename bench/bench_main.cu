@@ -1,5 +1,6 @@
 /* CLI for the standalone bucket-fill benchmark. */
 #include "bench.h"
+#include "platform.h"
 #include "ckpt.h"
 #include "runlog.h"
 #include <stdio.h>
@@ -607,7 +608,7 @@ static int recovery_count_write(const resume_recovery_t *r, unsigned count)
     if (!f) { perror(r->retry_tmp); return -1; }
     if (fprintf(f, "%u\n", count) < 0) { bad = 1; saved_errno = errno; }
     if (!bad && fflush(f)) { bad = 1; saved_errno = errno; }
-    if (!bad && fsync(fileno(f))) { bad = 1; saved_errno = errno; }
+    if (!bad && bench_sync_stream(f)) { bad = 1; saved_errno = errno; }
     if (fclose(f) && !bad) { bad = 1; saved_errno = errno; }
     if (bad) {
         errno = saved_errno;
@@ -615,44 +616,39 @@ static int recovery_count_write(const resume_recovery_t *r, unsigned count)
         remove(r->retry_tmp);
         return -1;
     }
-    if (rename(r->retry_tmp, r->retry)) {
+    if (bench_atomic_replace(r->retry_tmp, r->retry)) {
         perror(r->retry);
         remove(r->retry_tmp);
         return -1;
     }
-    {
-        char dir[CKPT_PATH_MAX];
-        const char *slash = strrchr(r->retry, '/');
-        int fd, sync_bad = 0, saved_errno = 0;
-        if (!slash) {
-            strcpy(dir, ".");
-        } else if (slash == r->retry) {
-            strcpy(dir, "/");
-        } else {
-            const size_t len = (size_t)(slash - r->retry);
-            memcpy(dir, r->retry, len);
-            dir[len] = '\0';
-        }
-        fd = open(dir, O_RDONLY);
-        if (fd < 0) { perror(dir); return -1; }
-        if (fsync(fd)) { sync_bad = 1; saved_errno = errno; }
-        if (close(fd) && !sync_bad) { sync_bad = 1; saved_errno = errno; }
-        if (sync_bad) {
-            errno = saved_errno;
-            perror(dir);
-            return -1;
-        }
+    if (bench_sync_parent(r->retry)) {
+        perror("recovery checkpoint directory");
+        return -1;
     }
     return 0;
 }
 
+static const char *last_path_separator(const char *path)
+{
+    const char *slash = strrchr(path, '/');
+#ifdef _WIN32
+    const char *backslash = strrchr(path, '\\');
+    if (!slash || (backslash && backslash > slash)) slash = backslash;
+#endif
+    return slash;
+}
+
 static int same_parent_directory(const char *a, const char *b)
 {
-    const char *as = strrchr(a, '/'), *bs = strrchr(b, '/');
+    const char *as = last_path_separator(a), *bs = last_path_separator(b);
     const size_t an = as ? (size_t)(as - a) : 0;
     const size_t bn = bs ? (size_t)(bs - b) : 0;
     if (!!as != !!bs || an != bn) return 0;
+#ifdef _WIN32
+    return an == 0 || _strnicmp(a, b, an) == 0;
+#else
     return an == 0 || !memcmp(a, b, an);
+#endif
 }
 
 /* A checkpoint pathname is data, not authority to unlink.  It is usable only
@@ -662,7 +658,7 @@ static int same_parent_directory(const char *a, const char *b)
 static int resume_recovery_add_checkpoint_candidate(resume_recovery_t *r,
                                                      const ckpt_t *ck)
 {
-    struct stat st;
+    bench_stat_t st;
     const size_t len = strlen(ck->cand_part);
     if (!len) return 0;             /* legacy checkpoint: identity unavailable */
     if (!same_parent_directory(r->part, ck->cand_part) ||
@@ -673,12 +669,12 @@ static int resume_recovery_add_checkpoint_candidate(resume_recovery_t *r,
                 " of %s\n", r->part);
         return -1;
     }
-    if (stat(ck->cand_part, &st)) {
+    if (bench_stat_path(ck->cand_part, &st)) {
         if (errno == ENOENT) return 1;
         perror(ck->cand_part);
         return -1;
     }
-    if (!S_ISREG(st.st_mode) ||
+    if (!bench_is_regular_mode((unsigned short)st.st_mode) ||
         (unsigned long long)st.st_dev != ck->cand_dev ||
         (unsigned long long)st.st_ino != ck->cand_ino ||
         (unsigned long long)st.st_size < ck->cand_bytes) {
@@ -1789,7 +1785,7 @@ static int bench_main_impl(int argc, char **argv)
          * checkpoint and exit 0 -- telling a job queue the work succeeded
          * while making no progress, forever. Refuse to start instead, rather
          * than deleting a path the operator created. */
-        if (cfg.stopfile && access(cfg.stopfile, F_OK) == 0) {
+        if (cfg.stopfile && bench_path_exists(cfg.stopfile)) {
             fprintf(stderr, "bench: --stop-file %s already exists; remove it"
                     " before starting.\n", cfg.stopfile);
             return 1;
@@ -1832,7 +1828,7 @@ static int bench_main_impl(int argc, char **argv)
         if (cfg.relations) {
             char part[CKPT_PATH_MAX], cpath[CKPT_PATH_MAX];
             char fp[17];
-            struct stat st;
+            bench_stat_t st;
             ckpt_t ck;
             if (ckpt_part_path(cfg.relations, part, sizeof part) ||
                 ckpt_ckpt_path(cfg.relations, cpath, sizeof cpath))
@@ -1842,7 +1838,7 @@ static int bench_main_impl(int argc, char **argv)
             int part_exists;
 
             if (resume_recovery_init(&recovery, &cfg, part, cpath)) return 1;
-            if (stat(part, &st) == 0)
+            if (bench_stat_path(part, &st) == 0)
                 part_exists = 1;
             else if (errno == ENOENT)
                 part_exists = 0;
@@ -1870,12 +1866,12 @@ static int bench_main_impl(int argc, char **argv)
              * overwriting it. An absent or empty candidates file is safe to
              * restart alongside the empty relations file. */
             if (!cfg.restart && part_exists && st.st_size == 0) {
-                struct stat sidecar_st;
+                bench_stat_t sidecar_st;
                 int sidecar_missing = 0;
                 int candidates_empty = 1, candidates_present = 0;
                 char candidates_part[CKPT_PATH_MAX] = "";
 
-                if (stat(cpath, &sidecar_st)) {
+                if (bench_stat_path(cpath, &sidecar_st)) {
                     if (errno == ENOENT)
                         sidecar_missing = 1;
                     else {
@@ -1884,11 +1880,11 @@ static int bench_main_impl(int argc, char **argv)
                     }
                 }
                 if (sidecar_missing && cfg.candidates) {
-                    struct stat candidates_st;
+                    bench_stat_t candidates_st;
                     if (ckpt_part_path(cfg.candidates, candidates_part,
                                        sizeof candidates_part))
                         return 1;
-                    if (stat(candidates_part, &candidates_st) == 0) {
+                    if (bench_stat_path(candidates_part, &candidates_st) == 0) {
                         candidates_present = 1;
                         candidates_empty = candidates_st.st_size == 0;
                     } else if (errno != ENOENT) {
@@ -1990,11 +1986,11 @@ static int bench_main_impl(int argc, char **argv)
                  * resume that omitted it records cand_bytes = 0, so the next
                  * resume that supplies it again truncates the whole file away. */
                 {
-                    struct stat cst;
+                    bench_stat_t cst;
                     int cpart_exists = 0;
                     const char *cpart = recovery.candidates_part;
                     if (cfg.candidates) {
-                        if (stat(cpart, &cst) == 0)
+                        if (bench_stat_path(cpart, &cst) == 0)
                             cpart_exists = 1;
                         else if (errno != ENOENT) {
                             perror(cpart);
@@ -2120,8 +2116,8 @@ static int bench_main_impl(int argc, char **argv)
                        " from the checkpoint\n",
                        cfg.scale, cfg.scale0, cfg.allowance, cfg.allowance0);
             } else {
-                struct stat checkpoint_st;
-                if (stat(cpath, &checkpoint_st) == 0) {
+                bench_stat_t checkpoint_st;
+                if (bench_stat_path(cpath, &checkpoint_st) == 0) {
                     BOINC_RECOVER_OR_RETURN(
                         "a checkpoint exists without its relation file");
                     fprintf(stderr,
