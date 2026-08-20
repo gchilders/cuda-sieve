@@ -35,6 +35,10 @@ bench/dumpcmp
 bench/mkcofbatch
 bench/ckpttest
 bench/stoptest
+# wintest.bat outputs (cross-platform byte-comparison harness)
+bench/wintest.dat*
+bench/wintest.out
+bench/wintest.runlog
 bench/.arch.stamp
 bench/.boinc.stamp
 bench/.link.stamp
