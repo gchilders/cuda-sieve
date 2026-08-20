@@ -1658,3 +1658,90 @@ absent from every document in the repo.
     made again: on this pipeline the survivor list is nearly free downstream,
     which also means **survivor counts are a poor proxy for work** in any
     cross-siever comparison (see item 7's funnel numbers).
+15. **Older cards, and the shared-memory ceiling that blocks them — code
+    read 2026-08-20, NOT tested on any such card.** `GPU_ARCH_all` starts at
+    sm_80, but nothing in the kernels requires it. The only warp primitives
+    used are `__shfl_up_sync` and `__syncwarp`; there is no `redux.sync`, no
+    `__reduce_*_sync`, no `cp.async`, no cooperative groups and no inline
+    PTX, and `BN_MULHI64` resolves to `__umul64hi` (`bigint.cuh:161`), which
+    is sm_20+. **The compute-capability floor is not an algorithm. It is one
+    hardcoded constant.**
+
+    `101376` appears at `pipeline.cuh:247` and `bench_kernels.cu:2119`,
+    described in both places as "the opt-in limit". It is not a constant of
+    CUDA — it is the limit for *one* arch family, 100 KB of hardware less the
+    1 KB the driver reserves — and it is wrong in both directions:
+
+    | target | max dynamic smem per block | vs. the constant |
+    |---|---:|---|
+    | sm_70 Volta | 96 KB | too high |
+    | sm_75 Turing | 64 KB | **too high — the opt-in call fails** |
+    | sm_80 A100 | 163 KB | **too low** |
+    | sm_86 / sm_89 / sm_120 | 99 KB | correct |
+    | sm_90 Hopper | 227 KB | **too low** |
+
+    Apply sizes its shared memory at `(1 << log_region) * 2 + nslice_pow2 *
+    2` (`pipeline.cuh:245`), so `--region 15` needs ~66 KB and `--region 16`
+    ~131 KB. **sm_80 is already in the default gencode list and is already
+    capped at 15 by this constant on hardware that allows 16** — so this is a
+    live limitation on a card we ship for today, not only a Hopper question.
+    Greg Childers' H200 has twice that headroom again.
+
+    The opt-in machinery is already in place: `cudaFuncSetAttribute` with
+    `cudaFuncAttributeMaxDynamicSharedMemorySize` is called at
+    `pipeline.cuh:443`. Only the *bound* is a literal. One
+    `cudaDeviceGetAttribute(..., cudaDevAttrMaxSharedMemoryPerBlockOptin,
+    dev)` fixes both directions at once.
+
+    **What is NOT established.** This is a code-reading result. No card older
+    than sm_120 has been run, and the claim is "nothing in the source
+    requires sm_80", not "it works on a 2080 Ti". Before claiming support:
+    add the gencode targets, run `make check` and a `wintest.bat`-style
+    byte-comparison band on the card, and check VRAM — the memory model above
+    puts a `2^30` area near 5 GB, which an 11 GB Turing carries and a 6 GB
+    card does not. Note also that each added target is nearly free in build
+    time (item 16), so the cost here is testing, not compilation. Relevant to
+    BOINC specifically, where volunteer hardware skews old and a card we
+    refuse is a host we never get.
+16. **Build wall time — MEASURED 2026-08-20, and the cause is `CF_LMAX=4`.**
+    A full `make all` is ~12.5 min on this 16-thread box and about 30 on a
+    busy Vast.ai 5090. The Makefile's timing table (`Makefile:43-55`) claims
+    214 s and blames sm_120's ptxas. **That table was measured 2026-08-11
+    (efd7219), before the 4-limb/ECM cofactor dispatch landed 2026-08-19
+    (e4a47f2), and it is now wrong by 3.5x.**
+
+    Measured here, `make -j8`, clean tree per arm, one target at a time:
+
+    | target | `CF_LMAX=3` | `CF_LMAX=4` (default) | cost of the 4th limb |
+    |---|---:|---:|---:|
+    | sm_120 | 277 s | **754 s** | **2.72x** |
+    | sm_80 | 15 s | 26 s | 1.73x |
+
+    Three things follow.
+
+    1. **The 4-limb dispatch is the regression, not the target count.** At
+       `CF_LMAX=3` sm_120 returns to 277 s, near the table's 215 s; the
+       residual is plausibly the ECM rewrite that shipped in the same commit.
+    2. **`-t 0` already works, so dropping targets buys nothing.** The full
+       six-target fat build measured **750 s** against sm_120 alone at 754 s.
+       The fat binary is free and adding sm_90 cost nothing measurable — the
+       one target that cannot be dropped is the expensive one. This confirms
+       the stale table's *conclusion* even though its numbers are wrong.
+    3. **The ptxas asymmetry widened.** sm_120/sm_80 was ~15x when the table
+       was written and is **29x** now (754/26). The 4th limb costs sm_120
+       disproportionately, so this is a ptxas scaling problem on Blackwell
+       rather than a linear code-size effect.
+
+    **For iteration today:** `make GPU_ARCH=120 CF_LMAX=3` is 277 s and is a
+    shippable binary — the cofcheck gate pins 3-limb and 4-limb output as
+    byte-identical, and `CF_LMAX` is deliberately not a `DEFS` value so such a
+    build still emits relations (`Makefile:112-130`). An Ampere or Ada box
+    with `GPU_ARCH=native` is 26 s. Neither helps a release build.
+
+    **Not yet investigated:** why the 4th limb triples ptxas time on sm_120.
+    `bench_kernels.cu` is a single 138 KB translation unit that includes the
+    125 KB `cofac.cuh`, and that is the only site including it
+    (`bench_kernels.cu:2682`), so splitting the cofactor kernels into their
+    own `.cu` would both parallelise across TUs and stop a sieve-kernel edit
+    from recompiling the cofactor templates. That is the first experiment;
+    instantiation count and register pressure are the obvious suspects.

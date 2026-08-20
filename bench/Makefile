@@ -41,18 +41,27 @@ GPU_ARCH_all := -gencode arch=compute_120,code=sm_120 \
 # ARCH=x86_64 would silently retarget the build to compute_x86_64.
 #
 # Measured on bench_kernels.cu, which is the entire build -- bench_main.cu is
-# 2.5 s and the C files are noise:
+# 2.5 s and the C files are noise. Re-measured 2026-08-20; the numbers below
+# REPLACE a table taken 2026-08-11, which predated the 4-limb/ECM cofactor
+# dispatch and understated a default build by 3.5x. See STATUS.md item 16.
 #
-#     all five targets, serial       309 s
-#     all five targets, -t 0         214 s   <- the default
-#     sm_120 alone                   215 s
-#     sm_80 alone                     14 s
+#                              CF_LMAX=3   CF_LMAX=4 (default)
+#     sm_120 alone                 277 s         754 s
+#     sm_80 alone                   15 s          26 s
+#     all six targets, -t 0           --         750 s   <- the default
 #
-# ptxas on sm_120 is ~16x slower than on sm_80 and swamps everything else, so on
-# a Blackwell host GPU_ARCH=native saves nothing once the passes run
-# concurrently: the one target that cannot be dropped is the expensive one. Keep
-# the fat binary here. GPU_ARCH=native is the real win on an Ampere or Ada host,
+# Two conclusions, and only the second one changed. ptxas on sm_120 is ~29x
+# slower than on sm_80 and swamps everything else, so the six-target fat build
+# costs no more than its slowest target alone (750 s vs 754 s): -t 0 is doing
+# its job, adding sm_90 was free, and dropping targets buys nothing. Keep the
+# fat binary here. GPU_ARCH=native is the real win on an Ampere or Ada host,
 # where it drops sm_120 and takes the build to well under a minute.
+#
+# What changed is the CAUSE. The 4th cofactor limb costs sm_120 2.72x, and
+# that -- not the target list -- is why a full build now takes ~12.5 min. For
+# iteration on a Blackwell host, CF_LMAX=3 is 277 s and still shippable (see
+# the CF_LMAX block below). Why ptxas scales this way is unsolved; STATUS.md
+# item 16 carries the open experiment.
 GPU_ARCH ?= all
 
 ifeq ($(GPU_ARCH),all)
