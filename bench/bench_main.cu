@@ -1234,6 +1234,12 @@ static int bench_main_impl(int argc, char **argv)
     if (!fbbound && cfg.side == 1 && !cfg.pipeline)
         fbbound = (q > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (uint32_t)q;
 
+    /* Shift in the destination width, not the source width. These are all
+     * provably in range -- logI is bounded to [2,20] and log_region to [1,30]
+     * above, so a 32-bit shift could not overflow -- but MSVC's C4334 fires on
+     * the pattern rather than on the proof, and a Windows build that always
+     * emits three warnings is a Windows build whose warnings get ignored.
+     * `(uint64_t)1 << n` says what was meant and costs nothing. */
     /* Bound log_region before ANY 1u << log_region: the shift is undefined for
      * >= 32 and UBSan flags --region 32 on the old ordering. */
     if (cfg.log_region < 1 || cfg.log_region > 30) {
@@ -1251,7 +1257,7 @@ static int bench_main_impl(int argc, char **argv)
             return 1;
         }
     }
-    if ((uint64_t)(1u << cfg.logI) * cfg.J > 0x80000000ull) {
+    if (((uint64_t)1 << cfg.logI) * cfg.J > 0x80000000ull) {
         fprintf(stderr, "I*J must fit in 31 bits (uint32 positions)\n"); return 1;
     }
     /* Two limits that used to be silent. A 2 B or 4 B record carries the
@@ -1321,7 +1327,7 @@ static int bench_main_impl(int argc, char **argv)
                 " hangs and a partial warp double-counts\n");
         return 1;
     }
-    if ((uint64_t)(1u << cfg.logI) * cfg.J % (1u << cfg.log_region)) {
+    if (((uint64_t)1 << cfg.logI) * cfg.J % ((uint64_t)1 << cfg.log_region)) {
         fprintf(stderr, "I*J must divide evenly into 2^%d regions\n", cfg.log_region);
         return 1;
     }

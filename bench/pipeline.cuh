@@ -242,7 +242,7 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
         goto done;
     }
     {
-        const size_t smem = (size_t)(1u << cfg->log_region) * 2 +
+        const size_t smem = ((size_t)1 << cfg->log_region) * 2 +
                             (size_t)S->nslice_pow2 * sizeof(*hlogp);
         if (smem > 101376u) {
             fprintf(stderr, "  apply needs %zu B of shared memory for %u"
