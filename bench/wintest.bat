@@ -32,15 +32,24 @@ bench.exe --pipeline --cofactor --poly input.job --fb1 fbase.m16 ^
     --relations wintest.dat --log wintest.runlog --log-every 1 > wintest.out 2>&1
 if errorlevel 1 (
     echo.
-    echo BAND FAILED -- matching lines follow, full output in wintest.out:
+    echo BAND FAILED. Matching lines:
     findstr /I /C:"error" /C:"cannot" /C:"refus" /C:"does not fit" wintest.out
+    echo.
+    echo ---------------- last 40 lines of wintest.out ----------------
+    powershell -NoProfile -Command "Get-Content wintest.out -Tail 40"
+    echo -------------------------------------------------------------
     exit /b 1
 )
 
 if not exist wintest.dat (
     echo.
-    echo BAND REPORTED SUCCESS BUT WROTE NO RELATION FILE.
-    echo That is itself a finding: the .part rename did not happen. See wintest.out.
+    echo NO RELATION FILE. bench.exe exited 0 but wintest.dat is not here.
+    echo Staging files left behind, if any:
+    dir /b wintest.* 2>nul
+    echo.
+    echo ---------------- last 40 lines of wintest.out ----------------
+    powershell -NoProfile -Command "Get-Content wintest.out -Tail 40"
+    echo -------------------------------------------------------------
     exit /b 1
 )
 

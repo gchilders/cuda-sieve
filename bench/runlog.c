@@ -82,8 +82,21 @@ int runlog_open(const char *path, double period_s)
         return -1;
     }
     /* Line buffered: a kill -9 loses at most the record being written, never a
-     * block of complete ones sitting in a 4 KB buffer. */
-    setvbuf(L.f, NULL, _IOLBF, 0);
+     * block of complete ones sitting in a 4 KB buffer.
+     *
+     * The size is explicit because it has to be. glibc reads a 0 here as "pick
+     * a default", but MSVC requires 2 <= size <= INT_MAX whenever the buffer
+     * pointer is NULL, and a 0 reaches the CRT's invalid-parameter handler --
+     * which does not return. It terminates the process through __fastfail,
+     * reported as 0xC0000409, the SAME status Windows uses for a stack-buffer
+     * overrun. So the failure presented as memory corruption in code that has
+     * none: bench.exe died here, right after opening the log and before
+     * writing a single record, on every Windows run that passed --log.
+     *
+     * MSVC also treats _IOLBF as full buffering, so the guarantee in the
+     * paragraph above rests on the explicit fflush after every record in
+     * runlog_vwrite and runlog_note rather than on the mode. */
+    setvbuf(L.f, NULL, _IOLBF, 4096);
     L.period_ms = period_s > 0.0 ? period_s * 1000.0 : 300000.0;
     L.t_open = runlog_now_ms();
     L.t_next = L.t_open + L.period_ms;
