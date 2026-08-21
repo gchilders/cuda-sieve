@@ -381,7 +381,7 @@ report_memory() {   # $@ = this geometry's bench output files
                      " THE CARD WAS BUSY, re-measure idle\n", lo, hi, card, nuse
           else
               printf "  memory: %.2f GB in use of %s GB, %s free   <- size from this\n",
-                     hi, card, last_free
+                     hi, card, last_free    
           if (nstage == 0 || bad || sum <= 0 || sum > hi)
               print "          setup breakdown unavailable or inconsistent" \
                     " (a memory probe failed, or the card was busy)"
@@ -550,9 +550,6 @@ if len(data) > 1:
         # sensor). Picking a winner here would be picking whichever geometry
         # was measured first and calling it an energy result.
         print("\n  no board-power samples: the energy columns are not meaningful")
-print("\n  Startup is excluded from every timing, and these are GPU-busy days:")
-print("  a real run adds the factor-base load once and whatever the host steals")
-print("  (RESULTS.md finding 56: ~6% at one competing thread per core).")
 EOF
 
 echo
