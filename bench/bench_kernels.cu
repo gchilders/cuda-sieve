@@ -1169,9 +1169,10 @@ static bool td_ab_less(const td_ab_t &x, const td_ab_t &y)
  * position CADO carried into cofactoring, i.e. its residual after its own
  * trial division. Ours must agree exactly, which is a far stronger statement
  * than agreeing on a count. */
-static int td_gate_cofactors(const char *path, uint32_t n,
-                             const int64_t *ha, const int64_t *hb,
-                             const bn_t *hcof, int side)
+static int td_gate_cofactors_part(const char *path, uint32_t n,
+                                  const int64_t *ha, const int64_t *hb,
+                                  const bn_t *hcof, int side,
+                                  uint32_t *found_out)
 {
     FILE *f = fopen(path, "r");
     char line[512];
@@ -1216,11 +1217,26 @@ static int td_gate_cofactors(const char *path, uint32_t n,
     printf("  %-30s %8u  (%u not in our survivor list)\n",
            "matched to a survivor", found, absent);
     printf("  %-30s %8u of %u   %s\n", "cofactors identical", match, found,
-           (found && match == found) ? "PASS" : "FAIL");
+           !found ? "NO OVERLAP"
+                  : (match == found ? "PASS" : "FAIL"));
+    if (found_out) *found_out += found;
     free(tab);
-    /* A gate that only prints FAIL is not a gate: every caller of this binary
-     * is a script. Report the shortfall so the process can exit nonzero. */
-    return (int)(found - match) + (found ? 0 : 1);
+    /* No overlap in one slab is not an error: a reference file covers the
+     * complete q. The slabbed pipeline accumulates found across all slabs and
+     * rejects the q if the total remains zero. Any actual mismatch is fatal. */
+    return (int)(found - match);
+}
+
+/* Whole-area/harness semantics retain the historical requirement that the
+ * reference overlap at least one survivor. */
+static int td_gate_cofactors(const char *path, uint32_t n,
+                             const int64_t *ha, const int64_t *hb,
+                             const bn_t *hcof, int side)
+{
+    uint32_t found = 0;
+    const int rc = td_gate_cofactors_part(path, n, ha, hb, hcof, side, &found);
+    if (rc) return rc;
+    return found ? 0 : 1;
 }
 
 /* ---- the stage ---------------------------------------------------------- */

@@ -535,6 +535,12 @@ static int verify_walk_cases(void)
          * 40*I`), and testing only nc < 0 would let a case that checked
          * nothing pass vacuously. */
         const int nc = verify_walk(walk_cases[w].logI, walk_cases[w].J, 24);
+        if (nc < 0) {
+            printf("[verify] FAILED at logI=%d J=%u (%s): walk verifier"
+                   " rejected the case\n",
+                   walk_cases[w].logI, walk_cases[w].J, walk_cases[w].shape);
+            return 1;
+        }
         if (nc != 24) {
             printf("[verify] FAILED at logI=%d J=%u (%s): %d of 24 primes\n",
                    walk_cases[w].logI, walk_cases[w].J, walk_cases[w].shape, nc);

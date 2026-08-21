@@ -23,6 +23,7 @@
 
 #include "bigint.cuh"
 #include "prp.cuh"
+#include "slab.h"
 
 /* ---- exact homogeneous form ------------------------------------------- */
 

@@ -40,7 +40,12 @@ static inline int slab_rows_shape_ok(int logI, uint32_t rows)
 }
 
 /* Position-space limit. 2^31 itself is a valid exclusive endpoint in a
- * uint32_t; individual positions are in [0, 2^31). */
+ * uint32_t; individual positions are in [0, 2^31).
+ *
+ * plat_t's walk increments are intentionally NOT a slab-plan constraint. They
+ * are uint64_t (plattice.cuh) because a reduced increment can exceed 2^32 even
+ * when every slab-local position is below 2^31. The planner only has to bound
+ * quantities that remain 32-bit: local x and the direct-TD reciprocal input. */
 static inline uint32_t slab_area_jmax(int logI)
 {
     if (logI < 0 || logI > 30) return 0;

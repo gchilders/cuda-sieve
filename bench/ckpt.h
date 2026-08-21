@@ -10,12 +10,15 @@
  * it. Guessing high skips special-q and loses relations with no symptom;
  * guessing low only re-sieves an overlap. See STATUS.md item 12a.
  *
- * WHAT MAKES THE SIDECAR EXACT. pipeline.cuh flushes the cofactor queue BEFORE
- * enqueuing a q that would not fit, rather than splitting it, so a flush never
- * straddles a special-q. Immediately after a flush the .part file holds the
- * complete relation set for every q processed so far and nothing partial. That
- * instant -- and under --cofactor, ONLY that instant -- is a valid resume
- * point. Recording it costs an fsync and a rename.
+ * WHAT MAKES THE SIDECAR EXACT. Without slabbing, pipeline.cuh flushes the
+ * cofactor queue before enqueuing a q that would not fit, so a flush is a
+ * whole-q boundary. With slabbing, the queue can fill between slabs of one q;
+ * that flush may write a partial q and is deliberately NOT checkpointed. A
+ * fresh cofactor run first records the empty/prefix boundary before q0, and a
+ * slab-0 flush (which still contains only earlier q) may advance it. Thus every
+ * sidecar names a whole-q prefix even though the .part may temporarily contain
+ * a later uncheckpointed tail. Resume truncates that tail and replays from the
+ * stored q. Recording a safe point costs an fsync and a rename.
  *
  * The stored byte offset is what makes a torn final line a non-problem: resume
  * truncates to it, so a partial write from a kill -9 is discarded rather than

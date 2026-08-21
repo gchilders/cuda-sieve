@@ -51,10 +51,12 @@ static void pipe_request_stop(void)
  *
  * THE PRECONDITION IS THE WHOLE DESIGN: the caller must guarantee that the
  * relation file holds a whole number of special-q. Under --cofactor that is
- * true at exactly one place -- immediately after cofq_flush -- because between
- * flushes the queue holds up to CQ_FLUSH candidates that are not in the file,
- * and recording that position as the resume point would drop every relation
- * they were going to yield, with no symptom until filtering came up short.
+ * true only at a whole-q boundary with no unflushed candidates belonging to
+ * completed work. The pipeline deliberately records such a point before q0,
+ * after a flush performed before any slab of the current q has been emitted,
+ * and after an explicit clean-stop drain. A flush after an earlier slab of the
+ * current q may leave a partial q in the file and is NOT checkpointable; resume
+ * truncates that tail to the previous whole-q checkpoint and replays the q.
  * Without --cofactor the host join loop writes each q as it finishes, so any q
  * boundary will do. */
 static int pipe_checkpoint(const poly_t *P, const bench_cfg_t *cfg, ckpt_t *ck,
@@ -144,7 +146,8 @@ typedef struct {
     uint16_t *slice, *slice_logp;
     uint32_t *sp, *srt, *sg;
     uint16_t *slp;
-    uint32_t  nslice_pow2, nsmall, nblk, nwrp;
+    uint32_t  nslice_pow2, nsmall, nblk, nwrp, nfb;
+    size_t    apply_smem;
     norm_t    N;
     uint32_t  CINIT, BOUND, tconst, nsurv;
     /* persistent across special-q */
@@ -223,6 +226,7 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
     memset(S, 0, sizeof(*S));
     S->CINIT = 4096u;
     S->BOUND = bound;
+    S->nfb = fb->n;
     /* Do not rely on every present and future loader remembering the lattice
      * transform's prime-power precondition. Loaders/builders earn this cookie
      * through fb_validate(); subsets preserve it. Refuse before the first
@@ -260,6 +264,10 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
                     smem, S->nslice_pow2);
             goto done;
         }
+        /* cudaFuncSetAttribute is a property of the kernel specialization, not
+         * of this side.  Remember the requirement here; run_pipeline configures
+         * k_apply once, after both sides are initialized, to the larger value. */
+        S->apply_smem = smem;
     }
     SIDE_INIT_CK(cudaMalloc(&S->slice, (size_t)fb->n * 2));
     SIDE_INIT_CK(cudaMalloc(&S->slice_logp, (size_t)S->nslice_pow2 * 2));
@@ -293,7 +301,6 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
     SIDE_INIT_CK(cudaMalloc(&S->d_nproj, 4));
     SIDE_INIT_CK(cudaMalloc(&S->d_nlost, 8));
     for (int k = 0; k < 4; k++) SIDE_INIT_CK(cudaEventCreate(&S->ev[k]));
-    (void)nbitword;
     rc = 0;
 
 done:
@@ -452,10 +459,7 @@ static int pipe_side_sieve_slab(const fb_t *fb, const bench_cfg_t *cfg,
     const int log_region = cfg->log_region;
     const uint32_t nregion = xmax >> log_region;
     const uint32_t nbitword = xmax >> 5;
-    const uint32_t ncell = 1u << log_region;
     const uint32_t maxsurv = 1u << 22;
-    const size_t smem = (size_t)ncell * 2 +
-                        (size_t)S->nslice_pow2 * sizeof(uint16_t);
     const int athr = cfg->apply_threads ? cfg->apply_threads : 512;
     int rc = -1;
 
@@ -471,9 +475,7 @@ static int pipe_side_sieve_slab(const fb_t *fb, const bench_cfg_t *cfg,
     SLAB_CK(cudaEventRecord(S->ev[2]));
     SLAB_CK(cudaMemset(S->d_nsurv, 0, 4));
     SLAB_CK(cudaMemset(S->survbits, 0, (size_t)nbitword * 4));
-    SLAB_CK(cudaFuncSetAttribute(k_apply<16, 1, NORM_HORNER, SLABBED>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
-    k_apply<16, 1, NORM_HORNER, SLABBED><<<nregion, athr, smem>>>(
+    k_apply<16, 1, NORM_HORNER, SLABBED><<<nregion, athr, S->apply_smem>>>(
         (const uint32_t *)d_bucket, d_cursor, cap, cfg->logI, log_region,
         S->slice_logp, S->nslice_pow2, S->N, S->CINIT, S->CINIT - S->BOUND,
         S->tconst, NULL, S->d_surv, S->d_nsurv, maxsurv, NULL, 0xFFFFFFFFu,
@@ -765,7 +767,8 @@ static int pipe_td_advance_small(pipe_td_t *C, uint32_t delta_j,
 template <bool SLABBED>
 static int pipe_td_verify(pipe_td_t *C, int side, uint32_t n, int logI,
                           uint32_t sq, const bench_cfg_t *cfg,
-                          int blocks, int threads, uint32_t j_base)
+                          int blocks, int threads, uint32_t j_base,
+                          uint32_t *gate_found)
 {
     uint32_t *d_fac = NULL, *d_faccnt = NULL;
     uint32_t *hfac = NULL, *hfn = NULL;
@@ -846,7 +849,8 @@ static int pipe_td_verify(pipe_td_t *C, int side, uint32_t n, int logI,
         rc = -1;
     }
     if (cfg->cofgate &&
-        td_gate_cofactors(cfg->cofgate, n, ha, hb, hcof, side) != 0) rc = -1;
+        td_gate_cofactors_part(cfg->cofgate, n, ha, hb, hcof, side,
+                               gate_found) != 0) rc = -1;
 
 out:
     free(hfac); free(hfn); free(hstat); free(hcof); free(ha); free(hb);
@@ -858,15 +862,14 @@ out:
 /* ---- one special-q of trial division, both sides ----------------------- */
 
 template <bool SLABBED>
-static int pipe_td_perq(pipe_td_t *C, const fb_t *fb1, const fb_t *fb0,
-                        const qlat_t *L, const bench_cfg_t *cfg,
+static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
                         const pside_t *S1, const pside_t *S0,
                         const uint32_t *d_two, uint32_t xmax,
                         uint32_t j_base, int blocks, int threads, int verify,
                         uint32_t *n_out, uint32_t *nacc_out, pipe_tm_t *tm,
-                        double *t_verify, int want_host, int accumulate_stats)
+                        double *t_verify, int want_host, int accumulate_stats,
+                        uint32_t gate_found[2])
 {
-    const fb_t *fb[2];
     const pside_t *S[2];
     const uint32_t lpb[2] = {cfg->lpb0, cfg->lpb};
     const uint32_t mfb[2] = {cfg->mfb0, cfg->mfb};
@@ -878,7 +881,6 @@ static int pipe_td_perq(pipe_td_t *C, const fb_t *fb1, const fb_t *fb0,
     const uint32_t ngroup = nbitword / TD_GROUP_W;
     const uint32_t nb = (ngroup + TD_SCAN_BLK - 1) / TD_SCAN_BLK;
 
-    fb[0] = fb0; fb[1] = fb1;
     S[0] = S0; S[1] = S1;
 
     if (!ngroup || nbitword % TD_GROUP_W) {
@@ -928,7 +930,7 @@ static int pipe_td_perq(pipe_td_t *C, const fb_t *fb1, const fb_t *fb0,
         const int e = si ? 7 : 4;
         CK(cudaMemsetAsync(C->d_pcnt[side], 0, (size_t)n * 4));
         k_resieve_scatter<4, SLABBED><<<blocks, threads>>>(
-            S[side]->plat, S[side]->primes, NULL, fb[side]->n, xmax, cfg->logI,
+            S[side]->plat, S[side]->primes, NULL, S[side]->nfb, xmax, cfg->logI,
             C->d_sum, d_two, C->d_gbase, C->d_plist[side], C->d_pcnt[side],
             PIPE_K, C->d_ovf, 6, S[side]->walk_cur);
         CK(cudaEventRecord(E[e + 1]));
@@ -996,10 +998,12 @@ static int pipe_td_perq(pipe_td_t *C, const fb_t *fb1, const fb_t *fb0,
          * same side, or the agreement is luck rather than evidence. */
         if (pipe_td_verify<SLABBED>(C, 1, n, cfg->logI,
                            cfg->sq_side == 1 ? (uint32_t)L->q : 0u,
-                           cfg, blocks, threads, j_base) ||
+                           cfg, blocks, threads, j_base,
+                           gate_found ? &gate_found[1] : NULL) ||
             pipe_td_verify<SLABBED>(C, 0, n, cfg->logI,
                            cfg->sq_side == 0 ? (uint32_t)L->q : 0u,
-                           cfg, blocks, threads, j_base)) return -1;
+                           cfg, blocks, threads, j_base,
+                           gate_found ? &gate_found[0] : NULL)) return -1;
         {
             const double vms = host_ms() - v0;
             *t_verify += vms;
@@ -1122,11 +1126,12 @@ static int pipe_finalize_outputs(FILE **frp, FILE **fcp,
     }
     if (!commit || bad) {
         /* A .part is resumable work only if a sidecar was actually written --
-         * NOT merely because a relation file was opened. Under --cofactor the
-         * file is empty until the first flush, and that flush is what writes
-         * the first checkpoint, so an unresumable .part here holds nothing.
-         * Keeping one would strand every rerun on the startup refusal, which
-         * is precisely the wedge an unattended queue cannot recover from. */
+         * NOT merely because a relation file was opened. A fresh --cofactor
+         * run seeds an initial whole-q checkpoint before q0, specifically so a
+         * later mid-q slab flush may leave an uncheckpointed tail without
+         * making the .part disposable. Resume truncates that tail to the safe
+         * sidecar prefix. If even the initial checkpoint could not be written,
+         * keeping the .part would strand every rerun on the startup refusal. */
         if (!keep_partial) {
             if (rtmp && rtmp[0]) remove(rtmp);
             if (ctmp && ctmp[0]) remove(ctmp);
@@ -1285,6 +1290,15 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     if (pipe_side_init<SLABBED>(fb1, fbs1, cfg, bound1, xmax_alloc, &S1) ||
         pipe_side_init<SLABBED>(fb0, fbs0, cfg, bound0, xmax_alloc, &S0))
         { rc = -1; goto done; }
+    {
+        const size_t apply_smem =
+            S1.apply_smem > S0.apply_smem ? S1.apply_smem : S0.apply_smem;
+        /* MaxDynamicSharedMemorySize belongs to this k_apply specialization.
+         * Setting it independently while initializing the two sides is wrong:
+         * the second side can lower the limit required by the first. */
+        PIPE_CK(cudaFuncSetAttribute(k_apply<16, 1, NORM_HORNER, SLABBED>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)apply_smem));
+    }
     VRAM_MARK("factor bases + bitmaps");
     PIPE_CK(cudaMalloc(&d_two, (size_t)nbitword_alloc * 4));
     PIPE_CK(cudaMalloc(&d_n, 4));
@@ -1382,6 +1396,15 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     if (fr) {
         memset(&ck, 0, sizeof ck);
         ckpt_fingerprint(POLY, cfg, ck.fp);
+        /* --resume starts from an existing valid sidecar; preserve the .part
+         * even if this session fails before advancing the checkpoint. */
+        if (cfg->resume) {
+            ckpt_written = 1;
+            ck.next_q = cfg->resume_q; ck.next_rho = cfg->resume_rho;
+            ck.rel_bytes = cfg->resume_rel_bytes;
+            ck.cand_bytes = cfg->resume_cand_bytes;
+            ck.nrel = cfg->resume_nrel; ck.nqdone = cfg->resume_nq;
+        }
         ck.scale = cfg->scale; ck.scale0 = cfg->scale0;
         ck.allowance = cfg->allowance; ck.allowance0 = cfg->allowance0;
         ckpt_armed = 1;
@@ -1425,6 +1448,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         double th1 = 0, th0 = 0, qwall = host_ms(), tv = 0;
         uint32_t hn = 0, nacc = 0, ncand = 0, nrel = 0;
         uint64_t side_surv1 = 0, side_surv0 = 0;
+        uint32_t cofgate_found[2] = {0, 0};
         int td_verified = 0;
         /* The host loop exists to write files. With inline cofactorisation and
          * no candidate file, nothing reads the host mirrors, so neither the
@@ -1490,6 +1514,15 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         }
         cur = &checked;
         last_q = *cur;
+
+        /* A cofactor queue can first fill in slab 1, 2, ... of q0. Such a
+         * flush contains a partial q and is not a resume point. Seed a safe
+         * empty/prefix checkpoint before any work so a crash can always keep
+         * the .part and replay this q from a whole-q boundary. */
+        if (fr && cfg->cofactor && !ckpt_written && !nqdone && Q.n == 0)
+            pipe_try_checkpoint(POLY, cfg, &ck, fr, fc, cur,
+                                base_rel + Q.nrel, base_nq + nqdone,
+                                &ckpt_written, &ckpt_warned);
 
         /* ---- clean stop ----
          *
@@ -1560,17 +1593,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             const uint32_t xmax = I * J_here;
             const uint32_t nbitword = xmax >> 5;
             float sf1 = 0, sa1 = 0, sf0 = 0, sa0 = 0;
-            float isect_s = 0;
             uint32_t hn_s = 0, nacc_s = 0;
             double td_start, tv_before, cf_start, join_start;
 
-            if (!J_here) {
-                fprintf(stderr,
-                        "  pipeline: internal slab-plan error: slab %u/%u has"
-                        " zero rows (J=%u, jmax=%u)\n",
-                        slab, slab_plan->nslab, cfg->J, slab_plan->jmax);
-                rc = -1; break;
-            }
             if (pipe_side_sieve_slab<SLABBED>(fb1, cfg, 1, xmax, j_base,
                                                d_bucket, d_cursor, cap,
                                                d_overflow, fblocks, fthreads,
@@ -1596,21 +1621,19 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             PIPE_CK(cudaEventRecord(eb));
             PIPE_CK(cudaEventSynchronize(eb));
             PIPE_CK(cudaGetLastError());
-            isect_s = time_kernel(ea, eb);
-            tis += isect_s;
+            tis += time_kernel(ea, eb);
             PIPE_CK(cudaMemcpy(&hn_s, d_n, 4, cudaMemcpyDeviceToHost));
 
             td_start = host_ms();
             tv_before = tv;
             {
                 uint32_t n = 0;
-                if (pipe_td_perq<SLABBED>(&C, fb1, fb0,
-                                          &Lq, cfg, &S1, &S0, d_two, xmax,
-                                          j_base, blocks, cfg->threads,
-                                          qi == 0 && cfg->td_verify &&
-                                              !td_verified && hn_s != 0,
+                const int do_verify = qi == 0 && cfg->td_verify && hn_s != 0 &&
+                    (!td_verified || cfg->cofgate);
+                if (pipe_td_perq<SLABBED>(&C, &Lq, cfg, &S1, &S0, d_two, xmax,
+                                          j_base, blocks, cfg->threads, do_verify,
                                           &n, &nacc_s, &tm, &tv, want_host,
-                                          !want_host)) {
+                                          !want_host, cofgate_found)) {
                     rc = -1; break;
                 }
                 if (qi == 0 && cfg->td_verify && !td_verified && hn_s != 0)
@@ -1740,6 +1763,15 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
          * individual slabs are allowed; only their sum is tested here. */
         if (!hn) {
             fprintf(stderr, "  pipeline: no survivors at this q\n");
+            rc = -1; break;
+        }
+        if (qi == 0 && cfg->cofgate &&
+            (!cofgate_found[0] || !cofgate_found[1])) {
+            fprintf(stderr,
+                    "  trial-division cofactor gate found no reference overlap"
+                    " on side%s%s across the complete q\n",
+                    cofgate_found[0] ? "" : " 0",
+                    cofgate_found[1] ? "" : " 1");
             rc = -1; break;
         }
 

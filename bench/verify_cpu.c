@@ -389,6 +389,20 @@ int verify_walk_slabs(int logI, uint32_t J, uint32_t slab_J, int nprimes)
  * I20, while the large-prime oracle above keeps their hit count modest. */
 int verify_walk_slab_cases(void)
 {
+    /* Exact reproducer from the slab review: the old uint32 plat_t stored
+     * inc_warp=111280357 instead of 4406247653 and enumerated 2431 hits where
+     * the defining congruence has 235. Keep it as a named regression. */
+    {
+        const plat_t P = pl_make(10000019u, 6000067u, 17);
+        if (P.inc_warp != 4406247653ull ||
+            check_one64_sparse(10000019u, 6000067u, 17, 65536u)) {
+            fprintf(stderr,
+                    "verify_walk_slab_cases FAILED 32-bit-overflow reproducer:"
+                    " inc_warp=%llu\n",
+                    (unsigned long long)P.inc_warp);
+            return -1;
+        }
+    }
     static const struct { int logI; uint32_t J, slabJ; } cases[] = {
         { 8,       512u,   127u },
         { 10,     1024u,   257u },
