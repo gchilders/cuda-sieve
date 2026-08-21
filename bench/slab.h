@@ -22,6 +22,23 @@ typedef struct {
     int      enabled;    /* nslab > 1                                  */
 } slab_plan_t;
 
+/* Trial division ranks the survivor bitmap in groups of 8 x 32-bit words =
+ * 256 positions. Every slab, including the final tail, must contain a whole
+ * number of those groups. For logI >= 8 every complete j row already does. */
+#define SLAB_TD_GROUP_POS 256u
+
+static inline uint32_t slab_row_quantum(int logI)
+{
+    if (logI < 0 || logI > 30) return 0;
+    return logI >= 8 ? 1u : (1u << (8 - logI));
+}
+
+static inline int slab_rows_shape_ok(int logI, uint32_t rows)
+{
+    const uint32_t q = slab_row_quantum(logI);
+    return q && rows && (rows % q) == 0;
+}
+
 /* Position-space limit. 2^31 itself is a valid exclusive endpoint in a
  * uint32_t; individual positions are in [0, 2^31). */
 static inline uint32_t slab_area_jmax(int logI)
@@ -57,19 +74,24 @@ static inline uint32_t slab_td_jmax(int logI, uint32_t max_prime)
 static inline int slab_make_plan(int logI, uint32_t J, uint32_t max_small_prime,
                                  uint32_t forced_j, slab_plan_t *P)
 {
-    uint32_t amax, tmax, jmax;
+    uint32_t amax, tmax, jmax, quantum;
     uint64_t n;
     if (!P || !J) return -1;
+    quantum = slab_row_quantum(logI);
+    if (!quantum || !slab_rows_shape_ok(logI, J)) return -1;
     amax = slab_area_jmax(logI);
     tmax = slab_td_jmax(logI, max_small_prime);
     if (!amax || !tmax) return -1;
     jmax = amax < tmax ? amax : tmax;
     if (forced_j) {
-        if (forced_j > jmax) return -1;
-        jmax = forced_j;
+        const uint32_t requested = forced_j < J ? forced_j : J;
+        if (requested > jmax || !slab_rows_shape_ok(logI, requested)) return -1;
+        jmax = requested;
+    } else {
+        jmax -= jmax % quantum;
     }
     if (jmax > J) jmax = J;
-    if (!jmax) return -1;
+    if (!jmax || !slab_rows_shape_ok(logI, jmax)) return -1;
     n = ((uint64_t)J + jmax - 1u) / jmax;
     if (n > 0xffffffffull) return -1;
     P->jmax = jmax;

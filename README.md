@@ -10,9 +10,11 @@ GPUs. It is research software: the correctness gates pass, but the current
 limitations and unfinished experiments in [`bench/STATUS.md`](bench/STATUS.md)
 are part of its release status.
 
-The current production path is limited to a `2^31`-position sieve area,
-`lpb <= 64`, `mfb <= 128`, and at most three large primes per side. These are
-checked limits, not suggested settings. Cofactor arithmetic width and
+The production path keeps each local sieve slab at or below `2^31` positions
+but automatically j-slabs larger rectangles; with the default geometry this
+means I17 -> 4 slabs, I18 -> 16, I19 -> 64, and I20 -> 256. `lpb <= 64`,
+`mfb <= 128`, and at most three large primes per side remain checked limits.
+Cofactor arithmetic width and
 factorisation method are both chosen **per side, automatically**, from that
 side's `mfb` and `lpb`: 3 limbs (96-bit residuals) or 4 (128-bit), and
 Pollard-Brent rho for a two-large-prime side or ECM for a three-large-prime

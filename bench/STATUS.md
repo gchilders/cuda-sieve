@@ -81,59 +81,58 @@ of the volunteer host population, so this is worth costing before a wider
 deployment rather than discovering per-file; the guards in `boinc_support.cpp`
 should not be read as evidence that the rest is close.
 
-## Current size limits, and what lifting them entails
+## Current size limits and j-slabbing
 
-This is a design assessment; the cofactor-width half of it was built on
-2026-08-18 and is marked as such below. The production path still refuses
-inputs outside the limits below; there is no unsafe override.
+The cofactor-width work landed on 2026-08-18 and the production pipeline now
+also supports rectangles larger than `2^31` positions by **j-slabbing** them.
+There is still no unsafe override of the local arithmetic bounds.
 
 | quantity | current limit | immediate reason |
 |---|---:|---|
-| sieve area `I*J` | `2^31` positions | the exclusive end `xmax` and the hot plattice walks use `uint32_t` |
+| local sieve slab | `2^31` positions | bucket/bitmap/rank positions remain `uint32_t` |
+| full pipeline rectangle | default geometries through `logI 20` | host scheduler splits `J` into safe slabs |
 | `lpb` | 64 | a resulting prime is stored in one `uint64_t` (was 32 until 2026-08-17) |
 | `mfb` | 128 | the cofactor queue narrows residuals to `mz<4>`; 96 in a `CF_LMAX=3` build |
 | large primes per side | 3 | `ceil(mfb/lpb) <= 3` is checked before the run |
 
-The area and cofactor limits are independent even though an A=32 job such as
-AS276 needs both lifted (`I=2^16`, `J=2^16`, `lpba=35`, `mfba=101`).
+With default `J=2^(logI-1)` and `bkthresh=I`, I17 uses 4 slabs, I18 16,
+I19 64, and I20 256. `--slab-j N` can force a smaller slab for regression or
+memory tuning. The actual largest direct-tested prime also constrains slab
+height, so raising `bkthresh` can make the planner choose more slabs.
 
-### A=32: representation is the first blocker, memory is the second
+### Why the lattice walk itself is wide
 
-Every valid position in a `2^32`-position rectangle still fits in a
-`uint32_t`; the value that does not fit is the exclusive endpoint `xmax =
-2^32`. The current fill and resieve loops compare a 32-bit walk position with
-that endpoint, and their next-position arithmetic wraps at the top of the
-range. Merely deleting the front-end check therefore makes an empty or
-incorrect sieve.
+A local sieve position still fits in 31 bits, but the Franke-Kleinjung reduced
+**increment** need not fit in 32. For realistic factor-base primes,
+`(j0 << logI) - mi0` or `(j1 << logI) + i1` can exceed `2^32` even on I15/I16.
+The earlier `uint32_t plat_t` therefore had a latent wrap: it could create
+spurious sieve hits even before whole-area slabbing was needed. `plat_t` now
+stores 64-bit increments; the bounded local walk terminates instead of wrapping
+when its exact next hit leaves the 32-bit coordinate, and slab continuation is
+carried exactly in 64 bits between slab origins.
 
-Two implementation levels are plausible:
+This widening costs 8 additional bytes per uploaded full-FB entry. Slabbed
+runs additionally keep two 64-bit continuation values per entry (16 bytes per
+entry total); unslabbed runs allocate no continuation arrays.
 
-1. **Whole-area, large-memory path.** Keep stored positions and bucket-local
-   offsets 32-bit, add an explicit full-range/end-of-walk representation, and
-   avoid promoting every operation in the hot walk to 64 bits. This is the
-   smaller change, but the complete allocation is only comfortable on a card
-   with substantially more than 16 GB.
-2. **Slabbed path.** Process A=32 as two or more A<=31 slabs, reusing the
-   bucket array and survivor bitmaps. A correct version needs persistent
-   per-prime walk positions, global row offsets in norm and small-sieve
-   calculations, slab-local rank/resieve state, and global coordinates in the
-   candidate queue. This is the portable solution for a 12 GB card and the
-   more invasive pipeline change.
+### Larger rectangles: memory is now the main constraint
 
-The measured memory model is linear in area for the two large allocations:
+The bucket array and survivor bitmaps are allocated for **one slab** and reused,
+so a full I17/I18/... rectangle no longer requires a monolithic `2^33`/`2^35`
+position workspace. Area-proportional work still scales with the full rectangle,
+and every slab re-enters the factor-base walk, so the number of slabs remains a
+runtime consideration even though it no longer multiplies peak bucket memory.
 
-| area | bucket array | three survivor bitmaps | subtotal |
+The measured pre-slabbing memory model for the two large allocations remains a
+useful per-local-area reference:
+
+| local area | bucket array | three survivor bitmaps | subtotal |
 |---:|---:|---:|---:|
 | `2^31` | 5.53 GB | 0.81 GB | 6.34 GB |
 | `2^32` | 11.06 GB | 1.61 GB | 12.67 GB |
 
-Fixed allocations plus the CUDA/driver footprint put the full A=32 projection
-at roughly **14–16 GB**. Work that touches positions or bucket records is
-also approximately linear in area: A=32 is about 2x A=31, and 8x the A=29
-C183 rectangle, per special-q. Relations per q rise too, so q/s alone is not
-a useful comparison. A stateful slab implementation should add only launch
-and boundary bookkeeping beyond that intrinsic work; this has not been built
-or measured.
+Only the `2^31` row is a production slab size now. The `2^32` row is retained
+as the old monolithic projection, not as an allocation the slabbed path makes.
 
 ### LPB and MFB are separate widths
 

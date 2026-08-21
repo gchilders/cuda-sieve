@@ -109,11 +109,26 @@ you either state them or let them derive.
   on any real target.
 - Side 1 is the algebraic side and carries the special-q. Side 0 is rational.
 
-### Current hard size limits
+### Current hard size limits and j-slabbing
 
-The production binary currently refuses:
+The production binary keeps **each local sieve slab at or below `2^31`
+positions**, but the full pipeline rectangle may be larger. Rectangles above
+that limit are split automatically along `j`; the hot bucket/bitmap/TD
+positions remain slab-local while exact global `j` is restored where norms,
+primitivity, and relation coordinates need it. With the default `J=2^(logI-1)`
+and default `bkthresh=I`, the plans are I17 -> 4 slabs, I18 -> 16, I19 -> 64,
+and I20 -> 256. Geometry at or below `2^31` uses one slab.
 
-- a sieve rectangle with more than `2^31` positions;
+`--slab-j N` is a regression/tuning override that caps a slab at `N` rows.
+The parser rejects shapes that cannot contain whole TD rank groups, and the
+runtime planner also enforces the `2^31` local-position bound and the arithmetic
+bound implied by the **actual largest direct-tested small prime**. Raising
+`--bkthresh` can therefore reduce the automatically chosen slab height. A
+forced height that violates either bound is rejected rather than used
+unsafely.
+
+The remaining representation limits are:
+
 - `lpbr` or `lpba` above 64;
 - `mfbr` or `mfba` above 128 (above 96 in a `CF_LMAX=3` build — see
   [Cofactorisation](#cofactorisation-width-and-method-both-per-side) below);
@@ -121,9 +136,24 @@ The production binary currently refuses:
 - `lim^2 <= 2^lpb` on either side, which makes the "prime by size" test in the
   splitter unsound (it binds around `lpb 55` at an `alim` of 240M).
 
-These are representation limits, not tuning advice, and there is no supported
-override. In particular, an A=32 job (`--logI 16 --J 65536`) would wrap the
-current 32-bit exclusive position endpoint and is therefore refused.
+These are checked limits, not tuning advice, and there is no unsafe override.
+The non-pipeline harness still requires its whole `I*J` area to fit in `2^31`.
+
+The p-lattice **increments** themselves are 64-bit even when a slab-local
+position is 32-bit. This is required for correctness: realistic large factor-
+base primes can produce a reduced `(j << logI) +/- i` increment above `2^32`.
+The local walk saturates when the next exact hit lies outside the 32-bit local
+coordinate; the slabbed walk carries an exact 64-bit continuation between
+slabs. This avoids the latent uint32 wrap that older monolithic walks could
+turn into spurious sieve hits.
+
+`--no-td-verify` disables the dense TD reconstruction gate. In the pipeline the
+gate normally runs once on the first slab of the first q; in the standalone TD
+harness it disables that harness reconstruction check as well. It saves a
+transient host/device allocation and is intended for production after the
+correctness gates are established. `--cofgate` requires TD verification, so
+`--cofgate` and `--no-td-verify` are rejected together during argument
+validation.
 
 **`lpb` above 32 is supported as of 2026-08-17** — an NFS@Home C194 asks for
 `lpba 33` with `mfba 95`, and that runs today. What it did *not* require is any
@@ -280,11 +310,10 @@ and **rho rational / ECM algebraic** on its own, which is the measured optimum.
 `--maxbits` should track `--logI`.
 
 That is `A = 31`. NFS@Home sieve this job at `I16e -J 16`, which in our
-coordinates is `2^17 x 2^15` — `A = 32`, still refused (finding 65's rule:
-our rectangle = `2^(J_bits+1) x 2^(I_bits-1)`). So a like-for-like throughput
-comparison against their geometry is not available until the area blocker
-moves; `--logI 17 --J 16384` gives the same area with their full `i` range if
-you want the other nesting.
+coordinates is `2^17 x 2^15` — `A = 32` (finding 65's rule: our rectangle =
+`2^(J_bits+1) x 2^(I_bits-1)`). The production pipeline now runs that geometry
+through j-slabbing rather than refusing it; `--logI 17 --J 16384` gives the
+same total area with their full `i` range if you want the other nesting.
 
 Note the ceiling that actually binds first is **not** the width. `CF_MAXFAC`
 caps a split at 3 large primes, so `mfb <= 3 * lpb` regardless — and at
@@ -311,8 +340,12 @@ numbers precisely when you most want them.
 Two knobs move device memory and they are not interchangeable
 (`bench/RESULTS.md` finding 64):
 
-    VRAM ~ bucket(larger side, nearly flat in lim) + 25.4 B x (entries_r + entries_a)
-           + 3 x area/8 + ~1.45 GB fixed     where entries ~ pi(lim)
+    VRAM ~ bucket(larger side, nearly flat in lim) + 33.4 B x (entries_r + entries_a)
+           + 3 x local_area/8 + ~1.45 GB fixed     where entries ~ pi(lim)
+
+A slabbed run additionally carries two 64-bit walk-continuation values per
+full-FB entry (16 B/entry). The 33.4 B coefficient is 8 B above the historical
+measurements below because `plat_t` now stores overflow-safe 64-bit increments.
 
 - **Area is the expensive axis.** On a C194 the bucket array is 1.46 GB at
   `2^29`, 2.91 GB at `2^30` and 5.20 GB at `2^31`. It is linear in `J` at fixed
@@ -321,12 +354,15 @@ Two knobs move device memory and they are not interchangeable
   why 2.91 → 5.20 is 1.79×, not 2×.
 - **Lim is the cheap one.** Doubling both lims doubles the factor base but
   moves the bucket array only ~5%, because records go as `Σ1/p ~ ln ln p`. It
-  costs ~25 bytes per entry, summed over both sides.
+  costs ~33 bytes per entry, summed over both sides, before slab-only walk state.
 - The bucket array is sized by the **larger** side, not the sum — the two sides
   share one allocation and run sequentially — so raising the smaller side's lim
   is nearly free until it overtakes the other.
-- The two effects are equal at **area ≈ 6.7 × lim**; below that a job is
-  factor-base dominated, above it bucket dominated.
+- With the widened walk representation, the same first-order model moves the
+  unslabbed crossover from the historical ~6.7 x lim to about **8.8 x lim**;
+  slab-only continuation state moves it higher still (about **13 x lim**).
+  Treat these as sizing estimates until fresh GPU measurements replace the
+  pre-wide-walk data below.
 
 Measured device-in-use totals for a C194 (`rlim 160M, alim 240M`): **3.63 GB**
 at `2^15 x 2^14`, 5.32 GB at the `2^15 x 2^15` square, **4.98 GB** at the

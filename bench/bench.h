@@ -234,6 +234,11 @@ int  fb_restrict(fb_t *fb, uint32_t bkthresh, uint32_t fb_bound);
  * Call BEFORE fb_restrict, which compacts fb in place. */
 int  fb_split_small(const fb_t *fb, uint32_t bkthresh, fb_t *small);
 
+/* Largest PRIME that actually reaches the direct-test table. Proper prime
+ * powers live in the small FB too, but td_fill_small deliberately skips them.
+ * Shared by the production pipeline and the CPU bkthresh integration gate. */
+uint32_t fb_max_td_prime(const fb_t *fb);
+
 /* ---- q-lattice -------------------------------------------------------- */
 
 /* Reduced basis of the q-lattice: a0*b1 - a1*b0 = +/- q. */
@@ -341,6 +346,7 @@ float norm_target_host(const norm_t *N, int32_t i, uint32_t j);
  * number of primes checked; aborts on mismatch. */
 int  verify_walk(int logI, uint32_t J, int nprimes);
 int  verify_walk_slabs(int logI, uint32_t J, uint32_t slab_J, int nprimes);
+int  verify_walk_slab_cases(void);
 
 /* Count updates the walk produces for the given FB, single-threaded.
  * This is the ground truth the GPU fill must reproduce exactly. */

@@ -88,14 +88,30 @@ static inline void td_magic_build(uint32_t m, uint32_t *magic, uint32_t *sh)
     }
 }
 
-#if defined(__CUDACC__)
-
-__device__ __forceinline__ uint32_t td_mod(uint32_t w, uint32_t m,
-                                           uint32_t magic, uint32_t sh)
+/* One implementation for both the CPU arithmetic gate and the device hot
+ * loop. The host half spells out umulhi with a 64-bit product; the CUDA device
+ * half uses the single __umulhi instruction. Keeping the quotient/remainder
+ * expression here prevents the regression test from validating a copied
+ * formula instead of the code the kernel actually executes. */
+#ifdef __CUDACC__
+#define TD_MOD_HD static __host__ __device__ __forceinline__
+#else
+#define TD_MOD_HD static inline
+#endif
+TD_MOD_HD uint32_t td_mod_magic(uint32_t w, uint32_t m,
+                                uint32_t magic, uint32_t sh)
 {
-    uint32_t q = __umulhi(w, magic) >> sh;
+    uint32_t q;
+#ifdef __CUDA_ARCH__
+    q = __umulhi(w, magic) >> sh;
+#else
+    q = (uint32_t)(((uint64_t)w * magic) >> 32) >> sh;
+#endif
     return w - q * m;
 }
+#undef TD_MOD_HD
+
+#if defined(__CUDACC__)
 
 /* Move the direct-test congruence origin forward by delta_j global rows. This
  * is deliberately a separate tiny kernel: it performs one 64-bit modulo per
@@ -361,7 +377,7 @@ __global__ void k_resieve_scatter(const plat_t *__restrict plat,
                                   uint32_t K,
                                   unsigned long long *__restrict noverflow,
                                   int log_gran,
-                                  const uint32_t *__restrict walk_cur)
+                                  const uint64_t *__restrict walk_cur)
 {
     const uint32_t Imask = (1u << logI) - 1;
     const uint32_t NONE = 0xFFFFFFFFu;      /* local x < 2^31, cannot collide */
@@ -371,13 +387,41 @@ __global__ void k_resieve_scatter(const plat_t *__restrict plat,
     for (uint64_t kk = bench_grid_thread_x(); kk < n; kk += stride) {
         const uint32_t k = (uint32_t)kk;
         plat_t P = plat[k];
-        if (P.inc_warp == 0xFFFFFFFFu) continue;
+        if (P.inc_warp == PL_INVALID) continue;
         if (ispow && ispow[k]) continue;
         uint32_t p = primes[k];
-        uint32_t x;
-        if constexpr (SLABBED) x = walk_cur[k];
-        else                   x = pl_first(&P, logI);
 
+        if constexpr (SLABBED) {
+            uint64_t x = walk_cur[k];
+            while (x < xmax) {
+                uint32_t xs[UNROLL], hit[UNROLL];
+
+                #pragma unroll
+                for (int u = 0; u < UNROLL; u++) {
+                    if (x < xmax) { xs[u] = (uint32_t)x; x = pl_next64(x, &P, Imask); }
+                    else xs[u] = NONE;
+                }
+                #pragma unroll
+                for (int u = 0; u < UNROLL; u++) {
+                    uint32_t sb = xs[u] >> log_gran;
+                    hit[u] = (xs[u] == NONE) ? 0u
+                                             : ((summary[sb >> 5] >> (sb & 31u)) & 1u);
+                }
+                #pragma unroll
+                for (int u = 0; u < UNROLL; u++) {
+                    if (!hit[u]) continue;
+                    uint32_t xv = xs[u];
+                    if (!((bits[xv >> 5] >> (xv & 31u)) & 1u)) continue;
+                    uint32_t idx = td_rank(bits, gbase, xv);
+                    uint32_t slot = atomicAdd(&pcnt[idx], 1u);
+                    if (slot < K) plist[(size_t)idx * K + slot] = p;
+                    else ovf++;
+                }
+            }
+            continue;
+        }
+
+        uint32_t x = pl_first(&P, logI);
         while (x < xmax) {
             uint32_t xs[UNROLL], hit[UNROLL];
 
@@ -563,7 +607,7 @@ __global__ void k_td(const int64_t *__restrict A, const int64_t *__restrict B,
                     }
                     if (tile[e].magic) {
                         uint32_t w = tile[e].rt * jp + hi;
-                        if (td_mod(w, m, tile[e].magic, tile[e].sh) != tile[e].cst)
+                        if (td_mod_magic(w, m, tile[e].magic, tile[e].sh) != tile[e].cst)
                             continue;
                     }
                     /* magic == 0 means m == 1: the row condition was the whole

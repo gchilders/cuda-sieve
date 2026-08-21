@@ -83,7 +83,7 @@ __global__ void k_transform(const uint32_t *__restrict primes,
                             int64_t a0, int64_t a1, int64_t b0, int64_t b1,
                             uint32_t *__restrict nproj,
                             unsigned long long *__restrict nlost,
-                            uint32_t *__restrict walk_cur)
+                            uint64_t *__restrict walk_cur)
 {
     const uint64_t stride = bench_grid_stride_x();
     for (uint64_t kk = bench_grid_thread_x(); kk < n; kk += stride) {
@@ -91,16 +91,16 @@ __global__ void k_transform(const uint32_t *__restrict primes,
         const uint32_t q = primes[k];
         uint32_t rt, g, m = pl_transform_enc(q, roots[k], a0, a1, b0, b1, &rt, &g);
         if (g > 1) {                         /* rows only: emit an empty walk */
-            plat_t P; P.inc_warp = 0xFFFFFFFFu; P.inc_step = PL_VERTICAL;
+            plat_t P; P.inc_warp = PL_INVALID; P.inc_step = PL_VERTICAL;
             P.bound_warp = 0; P.bound_step = 0;
             out[k] = P;
-            if constexpr (SLABBED) walk_cur[k] = 0xffffffffu;
+            if constexpr (SLABBED) walk_cur[k] = UINT64_MAX;
             atomicAdd(nproj, 1u);
             atomicAdd(nlost, (unsigned long long)(J / g) * ((1u << logI) / m));
         } else {
             const plat_t P = pl_make(m, rt, logI);
             out[k] = P;
-            if constexpr (SLABBED) walk_cur[k] = pl_first(&P, logI);
+            if constexpr (SLABBED) walk_cur[k] = pl_first64(&P, logI);
         }
     }
 }
@@ -117,8 +117,8 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
                               uint32_t *__restrict cursor,
                               uint8_t *__restrict out, uint32_t cap,
                               uint32_t *__restrict overflow,
-                              const uint32_t *__restrict walk_cur,
-                              uint32_t *__restrict walk_next)
+                              const uint64_t *__restrict walk_cur,
+                              uint64_t *__restrict walk_next)
 {
     const uint32_t Imask = (1u << logI) - 1;
     const uint32_t offmask = (1u << log_region) - 1;
@@ -127,7 +127,7 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
     for (uint64_t kk = bench_grid_thread_x(); kk < n; kk += stride) {
         const uint32_t k = (uint32_t)kk;
         plat_t P = plat[k];
-        if (P.inc_warp == 0xFFFFFFFFu) {
+        if (P.inc_warp == PL_INVALID) {
             if constexpr (SLABBED) walk_next[k] = walk_cur[k];
             continue;
         }
@@ -135,24 +135,41 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
          * kernel turns back into log p (and what resieve would use to recover
          * the prime itself), exactly as CADO's shorthint does */
         const uint32_t sl = slice[k];
-        uint32_t x;
-        if constexpr (SLABBED) x = walk_cur[k];
-        else                   x = pl_first(&P, logI);
-        for (; x < xmax; x = pl_next(x, &P, Imask)) {
-            uint32_t b = x >> log_region;
-            uint32_t slot = atomicAdd(&cursor[b], 1u);
-            if (slot >= cap) { atomicAdd(overflow, 1u); continue; }
-            size_t at = ((size_t)b * cap + slot) * RECBYTES;
-            if (RECBYTES == 2) {
-                *(uint16_t *)(out + at) = (uint16_t)(x & offmask);
-            } else if (RECBYTES == 4) {
-                /* 16-bit offset + 16-bit slice hint (CADO shorthint shape) */
-                *(uint32_t *)(out + at) = (x & offmask) | (sl << 16);
-            } else {
-                *(uint64_t *)(out + at) = (uint64_t)(x & offmask) | ((uint64_t)sl << 32);
+        if constexpr (SLABBED) {
+            uint64_t x = walk_cur[k];
+            for (; x < xmax; x = pl_next64(x, &P, Imask)) {
+                const uint32_t xl = (uint32_t)x;
+                const uint32_t b = xl >> log_region;
+                const uint32_t slot = atomicAdd(&cursor[b], 1u);
+                if (slot >= cap) { atomicAdd(overflow, 1u); continue; }
+                const size_t at = ((size_t)b * cap + slot) * RECBYTES;
+                if (RECBYTES == 2) {
+                    *(uint16_t *)(out + at) = (uint16_t)(xl & offmask);
+                } else if (RECBYTES == 4) {
+                    *(uint32_t *)(out + at) = (xl & offmask) | (sl << 16);
+                } else {
+                    *(uint64_t *)(out + at) = (uint64_t)(xl & offmask) | ((uint64_t)sl << 32);
+                }
+            }
+            /* x is the exact first hit at/after the slab end. It can be more
+             * than 2^32 beyond the next origin, so continuation state is wide. */
+            walk_next[k] = x - xmax;
+        } else {
+            uint32_t x = pl_first(&P, logI);
+            for (; x < xmax; x = pl_next(x, &P, Imask)) {
+                const uint32_t b = x >> log_region;
+                const uint32_t slot = atomicAdd(&cursor[b], 1u);
+                if (slot >= cap) { atomicAdd(overflow, 1u); continue; }
+                const size_t at = ((size_t)b * cap + slot) * RECBYTES;
+                if (RECBYTES == 2) {
+                    *(uint16_t *)(out + at) = (uint16_t)(x & offmask);
+                } else if (RECBYTES == 4) {
+                    *(uint32_t *)(out + at) = (x & offmask) | (sl << 16);
+                } else {
+                    *(uint64_t *)(out + at) = (uint64_t)(x & offmask) | ((uint64_t)sl << 32);
+                }
             }
         }
-        if constexpr (SLABBED) walk_next[k] = x - xmax;
     }
 }
 
@@ -488,7 +505,7 @@ void k_fill_l1(const plat_t *__restrict plat,
 
     const uint64_t stride = bench_grid_product_u64(gridDim.x, nth);
     uint64_t k = bench_grid_product_u64(blockIdx.x, nth) + tid;
-    plat_t P; P.inc_warp = 0xFFFFFFFFu;
+    plat_t P; P.inc_warp = PL_INVALID;
     uint32_t x = 0;
     int active = 0;
 
@@ -496,7 +513,7 @@ void k_fill_l1(const plat_t *__restrict plat,
         if (!active) {                       /* pick up the next prime */
             while (k < n) {
                 P = plat[(uint32_t)k];
-                if (P.inc_warp != 0xFFFFFFFFu) { x = pl_first(&P, logI); active = (x < xmax); }
+                if (P.inc_warp != PL_INVALID) { x = pl_first(&P, logI); active = (x < xmax); }
                 k += stride;
                 if (active) break;
             }
@@ -735,20 +752,24 @@ __device__ __forceinline__ uint32_t bgcd(uint32_t u, uint32_t v)
  */
 /* One summary bit per `wper` words of the full bitmap. wper == 2 reproduces
  * k_build_summary's 1-bit-per-64-positions table. Whole output words are built
- * by one thread, so unlike k_build_summary this needs no atomics. */
+ * by one thread, including a zero-padded partial final word, so unlike
+ * k_build_summary this needs neither atomics nor a cudaMemset between slabs. */
 __global__ void k_build_summary_g(const uint32_t *__restrict bits,
                                   uint32_t nword, uint32_t wper,
                                   uint32_t *__restrict summary)
 {
-    const uint32_t nsw = nword / (wper * 32);
+    const uint32_t span = wper * 32u;
+    const uint32_t nsw = (nword + span - 1u) / span;
     const uint64_t stride = bench_grid_stride_x();
     for (uint64_t ww = bench_grid_thread_x(); ww < nsw; ww += stride) {
         const uint32_t w = (uint32_t)ww;
         uint32_t out = 0;
         for (uint32_t b = 0; b < 32; b++) {
             uint32_t o = 0;
-            const uint32_t base = (w * 32 + b) * wper;
-            for (uint32_t k = 0; k < wper; k++) o |= bits[base + k];
+            const uint32_t base = (w * 32u + b) * wper;
+            if (base >= nword) break;
+            for (uint32_t k = 0; k < wper && base + k < nword; k++)
+                o |= bits[base + k];
             if (o) out |= 1u << b;
         }
         summary[w] = out;
@@ -784,7 +805,7 @@ __global__ void k_resieve_rewalk(const plat_t *__restrict plat,
     for (uint64_t kk = bench_grid_thread_x(); kk < n; kk += stride) {
         const uint32_t k = (uint32_t)kk;
         plat_t P = plat[k];
-        if (P.inc_warp == 0xFFFFFFFFu) continue;
+        if (P.inc_warp == PL_INVALID) continue;
         uint32_t p = primes[k];
         for (uint32_t x = pl_first(&P, logI); x < xmax; x = pl_next(x, &P, Imask)) {
             probes++;
@@ -876,7 +897,7 @@ __global__ void k_fill_segmented(const plat_t *__restrict plat,
          kk < kend; kk += stride) {
         const uint32_t k = (uint32_t)kk;
         plat_t P = plat[k];
-        if (P.inc_warp == 0xFFFFFFFFu) continue;
+        if (P.inc_warp == PL_INVALID) continue;
         const uint32_t soff = k - kbeg;          /* < 65536 by construction */
         for (uint32_t x = pl_first(&P, logI); x < xmax; x = pl_next(x, &P, Imask)) {
             uint32_t b = x >> log_region;
@@ -1695,6 +1716,77 @@ done:
     return rc;
 }
 
+typedef struct {
+    uint32_t w, m, magic, sh, ref;
+} td_mod_case_t;
+
+__global__ void k_verify_td_mod_cases(const td_mod_case_t *__restrict v,
+                                      uint32_t n, uint32_t *__restrict first_bad)
+{
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t kk = bench_grid_thread_x(); kk < n; kk += stride) {
+        const uint32_t k = (uint32_t)kk;
+        const td_mod_case_t c = v[k];
+        if (td_mod_magic(c.w, c.m, c.magic, c.sh) != c.ref)
+            atomicMin(first_bad, k);
+    }
+}
+
+/* Device half of the reciprocal gate. slabtest calls the same td_mod_magic()
+ * source on the CPU; this gate additionally executes the __umulhi branch used
+ * by k_td so a CUDA-codegen/device-only regression cannot hide behind the
+ * host implementation. It runs only under --verify. */
+static int verify_td_mod_device(void)
+{
+    enum { NCASE = 4096 };
+    td_mod_case_t *h = NULL, *d = NULL;
+    uint32_t *d_bad = NULL, bad = UINT32_MAX, seed = 0x7f4a7c15u;
+    int rc = -1;
+
+    h = (td_mod_case_t *)malloc(sizeof(*h) * NCASE);
+    if (!h) return -1;
+    for (uint32_t k = 0; k < NCASE; k++) {
+        uint32_t m, magic, sh, w;
+        if (k < 20) {
+            static const uint32_t edge[] = {
+                2,3,4,5,7,8,15,16,31,32,63,64,127,128,255,256,
+                1023,32767,131071,1048575
+            };
+            m = edge[k];
+        } else {
+            seed = seed * 1664525u + 1013904223u;
+            m = 2u + seed % 1048574u;
+        }
+        td_magic_build(m, &magic, &sh);
+        seed = seed * 1664525u + 1013904223u;
+        w = (k & 3u) == 0 ? 0x7fffffffu : (seed & 0x7fffffffu);
+        h[k].w = w; h[k].m = m; h[k].magic = magic; h[k].sh = sh;
+        h[k].ref = w % m;
+    }
+#define MODDEV_CK(x) do { if (CUDA_CHECKED(x)) goto out; } while (0)
+    MODDEV_CK(cudaMalloc(&d, sizeof(*h) * NCASE));
+    MODDEV_CK(cudaMalloc(&d_bad, sizeof(*d_bad)));
+    MODDEV_CK(cudaMemcpy(d, h, sizeof(*h) * NCASE, cudaMemcpyHostToDevice));
+    MODDEV_CK(cudaMemcpy(d_bad, &bad, sizeof(bad), cudaMemcpyHostToDevice));
+    k_verify_td_mod_cases<<<16, 256>>>(d, NCASE, d_bad);
+    MODDEV_CK(cudaDeviceSynchronize());
+    MODDEV_CK(cudaGetLastError());
+    MODDEV_CK(cudaMemcpy(&bad, d_bad, sizeof(bad), cudaMemcpyDeviceToHost));
+    if (bad != UINT32_MAX) {
+        const td_mod_case_t c = h[bad];
+        fprintf(stderr,
+                "[verify] device td_mod mismatch case %u: w=%u m=%u"
+                " magic=%u sh=%u ref=%u\n",
+                bad, c.w, c.m, c.magic, c.sh, c.ref);
+        goto out;
+    }
+    rc = 0;
+out:
+    cudaFree(d); cudaFree(d_bad); free(h);
+#undef MODDEV_CK
+    return rc;
+}
+
 extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                          const poly_t *POLY, const bench_cfg_t *cfg)
 {
@@ -1743,6 +1835,11 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     CK(cudaMemGetInfo(&freeB, &totalB));
     printf("  device memory: %.2f GB free of %.2f GB\n",
            freeB / 1073741824.0, totalB / 1073741824.0);
+    if (cfg->verify) {
+        printf("[verify] direct-TD reciprocal on device (__umulhi path)...\n");
+        if (verify_td_mod_device()) return -1;
+        printf("[verify] OK: 4096 device reciprocal cases through w=0x7fffffff\n");
+    }
 
     int td_failed = 0;      /* a failed gate must reach the exit status */
     dev_bufs D; memset(&D, 0, sizeof(D));

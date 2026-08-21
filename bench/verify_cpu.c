@@ -214,17 +214,62 @@ int verify_walk(int logI, uint32_t J, int nprimes)
     return (int)checked;
 }
 
-/* Forced-slab equivalence gate. The monolithic walk is valid here because the
- * test geometries are deliberately small; it is the oracle for the continuation
- * state used by I17+ where a monolithic uint32 position no longer exists. */
+/* Independent wide-coordinate oracle for p > I. There is then at most one
+ * lattice hit in each j row, so enumerate the defining congruence directly and
+ * compare it with pl_next64(). This does not share either the reduced-increment
+ * construction or the slab-continuation recurrence with the walk under test. */
+static int check_one64_sparse(uint32_t p, uint32_t r, int logI, uint32_t J)
+{
+    const uint32_t I = 1u << logI, Imask = I - 1u;
+    const int64_t half = (int64_t)I / 2;
+    const uint64_t xmax = (uint64_t)I * J;
+    const plat_t P = pl_make(p, r, logI);
+    uint64_t walk = (uint64_t)1 << (logI - 1);   /* (0,0) */
+
+    if (p <= I) return -1;
+    for (uint32_t j = 0; j < J; j++) {
+        const int64_t base = (int64_t)(((uint64_t)r * j) % p);
+        int64_t i = INT64_MAX;
+        if (base < half) i = base;
+        else if (base - (int64_t)p >= -half) i = base - (int64_t)p;
+        if (i != INT64_MAX) {
+            const uint64_t want = (uint64_t)(i + half) + ((uint64_t)j << logI);
+            if (walk != want) {
+                fprintf(stderr,
+                        "verify_walk64 MISMATCH p=%u r=%u logI=%d J=%u j=%u:"
+                        " walk=%llu ref=%llu\n",
+                        p, r, logI, J, j,
+                        (unsigned long long)walk,
+                        (unsigned long long)want);
+                return -1;
+            }
+            walk = pl_next64(walk, &P, Imask);
+        }
+    }
+    if (walk < xmax) {
+        fprintf(stderr,
+                "verify_walk64 SHORT p=%u r=%u logI=%d J=%u:"
+                " next=%llu xmax=%llu\n",
+                p, r, logI, J,
+                (unsigned long long)walk, (unsigned long long)xmax);
+        return -1;
+    }
+    return 0;
+}
+
+/* Forced-slab equivalence gate. The oracle is an exact 64-bit uninterrupted
+ * walk, not the legacy uint32 walk. Large factor-base primes are deliberate:
+ * realistic reduced increments can exceed 2^32 even at I15/I16, which was the
+ * hole in the first version of this gate. */
 int verify_walk_slabs(int logI, uint32_t J, uint32_t slab_J, int nprimes)
 {
     const uint32_t I = 1u << logI, Imask = I - 1u;
-    const uint32_t xmax = I * J;
-    uint32_t p, checked = 0;
-    if (!slab_J || slab_J >= J || (uint64_t)I * J > 0x80000000ull) return -1;
+    const uint64_t xmax = (uint64_t)I * J;
+    uint32_t p = 250000013u, checked = 0;
+    int saw_wide_increment = 0;
+    if (!slab_J || slab_J > J || nprimes <= 0) return -1;
 
-    for (p = I + 1; checked < (uint32_t)nprimes && p < 40u * I; p += 2) {
+    for (; checked < (uint32_t)nprimes && p < 250100000u; p += 2) {
         uint32_t d, isprime = 1;
         for (d = 3; (uint64_t)d * d <= p; d += 2)
             if (p % d == 0) { isprime = 0; break; }
@@ -232,39 +277,140 @@ int verify_walk_slabs(int logI, uint32_t J, uint32_t slab_J, int nprimes)
         for (uint32_t k = 0; k < 5; k++) {
             const uint32_t r = (uint32_t)(((uint64_t)p * k) / 5);
             const plat_t P = pl_make(p, r, logI);
-            uint32_t mono = pl_first(&P, logI);
-            uint32_t cur = mono;
-            uint64_t base_x = 0;
+            if (checked == 0 && check_one64_sparse(p, r, logI, J)) return -1;
+            pl_basis_t B = { p, 0u, r, 1u };
+            uint64_t want_warp, want_step;
+            uint64_t mono, cur, base_x = 0;
+
+            /* Independently spell the widening boundary after reduction. This
+             * catches a future regression that stores (j << logI) in 32 bits
+             * even though both continuation paths consume the same plat_t. */
+            pl_reduce(&B, I);
+            want_warp = ((uint64_t)B.j0 << logI) - B.mi0;
+            want_step = (B.i1 >> logI) ? PL_VERTICAL
+                                       : ((uint64_t)B.j1 << logI) + B.i1;
+            if (want_warp > UINT32_MAX ||
+                (want_step != PL_VERTICAL && want_step > UINT32_MAX))
+                saw_wide_increment = 1;
+            if (P.inc_warp != want_warp || P.inc_step != want_step) {
+                fprintf(stderr,
+                        "verify_walk_slabs PLAT WIDTH p=%u r=%u logI=%d:"
+                        " got %llu/%llu want %llu/%llu\n",
+                        p, r, logI,
+                        (unsigned long long)P.inc_warp,
+                        (unsigned long long)P.inc_step,
+                        (unsigned long long)want_warp,
+                        (unsigned long long)want_step);
+                return -1;
+            }
+
+            mono = pl_first64(&P, logI);
+            cur = mono;
             for (uint32_t jb = 0; jb < J; jb += slab_J) {
                 const uint32_t rows = J - jb < slab_J ? J - jb : slab_J;
-                const uint32_t sx = I * rows;
-                uint32_t x = cur;
+                const uint64_t sx = (uint64_t)I * rows;
+                uint64_t x = cur;
                 while (x < sx) {
                     const uint64_t gx = base_x + x;
                     if (mono >= xmax || gx != mono) {
                         fprintf(stderr,
-                            "verify_walk_slabs MISMATCH p=%u r=%u logI=%d J=%u"
-                            " slabJ=%u: slab=%llu mono=%u\n",
-                            p, r, logI, J, slab_J,
-                            (unsigned long long)gx, mono);
+                                "verify_walk_slabs MISMATCH p=%u r=%u logI=%d"
+                                " J=%u slabJ=%u: slab=%llu mono=%llu\n",
+                                p, r, logI, J, slab_J,
+                                (unsigned long long)gx,
+                                (unsigned long long)mono);
                         return -1;
                     }
-                    mono = pl_next(mono, &P, Imask);
-                    x = pl_next(x, &P, Imask);
+                    mono = pl_next64(mono, &P, Imask);
+                    x = pl_next64(x, &P, Imask);
+                }
+                if (base_x + x != mono) {
+                    fprintf(stderr,
+                            "verify_walk_slabs STATE p=%u r=%u logI=%d J=%u"
+                            " slabJ=%u: base+x=%llu mono=%llu\n",
+                            p, r, logI, J, slab_J,
+                            (unsigned long long)(base_x + x),
+                            (unsigned long long)mono);
+                    return -1;
                 }
                 cur = x - sx;
                 base_x += sx;
             }
-            if (mono < xmax) {
+            if (mono < xmax || base_x != xmax || base_x + cur != mono) {
                 fprintf(stderr,
-                    "verify_walk_slabs SHORT p=%u r=%u logI=%d J=%u slabJ=%u"
-                    " next=%u xmax=%u\n", p, r, logI, J, slab_J, mono, xmax);
+                        "verify_walk_slabs SHORT p=%u r=%u logI=%d J=%u"
+                        " slabJ=%u next=%llu xmax=%llu\n",
+                        p, r, logI, J, slab_J,
+                        (unsigned long long)mono,
+                        (unsigned long long)xmax);
                 return -1;
+            }
+
+            /* Where the whole rectangle fits the legacy local coordinate,
+             * also prove the bounded uint32 walk has exactly the same in-range
+             * hits and merely saturates when the true next hit is wider. */
+            if (xmax <= 0x80000000ull) {
+                uint32_t x32 = pl_first(&P, logI);
+                uint64_t x64 = pl_first64(&P, logI);
+                while (x64 < xmax) {
+                    if ((uint64_t)x32 != x64) {
+                        fprintf(stderr,
+                                "verify_walk_slabs U32 p=%u r=%u logI=%d:"
+                                " x32=%u x64=%llu\n", p, r, logI, x32,
+                                (unsigned long long)x64);
+                        return -1;
+                    }
+                    x32 = pl_next(x32, &P, Imask);
+                    x64 = pl_next64(x64, &P, Imask);
+                }
+                if ((uint64_t)x32 < xmax) {
+                    fprintf(stderr,
+                            "verify_walk_slabs U32 did not terminate p=%u r=%u"
+                            " logI=%d x32=%u xmax=%llu\n", p, r, logI, x32,
+                            (unsigned long long)xmax);
+                    return -1;
+                }
             }
         }
         checked++;
     }
+    if (!saw_wide_increment) {
+        fprintf(stderr,
+                "verify_walk_slabs did not exercise a >32-bit lattice increment"
+                " at logI=%d J=%u slabJ=%u\n", logI, J, slab_J);
+        return -1;
+    }
     return (int)checked;
+}
+
+/* Shared forced-slab cases for both --verify-only and slabtest. Keeping the
+ * table here prevents the two gates from silently drifting apart. The final
+ * three cases exercise native I17+, including hundreds of slab transitions at
+ * I20, while the large-prime oracle above keeps their hit count modest. */
+int verify_walk_slab_cases(void)
+{
+    static const struct { int logI; uint32_t J, slabJ; } cases[] = {
+        { 8,       512u,   127u },
+        { 10,     1024u,   257u },
+        { 15,    16384u,  4095u },
+        { 16,    32768u,  8191u },
+        { 17,    65536u, 16384u },
+        { 18,   131072u,  8192u },
+        { 20,   524288u,  2048u }
+    };
+    const unsigned ncase = sizeof(cases) / sizeof(cases[0]);
+    for (unsigned k = 0; k < ncase; k++) {
+        const int checked = verify_walk_slabs(cases[k].logI, cases[k].J,
+                                              cases[k].slabJ, 8);
+        if (checked != 8) {
+            fprintf(stderr,
+                    "verify_walk_slab_cases FAILED case %u logI=%d J=%u"
+                    " slabJ=%u: checked %d/8 primes\n",
+                    k, cases[k].logI, cases[k].J, cases[k].slabJ, checked);
+            return -1;
+        }
+    }
+    return (int)ncase;
 }
 
 /* Ground truth for the apply kernel: replay one region's bucket records into a

@@ -200,6 +200,7 @@ CPP_OBJS = $(CPP_SRCS:.cpp=.o)
 # runlog.o is deliberately NOT in C_SRCS: fbtest links C_OBJS, and it is a
 # CPU-only gate that must keep building on a machine with no driver library.
 OBJS     = $(CU_OBJS) $(C_OBJS) $(CPP_OBJS) runlog.o fbgen_lib.o
+TEST_OBJS = slabtest.o
 
 # Switching HAVE_BOINC on an existing tree must rebuild boinc_support.o; make
 # otherwise sees the same source timestamp and quietly reuses the no-op object.
@@ -242,7 +243,7 @@ $(shell { [ -f $(DEFS_STAMP) ] && [ "$$(cat $(DEFS_STAMP))" = '$(DEFS)' ]; } || 
 # without going through $(OBJS). Those two escaped the stamp, so
 # `make DEFS=... dumpcmp` reported "up to date" and linked a binary built
 # without the define -- the exact hole the stamp exists to close.
-$(OBJS): $(DEFS_STAMP) $(CF_LMAX_STAMP)
+$(OBJS) $(TEST_OBJS): $(DEFS_STAMP) $(CF_LMAX_STAMP)
 
 GIT_STAMP := .git.stamp
 GIT_RAW  := $(shell git -C . describe --always --abbrev=8 2>/dev/null)
@@ -322,7 +323,7 @@ mkcofbatch: mkcofbatch.c $(DEFS_STAMP) $(CF_LMAX_STAMP)
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
--include $(OBJS:.o=.d)
+-include $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
 
 clean:
 	rm -f bench fbtest fbgen sqgentest dumpcmp mkcofbatch ckpttest stoptest slabtest *.o *.d $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP) $(GIT_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP)
@@ -372,8 +373,9 @@ slabtest: slabtest.o $(C_OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ -lm
 
 # CPU-only arithmetic/scheduling gate for j-slabbing.  It covers automatic and
-# forced plans, partial tails, congruence phase translation, and the exact
-# w<2^31 range used by the existing reciprocal in the hot direct-TD loop.
+# forced plans, partial tails, actual bkthresh -> small-FB -> pmax wiring,
+# congruence phase translation, and the exact w<2^31 range used by the existing
+# reciprocal in the hot direct-TD loop.
 slabcheck: slabtest
 	./slabtest
 

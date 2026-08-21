@@ -5,13 +5,6 @@
 #include <stdio.h>
 #include <stdint.h>
 
-static uint32_t mod_magic_host(uint32_t w, uint32_t m, uint32_t magic,
-                               uint32_t sh)
-{
-    const uint32_t q = (uint32_t)(((uint64_t)w * magic) >> 32) >> sh;
-    return w - q * m;
-}
-
 static int check_plan(void)
 {
     slab_plan_t P = {0,0,0};
@@ -62,6 +55,72 @@ static int check_plan(void)
         fprintf(stderr, "slabtest: unsafe forced slab height was accepted\n");
         return -1;
     }
+    /* At logI=6 a TD rank group spans four j rows. Reject a forced height
+     * that would leave partial groups, and accept an aligned one. */
+    if (!slab_make_plan(6, 64u, 63u, 3u, &P) ||
+        slab_make_plan(6, 64u, 63u, 4u, &P)) {
+        fprintf(stderr, "slabtest: slab row-quantum validation failed\n");
+        return -1;
+    }
+    return 0;
+}
+
+static int check_bkthresh_integration(void)
+{
+    /* Exercise the same path as --pipeline after --bkthresh is resolved:
+     * validate FB -> split the line/direct tier -> find its largest prime ->
+     * build the slab plan. 131072 is also included as a proper power to make
+     * sure powers retained by fb_split_small() do not inflate the direct-TD
+     * prime bound. */
+    uint32_t primes[] = { 2u, 3u, 5u, 131071u, 131072u, 131101u, 262139u };
+    uint32_t roots[]  = { 1u, 1u, 1u,      1u,      1u,      1u,      1u };
+    uint8_t  ispow[]  = { 0u, 0u, 0u,      0u,      1u,      0u,      0u };
+    fb_t fb = {}, small = {};
+    slab_plan_t P = {0,0,0};
+    static const struct {
+        uint32_t bkthresh, want_pmax, want_jmax, want_nslab;
+    } v[] = {
+        { 131072u, 131071u, 16384u, 4u },
+        { 262144u, 262139u,  8192u, 8u },
+    };
+
+    fb.n = (uint32_t)(sizeof(primes) / sizeof(primes[0]));
+    fb.primes = primes;
+    fb.roots = roots;
+    fb.ispow = ispow;
+    if (fb_validate(&fb, FB_VALIDATE_EXTERNAL_PRIME_POWERS, NULL)) {
+        fprintf(stderr, "slabtest: synthetic FB validation failed\n");
+        return -1;
+    }
+
+    for (unsigned k = 0; k < sizeof(v)/sizeof(v[0]); k++) {
+        uint32_t pmax;
+        if (fb_split_small(&fb, v[k].bkthresh, &small)) {
+            fprintf(stderr, "slabtest: fb_split_small failed for bkthresh=%u\n",
+                    v[k].bkthresh);
+            return -1;
+        }
+        pmax = fb_max_td_prime(&small);
+        if (pmax != v[k].want_pmax ||
+            slab_make_plan(17, 65536u, pmax, 0u, &P) ||
+            P.jmax != v[k].want_jmax || P.nslab != v[k].want_nslab) {
+            fprintf(stderr,
+                    "slabtest: bkthresh=%u integration got pmax=%u jmax=%u"
+                    " n=%u; want %u/%u/%u\n",
+                    v[k].bkthresh, pmax, P.jmax, P.nslab,
+                    v[k].want_pmax, v[k].want_jmax, v[k].want_nslab);
+            fb_free(&small);
+            return -1;
+        }
+        fb_free(&small);
+    }
+    /* The same raised threshold must reject a forced slab that would have
+     * been safe at the default threshold. */
+    if (!slab_make_plan(17, 65536u, 262139u, 16384u, &P)) {
+        fprintf(stderr,
+                "slabtest: raised-bkthresh unsafe forced slab was accepted\n");
+        return -1;
+    }
     return 0;
 }
 
@@ -101,19 +160,10 @@ static int check_phase(void)
 
 static int check_walk_continuation(void)
 {
-    static const struct { int logI; uint32_t J, slabJ; } v[] = {
-        {8, 512u, 127u}, {9, 512u, 129u},
-        {10, 1024u, 257u}, {12, 2048u, 511u}
-    };
-    for (unsigned k = 0; k < sizeof(v)/sizeof(v[0]); k++) {
-        const int checked = verify_walk_slabs(v[k].logI, v[k].J,
-                                               v[k].slabJ, 24);
-        if (checked != 24) {
-            fprintf(stderr,
-                    "slabtest: walk continuation case %u checked %d/24 primes\n",
-                    k, checked);
-            return -1;
-        }
+    const int ncase = verify_walk_slab_cases();
+    if (ncase < 0) {
+        fprintf(stderr, "slabtest: shared walk continuation cases failed\n");
+        return -1;
     }
     return 0;
 }
@@ -144,11 +194,11 @@ static int check_magic(void)
                 seed = seed * 1664525u + 1013904223u;
                 w = seed & 0x7fffffffu;
             }
-            if (mod_magic_host(w, m, magic, sh) != w % m) {
+            if (td_mod_magic(w, m, magic, sh) != w % m) {
                 fprintf(stderr,
                         "slabtest: magic mismatch m=%u w=%u magic=%u sh=%u"
                         " got=%u ref=%u\n", m, w, magic, sh,
-                        mod_magic_host(w, m, magic, sh), w % m);
+                        td_mod_magic(w, m, magic, sh), w % m);
                 return -1;
             }
         }
@@ -158,8 +208,8 @@ static int check_magic(void)
 
 int main(void)
 {
-    if (check_plan() || check_phase() || check_magic() ||
-        check_walk_continuation()) return 1;
-    printf("slabtest: plan, phase, reciprocal, and continued-walk gates OK\n");
+    if (check_plan() || check_bkthresh_integration() || check_phase() ||
+        check_magic() || check_walk_continuation()) return 1;
+    printf("slabtest: plan, bkthresh wiring, phase, reciprocal, and continued-walk gates OK\n");
     return 0;
 }

@@ -224,8 +224,8 @@ static void usage(void)
 "                   both norms rebuild to 1, every prime within its lpb\n"
 "  --cofgate FILE   gate the cofactors against CADO's own (a b cof0 cof1);\n"
 "                   under --pipeline this runs in the first-q validation\n"
-"  --no-td-verify   skip the first-q dense TD reconstruction gate. Saves peak\n"
-"                   memory in production; incompatible with --cofgate\n"
+"  --no-td-verify   skip dense TD reconstruction (first q in pipeline; TD\n"
+"                   harness otherwise). Saves peak memory; incompatible with --cofgate\n"
 "  --verbose-q      print a line per special-q instead of a band summary\n"
 "\n"
 "RUNTIME\n"
@@ -544,28 +544,17 @@ static int verify_walk_cases(void)
     printf("[verify] OK: %u cases x 24 primes x 5 roots enumerated"
            " identically, 4:1 through 1:2\n", nwalk);
 
-    /* Force awkward slab boundaries while the whole rectangle still fits the
-     * legacy 31-bit oracle.  The continued local walk, translated back to
-     * global x, must be bit-for-bit the same sequence as one uninterrupted
-     * pl_first/pl_next walk.  Prime-ish heights guarantee a short tail slab. */
-    static const struct { int logI; uint32_t J, slabJ; } slab_cases[] = {
-        { 8,  512, 127 },
-        { 9,  512, 129 },
-        { 10,1024, 257 },
-        { 12,2048, 511 },
-    };
-    const unsigned nslab = sizeof slab_cases / sizeof slab_cases[0];
-    for (unsigned w = 0; w < nslab; w++) {
-        const int nc = verify_walk_slabs(slab_cases[w].logI, slab_cases[w].J,
-                                         slab_cases[w].slabJ, 24);
-        if (nc != 24) {
-            printf("[verify] SLAB FAILED at logI=%d J=%u slabJ=%u: %d of 24 primes\n",
-                   slab_cases[w].logI, slab_cases[w].J, slab_cases[w].slabJ, nc);
+    /* Shared with slabtest: one table, one 64-bit oracle, and large-prime
+     * cases that exercise increments beyond 2^32 and native I17+ geometry. */
+    {
+        const int nslab = verify_walk_slab_cases();
+        if (nslab < 0) {
+            printf("[verify] SLAB FAILED\n");
             return 1;
         }
+        printf("[verify] OK: %d forced/native slab walk cases, including"
+               " partial tails and I17+\n", nslab);
     }
-    printf("[verify] OK: %u forced-slab walk cases, including partial tails\n",
-           nslab);
     return 0;
 }
 
@@ -1257,6 +1246,11 @@ static int bench_main_impl(int argc, char **argv)
      * assignment after polynomial loading meant --logI 17 was validated with
      * logI 17 but the stale I15 J=16384, then silently changed to 65536 later. */
     if (!J_set) cfg.J = 1u << (cfg.logI - 1);
+    if (cfg.cofgate && !cfg.td_verify) {
+        fprintf(stderr, "--cofgate requires TD verification; remove"
+                        " --no-td-verify\n");
+        return 1;
+    }
     if (!maxbits_set) maxbits = cfg.logI;
     cfg.fb_maxbits = maxbits;      /* the resume fingerprint reads it from cfg */
     if (maxbits < 1 || maxbits > 31) {
@@ -1281,6 +1275,29 @@ static int bench_main_impl(int argc, char **argv)
     if (cfg.log_region < 1 || cfg.log_region > 30) {
         fprintf(stderr, "--region must be in [1,30] (got %d)\n", cfg.log_region);
         return 1;
+    }
+    if (cfg.pipeline) {
+        const uint32_t effective_slab_j =
+            cfg.slab_j && cfg.slab_j < cfg.J ? cfg.slab_j : cfg.J;
+        const uint32_t area_jmax = slab_area_jmax(cfg.logI);
+        if (!slab_rows_shape_ok(cfg.logI, cfg.J)) {
+            fprintf(stderr,
+                    "pipeline geometry logI=%d J=%u is not aligned to the"
+                    " %u-position TD rank group\n",
+                    cfg.logI, cfg.J, (unsigned)SLAB_TD_GROUP_POS);
+            return 1;
+        }
+        if (cfg.slab_j &&
+            (!effective_slab_j || effective_slab_j > area_jmax ||
+             !slab_rows_shape_ok(cfg.logI, effective_slab_j))) {
+            fprintf(stderr,
+                    "--slab-j %u is not a valid local slab shape for logI=%d:"
+                    " effective rows=%u, max rows by 2^31 area=%u, TD rank"
+                    " groups are %u positions\n",
+                    cfg.slab_j, cfg.logI, effective_slab_j, area_jmax,
+                    (unsigned)SLAB_TD_GROUP_POS);
+            return 1;
+        }
     }
     /* An out-of-range probe silently ALIASES another cell -- --probe 16384,0
      * lands on the real (-16384,1) -- so it would certify a coordinate nobody
@@ -1786,7 +1803,7 @@ static int bench_main_impl(int argc, char **argv)
         static const char *pipeline_only[] = {
             "--target-rels", "--lambda0", "--lambda1", "--sq-side",
             "--restart", "--stop-file", "--log", "--log-every",
-            "--slab-j", "--no-td-verify", NULL
+            "--slab-j", NULL
         };
         int nbad = 0;
         for (int i = 1; i < argc; i++)

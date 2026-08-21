@@ -139,7 +139,7 @@ typedef struct {
     plat_t   *plat;
     /* Present only in the slabbed specialization. fill advances walk_cur into
      * walk_next; resieve replays walk_cur, then the host swaps the pointers. */
-    uint32_t *walk_cur, *walk_next;
+    uint64_t *walk_cur, *walk_next;
     uint32_t *survbits;
     uint16_t *slice, *slice_logp;
     uint32_t *sp, *srt, *sg;
@@ -238,8 +238,8 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
     SIDE_INIT_CK(cudaMalloc(&S->roots,  (size_t)fb->n * 4));
     SIDE_INIT_CK(cudaMalloc(&S->plat,   (size_t)fb->n * sizeof(plat_t)));
     if constexpr (SLABBED) {
-        SIDE_INIT_CK(cudaMalloc(&S->walk_cur,  (size_t)fb->n * 4));
-        SIDE_INIT_CK(cudaMalloc(&S->walk_next, (size_t)fb->n * 4));
+        SIDE_INIT_CK(cudaMalloc(&S->walk_cur,  (size_t)fb->n * sizeof(uint64_t)));
+        SIDE_INIT_CK(cudaMalloc(&S->walk_next, (size_t)fb->n * sizeof(uint64_t)));
     }
     SIDE_INIT_CK(cudaMalloc(&S->survbits, (size_t)nbitword * 4));
     SIDE_INIT_CK(cudaMemcpy(S->primes, fb->primes, (size_t)fb->n * 4,
@@ -858,8 +858,7 @@ out:
 /* ---- one special-q of trial division, both sides ----------------------- */
 
 template <bool SLABBED>
-static int pipe_td_perq(pipe_td_t *C, const fb_t *fb1, const fb_t *fbs1,
-                        const fb_t *fb0, const fb_t *fbs0,
+static int pipe_td_perq(pipe_td_t *C, const fb_t *fb1, const fb_t *fb0,
                         const qlat_t *L, const bench_cfg_t *cfg,
                         const pside_t *S1, const pside_t *S0,
                         const uint32_t *d_two, uint32_t xmax,
@@ -878,11 +877,9 @@ static int pipe_td_perq(pipe_td_t *C, const fb_t *fb1, const fb_t *fbs1,
     const uint32_t nbitword = xmax >> 5;
     const uint32_t ngroup = nbitword / TD_GROUP_W;
     const uint32_t nb = (ngroup + TD_SCAN_BLK - 1) / TD_SCAN_BLK;
-    double h0;
 
     fb[0] = fb0; fb[1] = fb1;
     S[0] = S0; S[1] = S1;
-    (void)fbs0; (void)fbs1;
 
     if (!ngroup || nbitword % TD_GROUP_W) {
         fprintf(stderr,
@@ -907,8 +904,9 @@ static int pipe_td_perq(pipe_td_t *C, const fb_t *fb1, const fb_t *fbs1,
         n = base + cnt;
     }
     *n_out = n; *nacc_out = 0;
-    /* A partial tail slab can legitimately contain no survivors.  That is not
-     * a failed q; simply leave its candidate count at zero and continue. */
+    /* A slab can legitimately contain no survivors, especially a short tail.
+     * Preserve the original q-level invariant after all slabs have run rather
+     * than turning an empty individual slab into a failed q. */
     if (!n) return 0;
     if (pipe_td_grow(C, n)) return -1;
 
@@ -1002,8 +1000,11 @@ static int pipe_td_perq(pipe_td_t *C, const fb_t *fb1, const fb_t *fbs1,
             pipe_td_verify<SLABBED>(C, 0, n, cfg->logI,
                            cfg->sq_side == 0 ? (uint32_t)L->q : 0u,
                            cfg, blocks, threads, j_base)) return -1;
-        *t_verify += host_ms() - v0;
-        printf("  --- validation slab took %.1f ms ---\n\n", host_ms() - v0);
+        {
+            const double vms = host_ms() - v0;
+            *t_verify += vms;
+            printf("  --- validation took %.1f ms ---\n\n", vms);
+        }
     }
 
     /* ---- phase 3: record the joint candidates only ---- */
@@ -1424,6 +1425,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         double th1 = 0, th0 = 0, qwall = host_ms(), tv = 0;
         uint32_t hn = 0, nacc = 0, ncand = 0, nrel = 0;
         uint64_t side_surv1 = 0, side_surv0 = 0;
+        int td_verified = 0;
         /* The host loop exists to write files. With inline cofactorisation and
          * no candidate file, nothing reads the host mirrors, so neither the
          * copies nor the loop have to happen.
@@ -1562,7 +1564,13 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             uint32_t hn_s = 0, nacc_s = 0;
             double td_start, tv_before, cf_start, join_start;
 
-            if (!J_here) { rc = -1; break; }
+            if (!J_here) {
+                fprintf(stderr,
+                        "  pipeline: internal slab-plan error: slab %u/%u has"
+                        " zero rows (J=%u, jmax=%u)\n",
+                        slab, slab_plan->nslab, cfg->J, slab_plan->jmax);
+                rc = -1; break;
+            }
             if (pipe_side_sieve_slab<SLABBED>(fb1, cfg, 1, xmax, j_base,
                                                d_bucket, d_cursor, cap,
                                                d_overflow, fblocks, fthreads,
@@ -1596,14 +1604,17 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             tv_before = tv;
             {
                 uint32_t n = 0;
-                if (pipe_td_perq<SLABBED>(&C, fb1, fbs1, fb0, fbs0,
+                if (pipe_td_perq<SLABBED>(&C, fb1, fb0,
                                           &Lq, cfg, &S1, &S0, d_two, xmax,
                                           j_base, blocks, cfg->threads,
-                                          qi == 0 && cfg->td_verify,
+                                          qi == 0 && cfg->td_verify &&
+                                              !td_verified && hn_s != 0,
                                           &n, &nacc_s, &tm, &tv, want_host,
                                           !want_host)) {
                     rc = -1; break;
                 }
+                if (qi == 0 && cfg->td_verify && !td_verified && hn_s != 0)
+                    td_verified = 1;
                 if (n != hn_s) {
                     fprintf(stderr,
                             "  q=%llu slab %u: intersect counted %u survivors,"
@@ -1724,6 +1735,13 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             }
         }
         if (rc) break;
+        /* This is the original pre-slabbing invariant: an entire special-q
+         * with no two-sided survivors is suspicious and remains fatal. Empty
+         * individual slabs are allowed; only their sum is tested here. */
+        if (!hn) {
+            fprintf(stderr, "  pipeline: no survivors at this q\n");
+            rc = -1; break;
+        }
 
         if (cfg->verbose_q) {
             printf("  side 1: transform %.3f + fill %.3f + apply %.3f = %7.3f ms,"
@@ -2386,26 +2404,14 @@ done:
     return rc;
 }
 
-/* Largest PRIME that actually reaches the direct-test table. Proper prime
- * powers live in the small FB too, but td_fill_small deliberately skips them;
- * including one here would only make the slab planner needlessly pessimistic. */
-static uint32_t pipe_max_td_prime(const fb_t *fb)
-{
-    uint32_t pmax = 0;
-    if (!fb) return 0;
-    for (uint32_t k = 0; k < fb->n; k++)
-        if (!FB_ISPOW(fb, k) && fb->primes[k] > pmax) pmax = fb->primes[k];
-    return pmax;
-}
-
 extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                             const fb_t *fb0, const fb_t *fbs0,
                             const qsel_t *qlist, uint32_t nq, sqgen_t *qgen,
                             const poly_t *POLY, const bench_cfg_t *cfg)
 {
     slab_plan_t plan;
-    uint32_t pmax1 = pipe_max_td_prime(fbs1);
-    uint32_t pmax0 = pipe_max_td_prime(fbs0);
+    uint32_t pmax1 = fb_max_td_prime(fbs1);
+    uint32_t pmax0 = fb_max_td_prime(fbs0);
     uint32_t pmax = pmax1 > pmax0 ? pmax1 : pmax0;
 
     if (slab_make_plan(cfg->logI, cfg->J, pmax, cfg->slab_j, &plan)) {
@@ -2415,12 +2421,6 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                 cfg->logI, cfg->J, pmax, cfg->slab_j);
         return -1;
     }
-    if (cfg->cofgate && !cfg->td_verify) {
-        fprintf(stderr, "  --cofgate requires TD verification; remove"
-                        " --no-td-verify\n");
-        return -1;
-    }
-
     if (plan.enabled) {
         printf("  j-slabbing: %u slab%s, up to %u rows/slab"
                " (<=2^31 local positions)\n",

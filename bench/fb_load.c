@@ -522,3 +522,17 @@ nomem:
     errno = ENOMEM;
     return -1;
 }
+
+/* Largest PRIME that actually reaches the direct-test table. Proper prime
+ * powers live in the small FB too, but td_fill_small deliberately skips them;
+ * including one here would make slab planning needlessly pessimistic. Keeping
+ * this next to fb_split_small makes the bkthresh -> small-FB -> pmax path one
+ * shared implementation for production and the CPU integration gate. */
+uint32_t fb_max_td_prime(const fb_t *fb)
+{
+    uint32_t pmax = 0, k;
+    if (!fb) return 0;
+    for (k = 0; k < fb->n; k++)
+        if (!FB_ISPOW(fb, k) && fb->primes[k] > pmax) pmax = fb->primes[k];
+    return pmax;
+}
