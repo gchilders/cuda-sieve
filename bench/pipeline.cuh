@@ -1039,12 +1039,12 @@ static int pipe_td_perq(pipe_td_t *C, const fb_t *fb1, const fb_t *fb0,
         CK(cudaGetLastError());
     }
 
-    h0 = host_ms();
+    const double rb0 = host_ms();
     /* `want_host` is false under inline cofactorisation with no candidate file:
      * the queue has already taken everything it needs straight from device
      * memory, so the ~618 bytes per candidate this used to move existed only to
      * be counted. k_cand_stats counts them in place. */
-    if (!want_host) { tm->readback += host_ms() - h0; return 0; }
+    if (!want_host) { tm->readback += host_ms() - rb0; return 0; }
     CK(cudaMemcpy(C->h_ca, C->d_ca, (size_t)nacc * 8, cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(C->h_cb, C->d_cb, (size_t)nacc * 8, cudaMemcpyDeviceToHost));
     for (int s = 0; s < 2; s++) {
@@ -1057,7 +1057,7 @@ static int pipe_td_perq(pipe_td_t *C, const fb_t *fb1, const fb_t *fb0,
         CK(cudaMemcpy(C->h_cfac[s], C->d_cfac[s], (size_t)nacc * TD_FMAX * 4,
                       cudaMemcpyDeviceToHost));
     }
-    tm->readback += host_ms() - h0;
+    tm->readback += host_ms() - rb0;
     return 0;
 }
 
