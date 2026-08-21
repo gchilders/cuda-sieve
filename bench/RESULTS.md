@@ -4271,3 +4271,147 @@ refused, and an explicit small `--ecm-b1` synthesised an illegal `B2 = 30*B1`.
 Fixed with explicit `_set` flags rather than value tests. All three were caught
 by `cofcheck.sh`, which is what that suite is for.
 
+
+## Finding 71 — item 0's verdict band, run at last: 2.99x time and 2.94x whole-box relations per joule, with EVERY term measured on this box in one session
+
+**Date:** 2026-08-20, RTX 5070 **undervolted** (finding 61's 950 mV curve, so not
+comparable to findings below 61 without the 6.7% correction) against 16
+`gnfs-lasieve4I15e` workers on the 9800X3D. c183 `oracle/input.job`, `I15e`
+geometry (`--logI 15 --J 16384` / GGNFS default `J = I/2`), algebraic special-q,
+`--cofactor`. Both sides ran the **same q bands** — same first q, width
+`10000 * ln(q)` so each covers ~10,000 (q, rho) pairs — and neither ran while
+the other was on the box.
+
+This is the run item 0 was chartered to produce. Every prior end-to-end number
+was a proxy job or a single q interval, and **every term in the comparison was
+previously derived from something measured on a different day**: the CPU's
+throughput from finding 43's `N_eff` 10.24, both sides' power from item 6's
+constants. None of them is derived here.
+
+### The verdict, at q=190M — the band where the two sievers do identical work
+
+| | GPU, undervolted | CPU, 16 workers | **advantage** |
+|---|---:|---:|---:|
+| (q, rho) pairs | 10,000 | 10,054 | |
+| wall ms/pair | 100.95 | 301.47 | **2.99x** |
+| unique relations/pair | 41.98 | 41.95 | 1.001 |
+| factor base | 7,605,406 entries | 7,605,406 entries | identical |
+| whole box, at the wall | 240 W | 236 W | |
+| J/pair | 24.23 | 71.15 | 2.94x |
+| **J per unique relation** | **0.5771** | **1.6958** | **2.94x** |
+
+**This is the number to quote: 2.99x time, 2.94x energy.** q=190M is above
+`alim` (134.2M), so GGNFS *cannot* truncate its base — the "Trimmed cached aFB"
+line is absent from all 16 worker logs — and both sievers run the identical
+7.6M-entry base. Yield then agrees to **0.07%** (41.98 against 41.95), which is
+a tighter matched control than finding 57's 0.8% and leaves no room for a
+yield-accounting dispute in either direction.
+
+### The q=50M band, and why its bigger margin is not the answer
+
+| | GPU | CPU | ratio |
+|---|---:|---:|---:|
+| wall ms/pair | 105.99 | 271.95 | 2.57x |
+| unique relations/pair | 57.43 | 46.44 | 1.237 |
+| factor base | 7,605,406 | **3,001,128** | 2.53x |
+| J per unique relation | 0.4429 | 1.3819 | **3.12x** |
+
+**Do not quote the 3.12x.** GGNFS trims to `FB_bound 49999999` and keeps 39% of
+the base; we sieve all of it. Our resulting 24% yield surplus is not extra
+unique output — per finding 67 those relations are *duplicates* that a
+truncating siever re-finds later at their own larger q. The 50M row measures a
+convention difference, not a hardware one.
+
+It is worth having anyway, because it shows the convention costs us: at 50M we
+pay 5% more wall than at 190M for a base GGNFS gets to cut by 61%.
+
+### The GPU's margin GROWS with q, and the mechanism is the factor base
+
+| | q=50M | q=190M | change |
+|---|---:|---:|---:|
+| GPU ms/pair | 105.99 | 100.95 | **−4.8%** |
+| CPU ms/pair | 271.95 | 301.47 | **+10.9%** |
+| time advantage | 2.57x | 2.99x | |
+
+GGNFS slows with q because its FB trim stops helping — 3.0M entries at 50M, all
+7.6M at 190M. We sieve 7.6M at both, so our cost barely moves. **The GPU's
+advantage is smallest exactly where the CPU gets its discount**, and a real job
+spends most of its q range above the point where that discount is small.
+
+Note also that GGNFS absorbed **2.53x the entries for 10.9% more wall** — the
+CPU side independently reproducing finding 67's `sum 1/p ~ ln ln p` model,
+which until now had only been measured on our own bucket array.
+
+### Both sides' power, measured at the wall in this session
+
+Monitors measured at 45 W (item 6) and subtracted from both readings.
+
+| state | on-monitor | **monitors subtracted** | GPU board |
+|---|---:|---:|---:|
+| GPU sieving, pipeline | 285 W | **240 W** | 133.5 W |
+| CPU sieving, 16 x `I15e` | 280–282 W | **~236 W** | 30 W (idle) |
+
+The implied host constant during the GPU run is **106.5 W**, which lands 1.4%
+from item 6's independently measured ~105 W idle figure.
+
+**Item 6's 220 W for the CPU side is superseded by 236 W**, and the difference
+is not the cores. This box idles its GPU at **30 W**, not the ~16 W P8 figure
+item 6 assumed; that accounts for 14 of the 16 W. Per item 6's own rule the
+idle-GPU draw belongs on both sides of the comparison, so 236 W is correct and
+the CPU cores are drawing what item 6 said they were.
+
+**Sensitivity.** The UPS idle reading is jumpy at +/-7%. At 190M, the energy
+margin is 2.94x at (240, 236) W, 3.01x at (235, 236), and 2.88x at (245, 236).
+The conclusion is stable across the range.
+
+### Deduplication, measured rather than assumed
+
+| band | side | raw | unique | dup |
+|---|---|---:|---:|---:|
+| q=50M | GPU | 574,861 | 574,329 | 1.0009 |
+| q=50M | CPU | 464,685 | 464,335 | 1.0008 |
+| q=130M | GPU | 461,144 | 460,953 | 1.0004 |
+| q=190M | GPU | 419,946 | 419,845 | 1.0002 |
+| q=190M | CPU | 421,899 | 421,797 | 1.0002 |
+
+The RUNBOOK's 1.19–1.34x is a **band-scale** figure and does not apply at probe
+width; item 0 predicted this and it is confirmed on both sievers at once. The
+ratio falls with q on both sides, as it must — sparser primes mean fewer
+relations with both re-finding q inside a fixed window.
+
+### The third GPU probe, and the drift
+
+The GPU also ran q=130M (101.96 ms/pair, 46.10 rel/pair, dup 1.0004, 24.47
+J/pair). Across the three probes yield falls **57.43 -> 46.10 -> 41.98**
+rel/pair, 27%, while GPU cost falls 4.8% — so **GPU rel/J falls 23% across the
+band**. A whole-job figure is an integral over that curve, not any single probe.
+There is no matched CPU control at 130M; it was not run.
+
+### What this confirms, and what it retires
+
+- **Finding 43's `N_eff` 10.24 holds up.** It implied 306 ms/pair whole-box;
+  measured here at 190M is **301.47**, 1.5% away. The weakest link in item 0's
+  chain turns out to have been sound.
+- **Retire finding 57's 2.53x** — stock card, derived 270 W, single q interval.
+- **Retire item 10's 3.14x for the c183** — that is a C194 equal-work figure
+  carried across jobs.
+- The measured c183 undervolted figure is **2.94x energy, 2.99x time**.
+
+### Correctness
+
+All **1,455,951** GPU relations across the three probes pass
+`--check-relations`: every factor divides, both norms rebuild to 1 exactly,
+every prime within its lpb. This is the gate that matters on an undervolted
+card, where the failure mode is wrong answers rather than a crash.
+
+### Caveats
+
+- Host load was 1.0–1.9 during the GPU probes (six rate-limited Python
+  workers), not a silent box. Per finding 53 that direction costs the GPU, so
+  the margin is a floor.
+- One geometry (`I15e`). Finding 65's `2^16 x 2^14` is the better rel/J shape
+  for us but was not run on the CPU, so it cannot be graded.
+- The CPU bands used 16 workers over 16 equal-width disjoint subranges; workers
+  finish unevenly, so a few core-seconds of tail idle are charged to the CPU.
+  At 45 min/band that is well under 1%.
+- No 130M CPU control.

@@ -4,7 +4,7 @@
 the order they were discovered, including the ones later refuted, because the
 refutations are the most useful part. That makes them bad at answering "what
 does this thing do today". This file answers only that, and holds nothing that
-is not current. **Last updated 2026-08-17.**
+is not current. **Last updated 2026-08-20.**
 
 ## Architecture
 
@@ -715,7 +715,54 @@ survive; if work is worth returning to, it belongs here. Two lists drifted
 apart once already — items 7–9 below existed only in a chat session and were
 absent from every document in the repo.
 
-0. **The verdict band** *(added 2026-08-06, Fable review)*. The question the
+0. **The verdict band — RUN 2026-08-20, finding 71. 2.99x time and 2.94x
+   whole-box relations per joule, every term measured on this box in one
+   session.**
+
+   Both sievers over the **same q bands** (same first q, width `10000 * ln q`,
+   ~10,000 (q, rho) pairs each), `I15e`, neither running while the other was on
+   the box. GPU probes at 50M / 130M / 190M; matched GGNFS 16-worker controls
+   at 50M and 190M.
+
+   **Grade on q=190M.** It is above `alim`, so GGNFS cannot truncate — both
+   sides run the identical 7,605,406-entry base, and yield then agrees to
+   **0.07%**:
+
+   | q=190M | GPU | CPU, 16 workers | advantage |
+   |---|---:|---:|---:|
+   | wall ms/pair | 100.95 | 301.47 | **2.99x** |
+   | unique rel/pair | 41.98 | 41.95 | 1.001 |
+   | whole box, at the wall | 240 W | 236 W | |
+   | **J per unique relation** | **0.5771** | **1.6958** | **2.94x** |
+
+   **Do not quote the q=50M band's 3.12x.** There GGNFS trims to 39% of the
+   base while we sieve all of it, and our 24% yield surplus is duplicate work
+   that a truncating siever re-finds later (finding 67). It measures a
+   convention, not the hardware.
+
+   **The margin grows with q** (2.57x at 50M, 2.99x at 190M) because GGNFS's FB
+   discount shrinks as q rises: it sieves 3.0M entries at 50M and all 7.6M at
+   190M, costing it +10.9% wall, while ours falls 4.8%. A real job spends most
+   of its range where the discount is small.
+
+   Power measured both sides, monitors (45 W) subtracted: GPU sieving 285 ->
+   **240 W**, CPU sieving 280-282 -> **~236 W**. Implied host constant 106.5 W,
+   1.4% from item 6's measured ~105 W. **Item 6's 220 W CPU row is superseded**
+   — this box idles its GPU at 30 W, not the ~16 W assumed, which is 14 of the
+   16 W difference. Dedup measured at 1.0002-1.0009 on both sievers, so the
+   RUNBOOK's band-scale 1.19-1.34x does not apply at probe width. All 1,455,951
+   GPU relations pass `--check-relations`.
+
+   **Finding 43's `N_eff` 10.24 is vindicated**: it implied 306 ms/pair whole
+   box, measured 301.47. **Retire finding 57's 2.53x** (stock card, derived
+   270 W) and **item 10's 3.14x** (a C194 figure on a different job).
+
+   **Still open:** no CPU control at 130M; one geometry only (`I15e`) — finding
+   65's `2^16 x 2^14` is our better rel/J shape but has no CPU comparator; and
+   the GPU probes ran at host load 1.0-1.9 rather than silent, which per
+   finding 53 makes the margin a floor.
+
+   *Original statement of the item follows.* The question the
    project was chartered to answer — unique relations/sec/watt on the **c183**
    against the measured CPU box — has never actually been run; every
    end-to-end number so far is a proxy job (c147, c151, snfs236). The CPU side
@@ -1229,6 +1276,15 @@ absent from every document in the repo.
    ECM was a bad proxy: it is ALU-bound and drew 33% more per core than the
    siever it was standing in for. The earlier ~260 W estimate scaled from ECM
    was ~18% high. Use 220 W for the CPU side.
+
+   > **SUPERSEDED 2026-08-20 by finding 71, which metered both sides again.**
+   > The CPU row is **~236 W**, not 220 W, and the GPU row is **240 W**
+   > measured, not ~270 W derived. The CPU difference is not the cores: this
+   > box idles its GPU at **30 W**, not the ~16 W P8 figure assumed above, and
+   > that is 14 of the 16 W. The GPU row also moved because the card has been
+   > undervolted since (finding 61). Both new figures are UPS readings with the
+   > 45 W of monitors subtracted, taken in one session with the two workloads
+   > run separately. Use **240 W GPU / 236 W CPU**.
 
    Throughput measured in the same session, so both sides of the CPU figure
    come from one box on one day:
