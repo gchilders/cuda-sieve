@@ -19,10 +19,11 @@ CXX       ?= g++
 # sm_80 is also the floor, and it is a tuning floor rather than an instruction
 # one. The only warp intrinsics used are __syncwarp and __shfl{,_up}_sync, which
 # long predate Ampere -- but k_fill_l2's __launch_bounds__(512, 3) targets 1536
-# threads/SM and its 3 x 33 KB of shared memory, plus the opt-in shared-memory
-# limit in bench_kernels.cu (grep 101376), are all Ampere-and-later numbers.
-# sm_75 compiles, with ptxas warning that .minnctapersm is out of range on every
-# fill kernel, and then oversubscribes Turing's 64 KB of shared memory at launch.
+# threads/SM and its 3 x 33 KB of shared memory are Ampere-and-later tuning
+# numbers. The apply kernel's opt-in per-block shared-memory limit is queried
+# from the selected device at runtime rather than hardcoded. sm_75 still compiles
+# with ptxas warning that .minnctapersm is out of range on every fill kernel,
+# and then oversubscribes Turing's 64 KB of shared memory in the fill path.
 # Below that nothing is possible anyway: CUDA 13 dropped Volta, so nvcc 13.2
 # rejects sm_70 outright.
 GPU_ARCH_all := -gencode arch=compute_120,code=sm_120 \

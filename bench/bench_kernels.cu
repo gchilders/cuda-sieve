@@ -56,6 +56,27 @@ static int cuda_check_impl(cudaError_t err, const char *expr,
 #define CUDA_CHECKED(x) cuda_check_impl((x), #x, __FILE__, __LINE__)
 #define CK(x) do { if (CUDA_CHECKED(x)) return -1; } while (0)
 
+/* The maximum opt-in dynamic shared memory is a property of the selected
+ * device, not of a CUDA architecture family.  Query it at runtime so cards
+ * such as A100/H100 can use larger legal regions while cards with a smaller
+ * limit are rejected before cudaFuncSetAttribute()/launch. */
+static int cuda_optin_smem_limit(size_t *out)
+{
+    int dev = 0, lim = 0;
+    if (!out) return -1;
+    if (CUDA_CHECKED(cudaGetDevice(&dev))) return -1;
+    if (CUDA_CHECKED(cudaDeviceGetAttribute(
+            &lim, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev))) return -1;
+    if (lim <= 0) {
+        fprintf(stderr,
+                "CUDA device %d reported an invalid opt-in shared-memory limit"
+                " of %d B\n", dev, lim);
+        return -1;
+    }
+    *out = (size_t)lim;
+    return 0;
+}
+
 /* ---- stage T: root transform + plattice reduction --------------------- */
 
 /* The transform runs through pl_transform_enc, not pl_transform, for three
@@ -1815,6 +1836,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     const uint32_t nsuper = xmax >> log_super;
     const uint32_t CINIT = (cfg->cell_bits == 16) ? 4096u : 255u;
     uint32_t BOUND = 0;
+    size_t optin_smem_limit = 0;
     norm_t N;
 
     if (!fb_is_transform_validated(fb) ||
@@ -1846,6 +1868,8 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                 POLY->deg, norm_exact_bound_bits(&N), BN_LIMBS * 32);
         return -1;
     }
+
+    if (cuda_optin_smem_limit(&optin_smem_limit)) return -1;
 
     size_t freeB = 0, totalB = 0;
     CK(cudaMemGetInfo(&freeB, &totalB));
@@ -2256,8 +2280,9 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                    nregion, ncell, CB, smem, athr,
                    cfg->apply_atomic ? "smem atomicAdd" : "PLAIN (racy probe)",
                    cfg->norm_mode == NORM_CONST ? "const" : "horner");
-            if (smem > 101376) {
-                printf("  SKIP: %zu B exceeds the 101376 B opt-in limit\n", smem);
+            if (smem > optin_smem_limit) {
+                printf("  SKIP: %zu B exceeds this device's %zu B opt-in"
+                       " shared-memory limit\n", smem, optin_smem_limit);
                 goto after_apply;
             }
 

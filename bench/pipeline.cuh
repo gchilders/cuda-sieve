@@ -215,7 +215,8 @@ static double pipe_progress_fraction(const bench_cfg_t *cfg, int streaming,
 template <bool SLABBED>
 static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
                           const bench_cfg_t *cfg, uint32_t bound,
-                          uint32_t xmax_alloc, pside_t *S)
+                          uint32_t xmax_alloc, size_t optin_smem_limit,
+                          pside_t *S)
 {
     const uint32_t nbitword = xmax_alloc >> 5;
     const uint32_t maxsurv = 1u << 22;
@@ -258,10 +259,11 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
     {
         const size_t smem = ((size_t)1 << cfg->log_region) * 2 +
                             (size_t)S->nslice_pow2 * sizeof(*hlogp);
-        if (smem > 101376u) {
+        if (smem > optin_smem_limit) {
             fprintf(stderr, "  apply needs %zu B of shared memory for %u"
-                    " padded slices; device path supports at most 101376 B\n",
-                    smem, S->nslice_pow2);
+                    " padded slices; selected device supports at most %zu B"
+                    " opt-in per block\n",
+                    smem, S->nslice_pow2, optin_smem_limit);
             goto done;
         }
         /* cudaFuncSetAttribute is a property of the kernel specialization, not
@@ -1170,6 +1172,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     unsigned long long *d_pre = NULL;
     uint64_t est1, est0, est;
     uint32_t cap, nqdone = 0, bound1 = 0, bound0 = 0;
+    size_t optin_smem_limit = 0;
     double acc_isect = 0, acc_host = 0, acc_wall = 0;
     /* The three sieve stages, broken out because the band total alone cannot be
      * compared against the standalone bench (no --pipeline), which reports the
@@ -1287,8 +1290,12 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             vram_reporting = 0;
         }
     }
-    if (pipe_side_init<SLABBED>(fb1, fbs1, cfg, bound1, xmax_alloc, &S1) ||
-        pipe_side_init<SLABBED>(fb0, fbs0, cfg, bound0, xmax_alloc, &S0))
+    if (cuda_optin_smem_limit(&optin_smem_limit))
+        { rc = -1; goto done; }
+    if (pipe_side_init<SLABBED>(fb1, fbs1, cfg, bound1, xmax_alloc,
+                                optin_smem_limit, &S1) ||
+        pipe_side_init<SLABBED>(fb0, fbs0, cfg, bound0, xmax_alloc,
+                                optin_smem_limit, &S0))
         { rc = -1; goto done; }
     {
         const size_t apply_smem =

@@ -1658,50 +1658,40 @@ absent from every document in the repo.
     which also means **survivor counts are a poor proxy for work** in any
     cross-siever comparison (see item 7's funnel numbers).
 15. **Older cards, and the shared-memory ceiling that blocks them — code
-    read 2026-08-20, NOT tested on any such card.** `GPU_ARCH_all` starts at
-    sm_80, but nothing in the kernels requires it. The only warp primitives
-    used are `__shfl_up_sync` and `__syncwarp`; there is no `redux.sync`, no
-    `__reduce_*_sync`, no `cp.async`, no cooperative groups and no inline
-    PTX, and `BN_MULHI64` resolves to `__umul64hi` (`bigint.cuh:161`), which
-    is sm_20+. **The compute-capability floor is not an algorithm. It is one
-    hardcoded constant.**
+    read 2026-08-20, NOT tested on any such card.** **Fixed 2026-08-21:** both
+    the production pipeline and standalone apply benchmark now query
+    `cudaDevAttrMaxSharedMemoryPerBlockOptin` from the selected device at runtime;
+    the default remains `--region 14`. `GPU_ARCH_all` starts at sm_80, but the
+    apply path no longer assumes one architecture family's opt-in limit.
 
-    `101376` appears at `pipeline.cuh:247` and `bench_kernels.cu:2119`,
-    described in both places as "the opt-in limit". It is not a constant of
-    CUDA — it is the limit for *one* arch family, 100 KB of hardware less the
-    1 KB the driver reserves — and it is wrong in both directions:
+    Before the fix, both `pipeline.cuh` and `bench_kernels.cu` hardcoded
+    `101376` bytes as "the opt-in limit". CUDA does not define one universal
+    value; representative limits are:
 
-    | target | max dynamic smem per block | vs. the constant |
+    | target | max dynamic smem per block | old 101376-byte bound |
     |---|---:|---|
     | sm_70 Volta | 96 KB | too high |
     | sm_75 Turing | 64 KB | **too high — the opt-in call fails** |
     | sm_80 A100 | 163 KB | **too low** |
-    | sm_86 / sm_89 / sm_120 | 99 KB | correct |
+    | sm_86 / sm_89 / sm_120 | 99 KB | matched |
     | sm_90 Hopper | 227 KB | **too low** |
 
-    Apply sizes its shared memory at `(1 << log_region) * 2 + nslice_pow2 *
-    2` (`pipeline.cuh:245`), so `--region 15` needs ~66 KB and `--region 16`
-    ~131 KB. **sm_80 is already in the default gencode list and is already
-    capped at 15 by this constant on hardware that allows 16** — so this is a
-    live limitation on a card we ship for today, not only a Hopper question.
-    Greg Childers' H200 has twice that headroom again.
+    Apply sizes its shared memory at `(1 << log_region) * 2 + nslice_pow2 * 2`,
+    so `--region 15` needs roughly 66 KB and `--region 16` roughly 131 KB. The
+    old literal therefore prevented region 16 on A100/Hopper even though the
+    hardware permits it, while it would have admitted sizes that are illegal on
+    some older devices. The runtime query fixes both directions.
 
-    The opt-in machinery is already in place: `cudaFuncSetAttribute` with
-    `cudaFuncAttributeMaxDynamicSharedMemorySize` is called at
-    `pipeline.cuh:443`. Only the *bound* is a literal. One
-    `cudaDeviceGetAttribute(..., cudaDevAttrMaxSharedMemoryPerBlockOptin,
-    dev)` fixes both directions at once.
+    `cudaFuncSetAttribute(..., cudaFuncAttributeMaxDynamicSharedMemorySize, ...)`
+    remains the opt-in mechanism; the requested value is checked against the
+    selected device's reported limit before that attribute is set or the apply
+    kernel is launched. This is capability detection only: `--region 14` is
+    still the default because larger regions have not been shown to be faster.
 
-    **What is NOT established.** This is a code-reading result. No card older
-    than sm_120 has been run, and the claim is "nothing in the source
-    requires sm_80", not "it works on a 2080 Ti". Before claiming support:
-    add the gencode targets, run `make check` and a `wintest.bat`-style
-    byte-comparison band on the card, and check VRAM — the memory model above
-    puts a `2^30` area near 5 GB, which an 11 GB Turing carries and a 6 GB
-    card does not. Note also that each added target is nearly free in build
-    time (item 16), so the cost here is testing, not compilation. Relevant to
-    BOINC specifically, where volunteer hardware skews old and a card we
-    refuse is a host we never get.
+    **What is NOT established.** No card older than the current sm_80 build
+    floor has been qualified by this change. Lowering `GPU_ARCH_all` would still
+    require compilation and byte-comparison testing on that hardware; fill-kernel
+    launch-bounds/shared-memory tuning remains a separate constraint.
 16. **Build wall time — MEASURED 2026-08-20, and the cause is `CF_LMAX=4`.**
     A full `make all` is ~12.5 min on this 16-thread box and about 30 on a
     busy Vast.ai 5090. The Makefile's timing table (`Makefile:43-55`) claims
