@@ -10,9 +10,19 @@ GPUs. It is research software: the correctness gates pass, but the current
 limitations and unfinished experiments in [`bench/STATUS.md`](bench/STATUS.md)
 are part of its release status.
 
-The production path keeps each local sieve slab at or below `2^31` positions
-but automatically j-slabs larger rectangles; with the default geometry this
-means I17 -> 4 slabs, I18 -> 16, I19 -> 64, and I20 -> 256. `lpb <= 64`,
+The production path has a hard local-slab safety ceiling of `2^31` positions.
+For performance, automatic planning now starts j-slabbing once the full sieve
+reaches `2^30` positions and targets at most `2^29` positions per slab. Sieve
+areas below `2^30` are not split for performance alone, so `2^29` and smaller
+retain the ordinary unslabbed path. With default `J=2^(logI-1)`, this means
+I15 -> 1 slab, I16 -> 4, I17 -> 16, I18 -> 64, I19 -> 256, and I20 -> 1024.
+`--slab-j` remains an explicit tuning override subject to the safety bounds.
+The `2^29` target is a robust performance/memory default, not a universal
+speed optimum: an L40 benchmark preferred `2^30` positions per slab by 4.6%
+in complete time, while the `2^29` default still beat the former `2^31`
+behavior by 1.5% and reduced steady VRAM from 7.76 GB to 3.20 GB. Large-L2
+GPUs need more measurements before any cache-aware automatic policy is added.
+`lpb <= 64`,
 `mfb <= 128`, and at most three large primes per side remain checked limits.
 Cofactor arithmetic width and
 factorisation method are both chosen **per side, automatically**, from that

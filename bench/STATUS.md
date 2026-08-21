@@ -95,10 +95,28 @@ There is still no unsafe override of the local arithmetic bounds.
 | `mfb` | 128 | the cofactor queue narrows residuals to `mz<4>`; 96 in a `CF_LMAX=3` build |
 | large primes per side | 3 | `ceil(mfb/lpb) <= 3` is checked before the run |
 
-With default `J=2^(logI-1)` and `bkthresh=I`, I17 uses 4 slabs, I18 16,
-I19 64, and I20 256. `--slab-j N` can force a smaller slab for regression or
-memory tuning. The actual largest direct-tested prime also constrains slab
-height, so raising `bkthresh` can make the planner choose more slabs.
+Automatic planning uses `2^29` positions as a performance target once the full
+sieve reaches `2^30` positions; below that trigger it does not split for
+performance alone. With default `J=2^(logI-1)` and `bkthresh=I`, I15 uses 1
+slab, I16 4, I17 16, I18 64, I19 256, and I20 1024. The target is empirical
+and is a performance/memory default, not a correctness bound or a claim of a
+universal speed optimum. RTX 3090 and RTX 5070 both minimized complete time at
+`2^29` per slab. On an L40, `2^30` was instead 4.6% faster than `2^29`
+(531.16 vs 555.70 ms/q), but `2^29` still beat the former `2^31` behavior by
+1.5% (564.13 ms/q) while reducing steady VRAM from 7.76 GB to 3.20 GB.
+`--slab-j N` can override the default upward or downward for
+regression/memory/performance tuning, while the `2^31` position bound and the
+actual largest direct-tested prime remain mandatory safety constraints. Raising
+`bkthresh` can therefore still make the planner choose smaller slabs.
+
+**Open investigation -- slab target on large-L2 GPUs.** The L40 result shows
+that the locality/overhead crossover can move to a larger slab even when
+`2^29` remains a good overall default. Do not infer an L2-size threshold from
+one card or add a model-specific exception yet. Collect matched `2^31`, `2^30`,
+`2^29`, and `2^28` runs on more large-L2 Ada/Hopper/Blackwell cards, and where
+possible profile `k_fill_atomic` L2 hit/write-miss traffic and the per-slab TD
+overhead. Revisit a cache-aware target only if those measurements show a stable
+architecture-level rule.
 
 ### Why the lattice walk itself is wide
 
@@ -131,8 +149,11 @@ useful per-local-area reference:
 | `2^31` | 5.53 GB | 0.81 GB | 6.34 GB |
 | `2^32` | 11.06 GB | 1.61 GB | 12.67 GB |
 
-Only the `2^31` row is a production slab size now. The `2^32` row is retained
-as the old monolithic projection, not as an allocation the slabbed path makes.
+For automatically planned full areas of `2^30` and above, `2^29` is now the
+production performance target per slab. Larger local slabs remain available
+through explicit `--slab-j` when they satisfy the safety limits. The `2^32` row
+is retained as the old monolithic projection, not as an allocation the automatic
+slabbed path makes.
 
 ### LPB and MFB are separate widths
 

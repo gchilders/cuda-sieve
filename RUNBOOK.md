@@ -112,14 +112,38 @@ you either state them or let them derive.
 ### Current hard size limits and j-slabbing
 
 The production binary keeps **each local sieve slab at or below `2^31`
-positions**, but the full pipeline rectangle may be larger. Rectangles above
-that limit are split automatically along `j`; the hot bucket/bitmap/TD
-positions remain slab-local while exact global `j` is restored where norms,
-primitivity, and relation coordinates need it. With the default `J=2^(logI-1)`
-and default `bkthresh=I`, the plans are I17 -> 4 slabs, I18 -> 16, I19 -> 64,
-and I20 -> 256. Geometry at or below `2^31` uses one slab.
+positions** as a correctness limit, but the full pipeline rectangle may be
+larger. Automatic planning also has a performance policy: once the full sieve
+area reaches `2^30` positions, it targets slabs of at most `2^29` positions.
+Areas below `2^30` are not split for performance alone; in particular, `2^29`
+and smaller geometries retain the ordinary unslabbed path. The hot
+bucket/bitmap/TD positions remain slab-local while exact global `j` is restored
+where norms, primitivity, and relation coordinates need it. With default
+`J=2^(logI-1)` and default `bkthresh=I`, the plans are I15 -> 1 slab, I16 -> 4,
+I17 -> 16, I18 -> 64, I19 -> 256, and I20 -> 1024.
 
-`--slab-j N` is a regression/tuning override that caps a slab at `N` rows.
+The `2^29` target is a performance heuristic, not an arithmetic requirement.
+RTX 3090 and RTX 5070 runs both minimized complete time at `2^29` positions per
+slab. A later L40 run showed that the speed optimum can move on a large-L2 GPU:
+for the same `I=J=2^16` geometry it preferred `2^30` positions per slab.
+
+| L40 local slab area | slabs | steady VRAM | fill | TD + classify | complete time/q |
+|---:|---:|---:|---:|---:|---:|
+| `2^31` | 2 | 7.76 GB | 235.029 ms | 68.51 ms | 564.13 ms |
+| **`2^30`** | **4** | **4.72 GB** | **212.778 ms** | **70.39 ms** | **531.16 ms** |
+| `2^29` | 8 | 3.20 GB | 223.320 ms | 84.40 ms | 555.70 ms |
+| `2^28` | 16 | 2.43 GB | 267.659 ms | 121.06 ms | 628.78 ms |
+| `2^27` | 32 | 2.05 GB | 373.371 ms | 206.37 ms | 819.63 ms |
+
+Thus `2^29` is not claimed to be the universal maximum-throughput setting. On
+the L40 it is 4.6% slower than the `2^30` optimum, but it remains 1.5% faster
+than the former `2^31` default while using 59% less steady VRAM (3.20 vs
+7.76 GB). That performance/memory tradeoff is why `2^29` remains the generic
+default. More measurements are needed on cards with large L2 caches before
+introducing an L2-size or model-specific automatic slab target.
+
+`--slab-j N` remains a regression/tuning override and may select a larger or
+smaller slab subject to the mandatory safety bounds.
 The parser rejects shapes that cannot contain whole TD rank groups, and the
 runtime planner also enforces the `2^31` local-position bound and the arithmetic
 bound implied by the **actual largest direct-tested small prime**. Raising

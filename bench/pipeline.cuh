@@ -2461,9 +2461,15 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         return -1;
     }
     if (plan.enabled) {
-        printf("  j-slabbing: %u slab%s, up to %u rows/slab"
-               " (<=2^31 local positions)\n",
-               plan.nslab, plan.nslab == 1 ? "" : "s", plan.jmax);
+        const uint32_t perf_jmax = slab_perf_jmax(cfg->logI, cfg->J);
+        if (!cfg->slab_j && perf_jmax != 0xffffffffu)
+            printf("  j-slabbing: %u slab%s, up to %u rows/slab"
+                   " (auto <=2^29-position target; safety bounds may reduce it further)\n",
+                   plan.nslab, plan.nslab == 1 ? "" : "s", plan.jmax);
+        else
+            printf("  j-slabbing: %u slab%s, up to %u rows/slab"
+                   " (<=2^31 local-position safety bound)\n",
+                   plan.nslab, plan.nslab == 1 ? "" : "s", plan.jmax);
         return run_pipeline_impl<true>(fb1, fbs1, fb0, fbs0, qlist, nq, qgen,
                                        POLY, cfg, &plan);
     }

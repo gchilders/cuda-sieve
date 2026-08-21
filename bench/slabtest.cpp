@@ -11,14 +11,23 @@ static int check_plan(void)
     const struct {
         int logI; uint32_t J, pmax, forceJ, want_j, want_n;
     } v[] = {
-        {15, 16384u, 32767u, 0u,     16384u, 1u},
-        {16, 32768u, 65535u, 0u,     32768u, 1u},
-        {17, 65536u,131071u, 0u,     16384u, 4u},
-        {18,131072u,262143u, 0u,      8192u,16u},
-        {19,262144u,524287u, 0u,      4096u,64u},
-        {20,524288u,1048575u,0u,      2048u,256u},
+        /* Performance slabbing must not touch areas below 2^30. */
+        {16,  4096u, 65535u, 0u,      4096u, 1u}, /* 2^28 */
+        {16,  8192u, 65535u, 0u,      8192u, 1u}, /* 2^29 */
+        {16, 16383u, 65535u, 0u,     16383u, 1u}, /* just below 2^30 */
+        /* At 2^30 and above, auto mode targets 2^29 positions/slab. */
+        {16, 16384u, 65535u, 0u,      8192u, 2u}, /* 2^30 */
+        {16, 32768u, 65535u, 0u,      8192u, 4u}, /* 2^31 */
+        {16, 65536u, 65535u, 0u,      8192u, 8u}, /* 2^32 */
+        {17, 65536u,131071u, 0u,      4096u,16u},
+        {18,131072u,262143u, 0u,      2048u,64u},
+        {19,262144u,524287u, 0u,      1024u,256u},
+        {20,524288u,1048575u,0u,       512u,1024u},
+        {15, 16384u, 32767u, 0u,     16384u, 1u}, /* 2^29 */
         {15, 16384u, 32767u, 123u,      123u,134u},
-        {17, 65536u,262143u, 0u,      8192u, 8u},
+        /* Explicit --slab-j may override the performance target upward. */
+        {16, 32768u, 65535u,16384u,  16384u, 2u},
+        {17, 65536u,262143u, 0u,      4096u,16u},
     };
     for (unsigned k = 0; k < sizeof(v)/sizeof(v[0]); k++) {
         if (slab_make_plan(v[k].logI, v[k].J, v[k].pmax, v[k].forceJ, &P) ||
@@ -72,16 +81,18 @@ static int check_bkthresh_integration(void)
      * build the slab plan. 131072 is also included as a proper power to make
      * sure powers retained by fb_split_small() do not inflate the direct-TD
      * prime bound. */
-    uint32_t primes[] = { 2u, 3u, 5u, 131071u, 131072u, 131101u, 262139u };
-    uint32_t roots[]  = { 1u, 1u, 1u,      1u,      1u,      1u,      1u };
-    uint8_t  ispow[]  = { 0u, 0u, 0u,      0u,      1u,      0u,      0u };
+    uint32_t primes[] = { 2u, 3u, 5u, 131071u, 131072u, 131101u, 262139u, 1048573u };
+    uint32_t roots[]  = { 1u, 1u, 1u,      1u,      1u,      1u,      1u,       1u };
+    uint8_t  ispow[]  = { 0u, 0u, 0u,      0u,      1u,      0u,      0u,       0u };
     fb_t fb = {}, small = {};
     slab_plan_t P = {0,0,0};
     static const struct {
         uint32_t bkthresh, want_pmax, want_jmax, want_nslab;
     } v[] = {
-        { 131072u, 131071u, 16384u, 4u },
-        { 262144u, 262139u,  8192u, 8u },
+        {  131072u,  131071u, 4096u, 16u },
+        {  262144u,  262139u, 4096u, 16u },
+        /* Here the direct-TD safety cap is tighter than the 2^29 target. */
+        { 1048576u, 1048573u, 2048u, 32u },
     };
 
     fb.n = (uint32_t)(sizeof(primes) / sizeof(primes[0]));

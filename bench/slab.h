@@ -27,6 +27,16 @@ typedef struct {
  * number of those groups. For logI >= 8 every complete j row already does. */
 #define SLAB_TD_GROUP_POS 256u
 
+/* Performance policy: once a full sieve reaches 2^30 positions, auto mode
+ * targets slabs no larger than 2^29 positions.  Two independent benchmarks
+ * (Ampere RTX 3090 and Blackwell RTX 5070) found this working set near the
+ * fill/TD crossover; an L40 with a larger L2 cache instead preferred 2^30 for
+ * maximum throughput. This is a generic performance/memory tuning cap, not a
+ * universal speed optimum. Explicit --slab-j overrides it, while the 2^31
+ * position and direct-TD bounds below remain mandatory. */
+#define SLAB_PERF_TRIGGER_LOG2 30u
+#define SLAB_PERF_TARGET_LOG2  29u
+
 static inline uint32_t slab_row_quantum(int logI)
 {
     if (logI < 0 || logI > 30) return 0;
@@ -50,6 +60,22 @@ static inline uint32_t slab_area_jmax(int logI)
 {
     if (logI < 0 || logI > 30) return 0;
     return (uint32_t)(((uint64_t)1 << 31) >> logI);
+}
+
+/* Return the auto-mode performance cap in rows. UINT32_MAX means that the
+ * geometry is below the performance-slabbing trigger and should not be split
+ * for performance alone.  If one row itself exceeds 2^29 positions, one row
+ * is the smallest representable slab and the correctness caps still apply. */
+static inline uint32_t slab_perf_jmax(int logI, uint32_t J)
+{
+    uint64_t I, area, rows;
+    if (logI < 0 || logI > 30 || !J) return 0;
+    I = (uint64_t)1 << logI;
+    area = I * (uint64_t)J;
+    if (area < ((uint64_t)1 << SLAB_PERF_TRIGGER_LOG2)) return 0xffffffffu;
+    rows = ((uint64_t)1 << SLAB_PERF_TARGET_LOG2) / I;
+    if (!rows) rows = 1u;
+    return rows > 0xffffffffull ? 0xffffffffu : (uint32_t)rows;
 }
 
 /* The direct small-prime predicate uses
@@ -79,7 +105,7 @@ static inline uint32_t slab_td_jmax(int logI, uint32_t max_prime)
 static inline int slab_make_plan(int logI, uint32_t J, uint32_t max_small_prime,
                                  uint32_t forced_j, slab_plan_t *P)
 {
-    uint32_t amax, tmax, jmax, quantum;
+    uint32_t amax, tmax, perf_jmax, jmax, quantum;
     uint64_t n;
     if (!P || !J) return -1;
     quantum = slab_row_quantum(logI);
@@ -93,6 +119,9 @@ static inline int slab_make_plan(int logI, uint32_t J, uint32_t max_small_prime,
         if (requested > jmax || !slab_rows_shape_ok(logI, requested)) return -1;
         jmax = requested;
     } else {
+        perf_jmax = slab_perf_jmax(logI, J);
+        if (!perf_jmax) return -1;
+        if (perf_jmax < jmax) jmax = perf_jmax;
         jmax -= jmax % quantum;
     }
     if (jmax > J) jmax = J;
