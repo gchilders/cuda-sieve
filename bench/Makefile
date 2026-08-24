@@ -281,7 +281,7 @@ $(OBJS): $(BOINC_STAMP)
 # CPU-only correctness gates. No CUDA, so these run on a busy box and on
 # machines without the card.
 fbtest: fbtest.c $(C_OBJS)
-	$(CC) $(CFLAGS) -o $@ fbtest.c $(C_OBJS) -lm
+	$(CC) $(CFLAGS) -o $@ fbtest.c $(C_OBJS) -ldl -lm
 
 # Native algebraic factor-base generator; deliberately CPU-only and free of
 # CADO/GMP dependencies. It shares the job/poly parser and prime enumerator.
@@ -314,7 +314,7 @@ fbgen_lib.o: fbgen.c bench.h
 	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -DFBGEN_LIBRARY -c $< -o $@
 
 sqgentest: sqgentest.c fbgen_lib.o poly.o primes.o
-	$(CC) $(CFLAGS) -Wl,--gc-sections -o $@ $^ -lm
+	$(CC) $(CFLAGS) -Wl,--gc-sections -o $@ $^ -ldl -lm
 
 dumpcmp: dumpcmp.c $(DEFS_STAMP) $(CF_LMAX_STAMP)
 	$(CC) $(CFLAGS) -o $@ $< -lm
@@ -323,10 +323,10 @@ dumpcmp: dumpcmp.c $(DEFS_STAMP) $(CF_LMAX_STAMP)
 # contain whitespace after filename resolution, so candidate identity must not
 # depend on the checkpoint parser's ordinary whitespace tokenisation.
 ckpttest: ckpttest.c ckpt.h bench.h platform.o $(DEFS_STAMP) $(CF_LMAX_STAMP)
-	$(CC) $(CFLAGS) -o $@ ckpttest.c platform.o -lm
+	$(CC) $(CFLAGS) -o $@ ckpttest.c platform.o -ldl -lm
 
 stoptest: stoptest.c platform.h platform.o $(DEFS_STAMP) $(CF_LMAX_STAMP)
-	$(CC) $(CFLAGS) -o $@ stoptest.c platform.o -lm
+	$(CC) $(CFLAGS) -o $@ stoptest.c platform.o -ldl -lm
 
 # joins the two per-side --emit-cof files into cofactorisation batch input
 mkcofbatch: mkcofbatch.c $(DEFS_STAMP) $(CF_LMAX_STAMP)
@@ -388,7 +388,7 @@ walkcheck: bench
 
 
 slabtest: slabtest.o $(C_OBJS)
-	$(CXX) $(CXXFLAGS) -o $@ $^ -lm
+	$(CXX) $(CXXFLAGS) -o $@ $^ -ldl -lm
 
 # CPU-only arithmetic/scheduling gate for j-slabbing.  It covers automatic and
 # forced plans, partial tails, actual bkthresh -> small-FB -> pmax wiring,
