@@ -72,14 +72,14 @@ either: a suspended process resumes,
 but a process that exits and restarts begins the current band again (12a's
 sidecar is the repo's own mechanism, not BOINC's).
 
-**The application is Linux-only, and that is a bigger gap than it looks for a
-volunteer project.** `boinc_support.cpp` guards its POSIX paths with
-`#ifndef _WIN32`, which reads as a Windows build being within reach; it is not.
-`ckpt.h` uses `fsync`, `ftruncate`, `kill` and `<unistd.h>` unguarded, and
-`runlog.c` adds `<dlfcn.h>` and `getloadavg` on the same terms. Windows is most
-of the volunteer host population, so this is worth costing before a wider
-deployment rather than discovering per-file; the guards in `boinc_support.cpp`
-should not be read as evidence that the rest is close.
+**Native Windows is now a supported build target.** `platform.c` carries the
+filesystem/process/stop-hook differences, `build_windows.bat` builds a static-CRT
+`bench.exe`, and the Windows binary includes the same in-process GPU algebraic
+factor-base generator used on Linux. `build_windows.bat fbgen_gpu` additionally
+builds the standalone reusable-roots-file generator. Cross-platform relation
+bytes are gated separately by `wintest.bat`; Windows process termination still
+has the documented limitation that `TerminateProcess` cannot run a checkpoint
+handler, so use `--stop-file` for a clean stop.
 
 ## Current size limits and j-slabbing
 

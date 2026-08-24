@@ -360,10 +360,16 @@ expect_refused "lambda absurdly large"        --cofactor --lambda1 99
 # 0 is the documented "use CADO's automatic" sentinel and must stay legal.
 expect_rel     "lambda 0 == automatic"     37 --cofactor --cof-rounds 2 --cof-budget 65536 --lambda1 0
 
-# The GGNFS default factor base has no p = 2, so algebraic cofactors stay even
-# and mz_n0inv's odd-modulus contract is broken. Relation-producing runs must
-# refuse rather than exit 0 having lost two thirds of the yield.
-if ./bench --pipeline --poly $POLY --qrange 120000053:120000053 --cofactor \
+# A factor base missing p = 2 leaves algebraic cofactors even and breaks
+# mz_n0inv's odd-modulus contract.  This used to rely on omitting --fb1 and
+# thereby selecting the incomplete legacy GGNFS factor base.  Omitted --fb1
+# now deliberately means "generate a complete factor base on the GPU", so make
+# the broken input explicit: remove the q = 2 rows from the known-good native
+# C183 factor base and verify that relation production refuses it.  Powers of 2
+# may remain; the invariant being tested is specifically the missing p = 2 row.
+grep -v '^2:' "$FB" > "$TMP/no_p2.fb1"
+if ./bench --pipeline --fb1 "$TMP/no_p2.fb1" --poly $POLY \
+           --qrange 120000053:120000053 --cofactor \
            --relations $TMP/r.txt >$TMP/o 2>&1; then
     printf 'FAIL   %-34s accepted an even-cofactor factor base\n' "even cofactors refused"; fail=1
 else

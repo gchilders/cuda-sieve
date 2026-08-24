@@ -70,17 +70,31 @@ halves (8.99 MB to 4.02 MB), and `ptxas` has roughly half as much to do. Its
 relations are byte-identical to a full build's on any job both can run, so it
 is a shippable variant rather than a debug one.
 
-For a real job, generate its algebraic factor base and run the complete
-pipeline:
+For a real job, the complete algebraic factor base is generated in-process
+on the assigned GPU when `--fb1` is omitted.  Rare prime-power, ramified and
+projective branches are completed by the same exact CPU Hensel code used by
+`fbgen`:
 
 ```sh
-./bench/fbgen --poly JOB.job --lim ALIM --maxbits 14 \
-    --threads 6 --out JOB.roots1
-
-./bench/bench --pipeline --cofactor --poly JOB.job --fb1 JOB.roots1 \
+./bench/bench --pipeline --cofactor --poly JOB.job \
     --logI 14 --qrange 15000000: --target-rels 65000000 \
     --relations msieve.dat
 ```
+
+A pre-generated native factor base remains supported by passing
+`--fb1 JOB.roots1`; this is useful for A/B validation or campaigns that reuse
+one polynomial often enough to avoid paying the startup generation cost on
+every band.  The GPU generator can create that cache directly in the exact
+native `fbgen` format:
+
+```sh
+make -C bench GPU_ARCH=native fbgen_gpu
+./bench/fbgen_gpu --poly JOB.job --lim ALIM --maxbits LOGI --out JOB.roots1
+```
+
+The standalone writer uses a staging `.part` file and atomic rename.  Its
+correctness gate requires byte-identical output against CPU `fbgen`; the normal
+in-process `bench` path still bypasses text serialization entirely.
 
 The job's `rlim`, `alim`, large-prime bounds, cofactor bounds, and polynomial
 are read from the `.job` file. Adding `--log msieve.runlog` appends a run
@@ -159,7 +173,7 @@ A BOINC workunit command line should therefore name all files using the logical
 names declared in its workunit template, for example:
 
 ```text
---pipeline --cofactor --poly job_file --fb1 roots_file --logI 14 \
+--pipeline --cofactor --poly job_file --logI 14 \
 --qrange 15000000:16000000 --relations result_file
 ```
 
@@ -224,11 +238,25 @@ explanation rather than passed through to an opaque ptxas error.
 Makefile, and the build stamp is set the same way, so a Windows run log names
 the commit it was built from rather than `unknown`. Objects are compiled
 `/MT`, so `bench.exe` does not need the Visual C++ redistributable on a
-volunteer host. `build_windows.bat clean` removes the objects and the
-executable.
+volunteer host. The Windows `bench.exe` includes the same in-process GPU
+algebraic factor-base generator as the Linux build, so omitting `--fb1` has the
+same semantics on both platforms.
 
-The script builds `bench.exe`; the standalone Linux-oriented helper/test tools
-remain under the Makefile.
+The default script target builds `bench.exe`. To also build the standalone GPU
+cache generator, which can pay factor-base startup once and write a reusable
+byte-identical roots file:
+
+```bat
+build_windows.bat fbgen_gpu
+fbgen_gpu.exe --poly JOB.job --lim 600000000 --maxbits 16 --out JOB.roots1
+bench.exe --pipeline --cofactor --poly JOB.job --fb1 JOB.roots1 ...
+```
+
+This extra target is opt-in because it recompiles `fbgen_gpu.cu` with the
+standalone CLI/text writer enabled; an ordinary production build needs only the
+library form already linked into `bench.exe`. `build_windows.bat clean` removes
+the objects plus both possible executables. The remaining helper/test tools
+still use the Makefile.
 
 Relations, candidate files and checkpoints are written in binary mode on both
 platforms, so a Windows build produces byte-identical relation output to a

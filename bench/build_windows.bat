@@ -1,7 +1,8 @@
 @echo off
 setlocal EnableExtensions
 
-rem Native Windows build for the main CUDA sieve executable.
+rem Native Windows build for the main CUDA sieve executable and, optionally,
+rem the standalone GPU factor-base cache generator.
 rem Run from an "x64 Native Tools Command Prompt for VS" with CUDA on PATH.
 rem
 rem Knobs, matching bench/Makefile so a Windows binary is the same build:
@@ -11,10 +12,22 @@ rem   DEFS      extra -D's for pricing experiments, e.g. -DNORM_FAST_LOG2
 rem             (dash form: these reach nvcc too, which rejects /D)
 rem
 rem   set GPU_ARCH=86 ^&^& set CF_LMAX=3 ^&^& build_windows.bat
+rem   build_windows.bat fbgen_gpu   rem also build fbgen_gpu.exe
 rem
-rem "build_windows.bat clean" removes the objects and bench.exe.
+rem Default builds bench.exe only.  The fbgen_gpu argument additionally builds
+rem the reusable roots-file utility without making every ordinary build compile
+rem fbgen_gpu.cu twice.  "build_windows.bat clean" removes both executables.
 
 if /I "%~1"=="clean" goto :do_clean
+set "BUILD_FBGEN_GPU="
+if "%~1"=="" goto :arg_done
+if /I "%~1"=="fbgen_gpu" (
+    set "BUILD_FBGEN_GPU=1"
+    goto :arg_done
+)
+echo error: unknown target "%~1". Use no argument, fbgen_gpu, or clean.
+exit /b 1
+:arg_done
 
 where cl >nul 2>nul || (
     echo error: cl.exe not found. Run this from an x64 Visual Studio Native Tools prompt.
@@ -127,16 +140,34 @@ nvcc %NVCC_ARCH% --threads 0 -O3 -std=c++17 -lineinfo -ccbin cl %CF_LMAX_DEF% %D
     -Xcompiler "/O2 /W3 /EHsc /MT -D_CRT_SECURE_NO_WARNINGS" ^
     -c bench_kernels.cu -o bench_kernels.obj || exit /b 1
 
+rem Production bench needs the same in-process algebraic factor-base generator
+rem as the Makefile build.  FBGEN_GPU_LIBRARY removes the standalone CLI, timers
+rem and text writer, so omitting --fb1 has no extra serialization path.
+nvcc %NVCC_ARCH% --threads 0 -O3 -std=c++17 -lineinfo -ccbin cl %CF_LMAX_DEF% %DEFS% ^
+    -DFBGEN_GPU_LIBRARY ^
+    -Xcompiler "/O2 /W3 /EHsc /MT -D_CRT_SECURE_NO_WARNINGS" ^
+    -c fbgen_gpu.cu -o fbgen_gpu_lib.obj || exit /b 1
+
 echo Linking bench.exe...
 nvcc %NVCC_ARCH% --cudart static -ccbin cl -Xlinker "/OPT:REF" -o bench.exe ^
-    bench_main.obj bench_kernels.obj fb_load.obj verify_cpu.obj poly.obj ^
+    bench_main.obj bench_kernels.obj fbgen_gpu_lib.obj fb_load.obj verify_cpu.obj poly.obj ^
     primes.obj rfb.obj fb_cado.obj platform.obj runlog.obj fbgen_lib.obj ^
     boinc_support.obj || exit /b 1
 
 echo Built %CD%\bench.exe (GPU_ARCH=%GPU_ARCH% CF_LMAX=%CF_LMAX% build=%GIT_DESC%)
+
+if not defined BUILD_FBGEN_GPU exit /b 0
+
+echo Building standalone fbgen_gpu.exe...
+nvcc %NVCC_ARCH% --threads 0 -O3 -std=c++17 -lineinfo -ccbin cl %CF_LMAX_DEF% %DEFS% ^
+    -Xcompiler "/O2 /W3 /EHsc /MT -D_CRT_SECURE_NO_WARNINGS" ^
+    -c fbgen_gpu.cu -o fbgen_gpu.obj || exit /b 1
+nvcc %NVCC_ARCH% --cudart static -ccbin cl -Xlinker "/OPT:REF" -o fbgen_gpu.exe ^
+    fbgen_gpu.obj fbgen_lib.obj fb_load.obj fb_cado.obj poly.obj primes.obj platform.obj || exit /b 1
+echo Built %CD%\fbgen_gpu.exe
 exit /b 0
 
 :do_clean
-del /q *.obj bench.exe 2>nul
+del /q *.obj bench.exe fbgen_gpu.exe 2>nul
 echo Cleaned Windows build products in %CD%
 exit /b 0

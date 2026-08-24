@@ -10,10 +10,30 @@ and verified), 2026-08-05. Nothing in it is from memory.
    are ignored by `fbgen`, so `result.job` needs no
    conversion. A CADO `.poly` works too.
 
-2. **An algebraic factor base from the native `fbgen`.** This is required, not
-   optional: the GGNFS `.afb.0` format carries neither p = 2 nor prime powers,
-   and without p = 2 the algebraic cofactors stay even, which Montgomery
-   arithmetic cannot split. `bench` refuses to produce relations without it.
+2. **No algebraic factor-base file is required for pipeline runs.** When
+   `--fb1` is omitted, `bench` generates the complete algebraic factor base on
+   the assigned GPU before allocating the persistent sieve buffers. Ordinary
+   prime roots use the fixed-capacity CUDA generator; the small set of
+   prime-power, ramified, and projective branches is completed by the same
+   exact CPU Hensel code used by native `fbgen`.
+
+   A pre-generated native factor base remains supported and is useful for
+   validation or repeated bands that should not repay GPU generation at every
+   `bench` startup.  The preferred fast cached-file path is:
+
+   ```sh
+   make -C /path/to/cuda-sieve/bench GPU_ARCH=native fbgen_gpu
+   /path/to/cuda-sieve/bench/fbgen_gpu --poly JOB.job --lim ALIM \
+       --maxbits LOGI --out JOB.roots1
+   ```
+
+   That file is generated with the same GPU ordinary-root + exact CPU Hensel
+   hybrid used in-process and is serialized by the same writer as native
+   `fbgen`.  `--out` stages to `JOB.roots1.part` and renames only after success.
+   `make -C bench fbgpucheck` requires byte identity with native `fbgen` and
+   then compares the loaded `fb_t` contents as a second gate.
+
+   The CPU-only generator remains available as an independent oracle/fallback:
 
    ```sh
    make -C /path/to/cuda-sieve/bench fbgen
@@ -22,14 +42,10 @@ and verified), 2026-08-05. Nothing in it is from memory.
    ```
 
    `--lim` defaults to `alim` when the `.job` carries it. `--maxbits` should be
-   the sieve's `logI`: this includes the useful prime-power ladders through the
-   sieve width. Old files made with `maxbits=1` remain valid and loadable, but
-   are prime-only and normally lower-yielding; `bench` warns if a file's header
-   disagrees with `--maxbits`. The native output is byte-for-byte compatible
-   with CADO's text format, so existing `.roots1` files need no conversion.
-   Named output is staged through `NAME.part` and renamed only after every
-   worker succeeds, so a failed build cannot replace a good cache with a
-   plausible truncated file.
+   the sieve's `logI`. Both generators emit the same native text format.
+   Supplying `--fb1` bypasses in-process GPU generation and loads that file
+   exactly as before; the legacy GGNFS `.afb.0` `--fb` format is still
+   sieve/debug only because it lacks the required prime-power metadata.
 
 ## Where to put things
 
@@ -41,7 +57,7 @@ So: one directory per job, and run msieve from inside it.
 ```
 ~/nfs/c151/
   c151.job                 copy of result.job — the poly
-  c151.roots1              native fbgen output
+  c151.roots1              optional native fbgen output (only with --fb1)
   msieve.dat               relations: sieve STRAIGHT into this, no copy step
   msieve.fb                N, poly and bounds (see below)
   worktodo.ini             N on one line
@@ -51,8 +67,8 @@ So: one directory per job, and run msieve from inside it.
   sieve.log
 ```
 
-Run `fbgen` and `bench` from anywhere with `--out` / `--relations` pointing
-into the job directory; run `msieve` from inside it.
+Run `fbgen`, `fbgen_gpu`, and `bench` from anywhere with `--out` /
+`--relations` pointing into the job directory; run `msieve` from inside it.
 
 Two practical notes:
 
@@ -70,16 +86,32 @@ Two practical notes:
 
 ```sh
 bench --pipeline --cofactor \
-      --poly JOB.job --fb1 JOB.roots1 \
+      --poly JOB.job \
       --logI 14 \
       --qrange 15000000: --target-rels 65000000 \
       --relations ~/nfs/c151/msieve.dat
 ```
 
-That is the whole command. **`rlim`, `alim`, `lpbr`, `lpba`, `mfbr`, `mfba`
-and both lambdas are read from the `.job` file**, and the byte scale and
-survivor allowance are derived from the polynomial. Each one is printed with
-its source, so a run says where every number came from:
+That is the whole command. With no `--fb1`, startup first generates the complete
+algebraic factor base in-process. If the same polynomial will be reused across
+many bands, generate the native roots file once with `fbgen_gpu --out` and pass
+it back with `--fb1` to avoid that startup cost:
+
+```sh
+bench/fbgen_gpu --poly JOB.job --lim ALIM --maxbits LOGI --out JOB.roots1
+bench/bench --pipeline --cofactor --poly JOB.job --fb1 JOB.roots1 ...
+```
+
+The standalone GPU file is required by `fbgpucheck` to be byte-identical to
+CPU `fbgen` output. The in-process path does not serialize or write this file.
+On Windows, `build_windows.bat fbgen_gpu` additionally builds
+`fbgen_gpu.exe`; the default Windows build still compiles the library form into
+`bench.exe`.
+
+**`rlim`, `alim`, `lpbr`, `lpba`, `mfbr`, `mfba` and both lambdas are read from
+the `.job` file**, and the byte scale and survivor allowance are derived from
+the polynomial. Each one is printed with its source, so a run says where every
+number came from:
 
 ```
   job file: rlim 16700000, alim 33500000, lpbr 29, lpba 30, mfbr 56, mfba 59
@@ -660,13 +692,15 @@ An SNFS polynomial often has tiny algebraic coefficients — `x^5 + x^4 - 4x^3 -
 side, and the special-q and the 3LP `mfb` go there with it. Pass `--sq-side 0`:
 
 ```sh
-bench --pipeline --cofactor --poly snfs236.job --fb1 snfs236.roots1 \
+bench --pipeline --cofactor --poly snfs236.job \
       --sq-side 0 --logI 14 --qrange 30000000: --target-rels 150000000 \
       --relations msieve.dat
 ```
 
-`--fb1` is still the **algebraic** base — that side needs prime powers
-regardless of where the q lives. `fbgen --lim` takes `alim` as usual.
+The factor base is still **algebraic** regardless of where the special-q lives.
+With no `--fb1`, bench generates the complete algebraic base in-process on the
+assigned GPU and fills the rare prime-power/ramified branches with the exact
+CPU Hensel implementation.  Passing a native `--fb1` file remains supported.
 
 One thing that looks like an error and is not:
 

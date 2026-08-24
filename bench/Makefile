@@ -200,7 +200,7 @@ C_OBJS   = $(C_SRCS:.c=.o)
 CPP_OBJS = $(CPP_SRCS:.cpp=.o)
 # runlog.o is deliberately NOT in C_SRCS: fbtest links C_OBJS, and it is a
 # CPU-only gate that must keep building on a machine with no driver library.
-OBJS     = $(CU_OBJS) $(C_OBJS) $(CPP_OBJS) runlog.o fbgen_lib.o
+OBJS     = $(CU_OBJS) $(C_OBJS) $(CPP_OBJS) runlog.o fbgen_lib.o fbgen_gpu_lib.o
 TEST_OBJS = slabtest.o
 
 # Switching HAVE_BOINC on an existing tree must rebuild boinc_support.o; make
@@ -288,6 +288,23 @@ fbtest: fbtest.c $(C_OBJS)
 fbgen: fbgen.c poly.o primes.o
 	$(CC) $(CFLAGS) -o $@ fbgen.c poly.o primes.o -lm -pthread
 
+# Standalone GPU factor-base generator and benchmark.  It can either price the
+# ordinary-root kernels or write a reusable native roots file with --out.  Keep
+# it out of `all` because bench already compiles the same CUDA translation unit
+# as fbgen_gpu_lib.o; users who want the cached-file utility can build this
+# target explicitly without forcing every production build to compile it twice.
+fbgen_gpu: fbgen_gpu.o fbgen_lib.o fb_load.o fb_cado.o poly.o primes.o platform.o $(ARCH_STAMP) $(LINK_STAMP)
+	$(NVCC) $(NVCC_ARCH) --cudart $(CUDART_LINK) -o $@ \
+		fbgen_gpu.o fbgen_lib.o fb_load.o fb_cado.o poly.o primes.o platform.o -lm
+
+fbgen_gpu.o: $(ARCH_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP)
+
+# Same CUDA root generator, linked into production bench without the standalone
+# benchmark main().  The generated algebraic FB is now the pipeline default
+# when no --fb1/--cadofb file is supplied.
+fbgen_gpu_lib.o: fbgen_gpu.cu bench.h $(ARCH_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP)
+	$(NVCC) $(NVCC_FLAGS) -DFBGEN_GPU_LIBRARY -c $< -o $@
+
 # The same exact root finder drives on-the-fly special-q generation in bench.
 # Keep it in one source: a copied degree-5 root finder would eventually drift
 # from the factor-base generator whose output is gated against CADO. Function
@@ -324,12 +341,12 @@ mkcofbatch: mkcofbatch.c $(DEFS_STAMP) $(CF_LMAX_STAMP)
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
--include $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
+-include $(OBJS:.o=.d) $(TEST_OBJS:.o=.d) fbgen_gpu.d
 
 clean:
-	rm -f bench fbtest fbgen sqgentest dumpcmp mkcofbatch ckpttest stoptest slabtest *.o *.d $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP) $(GIT_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP)
+	rm -f bench fbtest fbgen fbgen_gpu sqgentest dumpcmp mkcofbatch ckpttest stoptest slabtest *.o *.d $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP) $(GIT_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP)
 
-.PHONY: all clean check ckptcheck stopcheck cofcheck fbgencheck sqgencheck walkcheck slabcheck
+.PHONY: all clean check ckptcheck stopcheck cofcheck fbgencheck fbgpucheck sqgencheck walkcheck slabcheck
 
 # `check` depended on fbtest alone, so the whole CUDA path -- kernels, the
 # cofactoriser, the pipeline -- could fail to compile while the gates reported
@@ -382,6 +399,11 @@ slabcheck: slabtest
 
 fbgencheck: fbgen
 	./fbgencheck.sh
+
+# Explicit GPU gate: not part of `check`, because the ordinary CPU suite must
+# remain runnable on build hosts with no NVIDIA device.
+fbgpucheck: fbgen fbgen_gpu
+	./fbgpucheck.sh
 
 sqgencheck: sqgentest
 	./sqgentest

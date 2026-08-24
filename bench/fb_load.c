@@ -247,14 +247,15 @@ int fb_validate(fb_t *fb, fb_validate_policy_t policy, const char *source)
             fb_modulus_kind_t kind;
 
             if (policy == FB_VALIDATE_GENERATED_PRIME_POWERS) {
-                /* The zero-flag entries were already proven prime by
-                 * prime_list_build() inside an in-process generator, so
-                 * reclassifying that stream here would re-sieve a range this
-                 * process just sieved. Proper powers are few and remain
-                 * independently checked so a bad flag cannot route a mixed
-                 * composite to the lattice transform. This shortcut is only
-                 * ever valid when the primes came from THIS process; file
-                 * input goes through the sieve below. */
+                /* The zero-flag entries must already have an independent
+                 * primality proof inside the in-process generator.  CPU
+                 * builders get that from prime_list_build(); the GPU builder
+                 * independently Miller-Rabin-checks every root-bearing q=p
+                 * before it can be emitted.  Reclassifying the full stream
+                 * here would re-sieve a range this process just proved.
+                 * Proper powers are few and remain independently checked so a
+                 * bad flag cannot route a mixed composite to the lattice
+                 * transform. File input never uses this policy. */
                 kind = flagged_power
                     ? (composite_is_prime_power(q)
                        ? FB_MODULUS_PROPER_POWER : FB_MODULUS_INVALID)

@@ -106,10 +106,10 @@ static void usage(void)
 "usage: bench [options]\n"
 "\n"
 "RUNNING A JOB\n"
-"  A typical run needs six flags. Everything else has a right answer that is\n"
-"  derived from the polynomial or read from the .job file, and is printed:\n"
+"  A typical run supplies the job, sieve geometry/band, and output. Everything\n"
+"  else has a right answer derived from the polynomial or .job file and is printed:\n"
 "\n"
-"    bench --pipeline --cofactor --poly JOB.job --fb1 JOB.roots1 \\\n"
+"    bench --pipeline --cofactor --poly JOB.job \\\n"
 "          --logI 14 --qrange 15000000: --target-rels 65000000 \\\n"
 "          --relations msieve.dat\n"
 "\n"
@@ -121,9 +121,13 @@ static void usage(void)
 "                   alim, lpbr/lpba, mfbr/mfba and lambdas are USED -- they do\n"
 "                   not need repeating below. A CADO .poly carries none of\n"
 "                   those, so state them or let them derive\n"
-"  --fb1 PATH       native fbgen factor base. REQUIRED to emit relations: the\n"
-"                   GGNFS .afb.0 has neither p = 2 nor prime powers\n"
+"  --fb1 PATH       native fbgen factor base. Optional: if omitted in pipeline\n"
+"                   mode, the complete algebraic FB is generated on the assigned\n"
+"                   GPU (including exact CPU Hensel/prime-power branches). To\n"
+"                   cache that startup once, use fbgen_gpu --out FILE and pass\n"
+"                   the resulting FILE here on later runs\n"
 "  --cadofb PATH    legacy alias for --fb1 (CADO files remain compatible)\n"
+"  --fb PATH        legacy GGNFS .afb.0 input; sieve/debug only, not relations\n"
 "  --logI N         log2 of sieve width I      [15]   (gnfs-lasieve4I14e -> 14)\n"
 "  --J N            sieve height J             [2^(logI-1), CADO's convention]\n"
 "  --slab-j N       pipeline: force at most N j rows per slab; 0/omitted =\n"
@@ -202,7 +206,8 @@ static void usage(void)
 "  --fbbound N      truncate FB at this p      [alim]  (GGNFS truncates at q)\n"
 "  --bkthresh N     bucket-sieve p >= this     [1<<logI]\n"
 "  --region N       log2 bucket region size    [14]  (16384 16-bit cells, 32 KB)\n"
-"  --maxbits N      prime powers below 2^N      [logI]\n"
+"  --maxbits N      prime powers below 2^N      [logI]; used by generated FBs,\n"
+"                   and should match the maxbits recorded by a cached --fb1 file\n"
 "\n"
 "COFACTORISATION\n"
 "  --cof-rounds N   rho requeue rounds, budget doubling each time\n"
@@ -841,6 +846,7 @@ static int bench_main_impl(int argc, char **argv)
     char dev_pci[32] = "";          /* NVML's domain:bus:device.function */
     int  dev_ordinal = -1, dev_count = 0;
     const char *fbpath = "../oracle/input.job.afb.0";
+    int fbpath_set = 0;
     const char *polypath = "../oracle/c183.poly";
     bench_cfg_t cfg;
     uint64_t q = 120000011ull;          /* prime, mid-range of [50M,190M] */
@@ -931,6 +937,7 @@ static int bench_main_impl(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--fb") && i + 1 < argc) {
             if (bench_boinc_resolve_path("--fb", argv[++i], &fbpath)) return 1;
+            fbpath_set = 1;
         }
         else if (!strcmp(argv[i], "--logI") && i + 1 < argc) cfg.logI = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--J") && i + 1 < argc) { cfg.J = (uint32_t)strtoul(argv[++i], 0, 10); J_set = 1; }
@@ -1830,6 +1837,7 @@ static int bench_main_impl(int argc, char **argv)
         sqgen_t *qgen = NULL;
         uint32_t nq = 0, capq = 0;
         int prc;
+        int fb1_generated = 0;
         /* Options that belong to the measurement harness only. The pipeline
          * runs ONE configuration -- the one every gate was closed against:
          * single-level atomic fill, 4 B records, 16-bit cells, the fp32/fp64
@@ -2589,9 +2597,28 @@ resume_artifacts_ready:
                         cfg.allowance0, cfg.allowance0 - d0, d0, cfg.mfb0);
                 (void)sl1; (void)sl0;
             }
-            if (cfg.cadofb) { if (fb_load_cado(cfg.cadofb, cfg.scale, &fb1) != 0) return 1; }
-            else if (fb_load(fbpath, &fb1) != 0) return 1;
-            if (fb_fill_logp(&fb1, cfg.scale) != 0) return 1;
+            if (cfg.cadofb) {
+                if (fb_load_cado(cfg.cadofb, cfg.scale, &fb1) != 0) return 1;
+            } else if (fbpath_set) {
+                /* Explicit --fb retains the legacy GGNFS .afb.0 path for
+                 * sieve-only/debug use.  It remains unsuitable for relation
+                 * production because it carries no prime-power metadata. */
+                if (fb_load(fbpath, &fb1) != 0) return 1;
+                if (fb_fill_logp(&fb1, cfg.scale) != 0) return 1;
+            } else {
+                /* Production default: regenerate the complete algebraic FB on
+                 * the assigned GPU.  --fbbound is a truncation knob, not an
+                 * extension beyond the job's alim, matching the file-backed
+                 * path and the reporting below. */
+                const uint32_t genlim = fbbound < alim ? fbbound : alim;
+                fprintf(stderr,
+                        "bench: no --fb1 supplied; generating algebraic factor base on GPU through %u\n",
+                        genlim);
+                if (afb_build_gpu(&POLY, genlim, maxbits, cfg.scale, -1, 0, 1,
+                                  &fb1) != 0)
+                    return 1;
+                fb1_generated = 1;
+            }
         }
         if (cfg.cadofb && fb1.maxbits > 0 && fb1.maxbits != maxbits)
             fprintf(stderr,
@@ -2618,23 +2645,17 @@ resume_artifacts_ready:
              * entry, and refusing the run rejects a perfectly good job. This
              * guard used to test only for the entry's presence and did exactly
              * that on the first SNFS job it saw. */
-            /* The p = 2 test was, in practice, what forced --cadofb: a GGNFS
-             * .afb.0 has neither p = 2 nor prime powers, and the missing 2 was
-             * the symptom that got caught. Exempting polynomials with no root
-             * mod 2 removed that gate for exactly the SNFS jobs -- which still
-             * need the prime powers, and would otherwise run to completion
-             * with every algebraic norm under-divided by p^(k-1), exiting 0
-             * having quietly lost yield.
-             *
-             * So the requirement is stated directly rather than inferred from
-             * a symptom. */
-            if (!cfg.cadofb && (cfg.relations || cfg.candidates || cfg.cofactor)) {
+            /* Historically this p=2 check exposed incomplete legacy .afb.0
+             * input.  Relation-producing runs now either load a complete
+             * --fb1 file or generate the complete algebraic FB in-process; an
+             * explicitly requested legacy --fb is rejected directly below. */
+            if (fbpath_set && !cfg.cadofb &&
+                (cfg.relations || cfg.candidates || cfg.cofactor)) {
                 fprintf(stderr,
-                    "ERROR: relation-producing runs need --fb1 <fbgen output>.\n"
-                    "         The GGNFS .afb.0 format carries neither p = 2 nor"
-                    " prime powers, so\n"
-                    "         algebraic norms are under-divided and the yield is"
-                    " silently short.\n");
+                    "ERROR: relation-producing runs cannot use legacy --fb .afb.0 input.\n"
+                    "         It carries neither p = 2 metadata nor prime powers.\n"
+                    "         Omit --fb to generate the complete algebraic factor base on GPU,\n"
+                    "         or pass --fb1 <fbgen output>.\n");
                 return 1;
             }
             if (!n2 && !poly_has_root_mod2(&POLY)) {
@@ -2752,6 +2773,9 @@ resume_artifacts_ready:
                         fbbound >= alim ? " = full base to alim"
                                         : " (truncated below alim)",
                         fb0.n, bkthresh, rlim);
+            runlog_note("fb-source", "side1 %s",
+                        fb1_generated ? "generated in-process on GPU with exact CPU Hensel branches" :
+                        (cfg.cadofb ? "fbgen/CADO text file" : "legacy GGNFS .afb.0"));
             runlog_note("gate", "sq-side %d  scale %.4f/%.4f  allowance"
                         " %.2f/%.2f  lpb %u/%u  mfb %u/%u", cfg.sq_side,
                         cfg.scale, cfg.scale0, cfg.allowance, cfg.allowance0,
