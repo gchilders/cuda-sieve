@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <math.h>
+#include "slab.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -114,10 +115,12 @@ int32_t fb_check_prime_powers(const fb_t *fb);
  * EXTERNAL_PRIME_POWERS accepts primes and proper powers, but verifies every
  * distinct modulus and checks ispow against the result. This is the policy for
  * text factor bases.
- * GENERATED_PRIME_POWERS is only for in-process builders whose prime entries
- * come directly from prime_list_build(); it still checks structure, roots,
- * ordering, flags, and every proper-power entry without re-sieving the full
- * generated prime range a second time. Never use it for file input.
+ * GENERATED_PRIME_POWERS is only for in-process builders whose q=p entries
+ * already have an independent primality proof (prime_list_build() for the CPU
+ * builder; deterministic Miller-Rabin at the GPU emission boundary). It still
+ * checks structure, roots, ordering, flags, and every proper-power entry without
+ * re-sieving the full generated prime range a second time. Never use it for file
+ * input.
  *
  * There is deliberately no "the loader already classified these" policy for
  * file input. One existed briefly for the CADO loader; it cost a Miller-Rabin
@@ -233,6 +236,11 @@ int  fb_restrict(fb_t *fb, uint32_t bkthresh, uint32_t fb_bound);
  * Call BEFORE fb_restrict, which compacts fb in place. */
 int  fb_split_small(const fb_t *fb, uint32_t bkthresh, fb_t *small);
 
+/* Largest PRIME that actually reaches the direct-test table. Proper prime
+ * powers live in the small FB too, but td_fill_small deliberately skips them.
+ * Shared by the production pipeline and the CPU bkthresh integration gate. */
+uint32_t fb_max_td_prime(const fb_t *fb);
+
 /* ---- q-lattice -------------------------------------------------------- */
 
 /* Reduced basis of the q-lattice: a0*b1 - a1*b0 = +/- q. */
@@ -269,6 +277,27 @@ typedef struct {
     uint32_t mfbr, mfba;        /* max cofactor bits                          */
     double   rlambda, alambda;  /* GGNFS units: multiples of log2(lim)        */
 } poly_t;
+
+/* Exact per-prime entries from the native fbgen p-adic/Hensel implementation.
+ * `base_p` is the prime whose branch is being expanded; q may be base_p or a
+ * proper power.  These are exposed so the GPU builder can use its fast root
+ * finder for the ordinary population while delegating the tiny power/ramified
+ * population to the same code that writes the reference text factor base. */
+typedef struct {
+    uint32_t q, r;
+    int n1, n0;
+} fbgen_exact_entry_t;
+
+int fbgen_exact_prime_entries(const poly_t *P, uint32_t base_p, int maxbits,
+                              fbgen_exact_entry_t **out, size_t *nout);
+
+/* Complete in-process algebraic factor-base builder.  Ordinary prime roots
+ * are generated on the selected CUDA device; proper powers and exceptional
+ * ramified/projective branches are filled by fbgen_exact_prime_entries().
+ * The result is globally ordered, has exact marginal log bytes, and is marked
+ * with the GENERATED validation policy before return. */
+int afb_build_gpu(const poly_t *P, uint32_t lim, int maxbits, double scale,
+                  int device, uint32_t segment_odds, int verbose, fb_t *fb);
 
 /* GGNFS lambda -> bits of tolerated cofactor. `lambda * log2(lim)`, which is
  * what the GGNFS test-sieve's own "Suggested rlambda: mfbr / log2(rlim)"
@@ -339,6 +368,8 @@ float norm_target_host(const norm_t *N, int32_t i, uint32_t j);
  * lattice points {x in [0,I*J) : i == r*j mod p}, for small p. Returns the
  * number of primes checked; aborts on mismatch. */
 int  verify_walk(int logI, uint32_t J, int nprimes);
+int  verify_walk_slabs(int logI, uint32_t J, uint32_t slab_J, int nprimes);
+int  verify_walk_slab_cases(void);
 
 /* Count updates the walk produces for the given FB, single-threaded.
  * This is the ground truth the GPU fill must reproduce exactly. */
@@ -452,6 +483,7 @@ static inline uint32_t cof_auto_b1(unsigned lpb)
 typedef struct {
     int      logI;          /* 15 for I15e */
     uint32_t J;             /* 16384 for I15e */
+    uint32_t slab_j;        /* 0 = auto; otherwise force rows/slab (pipeline) */
     int      log_region;    /* bucket region = 2^log_region positions */
     int      record_bytes;  /* 2, 4 or 8 */
     int      fill_mode;     /* see FILL_* below */

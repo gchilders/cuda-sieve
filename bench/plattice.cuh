@@ -11,9 +11,10 @@
  * inside the q-lattice with j0,j1 > 0, -I < i0 <= 0 <= i1 < I, i1-i0 >= I.
  * i0 is stored negated as mi0.
  *
- * Positions are encoded x = (i + I/2) + (j << logI). For I15e, I*J = 2^29,
- * so uint32 suffices for x and for both increments; CADO uses uint64 because
- * it must also handle I=16 with rescaled J.
+ * Positions are encoded x = (i + I/2) + (j << logI). A slab-local x is kept
+ * below 2^31, but the reduced lattice increment itself can exceed 2^32 even
+ * for I15/I16 with a large factor-base prime. CADO's wide walk arithmetic is
+ * therefore required independently of whole-rectangle size.
  */
 #ifndef CUDA_SIEVE_PLATTICE_CUH
 #define CUDA_SIEVE_PLATTICE_CUH
@@ -26,15 +27,21 @@
 #define PL_FN static inline
 #endif
 
-/* Walk parameters, 16 bytes. Produced once per (p,r) per special-q. */
+/* Walk parameters. The increments must be 64-bit even while a slab-local
+ * position stays below 2^31. Reduction can produce j0/j1 large enough that
+ * (j << logI) exceeds 2^32 (for example an I16, p~250M walk can have a warp
+ * increment above 8.5e9). Truncating the increment, or later wrapping x while
+ * adding it, creates spurious lattice hits. CADO likewise carries wide walk
+ * offsets. The bounds remain I-local and therefore 32-bit. */
 typedef struct {
-    uint32_t inc_warp;   /* (j0 << logI) + i0 , always > 0 as an offset */
-    uint32_t inc_step;   /* (j1 << logI) + i1 , or PL_VERTICAL          */
+    uint64_t inc_warp;   /* (j0 << logI) + i0 , always > 0 as an offset */
+    uint64_t inc_step;   /* (j1 << logI) + i1 , or PL_VERTICAL          */
     uint32_t bound_warp; /* add warp when (x & (I-1)) >= bound_warp     */
     uint32_t bound_step; /* add step when (x & (I-1)) <  bound_step     */
 } plat_t;
 
-#define PL_VERTICAL 0xFFFFFFFFu
+#define PL_VERTICAL UINT64_MAX
+#define PL_INVALID  UINT64_MAX
 
 typedef struct { uint32_t mi0, j0, i1, j1; } pl_basis_t;
 
@@ -117,20 +124,53 @@ PL_FN plat_t pl_make(uint32_t p, uint32_t r, int logI)
         P.inc_step   = PL_VERTICAL;
     } else {
         P.bound_warp = I - B.i1;
-        P.inc_step   = (B.j1 << logI) + B.i1;
+        P.inc_step   = ((uint64_t)B.j1 << logI) + B.i1;
     }
     /* inc_warp = (j0 << logI) + i0 with i0 = -mi0; positive because
      * the post-conditions give mi0 < I <= j0*I whenever j0 >= 1. */
-    P.inc_warp = (B.j0 << logI) - B.mi0;
+    P.inc_warp = ((uint64_t)B.j0 << logI) - B.mi0;
     return P;
 }
 
-/* Advance x to the next lattice position. */
+/* Exact walk step. Slab continuation uses this because the first hit after a
+ * slab can be several billion positions beyond its end. Only the low logI
+ * bits choose the step, so translating by a whole number of rows remains
+ * exact even when x itself is wider. */
+PL_FN uint64_t pl_next64(uint64_t x, const plat_t *P, uint32_t Imask)
+{
+    const uint32_t i = (uint32_t)x & Imask;
+    if (i >= P->bound_warp) x += P->inc_warp;
+    if (i < P->bound_step) {
+        if (P->inc_step == PL_VERTICAL) return UINT64_MAX;
+        x += P->inc_step;
+    }
+    return x;
+}
+
+/* Bounded 32-bit walk used by the legacy <=2^31 local-position kernels. A
+ * mathematically valid next hit can lie above UINT32_MAX even though every hit
+ * we care about is below 2^31. Saturate instead of wrapping back into the sieve
+ * area. This keeps the hot local x itself 32-bit while fixing the latent
+ * monolithic overflow found by the slab-equivalence review. */
+PL_FN uint32_t pl_add32_sat(uint32_t x, uint64_t inc)
+{
+    const uint32_t hi = (uint32_t)(inc >> 32);
+    const uint32_t lo = (uint32_t)inc;
+    if (hi || x > UINT32_MAX - lo) return UINT32_MAX;
+    return x + lo;
+}
+
 PL_FN uint32_t pl_next(uint32_t x, const plat_t *P, uint32_t Imask)
 {
     const uint32_t i = x & Imask;
-    if (i >= P->bound_warp) x += P->inc_warp;
-    if (i <  P->bound_step) x += P->inc_step;
+    if (i >= P->bound_warp) {
+        x = pl_add32_sat(x, P->inc_warp);
+        if (x == UINT32_MAX) return x;
+    }
+    if (i < P->bound_step) {
+        if (P->inc_step == PL_VERTICAL) return UINT32_MAX;
+        x = pl_add32_sat(x, P->inc_step);
+    }
     return x;
 }
 
@@ -146,6 +186,11 @@ PL_FN uint32_t pl_start(int logI) { return 1u << (logI - 1); }
 PL_FN uint32_t pl_first(const plat_t *P, int logI)
 {
     return pl_next(1u << (logI - 1), P, (1u << logI) - 1);
+}
+
+PL_FN uint64_t pl_first64(const plat_t *P, int logI)
+{
+    return pl_next64((uint64_t)1 << (logI - 1), P, (1u << logI) - 1);
 }
 
 /* ---- modular arithmetic used by the root transform ------------------- */

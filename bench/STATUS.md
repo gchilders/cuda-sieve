@@ -72,68 +72,88 @@ either: a suspended process resumes,
 but a process that exits and restarts begins the current band again (12a's
 sidecar is the repo's own mechanism, not BOINC's).
 
-**The application is Linux-only, and that is a bigger gap than it looks for a
-volunteer project.** `boinc_support.cpp` guards its POSIX paths with
-`#ifndef _WIN32`, which reads as a Windows build being within reach; it is not.
-`ckpt.h` uses `fsync`, `ftruncate`, `kill` and `<unistd.h>` unguarded, and
-`runlog.c` adds `<dlfcn.h>` and `getloadavg` on the same terms. Windows is most
-of the volunteer host population, so this is worth costing before a wider
-deployment rather than discovering per-file; the guards in `boinc_support.cpp`
-should not be read as evidence that the rest is close.
+**Native Windows is now a supported build target.** `platform.c` carries the
+filesystem/process/stop-hook differences, `build_windows.bat` builds a static-CRT
+`bench.exe`, and the Windows binary includes the same in-process GPU algebraic
+factor-base generator used on Linux. `build_windows.bat fbgen_gpu` additionally
+builds the standalone reusable-roots-file generator. Cross-platform relation
+bytes are gated separately by `wintest.bat`; Windows process termination still
+has the documented limitation that `TerminateProcess` cannot run a checkpoint
+handler, so use `--stop-file` for a clean stop.
 
-## Current size limits, and what lifting them entails
+## Current size limits and j-slabbing
 
-This is a design assessment; the cofactor-width half of it was built on
-2026-08-18 and is marked as such below. The production path still refuses
-inputs outside the limits below; there is no unsafe override.
+The cofactor-width work landed on 2026-08-18 and the production pipeline now
+also supports rectangles larger than `2^31` positions by **j-slabbing** them.
+There is still no unsafe override of the local arithmetic bounds.
 
 | quantity | current limit | immediate reason |
 |---|---:|---|
-| sieve area `I*J` | `2^31` positions | the exclusive end `xmax` and the hot plattice walks use `uint32_t` |
+| local sieve slab | `2^31` positions | bucket/bitmap/rank positions remain `uint32_t` |
+| full pipeline rectangle | default geometries through `logI 20` | host scheduler splits `J` into safe slabs |
 | `lpb` | 64 | a resulting prime is stored in one `uint64_t` (was 32 until 2026-08-17) |
 | `mfb` | 128 | the cofactor queue narrows residuals to `mz<4>`; 96 in a `CF_LMAX=3` build |
 | large primes per side | 3 | `ceil(mfb/lpb) <= 3` is checked before the run |
 
-The area and cofactor limits are independent even though an A=32 job such as
-AS276 needs both lifted (`I=2^16`, `J=2^16`, `lpba=35`, `mfba=101`).
+Automatic planning uses `2^29` positions as a performance target once the full
+sieve reaches `2^30` positions; below that trigger it does not split for
+performance alone. With default `J=2^(logI-1)` and `bkthresh=I`, I15 uses 1
+slab, I16 4, I17 16, I18 64, I19 256, and I20 1024. The target is empirical
+and is a performance/memory default, not a correctness bound or a claim of a
+universal speed optimum. RTX 3090 and RTX 5070 both minimized complete time at
+`2^29` per slab. On an L40, `2^30` was instead 4.6% faster than `2^29`
+(531.16 vs 555.70 ms/q), but `2^29` still beat the former `2^31` behavior by
+1.5% (564.13 ms/q) while reducing steady VRAM from 7.76 GB to 3.20 GB.
+`--slab-j N` can override the default upward or downward for
+regression/memory/performance tuning, while the `2^31` position bound and the
+actual largest direct-tested prime remain mandatory safety constraints. Raising
+`bkthresh` can therefore still make the planner choose smaller slabs.
 
-### A=32: representation is the first blocker, memory is the second
+**Open investigation -- slab target on large-L2 GPUs.** The L40 result shows
+that the locality/overhead crossover can move to a larger slab even when
+`2^29` remains a good overall default. Do not infer an L2-size threshold from
+one card or add a model-specific exception yet. Collect matched `2^31`, `2^30`,
+`2^29`, and `2^28` runs on more large-L2 Ada/Hopper/Blackwell cards, and where
+possible profile `k_fill_atomic` L2 hit/write-miss traffic and the per-slab TD
+overhead. Revisit a cache-aware target only if those measurements show a stable
+architecture-level rule.
 
-Every valid position in a `2^32`-position rectangle still fits in a
-`uint32_t`; the value that does not fit is the exclusive endpoint `xmax =
-2^32`. The current fill and resieve loops compare a 32-bit walk position with
-that endpoint, and their next-position arithmetic wraps at the top of the
-range. Merely deleting the front-end check therefore makes an empty or
-incorrect sieve.
+### Why the lattice walk itself is wide
 
-Two implementation levels are plausible:
+A local sieve position still fits in 31 bits, but the Franke-Kleinjung reduced
+**increment** need not fit in 32. For realistic factor-base primes,
+`(j0 << logI) - mi0` or `(j1 << logI) + i1` can exceed `2^32` even on I15/I16.
+The earlier `uint32_t plat_t` therefore had a latent wrap: it could create
+spurious sieve hits even before whole-area slabbing was needed. `plat_t` now
+stores 64-bit increments; the bounded local walk terminates instead of wrapping
+when its exact next hit leaves the 32-bit coordinate, and slab continuation is
+carried exactly in 64 bits between slab origins.
 
-1. **Whole-area, large-memory path.** Keep stored positions and bucket-local
-   offsets 32-bit, add an explicit full-range/end-of-walk representation, and
-   avoid promoting every operation in the hot walk to 64 bits. This is the
-   smaller change, but the complete allocation is only comfortable on a card
-   with substantially more than 16 GB.
-2. **Slabbed path.** Process A=32 as two or more A<=31 slabs, reusing the
-   bucket array and survivor bitmaps. A correct version needs persistent
-   per-prime walk positions, global row offsets in norm and small-sieve
-   calculations, slab-local rank/resieve state, and global coordinates in the
-   candidate queue. This is the portable solution for a 12 GB card and the
-   more invasive pipeline change.
+This widening costs 8 additional bytes per uploaded full-FB entry. Slabbed
+runs additionally keep two 64-bit continuation values per entry (16 bytes per
+entry total); unslabbed runs allocate no continuation arrays.
 
-The measured memory model is linear in area for the two large allocations:
+### Larger rectangles: memory is now the main constraint
 
-| area | bucket array | three survivor bitmaps | subtotal |
+The bucket array and survivor bitmaps are allocated for **one slab** and reused,
+so a full I17/I18/... rectangle no longer requires a monolithic `2^33`/`2^35`
+position workspace. Area-proportional work still scales with the full rectangle,
+and every slab re-enters the factor-base walk, so the number of slabs remains a
+runtime consideration even though it no longer multiplies peak bucket memory.
+
+The measured pre-slabbing memory model for the two large allocations remains a
+useful per-local-area reference:
+
+| local area | bucket array | three survivor bitmaps | subtotal |
 |---:|---:|---:|---:|
 | `2^31` | 5.53 GB | 0.81 GB | 6.34 GB |
 | `2^32` | 11.06 GB | 1.61 GB | 12.67 GB |
 
-Fixed allocations plus the CUDA/driver footprint put the full A=32 projection
-at roughly **14–16 GB**. Work that touches positions or bucket records is
-also approximately linear in area: A=32 is about 2x A=31, and 8x the A=29
-C183 rectangle, per special-q. Relations per q rise too, so q/s alone is not
-a useful comparison. A stateful slab implementation should add only launch
-and boundary bookkeeping beyond that intrinsic work; this has not been built
-or measured.
+For automatically planned full areas of `2^30` and above, `2^29` is now the
+production performance target per slab. Larger local slabs remain available
+through explicit `--slab-j` when they satisfy the safety limits. The `2^32` row
+is retained as the old monolithic projection, not as an allocation the automatic
+slabbed path makes.
 
 ### LPB and MFB are separate widths
 
@@ -1715,50 +1735,40 @@ absent from every document in the repo.
     which also means **survivor counts are a poor proxy for work** in any
     cross-siever comparison (see item 7's funnel numbers).
 15. **Older cards, and the shared-memory ceiling that blocks them — code
-    read 2026-08-20, NOT tested on any such card.** `GPU_ARCH_all` starts at
-    sm_80, but nothing in the kernels requires it. The only warp primitives
-    used are `__shfl_up_sync` and `__syncwarp`; there is no `redux.sync`, no
-    `__reduce_*_sync`, no `cp.async`, no cooperative groups and no inline
-    PTX, and `BN_MULHI64` resolves to `__umul64hi` (`bigint.cuh:161`), which
-    is sm_20+. **The compute-capability floor is not an algorithm. It is one
-    hardcoded constant.**
+    read 2026-08-20, NOT tested on any such card.** **Fixed 2026-08-21:** both
+    the production pipeline and standalone apply benchmark now query
+    `cudaDevAttrMaxSharedMemoryPerBlockOptin` from the selected device at runtime;
+    the default remains `--region 14`. `GPU_ARCH_all` starts at sm_80, but the
+    apply path no longer assumes one architecture family's opt-in limit.
 
-    `101376` appears at `pipeline.cuh:247` and `bench_kernels.cu:2119`,
-    described in both places as "the opt-in limit". It is not a constant of
-    CUDA — it is the limit for *one* arch family, 100 KB of hardware less the
-    1 KB the driver reserves — and it is wrong in both directions:
+    Before the fix, both `pipeline.cuh` and `bench_kernels.cu` hardcoded
+    `101376` bytes as "the opt-in limit". CUDA does not define one universal
+    value; representative limits are:
 
-    | target | max dynamic smem per block | vs. the constant |
+    | target | max dynamic smem per block | old 101376-byte bound |
     |---|---:|---|
     | sm_70 Volta | 96 KB | too high |
     | sm_75 Turing | 64 KB | **too high — the opt-in call fails** |
     | sm_80 A100 | 163 KB | **too low** |
-    | sm_86 / sm_89 / sm_120 | 99 KB | correct |
+    | sm_86 / sm_89 / sm_120 | 99 KB | matched |
     | sm_90 Hopper | 227 KB | **too low** |
 
-    Apply sizes its shared memory at `(1 << log_region) * 2 + nslice_pow2 *
-    2` (`pipeline.cuh:245`), so `--region 15` needs ~66 KB and `--region 16`
-    ~131 KB. **sm_80 is already in the default gencode list and is already
-    capped at 15 by this constant on hardware that allows 16** — so this is a
-    live limitation on a card we ship for today, not only a Hopper question.
-    Greg Childers' H200 has twice that headroom again.
+    Apply sizes its shared memory at `(1 << log_region) * 2 + nslice_pow2 * 2`,
+    so `--region 15` needs roughly 66 KB and `--region 16` roughly 131 KB. The
+    old literal therefore prevented region 16 on A100/Hopper even though the
+    hardware permits it, while it would have admitted sizes that are illegal on
+    some older devices. The runtime query fixes both directions.
 
-    The opt-in machinery is already in place: `cudaFuncSetAttribute` with
-    `cudaFuncAttributeMaxDynamicSharedMemorySize` is called at
-    `pipeline.cuh:443`. Only the *bound* is a literal. One
-    `cudaDeviceGetAttribute(..., cudaDevAttrMaxSharedMemoryPerBlockOptin,
-    dev)` fixes both directions at once.
+    `cudaFuncSetAttribute(..., cudaFuncAttributeMaxDynamicSharedMemorySize, ...)`
+    remains the opt-in mechanism; the requested value is checked against the
+    selected device's reported limit before that attribute is set or the apply
+    kernel is launched. This is capability detection only: `--region 14` is
+    still the default because larger regions have not been shown to be faster.
 
-    **What is NOT established.** This is a code-reading result. No card older
-    than sm_120 has been run, and the claim is "nothing in the source
-    requires sm_80", not "it works on a 2080 Ti". Before claiming support:
-    add the gencode targets, run `make check` and a `wintest.bat`-style
-    byte-comparison band on the card, and check VRAM — the memory model above
-    puts a `2^30` area near 5 GB, which an 11 GB Turing carries and a 6 GB
-    card does not. Note also that each added target is nearly free in build
-    time (item 16), so the cost here is testing, not compilation. Relevant to
-    BOINC specifically, where volunteer hardware skews old and a card we
-    refuse is a host we never get.
+    **What is NOT established.** No card older than the current sm_80 build
+    floor has been qualified by this change. Lowering `GPU_ARCH_all` would still
+    require compilation and byte-comparison testing on that hardware; fill-kernel
+    launch-bounds/shared-memory tuning remains a separate constraint.
 16. **Build wall time — MEASURED 2026-08-20, and the cause is `CF_LMAX=4`.**
     A full `make all` is ~12.5 min on this 16-thread box and about 30 on a
     busy Vast.ai 5090. The Makefile's timing table (`Makefile:43-55`) claims

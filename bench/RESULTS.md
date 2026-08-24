@@ -4415,3 +4415,32 @@ card, where the failure mode is wrong answers rather than a crash.
   finish unevenly, so a few core-seconds of tail idle are charged to the CPU.
   At 45 min/band that is well under 1%.
 - No 130M CPU control.
+## Finding 71 — L40 moves the slab-speed optimum to `2^30`, while `2^29` remains the better generic memory/performance default
+
+A matched `I=J=2^16` cofactor run on an NVIDIA L40 gives a different optimum
+from the RTX 3090 and RTX 5070: four `2^30`-position slabs are fastest, not
+eight `2^29` slabs.
+
+| local slab area | slabs | steady VRAM | fill | TD + classify | complete time/q | relations/q |
+|---:|---:|---:|---:|---:|---:|---:|
+| `2^31` | 2 | 7.76 GB | 235.029 ms | 68.51 ms | 564.13 ms | 110.58 |
+| **`2^30`** | **4** | **4.72 GB** | **212.778 ms** | **70.39 ms** | **531.16 ms** | **110.58** |
+| `2^29` | 8 | 3.20 GB | 223.320 ms | 84.40 ms | 555.70 ms | 110.58 |
+| `2^28` | 16 | 2.43 GB | 267.659 ms | 121.06 ms | 628.78 ms | 110.58 |
+| `2^27` | 32 | 2.05 GB | 373.371 ms | 206.37 ms | 819.63 ms | 110.58 |
+
+The L40 therefore makes two points at once. First, `2^29` is **not** a
+universal maximum-throughput slab size: `2^30` is 4.6% faster here, and fill
+itself reaches its minimum at `2^30` before rising again at `2^29`. Second,
+`2^29` is still a sound generic default: it is 1.5% faster than the former
+`2^31` behavior and reduces steady VRAM by 59% (7.76 -> 3.20 GB). Relative to
+the L40's speed optimum, it trades 4.6% of throughput for another 32% reduction
+in steady VRAM (4.72 -> 3.20 GB).
+
+This is a reason to **investigate large-L2 GPUs, not to add an L40 special
+case**. The RTX 3090 and RTX 5070 both prefer `2^29`, while the L40 prefers
+`2^30`. More matched data from large-L2 Ada/Hopper/Blackwell cards, ideally
+including `k_fill_atomic` L2 hit/write-miss counters, is needed before an
+L2-informed automatic slab target can be justified. Until then, the production
+planner keeps `2^29` as the performance/memory compromise and `--slab-j`
+remains the explicit per-device tuning override.

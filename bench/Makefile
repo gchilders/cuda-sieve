@@ -19,10 +19,11 @@ CXX       ?= g++
 # sm_80 is also the floor, and it is a tuning floor rather than an instruction
 # one. The only warp intrinsics used are __syncwarp and __shfl{,_up}_sync, which
 # long predate Ampere -- but k_fill_l2's __launch_bounds__(512, 3) targets 1536
-# threads/SM and its 3 x 33 KB of shared memory, plus the opt-in shared-memory
-# limit in bench_kernels.cu (grep 101376), are all Ampere-and-later numbers.
-# sm_75 compiles, with ptxas warning that .minnctapersm is out of range on every
-# fill kernel, and then oversubscribes Turing's 64 KB of shared memory at launch.
+# threads/SM and its 3 x 33 KB of shared memory are Ampere-and-later tuning
+# numbers. The apply kernel's opt-in per-block shared-memory limit is queried
+# from the selected device at runtime rather than hardcoded. sm_75 still compiles
+# with ptxas warning that .minnctapersm is out of range on every fill kernel,
+# and then oversubscribes Turing's 64 KB of shared memory in the fill path.
 # Below that nothing is possible anyway: CUDA 13 dropped Volta, so nvcc 13.2
 # rejects sm_70 outright.
 GPU_ARCH_all := -gencode arch=compute_120,code=sm_120 \
@@ -199,7 +200,8 @@ C_OBJS   = $(C_SRCS:.c=.o)
 CPP_OBJS = $(CPP_SRCS:.cpp=.o)
 # runlog.o is deliberately NOT in C_SRCS: fbtest links C_OBJS, and it is a
 # CPU-only gate that must keep building on a machine with no driver library.
-OBJS     = $(CU_OBJS) $(C_OBJS) $(CPP_OBJS) runlog.o fbgen_lib.o
+OBJS     = $(CU_OBJS) $(C_OBJS) $(CPP_OBJS) runlog.o fbgen_lib.o fbgen_gpu_lib.o
+TEST_OBJS = slabtest.o
 
 # Switching HAVE_BOINC on an existing tree must rebuild boinc_support.o; make
 # otherwise sees the same source timestamp and quietly reuses the no-op object.
@@ -242,7 +244,7 @@ $(shell { [ -f $(DEFS_STAMP) ] && [ "$$(cat $(DEFS_STAMP))" = '$(DEFS)' ]; } || 
 # without going through $(OBJS). Those two escaped the stamp, so
 # `make DEFS=... dumpcmp` reported "up to date" and linked a binary built
 # without the define -- the exact hole the stamp exists to close.
-$(OBJS): $(DEFS_STAMP) $(CF_LMAX_STAMP)
+$(OBJS) $(TEST_OBJS): $(DEFS_STAMP) $(CF_LMAX_STAMP)
 
 GIT_STAMP := .git.stamp
 GIT_RAW  := $(shell git -C . describe --always --abbrev=8 2>/dev/null)
@@ -279,12 +281,29 @@ $(OBJS): $(BOINC_STAMP)
 # CPU-only correctness gates. No CUDA, so these run on a busy box and on
 # machines without the card.
 fbtest: fbtest.c $(C_OBJS)
-	$(CC) $(CFLAGS) -o $@ fbtest.c $(C_OBJS) -lm
+	$(CC) $(CFLAGS) -o $@ fbtest.c $(C_OBJS) -ldl -lm
 
 # Native algebraic factor-base generator; deliberately CPU-only and free of
 # CADO/GMP dependencies. It shares the job/poly parser and prime enumerator.
 fbgen: fbgen.c poly.o primes.o
 	$(CC) $(CFLAGS) -o $@ fbgen.c poly.o primes.o -lm -pthread
+
+# Standalone GPU factor-base generator and benchmark.  It can either price the
+# ordinary-root kernels or write a reusable native roots file with --out.  Keep
+# it out of `all` because bench already compiles the same CUDA translation unit
+# as fbgen_gpu_lib.o; users who want the cached-file utility can build this
+# target explicitly without forcing every production build to compile it twice.
+fbgen_gpu: fbgen_gpu.o fbgen_lib.o fb_load.o fb_cado.o poly.o primes.o platform.o $(ARCH_STAMP) $(LINK_STAMP)
+	$(NVCC) $(NVCC_ARCH) --cudart $(CUDART_LINK) -o $@ \
+		fbgen_gpu.o fbgen_lib.o fb_load.o fb_cado.o poly.o primes.o platform.o -lm
+
+fbgen_gpu.o: $(ARCH_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP)
+
+# Same CUDA root generator, linked into production bench without the standalone
+# benchmark main().  The generated algebraic FB is now the pipeline default
+# when no --fb1/--cadofb file is supplied.
+fbgen_gpu_lib.o: fbgen_gpu.cu bench.h $(ARCH_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP)
+	$(NVCC) $(NVCC_FLAGS) -DFBGEN_GPU_LIBRARY -c $< -o $@
 
 # The same exact root finder drives on-the-fly special-q generation in bench.
 # Keep it in one source: a copied degree-5 root finder would eventually drift
@@ -295,7 +314,7 @@ fbgen_lib.o: fbgen.c bench.h
 	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -DFBGEN_LIBRARY -c $< -o $@
 
 sqgentest: sqgentest.c fbgen_lib.o poly.o primes.o
-	$(CC) $(CFLAGS) -Wl,--gc-sections -o $@ $^ -lm
+	$(CC) $(CFLAGS) -Wl,--gc-sections -o $@ $^ -ldl -lm
 
 dumpcmp: dumpcmp.c $(DEFS_STAMP) $(CF_LMAX_STAMP)
 	$(CC) $(CFLAGS) -o $@ $< -lm
@@ -304,10 +323,10 @@ dumpcmp: dumpcmp.c $(DEFS_STAMP) $(CF_LMAX_STAMP)
 # contain whitespace after filename resolution, so candidate identity must not
 # depend on the checkpoint parser's ordinary whitespace tokenisation.
 ckpttest: ckpttest.c ckpt.h bench.h platform.o $(DEFS_STAMP) $(CF_LMAX_STAMP)
-	$(CC) $(CFLAGS) -o $@ ckpttest.c platform.o -lm
+	$(CC) $(CFLAGS) -o $@ ckpttest.c platform.o -ldl -lm
 
 stoptest: stoptest.c platform.h platform.o $(DEFS_STAMP) $(CF_LMAX_STAMP)
-	$(CC) $(CFLAGS) -o $@ stoptest.c platform.o -lm
+	$(CC) $(CFLAGS) -o $@ stoptest.c platform.o -ldl -lm
 
 # joins the two per-side --emit-cof files into cofactorisation batch input
 mkcofbatch: mkcofbatch.c $(DEFS_STAMP) $(CF_LMAX_STAMP)
@@ -322,17 +341,17 @@ mkcofbatch: mkcofbatch.c $(DEFS_STAMP) $(CF_LMAX_STAMP)
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
--include $(OBJS:.o=.d)
+-include $(OBJS:.o=.d) $(TEST_OBJS:.o=.d) fbgen_gpu.d
 
 clean:
-	rm -f bench fbtest fbgen sqgentest dumpcmp mkcofbatch ckpttest stoptest *.o *.d $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP) $(GIT_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP)
+	rm -f bench fbtest fbgen fbgen_gpu sqgentest dumpcmp mkcofbatch ckpttest stoptest slabtest *.o *.d $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP) $(GIT_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP)
 
-.PHONY: all clean check ckptcheck stopcheck cofcheck fbgencheck sqgencheck walkcheck
+.PHONY: all clean check ckptcheck stopcheck cofcheck fbgencheck fbgpucheck sqgencheck walkcheck slabcheck
 
 # `check` depended on fbtest alone, so the whole CUDA path -- kernels, the
 # cofactoriser, the pipeline -- could fail to compile while the gates reported
 # "all gates passed". Depend on `all`.
-check: all ckptcheck stopcheck cofcheck fbgencheck sqgencheck walkcheck
+check: all ckptcheck stopcheck cofcheck fbgencheck sqgencheck walkcheck slabcheck
 	./fbtest --fb1 ../oracle/c183.fb1
 
 ckptcheck: ckpttest
@@ -367,8 +386,24 @@ walkcheck: bench
 	   echo "  walkcheck FAILED (exit $$st)"; exit 1; \
 	 fi
 
+
+slabtest: slabtest.o $(C_OBJS)
+	$(CXX) $(CXXFLAGS) -o $@ $^ -ldl -lm
+
+# CPU-only arithmetic/scheduling gate for j-slabbing.  It covers automatic and
+# forced plans, partial tails, actual bkthresh -> small-FB -> pmax wiring,
+# congruence phase translation, and the exact w<2^31 range used by the existing
+# reciprocal in the hot direct-TD loop.
+slabcheck: slabtest
+	./slabtest
+
 fbgencheck: fbgen
 	./fbgencheck.sh
+
+# Explicit GPU gate: not part of `check`, because the ordinary CPU suite must
+# remain runnable on build hosts with no NVIDIA device.
+fbgpucheck: fbgen fbgen_gpu
+	./fbgpucheck.sh
 
 sqgencheck: sqgentest
 	./sqgentest

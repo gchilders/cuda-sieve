@@ -247,14 +247,15 @@ int fb_validate(fb_t *fb, fb_validate_policy_t policy, const char *source)
             fb_modulus_kind_t kind;
 
             if (policy == FB_VALIDATE_GENERATED_PRIME_POWERS) {
-                /* The zero-flag entries were already proven prime by
-                 * prime_list_build() inside an in-process generator, so
-                 * reclassifying that stream here would re-sieve a range this
-                 * process just sieved. Proper powers are few and remain
-                 * independently checked so a bad flag cannot route a mixed
-                 * composite to the lattice transform. This shortcut is only
-                 * ever valid when the primes came from THIS process; file
-                 * input goes through the sieve below. */
+                /* The zero-flag entries must already have an independent
+                 * primality proof inside the in-process generator.  CPU
+                 * builders get that from prime_list_build(); the GPU builder
+                 * independently Miller-Rabin-checks every root-bearing q=p
+                 * before it can be emitted.  Reclassifying the full stream
+                 * here would re-sieve a range this process just proved.
+                 * Proper powers are few and remain independently checked so a
+                 * bad flag cannot route a mixed composite to the lattice
+                 * transform. File input never uses this policy. */
                 kind = flagged_power
                     ? (composite_is_prime_power(q)
                        ? FB_MODULUS_PROPER_POWER : FB_MODULUS_INVALID)
@@ -521,4 +522,18 @@ nomem:
     fb_free(small);
     errno = ENOMEM;
     return -1;
+}
+
+/* Largest PRIME that actually reaches the direct-test table. Proper prime
+ * powers live in the small FB too, but td_fill_small deliberately skips them;
+ * including one here would make slab planning needlessly pessimistic. Keeping
+ * this next to fb_split_small makes the bkthresh -> small-FB -> pmax path one
+ * shared implementation for production and the CPU integration gate. */
+uint32_t fb_max_td_prime(const fb_t *fb)
+{
+    uint32_t pmax = 0, k;
+    if (!fb) return 0;
+    for (k = 0; k < fb->n; k++)
+        if (!FB_ISPOW(fb, k) && fb->primes[k] > pmax) pmax = fb->primes[k];
+    return pmax;
 }

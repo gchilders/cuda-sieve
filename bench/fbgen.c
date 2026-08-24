@@ -44,10 +44,10 @@ typedef struct {
     uint32_t c[2 * FBGEN_MAX_DEG + 2];
 } mpoly_t;
 
-typedef struct {
-    uint32_t q, r;
-    int n1, n0;
-} fbgen_entry_t;
+/* Keep the native generator and the library-facing exact-entry API on the
+ * same representation.  The standalone GPU writer uses the public form so
+ * both CPU and GPU output pass through the exact same serializer. */
+typedef fbgen_exact_entry_t fbgen_entry_t;
 
 typedef struct {
     fbgen_entry_t *v;
@@ -67,14 +67,6 @@ static void *xmalloc(size_t n)
     if (!p) die_oom();
     return p;
 }
-
-static void *xrealloc(void *p, size_t n)
-{
-    p = realloc(p, n ? n : 1);
-    if (!p) die_oom();
-    return p;
-}
-
 #endif
 
 /* ---- fixed-width signed integers ----------------------------------- */
@@ -107,16 +99,9 @@ static int big_parse(sbig_t *a, const char *s)
     return 0;
 }
 
-/* Signed bignum arithmetic, reachable only from the root finder -- which the
- * library build excludes, so all of it is dead there and -Wall -Wextra reports
- * every function. The chain is big_abs_cmp/add/sub -> big_add -> ... ->
- * zpoly_linear_comp -> all_roots_affine, so it has to be cut at the top rather
- * than at whichever function happens to warn first.
- *
- * The block ends BEFORE big_mod_ui, and big_norm above stays outside it: both
- * are reachable from the streaming special-q generator the main executable
- * actually links. That is the only reason this is two blocks and not one. */
-#ifndef FBGEN_LIBRARY
+/* Signed bignum arithmetic used by the exact p-adic/Hensel branch builder.
+ * This is compiled into fbgen_lib.o as well as the standalone generator so the
+ * in-process GPU builder and the text oracle share one exact implementation. */
 static int big_abs_cmp(const sbig_t *a, const sbig_t *b)
 {
     int i;
@@ -210,7 +195,6 @@ static uint32_t big_div_ui(sbig_t *a, uint32_t d)
     return (uint32_t)rem;
 }
 
-#endif /* !FBGEN_LIBRARY */
 
 /* Signed a modulo m, in [0,m). */
 static uint32_t big_mod_ui(const sbig_t *a, uint32_t m)
@@ -222,14 +206,7 @@ static uint32_t big_mod_ui(const sbig_t *a, uint32_t m)
     return (uint32_t)r;
 }
 
-/* Used only by all_roots_affine/all_roots, which are themselves inside the
- * #ifndef FBGEN_LIBRARY block below. The main executable links fbgen only for
- * its streaming special-q generator, so in that build these are unreachable
- * and -Wall -Wextra reports each one. big_p_val and binom_small are in here
- * for the same reason even though they do not warn today: they are reachable
- * only through the other three, so excluding those alone would just move the
- * warning onto them. */
-#ifndef FBGEN_LIBRARY
+/* Exact integer helpers for ramified and projective Hensel branches. */
 static int big_p_val(const sbig_t *a, uint32_t p)
 {
     sbig_t t = *a;
@@ -293,7 +270,6 @@ static void zpoly_linear_comp(zpoly_t *g, const zpoly_t *f, uint32_t a, uint32_t
     }
 }
 
-#endif /* !FBGEN_LIBRARY */
 
 /* ---- polynomials over F_p ------------------------------------------ */
 
@@ -595,7 +571,6 @@ void sqgen_free(sqgen_t *G)
     free(G);
 }
 
-#ifndef FBGEN_LIBRARY
 static uint32_t zpoly_eval_mod(const zpoly_t *f, uint32_t x, uint32_t m)
 {
     uint64_t r = 0;
@@ -632,13 +607,25 @@ static uint32_t lift_unramified(const zpoly_t *f, uint32_t r, uint32_t p, int km
 
 /* ---- p-adic branches and output entries ---------------------------- */
 
-static void ev_push(entry_vec_t *v, fbgen_entry_t e)
+static int ev_push(entry_vec_t *v, fbgen_entry_t e)
 {
     if (v->n == v->cap) {
-        v->cap = v->cap ? 2 * v->cap : 32;
-        v->v = (fbgen_entry_t *)xrealloc(v->v, v->cap * sizeof(*v->v));
+        size_t cap = v->cap ? 2 * v->cap : 32;
+        fbgen_entry_t *p;
+        if (cap < v->cap || cap > SIZE_MAX / sizeof(*v->v)) {
+            errno = ENOMEM;
+            return -1;
+        }
+        p = (fbgen_entry_t *)realloc(v->v, cap * sizeof(*v->v));
+        if (!p) {
+            errno = ENOMEM;
+            return -1;
+        }
+        v->v = p;
+        v->cap = cap;
     }
     v->v[v->n++] = e;
+    return 0;
 }
 
 static uint32_t pow_u32(uint32_t p, int k)
@@ -649,13 +636,13 @@ static uint32_t pow_u32(uint32_t p, int k)
     return (uint32_t)q;
 }
 
-static void all_roots_affine(entry_vec_t *L, const zpoly_t *f, uint32_t p,
-                             int kmax, int k0, int m,
-                             uint32_t phi1, uint32_t phi0)
+static int all_roots_affine(entry_vec_t *L, const zpoly_t *f, uint32_t p,
+                            int kmax, int k0, int m,
+                            uint32_t phi1, uint32_t phi0)
 {
     uint32_t roots[FBGEN_MAX_DEG + 1];
     int i, nr;
-    if (k0 >= kmax) return;
+    if (k0 >= kmax) return 0;
     nr = zpoly_roots(f, p, roots);
     for (i = 0; i < nr; i++) {
         uint32_t r = roots[i];
@@ -667,8 +654,9 @@ static void all_roots_affine(entry_vec_t *L, const zpoly_t *f, uint32_t p,
             uint32_t pml = pow_u32(p, m);
             for (l = 1; l <= klift; l++) {
                 pml = (uint32_t)((uint64_t)pml * p);
-                ev_push(L, (fbgen_entry_t){pml, (uint32_t)(phir % pml),
-                                           k0 + l, k0 + l - 1});
+                if (ev_push(L, (fbgen_entry_t){pml, (uint32_t)(phir % pml),
+                                               k0 + l, k0 + l - 1}))
+                    return -1;
             }
         } else {
             zpoly_t ff;
@@ -682,13 +670,17 @@ static void all_roots_affine(entry_vec_t *L, const zpoly_t *f, uint32_t p,
                 fprintf(stderr, "fbgen: zero polynomial on ramified branch mod %u\n", p);
                 exit(EXIT_FAILURE);
             }
-            ev_push(L, (fbgen_entry_t){q, (uint32_t)(phir % q), k0 + val, k0});
+            if (ev_push(L, (fbgen_entry_t){q, (uint32_t)(phir % q), k0 + val, k0}))
+                return -1;
             nphi1 = (uint32_t)((uint64_t)phi1 * p);
             nphi0 = (uint32_t)((uint64_t)phi0 + (uint64_t)phi1 * r);
             zpoly_div_p(&ff, p, val);
-            all_roots_affine(L, &ff, p, kmax, k0 + val, m + 1, nphi1, nphi0);
+            if (all_roots_affine(L, &ff, p, kmax, k0 + val, m + 1,
+                                 nphi1, nphi0))
+                return -1;
         }
     }
+    return 0;
 }
 
 static int entry_cmp(const void *aa, const void *bb)
@@ -701,10 +693,10 @@ static int entry_cmp(const void *aa, const void *bb)
     return 0;
 }
 
-static entry_vec_t all_roots(const zpoly_t *f, uint32_t p, int maxbits)
+static int all_roots(const zpoly_t *f, uint32_t p, int maxbits, entry_vec_t *L)
 {
-    entry_vec_t L = {0};
     zpoly_t rev;
+    memset(L, 0, sizeof(*L));
     int i, v, kmax = 0;
     uint64_t q = 1, bound = 1ull << maxbits;
     while (q * p <= bound) { q *= p; kmax++; }
@@ -718,68 +710,92 @@ static entry_vec_t all_roots(const zpoly_t *f, uint32_t p, int maxbits)
     v = zpoly_content_val(&rev, p);
     if (v > 0 && v != INT_MAX) {
         size_t first;
-        ev_push(&L, (fbgen_entry_t){p, p, v, 0});
+        if (ev_push(L, (fbgen_entry_t){p, p, v, 0})) goto nomem;
         zpoly_div_p(&rev, p, v);
-        first = L.n;
-        all_roots_affine(&L, &rev, p, kmax - 1, 0, 0, 1, 0);
-        for (i = (int)first; i < (int)L.n; i++) {
-            L.v[i].q *= p;
-            L.v[i].n1 += v;
-            L.v[i].n0 += v;
-            L.v[i].r = L.v[i].r * p + L.v[i].q;
+        first = L->n;
+        if (all_roots_affine(L, &rev, p, kmax - 1, 0, 0, 1, 0)) goto nomem;
+        for (i = (int)first; i < (int)L->n; i++) {
+            L->v[i].q *= p;
+            L->v[i].n1 += v;
+            L->v[i].n0 += v;
+            L->v[i].r = L->v[i].r * p + L->v[i].q;
         }
     }
-    all_roots_affine(&L, f, p, kmax, 0, 0, 1, 0);
-    if (L.n > 1) qsort(L.v, L.n, sizeof(*L.v), entry_cmp);
-    return L;
+    if (all_roots_affine(L, f, p, kmax, 0, 0, 1, 0)) goto nomem;
+    if (L->n > 1) qsort(L->v, L->n, sizeof(*L->v), entry_cmp);
+    return 0;
+
+nomem:
+    free(L->v);
+    memset(L, 0, sizeof(*L));
+    errno = ENOMEM;
+    return -1;
 }
 
-static void print_prime_entries(FILE *out, const entry_vec_t *L)
+int fbgen_exact_prime_entries(const poly_t *P, uint32_t base_p, int maxbits,
+                              fbgen_exact_entry_t **out, size_t *nout)
+{
+    zpoly_t f;
+    entry_vec_t L;
+    fbgen_exact_entry_t *v = NULL;
+    size_t i;
+
+    if (!P || !out || !nout || P->deg < 1 || P->deg > FBGEN_MAX_DEG ||
+        base_p < 2 || maxbits < 1 || maxbits > 31 ||
+        !bench_is_prime32(base_p)) {
+        errno = EINVAL;
+        return -1;
+    }
+    *out = NULL;
+    *nout = 0;
+    memset(&f, 0, sizeof(f));
+    f.deg = P->deg;
+    for (int k = 0; k <= P->deg; k++) {
+        const char *cs = P->cs[k][0] ? P->cs[k] : "0";
+        if (big_parse(&f.c[k], cs)) {
+            errno = ERANGE;
+            return -1;
+        }
+    }
+    if (all_roots(&f, base_p, maxbits, &L)) return -1;
+    if (L.n) {
+        v = (fbgen_exact_entry_t *)malloc(L.n * sizeof(*v));
+        if (!v) { free(L.v); return -1; }
+        for (i = 0; i < L.n; i++) {
+            v[i].q = L.v[i].q;
+            v[i].r = L.v[i].r;
+            v[i].n1 = L.v[i].n1;
+            v[i].n0 = L.v[i].n0;
+        }
+    }
+    free(L.v);
+    *out = v;
+    *nout = L.n;
+    return 0;
+}
+
+int fbgen_write_prime_entries(FILE *out, const fbgen_exact_entry_t *v, size_t n)
 {
     uint32_t oldq = 0;
     int oldn1 = -1, oldn0 = -1;
     size_t i;
-    for (i = 0; i < L->n; i++) {
-        const fbgen_entry_t *e = &L->v[i];
+    if (!out || (!v && n)) { errno = EINVAL; return -1; }
+    for (i = 0; i < n; i++) {
+        const fbgen_exact_entry_t *e = &v[i];
         if (e->q == oldq && e->n1 == oldn1 && e->n0 == oldn0) {
-            fprintf(out, ",%u", e->r);
+            if (fprintf(out, ",%u", e->r) < 0) return -1;
         } else {
-            if (i) fputc('\n', out);
+            if (i && fputc('\n', out) == EOF) return -1;
             oldq = e->q; oldn1 = e->n1; oldn0 = e->n0;
-            if (e->n1 == 1 && e->n0 == 0) fprintf(out, "%u: %u", e->q, e->r);
-            else fprintf(out, "%u:%d,%d: %u", e->q, e->n1, e->n0, e->r);
+            if (e->n1 == 1 && e->n0 == 0) {
+                if (fprintf(out, "%u: %u", e->q, e->r) < 0) return -1;
+            } else if (fprintf(out, "%u:%d,%d: %u", e->q, e->n1, e->n0, e->r) < 0) {
+                return -1;
+            }
         }
     }
-    if (L->n) fputc('\n', out);
-}
-
-/* ---- prime enumeration and workers --------------------------------- */
-
-typedef struct {
-    const zpoly_t *f;
-    const uint32_t *primes;
-    size_t begin, end;
-    int maxbits;
-    char *data;
-    size_t size;
-    int failed;
-} worker_t;
-
-static void *worker_main(void *arg)
-{
-    worker_t *w = (worker_t *)arg;
-    FILE *stream;
-    size_t i;
-    stream = open_memstream(&w->data, &w->size);
-    if (!stream) { w->failed = errno ? errno : EIO; return NULL; }
-    for (i = w->begin; i < w->end; i++) {
-        entry_vec_t L = all_roots(w->f, w->primes[i], w->maxbits);
-        print_prime_entries(stream, &L);
-        free(L.v);
-        if (ferror(stream)) { w->failed = errno ? errno : EIO; break; }
-    }
-    if (fclose(stream) && !w->failed) w->failed = errno ? errno : EIO;
-    return NULL;
+    if (n && fputc('\n', out) == EOF) return -1;
+    return ferror(out) ? -1 : 0;
 }
 
 static void print_poly(FILE *out, const poly_t *P)
@@ -808,6 +824,64 @@ static void print_poly(FILE *out, const poly_t *P)
     }
     if (!any) fputc('0', out);
     fputc('\n', out);
+}
+
+int fbgen_write_header(FILE *out, const poly_t *P, uint32_t lim, int maxbits)
+{
+    if (!out || !P || P->deg < 1 || P->deg > FBGEN_MAX_DEG || lim < 2 ||
+        maxbits < 1 || maxbits > 31) {
+        errno = EINVAL;
+        return -1;
+    }
+    print_poly(out, P);
+    if (fprintf(out, "# DEGREE: %d\n# lim = %u\n# maxbits = %d\n",
+                P->deg, lim, maxbits) < 0)
+        return -1;
+    return ferror(out) ? -1 : 0;
+}
+
+#ifndef FBGEN_LIBRARY
+
+static int print_prime_entries(FILE *out, const entry_vec_t *L)
+{
+    return fbgen_write_prime_entries(out, L->v, L->n);
+}
+
+/* ---- prime enumeration and workers --------------------------------- */
+
+typedef struct {
+    const zpoly_t *f;
+    const uint32_t *primes;
+    size_t begin, end;
+    int maxbits;
+    char *data;
+    size_t size;
+    int failed;
+} worker_t;
+
+static void *worker_main(void *arg)
+{
+    worker_t *w = (worker_t *)arg;
+    FILE *stream;
+    size_t i;
+    stream = open_memstream(&w->data, &w->size);
+    if (!stream) { w->failed = errno ? errno : EIO; return NULL; }
+    for (i = w->begin; i < w->end; i++) {
+        entry_vec_t L;
+        if (all_roots(w->f, w->primes[i], w->maxbits, &L)) {
+            w->failed = errno ? errno : ENOMEM;
+            break;
+        }
+        if (print_prime_entries(stream, &L)) {
+            free(L.v);
+            w->failed = errno ? errno : EIO;
+            break;
+        }
+        free(L.v);
+        if (ferror(stream)) { w->failed = errno ? errno : EIO; break; }
+    }
+    if (fclose(stream) && !w->failed) w->failed = errno ? errno : EIO;
+    return NULL;
 }
 
 static int generate(FILE *out, const poly_t *P, uint32_t lim,
@@ -857,8 +931,7 @@ static int generate(FILE *out, const poly_t *P, uint32_t lim,
             goto cleanup;
         }
     }
-    print_poly(out, P);
-    fprintf(out, "# DEGREE: %d\n# lim = %u\n# maxbits = %d\n", P->deg, lim, maxbits);
+    if (fbgen_write_header(out, P, lim, maxbits)) goto cleanup;
     for (int t = 0; t < nthr; t++)
         if (fwrite(w[t].data, 1, w[t].size, out) != w[t].size) goto cleanup;
     if (ferror(out)) goto cleanup;

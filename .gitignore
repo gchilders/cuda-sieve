@@ -30,11 +30,13 @@ bench/bench
 bench/bench.exe
 bench/fbtest
 bench/fbgen
+bench/fbgen_gpu
 bench/sqgentest
 bench/dumpcmp
 bench/mkcofbatch
 bench/ckpttest
 bench/stoptest
+bench/slabtest
 # wintest.bat outputs (cross-platform byte-comparison harness)
 bench/wintest.dat*
 bench/wintest.out
@@ -72,3 +74,7 @@ bench/fbase.m*
 # commit field meaningful -- see bench/Makefile.
 __pycache__/
 *.pyc
+*.dat
+*.poly
+*.log
+

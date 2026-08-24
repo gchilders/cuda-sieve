@@ -56,6 +56,27 @@ static int cuda_check_impl(cudaError_t err, const char *expr,
 #define CUDA_CHECKED(x) cuda_check_impl((x), #x, __FILE__, __LINE__)
 #define CK(x) do { if (CUDA_CHECKED(x)) return -1; } while (0)
 
+/* The maximum opt-in dynamic shared memory is a property of the selected
+ * device, not of a CUDA architecture family.  Query it at runtime so cards
+ * such as A100/H100 can use larger legal regions while cards with a smaller
+ * limit are rejected before cudaFuncSetAttribute()/launch. */
+static int cuda_optin_smem_limit(size_t *out)
+{
+    int dev = 0, lim = 0;
+    if (!out) return -1;
+    if (CUDA_CHECKED(cudaGetDevice(&dev))) return -1;
+    if (CUDA_CHECKED(cudaDeviceGetAttribute(
+            &lim, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev))) return -1;
+    if (lim <= 0) {
+        fprintf(stderr,
+                "CUDA device %d reported an invalid opt-in shared-memory limit"
+                " of %d B\n", dev, lim);
+        return -1;
+    }
+    *out = (size_t)lim;
+    return 0;
+}
+
 /* ---- stage T: root transform + plattice reduction --------------------- */
 
 /* The transform runs through pl_transform_enc, not pl_transform, for three
@@ -75,13 +96,15 @@ static int cuda_check_impl(cudaError_t err, const char *expr,
  * accumulates the number of positions thereby dropped so the loss is a printed
  * number rather than a silence. With the default bkthresh = I >= J it is
  * exactly zero: g > 1 needs q | (rows), and every bucketed q exceeds J. */
+template <bool SLABBED>
 __global__ void k_transform(const uint32_t *__restrict primes,
                             const uint32_t *__restrict roots,
                             plat_t *__restrict out,
                             uint32_t n, int logI, uint32_t J,
                             int64_t a0, int64_t a1, int64_t b0, int64_t b1,
                             uint32_t *__restrict nproj,
-                            unsigned long long *__restrict nlost)
+                            unsigned long long *__restrict nlost,
+                            uint64_t *__restrict walk_cur)
 {
     const uint64_t stride = bench_grid_stride_x();
     for (uint64_t kk = bench_grid_thread_x(); kk < n; kk += stride) {
@@ -89,13 +112,16 @@ __global__ void k_transform(const uint32_t *__restrict primes,
         const uint32_t q = primes[k];
         uint32_t rt, g, m = pl_transform_enc(q, roots[k], a0, a1, b0, b1, &rt, &g);
         if (g > 1) {                         /* rows only: emit an empty walk */
-            plat_t P; P.inc_warp = 0xFFFFFFFFu; P.inc_step = PL_VERTICAL;
+            plat_t P; P.inc_warp = PL_INVALID; P.inc_step = PL_VERTICAL;
             P.bound_warp = 0; P.bound_step = 0;
             out[k] = P;
+            if constexpr (SLABBED) walk_cur[k] = UINT64_MAX;
             atomicAdd(nproj, 1u);
-            atomicAdd(nlost, (unsigned long long)((J / g) * ((1u << logI) / m)));
+            atomicAdd(nlost, (unsigned long long)(J / g) * ((1u << logI) / m));
         } else {
-            out[k] = pl_make(m, rt, logI);
+            const plat_t P = pl_make(m, rt, logI);
+            out[k] = P;
+            if constexpr (SLABBED) walk_cur[k] = pl_first64(&P, logI);
         }
     }
 }
@@ -104,14 +130,16 @@ __global__ void k_transform(const uint32_t *__restrict primes,
 
 /* One atomicAdd per record into a 2^log_nbuckets-way split. This is the
  * baseline the design doc says to beat. */
-template <int RECBYTES>
+template <int RECBYTES, bool SLABBED = false>
 __global__ void k_fill_atomic(const plat_t *__restrict plat,
                               const uint16_t *__restrict slice,
                               uint32_t n, uint32_t xmax, int logI,
                               int log_region,
                               uint32_t *__restrict cursor,
                               uint8_t *__restrict out, uint32_t cap,
-                              uint32_t *__restrict overflow)
+                              uint32_t *__restrict overflow,
+                              const uint64_t *__restrict walk_cur,
+                              uint64_t *__restrict walk_next)
 {
     const uint32_t Imask = (1u << logI) - 1;
     const uint32_t offmask = (1u << log_region) - 1;
@@ -120,23 +148,47 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
     for (uint64_t kk = bench_grid_thread_x(); kk < n; kk += stride) {
         const uint32_t k = (uint32_t)kk;
         plat_t P = plat[k];
-        if (P.inc_warp == 0xFFFFFFFFu) continue;
+        if (P.inc_warp == PL_INVALID) {
+            if constexpr (SLABBED) walk_next[k] = walk_cur[k];
+            continue;
+        }
         /* one read per prime, not per record: the slice hint is what the apply
          * kernel turns back into log p (and what resieve would use to recover
          * the prime itself), exactly as CADO's shorthint does */
         const uint32_t sl = slice[k];
-        for (uint32_t x = pl_first(&P, logI); x < xmax; x = pl_next(x, &P, Imask)) {
-            uint32_t b = x >> log_region;
-            uint32_t slot = atomicAdd(&cursor[b], 1u);
-            if (slot >= cap) { atomicAdd(overflow, 1u); continue; }
-            size_t at = ((size_t)b * cap + slot) * RECBYTES;
-            if (RECBYTES == 2) {
-                *(uint16_t *)(out + at) = (uint16_t)(x & offmask);
-            } else if (RECBYTES == 4) {
-                /* 16-bit offset + 16-bit slice hint (CADO shorthint shape) */
-                *(uint32_t *)(out + at) = (x & offmask) | (sl << 16);
-            } else {
-                *(uint64_t *)(out + at) = (uint64_t)(x & offmask) | ((uint64_t)sl << 32);
+        if constexpr (SLABBED) {
+            uint64_t x = walk_cur[k];
+            for (; x < xmax; x = pl_next64(x, &P, Imask)) {
+                const uint32_t xl = (uint32_t)x;
+                const uint32_t b = xl >> log_region;
+                const uint32_t slot = atomicAdd(&cursor[b], 1u);
+                if (slot >= cap) { atomicAdd(overflow, 1u); continue; }
+                const size_t at = ((size_t)b * cap + slot) * RECBYTES;
+                if (RECBYTES == 2) {
+                    *(uint16_t *)(out + at) = (uint16_t)(xl & offmask);
+                } else if (RECBYTES == 4) {
+                    *(uint32_t *)(out + at) = (xl & offmask) | (sl << 16);
+                } else {
+                    *(uint64_t *)(out + at) = (uint64_t)(xl & offmask) | ((uint64_t)sl << 32);
+                }
+            }
+            /* x is the exact first hit at/after the slab end. It can be more
+             * than 2^32 beyond the next origin, so continuation state is wide. */
+            walk_next[k] = x - xmax;
+        } else {
+            uint32_t x = pl_first(&P, logI);
+            for (; x < xmax; x = pl_next(x, &P, Imask)) {
+                const uint32_t b = x >> log_region;
+                const uint32_t slot = atomicAdd(&cursor[b], 1u);
+                if (slot >= cap) { atomicAdd(overflow, 1u); continue; }
+                const size_t at = ((size_t)b * cap + slot) * RECBYTES;
+                if (RECBYTES == 2) {
+                    *(uint16_t *)(out + at) = (uint16_t)(x & offmask);
+                } else if (RECBYTES == 4) {
+                    *(uint32_t *)(out + at) = (x & offmask) | (sl << 16);
+                } else {
+                    *(uint64_t *)(out + at) = (uint64_t)(x & offmask) | ((uint64_t)sl << 32);
+                }
             }
         }
     }
@@ -183,18 +235,20 @@ __device__ __forceinline__ uint32_t ss_first(uint32_t p, uint32_t rt,
     return (uint32_t)(c < 0 ? c + (int32_t)p : c);
 }
 
-template <int CELLBITS, int ATOMIC>
+template <int CELLBITS, int ATOMIC, bool SLABBED = false>
 __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_region,
                             const uint32_t *__restrict sp,
                             const uint32_t *__restrict srt,
                             const uint32_t *__restrict sg,
                             const uint16_t *__restrict slp,
                             uint32_t nsmall, uint32_t nblk, uint32_t nwrp,
-                            uint32_t tid, uint32_t nth)
+                            uint32_t tid, uint32_t nth, uint32_t j_base)
 {
     const uint32_t width = 1u << log_region;
     const uint32_t x0    = region << log_region;
-    const uint32_t j     = x0 >> logI;
+    const uint32_t jlocal = x0 >> logI;
+    uint32_t j = jlocal;
+    if constexpr (SLABBED) j += j_base;
     const int32_t  ilo   = (int32_t)(x0 & ((1u << logI) - 1)) - (int32_t)(1u << (logI - 1));
     const uint32_t warp = tid >> 5, lane = tid & 31, nwarps = nth >> 5;
 
@@ -242,7 +296,7 @@ __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_regi
  * price what correctness costs, since a byte cell overflows into its
  * neighbour (accumulated logs do exceed 255) and cannot be used for real.
  */
-template <int CELLBITS, int ATOMIC, int NORMMODE>
+template <int CELLBITS, int ATOMIC, int NORMMODE, bool SLABBED = false>
 __global__ void k_apply(const uint32_t *__restrict buckets,
                         const uint32_t *__restrict cnt, uint32_t cap,
                         int logI, int log_region,
@@ -256,7 +310,8 @@ __global__ void k_apply(const uint32_t *__restrict buckets,
                         const uint32_t *__restrict sg, const uint16_t *__restrict slp,
                         uint32_t nsmall, uint32_t nblk, uint32_t nwrp,
                         uint32_t probe_x, uint32_t *__restrict probe_out,
-                        uint32_t *__restrict survbits, int not_both_even)
+                        uint32_t *__restrict survbits, int not_both_even,
+                        uint32_t j_base)
 {
     extern __shared__ uint32_t sm[];
     const uint32_t ncell  = 1u << log_region;
@@ -283,7 +338,9 @@ __global__ void k_apply(const uint32_t *__restrict buckets,
             } else {
                 const uint32_t x = xbase + w * CPW + c;
                 const int32_t  ii = (int32_t)(x & Imask) - Ihalf;
-                const uint32_t jj = x >> logI;
+                const uint32_t jlocal = x >> logI;
+                uint32_t jj = jlocal;
+                if constexpr (SLABBED) jj += j_base;
                 const float fi = (float)ii;
                 const float fj = (float)jj;
                 const float u = fmaf(N.ua, fi, N.ub * fj);
@@ -368,8 +425,8 @@ report spurious cell mismatches. Pricing builds only, never for relations."
 
     /* ---- small primes: line-sieved straight into the same shared region ---- */
     if (nsmall)
-        sieve_small<CELLBITS, ATOMIC>(S, b, logI, log_region, sp, srt, sg, slp,
-                                      nsmall, nblk, nwrp, tid, nth);
+        sieve_small<CELLBITS, ATOMIC, SLABBED>(S, b, logI, log_region, sp, srt, sg, slp,
+                                               nsmall, nblk, nwrp, tid, nth, j_base);
 
     /* ---- apply ---- */
     uint32_t n = cnt[b];
@@ -407,7 +464,10 @@ report spurious cell mismatches. Pricing builds only, never for relations."
              * relation is a duplicate of (a/2, b/2); las marks these 255 so
              * they can never survive. Off by default so that every survivor
              * count recorded before 2026-08-03 still reproduces. */
-            const int botheven = ((x & 1u) == 0u) && (((x >> logI) & 1u) == 0u);
+            const uint32_t jlocal = x >> logI;
+            uint32_t jpar = jlocal;
+            if constexpr (SLABBED) jpar += j_base;
+            const int botheven = ((x & 1u) == 0u) && ((jpar & 1u) == 0u);
             if (v >= THRESH && !(not_both_even && botheven)) {
                 uint32_t at = atomicAdd(nsurv, 1u);
                 if (at < maxsurv) surv[at] = x;
@@ -466,7 +526,7 @@ void k_fill_l1(const plat_t *__restrict plat,
 
     const uint64_t stride = bench_grid_product_u64(gridDim.x, nth);
     uint64_t k = bench_grid_product_u64(blockIdx.x, nth) + tid;
-    plat_t P; P.inc_warp = 0xFFFFFFFFu;
+    plat_t P; P.inc_warp = PL_INVALID;
     uint32_t x = 0;
     int active = 0;
 
@@ -474,7 +534,7 @@ void k_fill_l1(const plat_t *__restrict plat,
         if (!active) {                       /* pick up the next prime */
             while (k < n) {
                 P = plat[(uint32_t)k];
-                if (P.inc_warp != 0xFFFFFFFFu) { x = pl_first(&P, logI); active = (x < xmax); }
+                if (P.inc_warp != PL_INVALID) { x = pl_first(&P, logI); active = (x < xmax); }
                 k += stride;
                 if (active) break;
             }
@@ -713,20 +773,24 @@ __device__ __forceinline__ uint32_t bgcd(uint32_t u, uint32_t v)
  */
 /* One summary bit per `wper` words of the full bitmap. wper == 2 reproduces
  * k_build_summary's 1-bit-per-64-positions table. Whole output words are built
- * by one thread, so unlike k_build_summary this needs no atomics. */
+ * by one thread, including a zero-padded partial final word, so unlike
+ * k_build_summary this needs neither atomics nor a cudaMemset between slabs. */
 __global__ void k_build_summary_g(const uint32_t *__restrict bits,
                                   uint32_t nword, uint32_t wper,
                                   uint32_t *__restrict summary)
 {
-    const uint32_t nsw = nword / (wper * 32);
+    const uint32_t span = wper * 32u;
+    const uint32_t nsw = (nword + span - 1u) / span;
     const uint64_t stride = bench_grid_stride_x();
     for (uint64_t ww = bench_grid_thread_x(); ww < nsw; ww += stride) {
         const uint32_t w = (uint32_t)ww;
         uint32_t out = 0;
         for (uint32_t b = 0; b < 32; b++) {
             uint32_t o = 0;
-            const uint32_t base = (w * 32 + b) * wper;
-            for (uint32_t k = 0; k < wper; k++) o |= bits[base + k];
+            const uint32_t base = (w * 32u + b) * wper;
+            if (base >= nword) break;
+            for (uint32_t k = 0; k < wper && base + k < nword; k++)
+                o |= bits[base + k];
             if (o) out |= 1u << b;
         }
         summary[w] = out;
@@ -762,7 +826,7 @@ __global__ void k_resieve_rewalk(const plat_t *__restrict plat,
     for (uint64_t kk = bench_grid_thread_x(); kk < n; kk += stride) {
         const uint32_t k = (uint32_t)kk;
         plat_t P = plat[k];
-        if (P.inc_warp == 0xFFFFFFFFu) continue;
+        if (P.inc_warp == PL_INVALID) continue;
         uint32_t p = primes[k];
         for (uint32_t x = pl_first(&P, logI); x < xmax; x = pl_next(x, &P, Imask)) {
             probes++;
@@ -854,7 +918,7 @@ __global__ void k_fill_segmented(const plat_t *__restrict plat,
          kk < kend; kk += stride) {
         const uint32_t k = (uint32_t)kk;
         plat_t P = plat[k];
-        if (P.inc_warp == 0xFFFFFFFFu) continue;
+        if (P.inc_warp == PL_INVALID) continue;
         const uint32_t soff = k - kbeg;          /* < 65536 by construction */
         for (uint32_t x = pl_first(&P, logI); x < xmax; x = pl_next(x, &P, Imask)) {
             uint32_t b = x >> log_region;
@@ -917,7 +981,7 @@ __global__ void k_purge_prime(const uint32_t *__restrict recs,
     }
 }
 
-template <int AGG>
+template <int AGG, bool SLABBED = false>
 __global__ void k_intersect_compact(const uint32_t *__restrict A,
                                     const uint32_t *__restrict B,
                                     uint32_t nword, uint32_t logI,
@@ -930,7 +994,8 @@ __global__ void k_intersect_compact(const uint32_t *__restrict A,
                                     uint32_t *__restrict nout,
                                     unsigned long long *__restrict npre,
                                     uint32_t *__restrict twosided,
-                                    unsigned long long *__restrict nqb)
+                                    unsigned long long *__restrict nqb,
+                                    uint32_t j_base)
 {
     const uint32_t Imask = (1u << logI) - 1;
     const int32_t  Ihalf = (int32_t)(1u << (logI - 1));
@@ -961,7 +1026,9 @@ __global__ void k_intersect_compact(const uint32_t *__restrict A,
             m &= m - 1;
             uint32_t x = (w << 5) + k;
             int32_t  i = (int32_t)(x & Imask) - Ihalf;
-            uint32_t j = x >> logI;
+            uint32_t jlocal = x >> logI;
+            uint32_t j = jlocal;
+            if constexpr (SLABBED) j += j_base;
             uint32_t ai = (uint32_t)(i < 0 ? -i : i);
             if (bgcd(ai, j) != 1) continue;
             /* the second test: q | b makes (a,b) = q*(a',b'). One 64-bit
@@ -1007,7 +1074,9 @@ __global__ void k_intersect_compact(const uint32_t *__restrict A,
             keep &= keep - 1;
             uint32_t x = (w << 5) + k;
             int32_t  i = (int32_t)(x & Imask) - Ihalf;
-            uint32_t j = x >> logI;
+            uint32_t jlocal = x >> logI;
+            uint32_t j = jlocal;
+            if constexpr (SLABBED) j += j_base;
             if (slot < cap) {
                 out_x[slot] = x;
                 out_a[slot] = (int64_t)i * a0 + (int64_t)j * b0;
@@ -1121,9 +1190,10 @@ static bool td_ab_less(const td_ab_t &x, const td_ab_t &y)
  * position CADO carried into cofactoring, i.e. its residual after its own
  * trial division. Ours must agree exactly, which is a far stronger statement
  * than agreeing on a count. */
-static int td_gate_cofactors(const char *path, uint32_t n,
-                             const int64_t *ha, const int64_t *hb,
-                             const bn_t *hcof, int side)
+static int td_gate_cofactors_part(const char *path, uint32_t n,
+                                  const int64_t *ha, const int64_t *hb,
+                                  const bn_t *hcof, int side,
+                                  uint32_t *found_out)
 {
     FILE *f = fopen(path, "r");
     char line[512];
@@ -1168,11 +1238,26 @@ static int td_gate_cofactors(const char *path, uint32_t n,
     printf("  %-30s %8u  (%u not in our survivor list)\n",
            "matched to a survivor", found, absent);
     printf("  %-30s %8u of %u   %s\n", "cofactors identical", match, found,
-           (found && match == found) ? "PASS" : "FAIL");
+           !found ? "NO OVERLAP"
+                  : (match == found ? "PASS" : "FAIL"));
+    if (found_out) *found_out += found;
     free(tab);
-    /* A gate that only prints FAIL is not a gate: every caller of this binary
-     * is a script. Report the shortfall so the process can exit nonzero. */
-    return (int)(found - match) + (found ? 0 : 1);
+    /* No overlap in one slab is not an error: a reference file covers the
+     * complete q. The slabbed pipeline accumulates found across all slabs and
+     * rejects the q if the total remains zero. Any actual mismatch is fatal. */
+    return (int)(found - match);
+}
+
+/* Whole-area/harness semantics retain the historical requirement that the
+ * reference overlap at least one survivor. */
+static int td_gate_cofactors(const char *path, uint32_t n,
+                             const int64_t *ha, const int64_t *hb,
+                             const bn_t *hcof, int side)
+{
+    uint32_t found = 0;
+    const int rc = td_gate_cofactors_part(path, n, ha, hb, hcof, side, &found);
+    if (rc) return rc;
+    return found ? 0 : 1;
 }
 
 /* ---- the stage ---------------------------------------------------------- */
@@ -1274,9 +1359,9 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     ms_emit = 1e30f;
     for (int rep = 0; rep < 3; rep++) {
         cudaEventRecord(t0);
-        k_emit_ranked<<<blocks, threads>>>(d_two, d_gbase, nbitword, cfg->logI,
+        k_emit_ranked<false><<<blocks, threads>>>(d_two, d_gbase, nbitword, cfg->logI,
                                            L->a0, L->a1, L->b0, L->b1,
-                                           d_x, d_a, d_b, n);
+                                           d_x, d_a, d_b, n, 0u);
         cudaEventRecord(t1);
         CK(cudaEventSynchronize(t1)); CK(cudaGetLastError());
         { float t = time_kernel(t0, t1); if (t < ms_emit) ms_emit = t; }
@@ -1332,18 +1417,18 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                 CK(cudaMemset(d_ovf, 0, 8));
                 cudaEventRecord(t0);
                 switch (U) {
-                case 1: k_resieve_scatter<1><<<blocks, threads>>>(
+                case 1: k_resieve_scatter<1, false><<<blocks, threads>>>(
                             d_plat, d_primes, NULL, fb->n, xmax, cfg->logI,
-                            d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, log_gran); break;
-                case 2: k_resieve_scatter<2><<<blocks, threads>>>(
+                            d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, log_gran, NULL); break;
+                case 2: k_resieve_scatter<2, false><<<blocks, threads>>>(
                             d_plat, d_primes, NULL, fb->n, xmax, cfg->logI,
-                            d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, log_gran); break;
-                case 4: k_resieve_scatter<4><<<blocks, threads>>>(
+                            d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, log_gran, NULL); break;
+                case 4: k_resieve_scatter<4, false><<<blocks, threads>>>(
                             d_plat, d_primes, NULL, fb->n, xmax, cfg->logI,
-                            d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, log_gran); break;
-                default: k_resieve_scatter<8><<<blocks, threads>>>(
+                            d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, log_gran, NULL); break;
+                default: k_resieve_scatter<8, false><<<blocks, threads>>>(
                             d_plat, d_primes, NULL, fb->n, xmax, cfg->logI,
-                            d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, log_gran); break;
+                            d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, log_gran, NULL); break;
                 }
                 cudaEventRecord(t1);
                 CK(cudaEventSynchronize(t1)); CK(cudaGetLastError());
@@ -1394,9 +1479,9 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
         k_build_summary_g<<<blocks, threads>>>(d_two, nbitword, 2u, d_sum);
         CK(cudaMemset(d_pcnt, 0, (size_t)n * 4));
         CK(cudaMemset(d_ovf, 0, 8));
-        k_resieve_scatter<4><<<blocks, threads>>>(
+        k_resieve_scatter<4, false><<<blocks, threads>>>(
             d_plat, d_primes, NULL, fb->n, xmax, cfg->logI,
-            d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, 6);
+            d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, 6, NULL);
         CK(cudaDeviceSynchronize()); CK(cudaGetLastError());
         CK(cudaMemcpy(&hovf, d_ovf, 8, cudaMemcpyDeviceToHost));
     }
@@ -1420,11 +1505,11 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
      * full pass overwrites its output. */
     for (int rep = 0; rep < 3; rep++) {
         cudaEventRecord(t0);
-        k_td<1, 0, 0><<<blocks, threads>>>(d_a, d_b, d_x, NULL, n, cfg->logI, d_poly,
+        k_td<1, 0, 0, false><<<blocks, threads>>>(d_a, d_b, d_x, NULL, n, cfg->logI, d_poly,
                                            cfg->side == 1 ? (uint32_t)L->q : 0u,
                                            d_plist, d_pcnt, K, d_sm, 0u,
                                            d_cof, d_cofbits, d_flags, NULL,
-                                           NULL, NULL, 0);
+                                           NULL, NULL, 0, 0u);
         cudaEventRecord(t1);
         CK(cudaEventSynchronize(t1)); CK(cudaGetLastError());
         { float t = time_kernel(t0, t1); if (t < ms_td_nosm) ms_td_nosm = t; }
@@ -1435,11 +1520,11 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     CK(cudaMemset(d_ovf, 0, 8));
     for (int rep = 0; rep < 3; rep++) {
         cudaEventRecord(t0);
-        k_td<0, 0, 0><<<blocks, threads>>>(d_a, d_b, d_x, NULL, n, cfg->logI, d_poly,
+        k_td<0, 0, 0, false><<<blocks, threads>>>(d_a, d_b, d_x, NULL, n, cfg->logI, d_poly,
                                            cfg->side == 1 ? (uint32_t)L->q : 0u,
                                            d_plist, d_pcnt, K, d_sm, nsm,
                                            d_cof, d_cofbits, d_flags, d_ovf,
-                                           NULL, NULL, 0);
+                                           NULL, NULL, 0, 0u);
         cudaEventRecord(t1);
         CK(cudaEventSynchronize(t1)); CK(cudaGetLastError());
         { float t = time_kernel(t0, t1); if (t < ms_td_nodiv) ms_td_nodiv = t; }
@@ -1450,11 +1535,11 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     for (int rep = 0; rep < 3; rep++) {
         CK(cudaMemset(d_flags, 0, 4));
         cudaEventRecord(t0);
-        k_td<1, 0, 0><<<blocks, threads>>>(d_a, d_b, d_x, NULL, n, cfg->logI, d_poly,
+        k_td<1, 0, 0, false><<<blocks, threads>>>(d_a, d_b, d_x, NULL, n, cfg->logI, d_poly,
                                            cfg->side == 1 ? (uint32_t)L->q : 0u,
                                            d_plist, d_pcnt, K, d_sm, nsm,
                                            d_cof, d_cofbits, d_flags, NULL,
-                                           NULL, NULL, 0);
+                                           NULL, NULL, 0, 0u);
         cudaEventRecord(t1);
         CK(cudaEventSynchronize(t1)); CK(cudaGetLastError());
         { float t = time_kernel(t0, t1); if (t < ms_td) ms_td = t; }
@@ -1494,11 +1579,11 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     if (cfg->emit_cof) {
         CK(cudaMalloc(&d_fac, (size_t)n * TD_FMAX * 4));
         CK(cudaMalloc(&d_faccnt, (size_t)n * 4));
-        k_td<1, 1, 0><<<blocks, threads>>>(d_a, d_b, d_x, NULL, n, cfg->logI, d_poly,
+        k_td<1, 1, 0, false><<<blocks, threads>>>(d_a, d_b, d_x, NULL, n, cfg->logI, d_poly,
                                            cfg->side == 1 ? (uint32_t)L->q : 0u,
                                            d_plist, d_pcnt, K, d_sm, nsm,
                                            d_cof, d_cofbits, d_flags, NULL,
-                                           d_fac, d_faccnt, TD_FMAX);
+                                           d_fac, d_faccnt, TD_FMAX, 0u);
         CK(cudaDeviceSynchronize()); CK(cudaGetLastError());
     }
 
@@ -1668,6 +1753,77 @@ done:
     return rc;
 }
 
+typedef struct {
+    uint32_t w, m, magic, sh, ref;
+} td_mod_case_t;
+
+__global__ void k_verify_td_mod_cases(const td_mod_case_t *__restrict v,
+                                      uint32_t n, uint32_t *__restrict first_bad)
+{
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t kk = bench_grid_thread_x(); kk < n; kk += stride) {
+        const uint32_t k = (uint32_t)kk;
+        const td_mod_case_t c = v[k];
+        if (td_mod_magic(c.w, c.m, c.magic, c.sh) != c.ref)
+            atomicMin(first_bad, k);
+    }
+}
+
+/* Device half of the reciprocal gate. slabtest calls the same td_mod_magic()
+ * source on the CPU; this gate additionally executes the __umulhi branch used
+ * by k_td so a CUDA-codegen/device-only regression cannot hide behind the
+ * host implementation. It runs only under --verify. */
+static int verify_td_mod_device(void)
+{
+    enum { NCASE = 4096 };
+    td_mod_case_t *h = NULL, *d = NULL;
+    uint32_t *d_bad = NULL, bad = UINT32_MAX, seed = 0x7f4a7c15u;
+    int rc = -1;
+
+    h = (td_mod_case_t *)malloc(sizeof(*h) * NCASE);
+    if (!h) return -1;
+    for (uint32_t k = 0; k < NCASE; k++) {
+        uint32_t m, magic, sh, w;
+        if (k < 20) {
+            static const uint32_t edge[] = {
+                2,3,4,5,7,8,15,16,31,32,63,64,127,128,255,256,
+                1023,32767,131071,1048575
+            };
+            m = edge[k];
+        } else {
+            seed = seed * 1664525u + 1013904223u;
+            m = 2u + seed % 1048574u;
+        }
+        td_magic_build(m, &magic, &sh);
+        seed = seed * 1664525u + 1013904223u;
+        w = (k & 3u) == 0 ? 0x7fffffffu : (seed & 0x7fffffffu);
+        h[k].w = w; h[k].m = m; h[k].magic = magic; h[k].sh = sh;
+        h[k].ref = w % m;
+    }
+#define MODDEV_CK(x) do { if (CUDA_CHECKED(x)) goto out; } while (0)
+    MODDEV_CK(cudaMalloc(&d, sizeof(*h) * NCASE));
+    MODDEV_CK(cudaMalloc(&d_bad, sizeof(*d_bad)));
+    MODDEV_CK(cudaMemcpy(d, h, sizeof(*h) * NCASE, cudaMemcpyHostToDevice));
+    MODDEV_CK(cudaMemcpy(d_bad, &bad, sizeof(bad), cudaMemcpyHostToDevice));
+    k_verify_td_mod_cases<<<16, 256>>>(d, NCASE, d_bad);
+    MODDEV_CK(cudaDeviceSynchronize());
+    MODDEV_CK(cudaGetLastError());
+    MODDEV_CK(cudaMemcpy(&bad, d_bad, sizeof(bad), cudaMemcpyDeviceToHost));
+    if (bad != UINT32_MAX) {
+        const td_mod_case_t c = h[bad];
+        fprintf(stderr,
+                "[verify] device td_mod mismatch case %u: w=%u m=%u"
+                " magic=%u sh=%u ref=%u\n",
+                bad, c.w, c.m, c.magic, c.sh, c.ref);
+        goto out;
+    }
+    rc = 0;
+out:
+    cudaFree(d); cudaFree(d_bad); free(h);
+#undef MODDEV_CK
+    return rc;
+}
+
 extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                          const poly_t *POLY, const bench_cfg_t *cfg)
 {
@@ -1680,6 +1836,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     const uint32_t nsuper = xmax >> log_super;
     const uint32_t CINIT = (cfg->cell_bits == 16) ? 4096u : 255u;
     uint32_t BOUND = 0;
+    size_t optin_smem_limit = 0;
     norm_t N;
 
     if (!fb_is_transform_validated(fb) ||
@@ -1712,10 +1869,17 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
         return -1;
     }
 
+    if (cuda_optin_smem_limit(&optin_smem_limit)) return -1;
+
     size_t freeB = 0, totalB = 0;
     CK(cudaMemGetInfo(&freeB, &totalB));
     printf("  device memory: %.2f GB free of %.2f GB\n",
            freeB / 1073741824.0, totalB / 1073741824.0);
+    if (cfg->verify) {
+        printf("[verify] direct-TD reciprocal on device (__umulhi path)...\n");
+        if (verify_td_mod_device()) return -1;
+        printf("[verify] OK: 4096 device reciprocal cases through w=0x7fffffff\n");
+    }
 
     int td_failed = 0;      /* a failed gate must reach the exit status */
     dev_bufs D; memset(&D, 0, sizeof(D));
@@ -1884,15 +2048,15 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
      * different people compared that number across GPUs before anyone noticed
      * it was measuring startup. The memsets follow the warm-up because nproj
      * and nlost are accumulators divided by reps. */
-    k_transform<<<blocks, cfg->threads>>>(D.primes, D.roots, D.plat, fb->n,
-        cfg->logI, cfg->J, L->a0, L->a1, L->b0, L->b1, D.nproj, D.nlost);
+    k_transform<false><<<blocks, cfg->threads>>>(D.primes, D.roots, D.plat, fb->n,
+        cfg->logI, cfg->J, L->a0, L->a1, L->b0, L->b1, D.nproj, D.nlost, NULL);
     CK(cudaDeviceSynchronize());
     CK(cudaMemset(D.nproj, 0, 4));
     CK(cudaMemset(D.nlost, 0, 8));
     cudaEventRecord(e0);
     for (int rep = 0; rep < cfg->reps; rep++)
-        k_transform<<<blocks, cfg->threads>>>(D.primes, D.roots, D.plat, fb->n,
-            cfg->logI, cfg->J, L->a0, L->a1, L->b0, L->b1, D.nproj, D.nlost);
+        k_transform<false><<<blocks, cfg->threads>>>(D.primes, D.roots, D.plat, fb->n,
+            cfg->logI, cfg->J, L->a0, L->a1, L->b0, L->b1, D.nproj, D.nlost, NULL);
     cudaEventRecord(e1);
     CK(cudaEventSynchronize(e1));
     CK(cudaGetLastError());
@@ -1930,14 +2094,14 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
         for (int rep = 0; rep < cfg->reps; rep++) {
             CK(cudaMemset(D.cursor, 0, (size_t)nregion * 4));
             if (cfg->record_bytes == 2)
-                k_fill_atomic<2><<<fblocks, fthreads>>>(D.plat, D.slice, fb->n, xmax,
-                    cfg->logI, log_region, D.cursor, D.out, cap, D.overflow);
+                k_fill_atomic<2, false><<<fblocks, fthreads>>>(D.plat, D.slice, fb->n, xmax,
+                    cfg->logI, log_region, D.cursor, D.out, cap, D.overflow, NULL, NULL);
             else if (cfg->record_bytes == 4)
-                k_fill_atomic<4><<<fblocks, fthreads>>>(D.plat, D.slice, fb->n, xmax,
-                    cfg->logI, log_region, D.cursor, D.out, cap, D.overflow);
+                k_fill_atomic<4, false><<<fblocks, fthreads>>>(D.plat, D.slice, fb->n, xmax,
+                    cfg->logI, log_region, D.cursor, D.out, cap, D.overflow, NULL, NULL);
             else
-                k_fill_atomic<8><<<fblocks, fthreads>>>(D.plat, D.slice, fb->n, xmax,
-                    cfg->logI, log_region, D.cursor, D.out, cap, D.overflow);
+                k_fill_atomic<8, false><<<fblocks, fthreads>>>(D.plat, D.slice, fb->n, xmax,
+                    cfg->logI, log_region, D.cursor, D.out, cap, D.overflow, NULL, NULL);
         }
         cudaEventRecord(e3);
         CK(cudaEventSynchronize(e3));
@@ -2116,28 +2280,29 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                    nregion, ncell, CB, smem, athr,
                    cfg->apply_atomic ? "smem atomicAdd" : "PLAIN (racy probe)",
                    cfg->norm_mode == NORM_CONST ? "const" : "horner");
-            if (smem > 101376) {
-                printf("  SKIP: %zu B exceeds the 101376 B opt-in limit\n", smem);
+            if (smem > optin_smem_limit) {
+                printf("  SKIP: %zu B exceeds this device's %zu B opt-in"
+                       " shared-memory limit\n", smem, optin_smem_limit);
                 goto after_apply;
             }
 
 #define LAUNCH_APPLY(CBV, AT, NM)                                              \
             do {                                                               \
-                CK(cudaFuncSetAttribute(k_apply<CBV, AT, NM>,                  \
+                CK(cudaFuncSetAttribute(k_apply<CBV, AT, NM, false>,                  \
                     cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));  \
                 cudaEventRecord(e3);                                           \
                 for (int rep = 0; rep < cfg->reps; rep++) {                    \
                     CK(cudaMemset(D.nsurv, 0, 4));                             \
                     if (D.survbits)                                            \
                         CK(cudaMemset(D.survbits, 0, (size_t)nbitword * 4));   \
-                    k_apply<CBV, AT, NM><<<nregion, athr, smem>>>(             \
+                    k_apply<CBV, AT, NM, false><<<nregion, athr, smem>>>(             \
                         (const uint32_t *)D.out, D.cursor, cap,                \
                         cfg->logI, log_region, D.slice_logp, nslice_pow2,      \
                         N, CINIT, CINIT - BOUND, tconst, D.dumpbuf,            \
                         D.surv, D.nsurv, maxsurv,                              \
                         D.dbg, dbgreg, D.sp, D.srt, D.sg, D.slp,             \
                         nsmall, nblk, nwrp, probe_x, D.probe,                  \
-                        D.survbits, cfg->not_both_even);                       \
+                        D.survbits, cfg->not_both_even, 0u);                   \
                 }                                                              \
                 cudaEventRecord(e4);                                           \
                 CK(cudaEventSynchronize(e4));                                  \
@@ -2220,10 +2385,10 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                             CK(cudaMemset(d_pre, 0, 8));
                             CK(cudaMemset(d_qb, 0, 8));
                             cudaEventRecord(e3);
-                            k_intersect_compact<1><<<blocks, cfg->threads>>>(
+                            k_intersect_compact<1, false><<<blocks, cfg->threads>>>(
                                 D.survbits, dother, nbitword, cfg->logI,
                                 L->a0, L->a1, L->b0, L->b1, (int64_t)L->q,
-                                d_x, d_a, d_b, icap, d_n, d_pre, d_two, d_qb);
+                                d_x, d_a, d_b, icap, d_n, d_pre, d_two, d_qb, 0u);
                             cudaEventRecord(e4);
                             CK(cudaEventSynchronize(e4));
                             CK(cudaGetLastError());

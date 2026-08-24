@@ -23,6 +23,7 @@
 
 #include "bigint.cuh"
 #include "prp.cuh"
+#include "slab.h"
 
 /* ---- exact homogeneous form ------------------------------------------- */
 
@@ -44,7 +45,7 @@ typedef struct {
  * Rewritten to keep the reduced value NONNEGATIVE so a single unsigned
  * multiply-shift reciprocal suffices:
  *
- *     w = rt*j' + (Ihalf - i)          in [1, 2^30), since i < Ihalf
+ *     w = rt*j' + (Ihalf - i)          in [1, 2^31), since i < Ihalf
  *     hit  <=>  w mod m == Ihalf mod m
  *
  * `cst` holds Ihalf mod m. m == 1 ("every i, on every g-th row") has no valid
@@ -60,16 +61,17 @@ typedef struct {
     uint32_t sh;
 } tdsmall_t;
 
-/* Multiply-shift reciprocal for divisors below 2^15, exact for dividends below
- * 2^30 -- which is all this kernel produces (rt*j' < 2^15 * 2^14, plus 2^15).
+/* Multiply-shift reciprocal, exact for dividends below 2^31. The slab
+ * planner enforces this bound for the local j range used by the hot TD loop.
  *
  *   m a power of two 2^k, k >= 1 : magic = 2^(32-k), sh = 0
  *   otherwise                    : sh = floor(log2 m), magic = 2^(32+sh)/m + 1
  *
- * The general case needs magic < 2^32 and (magic*m - 2^(32+sh)) * 2^30 <
+ * The general case needs magic < 2^32 and (magic*m - 2^(32+sh)) * 2^31 <
  * 2^(32+sh). Both follow from 2^sh < m < 2^(sh+1): the first because
- * 2^(32+sh)/m < 2^32, the second because the error is at most m and
- * m * 2^30 < 2^32 * 2^sh whenever 2^sh > m/4. */
+ * 2^(32+sh)/m < 2^32. For w < 2^31, the reciprocal overestimate contributes
+ * less than 1/2^(sh+1), while the next quotient boundary is at least 1/m away
+ * and m < 2^(sh+1), so the truncated quotient is exact. */
 static inline void td_magic_build(uint32_t m, uint32_t *magic, uint32_t *sh)
 {
     if (m == 1) { *magic = 0; *sh = 0; return; }
@@ -87,13 +89,45 @@ static inline void td_magic_build(uint32_t m, uint32_t *magic, uint32_t *sh)
     }
 }
 
+/* One implementation for both the CPU arithmetic gate and the device hot
+ * loop. The host half spells out umulhi with a 64-bit product; the CUDA device
+ * half uses the single __umulhi instruction. Keeping the quotient/remainder
+ * expression here prevents the regression test from validating a copied
+ * formula instead of the code the kernel actually executes. */
+#ifdef __CUDACC__
+#define TD_MOD_HD static __host__ __device__ __forceinline__
+#else
+#define TD_MOD_HD static inline
+#endif
+TD_MOD_HD uint32_t td_mod_magic(uint32_t w, uint32_t m,
+                                uint32_t magic, uint32_t sh)
+{
+    uint32_t q;
+#ifdef __CUDA_ARCH__
+    q = __umulhi(w, magic) >> sh;
+#else
+    q = (uint32_t)(((uint64_t)w * magic) >> 32) >> sh;
+#endif
+    return w - q * m;
+}
+#undef TD_MOD_HD
+
 #if defined(__CUDACC__)
 
-__device__ __forceinline__ uint32_t td_mod(uint32_t w, uint32_t m,
-                                           uint32_t magic, uint32_t sh)
+/* Move the direct-test congruence origin forward by delta_j global rows. This
+ * is deliberately a separate tiny kernel: it performs one 64-bit modulo per
+ * small-prime ENTRY per slab so the billions-of-tests k_td loop stays on its
+ * original 32-bit multiply/high-multiply sequence. */
+__global__ void k_tdsmall_advance(tdsmall_t *__restrict sm, uint32_t n,
+                                  uint32_t delta_j)
 {
-    uint32_t q = __umulhi(w, magic) >> sh;
-    return w - q * m;
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t tt = bench_grid_thread_x(); tt < n; tt += stride) {
+        const uint32_t t = (uint32_t)tt;
+        tdsmall_t v = sm[t];
+        if (v.magic) v.cst = slab_phase_cst(v.cst, v.rt, v.m, delta_j);
+        sm[t] = v;
+    }
 }
 
 /* Divide p out of N to full multiplicity.
@@ -258,6 +292,7 @@ __global__ void k_scan_pass3(uint32_t *__restrict out, uint32_t n,
  * come from that. The resieve can find a position's slot with td_rank instead
  * of a sort, and the emitted list is reproducible run to run, which is what
  * makes a bit-identical regression test on it mean anything. */
+template <bool SLABBED = false>
 __global__ void k_emit_ranked(const uint32_t *__restrict bits,
                               const uint32_t *__restrict gbase,
                               uint32_t nword, uint32_t logI,
@@ -265,7 +300,7 @@ __global__ void k_emit_ranked(const uint32_t *__restrict bits,
                               uint32_t *__restrict out_x,
                               int64_t *__restrict out_a,
                               int64_t *__restrict out_b,
-                              uint32_t cap)
+                              uint32_t cap, uint32_t j_base)
 {
     const uint32_t Imask = (1u << logI) - 1;
     const int32_t  Ihalf = (int32_t)(1u << (logI - 1));
@@ -285,7 +320,9 @@ __global__ void k_emit_ranked(const uint32_t *__restrict bits,
             m &= m - 1;
             uint32_t x = (w << 5) + k;
             int32_t  i = (int32_t)(x & Imask) - Ihalf;
-            uint32_t j = x >> logI;
+            const uint32_t jlocal = x >> logI;
+            uint32_t j = jlocal;
+            if constexpr (SLABBED) j += j_base;
             if (slot < cap) {
                 out_x[slot] = x;
                 out_a[slot] = (int64_t)i * a0 + (int64_t)j * b0;
@@ -328,7 +365,7 @@ __global__ void k_emit_ranked(const uint32_t *__restrict bits,
  * itself is pure register arithmetic, so running ahead costs nothing and needs
  * no speculation.
  */
-template <int UNROLL>
+template <int UNROLL, bool SLABBED = false>
 __global__ void k_resieve_scatter(const plat_t *__restrict plat,
                                   const uint32_t *__restrict primes,
                                   const uint8_t *__restrict ispow,
@@ -340,21 +377,52 @@ __global__ void k_resieve_scatter(const plat_t *__restrict plat,
                                   uint32_t *__restrict pcnt,
                                   uint32_t K,
                                   unsigned long long *__restrict noverflow,
-                                  int log_gran)
+                                  int log_gran,
+                                  const uint64_t *__restrict walk_cur)
 {
     const uint32_t Imask = (1u << logI) - 1;
-    const uint32_t NONE = 0xFFFFFFFFu;      /* x < 2^29, so this cannot collide */
+    const uint32_t NONE = 0xFFFFFFFFu;      /* local x < 2^31, cannot collide */
     const uint64_t stride = bench_grid_stride_x();
     unsigned long long ovf = 0;
 
     for (uint64_t kk = bench_grid_thread_x(); kk < n; kk += stride) {
         const uint32_t k = (uint32_t)kk;
         plat_t P = plat[k];
-        if (P.inc_warp == 0xFFFFFFFFu) continue;
+        if (P.inc_warp == PL_INVALID) continue;
         if (ispow && ispow[k]) continue;
         uint32_t p = primes[k];
-        uint32_t x = pl_first(&P, logI);
 
+        if constexpr (SLABBED) {
+            uint64_t x = walk_cur[k];
+            while (x < xmax) {
+                uint32_t xs[UNROLL], hit[UNROLL];
+
+                #pragma unroll
+                for (int u = 0; u < UNROLL; u++) {
+                    if (x < xmax) { xs[u] = (uint32_t)x; x = pl_next64(x, &P, Imask); }
+                    else xs[u] = NONE;
+                }
+                #pragma unroll
+                for (int u = 0; u < UNROLL; u++) {
+                    uint32_t sb = xs[u] >> log_gran;
+                    hit[u] = (xs[u] == NONE) ? 0u
+                                             : ((summary[sb >> 5] >> (sb & 31u)) & 1u);
+                }
+                #pragma unroll
+                for (int u = 0; u < UNROLL; u++) {
+                    if (!hit[u]) continue;
+                    uint32_t xv = xs[u];
+                    if (!((bits[xv >> 5] >> (xv & 31u)) & 1u)) continue;
+                    uint32_t idx = td_rank(bits, gbase, xv);
+                    uint32_t slot = atomicAdd(&pcnt[idx], 1u);
+                    if (slot < K) plist[(size_t)idx * K + slot] = p;
+                    else ovf++;
+                }
+            }
+            continue;
+        }
+
+        uint32_t x = pl_first(&P, logI);
         while (x < xmax) {
             uint32_t xs[UNROLL], hit[UNROLL];
 
@@ -425,7 +493,7 @@ __global__ void k_resieve_scatter(const plat_t *__restrict plat,
  * candidates instead of the ~240,000 survivors, which is the difference between
  * a 61 MB device array read back per side and a 600 KB one. The dense form is
  * still what the measured passes use; recording is not on the hot path. */
-template <int DIVIDE, int RECORD, int SELECT>
+template <int DIVIDE, int RECORD, int SELECT, bool SLABBED = false>
 __global__ void k_td(const int64_t *__restrict A, const int64_t *__restrict B,
                      const uint32_t *__restrict X,
                      const uint32_t *__restrict sel, uint32_t n, int logI,
@@ -438,7 +506,7 @@ __global__ void k_td(const int64_t *__restrict A, const int64_t *__restrict B,
                      uint32_t *__restrict flags,
                      unsigned long long *__restrict nhit,
                      uint32_t *__restrict fac, uint32_t *__restrict faccnt,
-                     uint32_t fmax)
+                     uint32_t fmax, uint32_t j_base)
 {
     __shared__ tdsmall_t tile[TD_TILE];
 
@@ -509,7 +577,9 @@ __global__ void k_td(const int64_t *__restrict A, const int64_t *__restrict B,
         {
             const uint32_t x = active ? X[s] : 0u;
             const int32_t  i = (int32_t)(x & Imask) - Ihalf;
-            const uint32_t j = x >> logI;
+            const uint32_t jlocal = x >> logI;
+            uint32_t jglobal = jlocal;
+            if constexpr (SLABBED) jglobal += j_base;
             const uint32_t hi = (uint32_t)(Ihalf - i);      /* in (0, 2^logI] */
             uint32_t hitp[TD_MAXHIT];
             uint64_t hitr[TD_MAXHIT];       /* carry the reciprocal with it:
@@ -528,14 +598,17 @@ __global__ void k_td(const int64_t *__restrict A, const int64_t *__restrict B,
                 if (!active) continue;
                 for (uint32_t e = 0; e < cnt; e++) {
                     const uint32_t m = tile[e].m, g = tile[e].g;
-                    uint32_t jp = j;
+                    /* Ordinary prime entries have g==1 and use slab-local j
+                     * with cst pre-phased once per slab. g>1 implies m==1 for
+                     * a prime modulus, so only its global-row condition remains. */
+                    uint32_t jp = jlocal;
                     if (g > 1) {
-                        if (j % g) continue;
-                        jp = j / g;
+                        if (jglobal % g) continue;
+                        jp = jglobal / g;
                     }
                     if (tile[e].magic) {
                         uint32_t w = tile[e].rt * jp + hi;
-                        if (td_mod(w, m, tile[e].magic, tile[e].sh) != tile[e].cst)
+                        if (td_mod_magic(w, m, tile[e].magic, tile[e].sh) != tile[e].cst)
                             continue;
                     }
                     /* magic == 0 means m == 1: the row condition was the whole

@@ -106,10 +106,10 @@ static void usage(void)
 "usage: bench [options]\n"
 "\n"
 "RUNNING A JOB\n"
-"  A typical run needs six flags. Everything else has a right answer that is\n"
-"  derived from the polynomial or read from the .job file, and is printed:\n"
+"  A typical run supplies the job, sieve geometry/band, and output. Everything\n"
+"  else has a right answer derived from the polynomial or .job file and is printed:\n"
 "\n"
-"    bench --pipeline --cofactor --poly JOB.job --fb1 JOB.roots1 \\\n"
+"    bench --pipeline --cofactor --poly JOB.job \\\n"
 "          --logI 14 --qrange 15000000: --target-rels 65000000 \\\n"
 "          --relations msieve.dat\n"
 "\n"
@@ -121,11 +121,19 @@ static void usage(void)
 "                   alim, lpbr/lpba, mfbr/mfba and lambdas are USED -- they do\n"
 "                   not need repeating below. A CADO .poly carries none of\n"
 "                   those, so state them or let them derive\n"
-"  --fb1 PATH       native fbgen factor base. REQUIRED to emit relations: the\n"
-"                   GGNFS .afb.0 has neither p = 2 nor prime powers\n"
+"  --fb1 PATH       native fbgen factor base. Optional: if omitted in pipeline\n"
+"                   mode, the complete algebraic FB is generated on the assigned\n"
+"                   GPU (including exact CPU Hensel/prime-power branches). To\n"
+"                   cache that startup once, use fbgen_gpu --out FILE and pass\n"
+"                   the resulting FILE here on later runs\n"
 "  --cadofb PATH    legacy alias for --fb1 (CADO files remain compatible)\n"
+"  --fb PATH        legacy GGNFS .afb.0 input; sieve/debug only, not relations\n"
 "  --logI N         log2 of sieve width I      [15]   (gnfs-lasieve4I14e -> 14)\n"
 "  --J N            sieve height J             [2^(logI-1), CADO's convention]\n"
+"  --slab-j N       pipeline: force at most N j rows per slab; 0/omitted =\n"
+"                   automatic. At >=2^30 total positions, auto targets\n"
+"                   <=2^29 positions/slab; smaller areas are not split for\n"
+"                   performance alone\n"
 "  --relations F    write complete relations here (GGNFS/msieve format)\n"
 "  --cofactor       split the cofactors INLINE, in a cross-q device queue;\n"
 "                   --relations then holds every relation, not just TD's\n"
@@ -198,7 +206,8 @@ static void usage(void)
 "  --fbbound N      truncate FB at this p      [alim]  (GGNFS truncates at q)\n"
 "  --bkthresh N     bucket-sieve p >= this     [1<<logI]\n"
 "  --region N       log2 bucket region size    [14]  (16384 16-bit cells, 32 KB)\n"
-"  --maxbits N      prime powers below 2^N      [logI]\n"
+"  --maxbits N      prime powers below 2^N      [logI]; used by generated FBs,\n"
+"                   and should match the maxbits recorded by a cached --fb1 file\n"
 "\n"
 "COFACTORISATION\n"
 "  --cof-rounds N   rho requeue rounds, budget doubling each time\n"
@@ -222,6 +231,8 @@ static void usage(void)
 "                   both norms rebuild to 1, every prime within its lpb\n"
 "  --cofgate FILE   gate the cofactors against CADO's own (a b cof0 cof1);\n"
 "                   under --pipeline this runs in the first-q validation\n"
+"  --no-td-verify   skip dense TD reconstruction (first q in pipeline; TD\n"
+"                   harness otherwise). Saves peak memory; incompatible with --cofgate\n"
 "  --verbose-q      print a line per special-q instead of a band summary\n"
 "\n"
 "RUNTIME\n"
@@ -531,6 +542,12 @@ static int verify_walk_cases(void)
          * 40*I`), and testing only nc < 0 would let a case that checked
          * nothing pass vacuously. */
         const int nc = verify_walk(walk_cases[w].logI, walk_cases[w].J, 24);
+        if (nc < 0) {
+            printf("[verify] FAILED at logI=%d J=%u (%s): walk verifier"
+                   " rejected the case\n",
+                   walk_cases[w].logI, walk_cases[w].J, walk_cases[w].shape);
+            return 1;
+        }
         if (nc != 24) {
             printf("[verify] FAILED at logI=%d J=%u (%s): %d of 24 primes\n",
                    walk_cases[w].logI, walk_cases[w].J, walk_cases[w].shape, nc);
@@ -539,6 +556,18 @@ static int verify_walk_cases(void)
     }
     printf("[verify] OK: %u cases x 24 primes x 5 roots enumerated"
            " identically, 4:1 through 1:2\n", nwalk);
+
+    /* Shared with slabtest: one table, one 64-bit oracle, and large-prime
+     * cases that exercise increments beyond 2^32 and native I17+ geometry. */
+    {
+        const int nslab = verify_walk_slab_cases();
+        if (nslab < 0) {
+            printf("[verify] SLAB FAILED\n");
+            return 1;
+        }
+        printf("[verify] OK: %d forced/native slab walk cases, including"
+               " partial tails and I17+\n", nslab);
+    }
     return 0;
 }
 
@@ -817,6 +846,7 @@ static int bench_main_impl(int argc, char **argv)
     char dev_pci[32] = "";          /* NVML's domain:bus:device.function */
     int  dev_ordinal = -1, dev_count = 0;
     const char *fbpath = "../oracle/input.job.afb.0";
+    int fbpath_set = 0;
     const char *polypath = "../oracle/c183.poly";
     bench_cfg_t cfg;
     uint64_t q = 120000011ull;          /* prime, mid-range of [50M,190M] */
@@ -832,7 +862,7 @@ static int bench_main_impl(int argc, char **argv)
      * level lost by 2.7x (RESULTS.md finding 1) and 2^15 regions lost to 2^14
      * (finding 8); leaving those as defaults meant the commands in RESULTS
      * reproduced a path nobody would ship. */
-    cfg.logI = 15; cfg.J = 16384; cfg.log_region = 14;
+    cfg.logI = 15; cfg.J = 16384; cfg.slab_j = 0; cfg.log_region = 14;
     cfg.record_bytes = 4; cfg.fill_mode = FILL_ATOMIC;
     cfg.threads = 256; cfg.blocks = 0; cfg.fill_blocks = 0; cfg.fill_threads = 0;
     cfg.reps = 3; cfg.verify = 0;
@@ -907,9 +937,14 @@ static int bench_main_impl(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--fb") && i + 1 < argc) {
             if (bench_boinc_resolve_path("--fb", argv[++i], &fbpath)) return 1;
+            fbpath_set = 1;
         }
         else if (!strcmp(argv[i], "--logI") && i + 1 < argc) cfg.logI = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--J") && i + 1 < argc) { cfg.J = (uint32_t)strtoul(argv[++i], 0, 10); J_set = 1; }
+        else if (!strcmp(argv[i], "--slab-j") && i + 1 < argc) {
+            if (parse_u32_range_arg("--slab-j", argv[++i], 0u, UINT32_MAX,
+                                    &cfg.slab_j)) return 1;
+        }
         else if (!strcmp(argv[i], "--region") && i + 1 < argc) cfg.log_region = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--bkthresh") && i + 1 < argc) bkthresh = (uint32_t)strtoul(argv[++i], 0, 10);
         else if (!strcmp(argv[i], "--fbbound") && i + 1 < argc) { fbbound = (uint32_t)strtoul(argv[++i], 0, 10); fbbound_set = 1; }
@@ -1035,6 +1070,7 @@ static int bench_main_impl(int argc, char **argv)
         else if (!strcmp(argv[i], "--ab-resieve")) cfg.ab_resieve = 1;
         else if (!strcmp(argv[i], "--resieve-sweep")) cfg.resieve_sweep = 1;
         else if (!strcmp(argv[i], "--pipeline")) cfg.pipeline = 1;
+        else if (!strcmp(argv[i], "--no-td-verify")) cfg.td_verify = 0;
         /* strtol, not atoi: atoi("rational") is 0, which is a LEGAL value here,
          * so a typo would silently configure the wrong side instead of being
          * rejected. Every other numeric flag in this parser avoids atoi for
@@ -1221,6 +1257,15 @@ static int bench_main_impl(int argc, char **argv)
     /* logI bounds FIRST: every default below shifts by it (bkthresh, the area
      * check, the probe range), and an out-of-range shift is undefined. */
     if (cfg.logI < 2 || cfg.logI > 20) { usage(); return 1; }
+    /* Resolve J before any area/probe validation.  Keeping the old default
+     * assignment after polynomial loading meant --logI 17 was validated with
+     * logI 17 but the stale I15 J=16384, then silently changed to 65536 later. */
+    if (!J_set) cfg.J = 1u << (cfg.logI - 1);
+    if (cfg.cofgate && !cfg.td_verify) {
+        fprintf(stderr, "--cofgate requires TD verification; remove"
+                        " --no-td-verify\n");
+        return 1;
+    }
     if (!maxbits_set) maxbits = cfg.logI;
     cfg.fb_maxbits = maxbits;      /* the resume fingerprint reads it from cfg */
     if (maxbits < 1 || maxbits > 31) {
@@ -1246,6 +1291,29 @@ static int bench_main_impl(int argc, char **argv)
         fprintf(stderr, "--region must be in [1,30] (got %d)\n", cfg.log_region);
         return 1;
     }
+    if (cfg.pipeline) {
+        const uint32_t effective_slab_j =
+            cfg.slab_j && cfg.slab_j < cfg.J ? cfg.slab_j : cfg.J;
+        const uint32_t area_jmax = slab_area_jmax(cfg.logI);
+        if (!slab_rows_shape_ok(cfg.logI, cfg.J)) {
+            fprintf(stderr,
+                    "pipeline geometry logI=%d J=%u is not aligned to the"
+                    " %u-position TD rank group\n",
+                    cfg.logI, cfg.J, (unsigned)SLAB_TD_GROUP_POS);
+            return 1;
+        }
+        if (cfg.slab_j &&
+            (!effective_slab_j || effective_slab_j > area_jmax ||
+             !slab_rows_shape_ok(cfg.logI, effective_slab_j))) {
+            fprintf(stderr,
+                    "--slab-j %u is not a valid local slab shape for logI=%d:"
+                    " effective rows=%u, max rows by 2^31 area=%u, TD rank"
+                    " groups are %u positions\n",
+                    cfg.slab_j, cfg.logI, effective_slab_j, area_jmax,
+                    (unsigned)SLAB_TD_GROUP_POS);
+            return 1;
+        }
+    }
     /* An out-of-range probe silently ALIASES another cell -- --probe 16384,0
      * lands on the real (-16384,1) -- so it would certify a coordinate nobody
      * asked about. */
@@ -1257,8 +1325,10 @@ static int bench_main_impl(int argc, char **argv)
             return 1;
         }
     }
-    if (((uint64_t)1 << cfg.logI) * cfg.J > 0x80000000ull) {
-        fprintf(stderr, "I*J must fit in 31 bits (uint32 positions)\n"); return 1;
+    if (!cfg.pipeline && ((uint64_t)1 << cfg.logI) * cfg.J > 0x80000000ull) {
+        fprintf(stderr, "I*J must fit in 31 bits outside --pipeline; the pipeline"
+                " uses j-slabs for larger rectangles\n");
+        return 1;
     }
     /* Two limits that used to be silent. A 2 B or 4 B record carries the
      * in-region offset in 16 bits, so a region above 2^16 wraps and every
@@ -1336,10 +1406,12 @@ static int bench_main_impl(int argc, char **argv)
                 " only a 16-bit offset field\n", cfg.log_region, cfg.record_bytes);
         return 1;
     }
-    if (cfg.log_region > cfg.logI && cfg.small_sieve) {
-        fprintf(stderr, "--region %d > --logI %d: the fused small sieve assumes"
-                " a region lies within one j-row.\n  Use --no-smallsieve, or a"
-                " region <= 2^%d.\n", cfg.log_region, cfg.logI, cfg.logI);
+    if (cfg.log_region > cfg.logI && (cfg.small_sieve || cfg.pipeline)) {
+        fprintf(stderr, "--region %d > --logI %d: %s assumes a region lies"
+                " within one j-row.\n  Use a region <= 2^%d%s.\n",
+                cfg.log_region, cfg.logI,
+                cfg.pipeline ? "the slabbed pipeline" : "the fused small sieve",
+                cfg.logI, cfg.pipeline ? "" : ", or --no-smallsieve");
         return 1;
     }
     /* Scale is free with 16-bit cells (see k_apply), but not unbounded: the
@@ -1438,10 +1510,6 @@ static int bench_main_impl(int argc, char **argv)
                    " only; the allowance is derived below\n",
                    POLY.rlambda, job_allowance_bits(POLY.rlambda, rlim));
     }
-
-    /* CADO's convention, and the only value we have ever wanted. Deriving it
-     * removes one more flag whose right answer is a function of another. */
-    if (!J_set && cfg.logI > 1) cfg.J = 1u << (cfg.logI - 1);
 
     /* HERE, not before poly_load: lpb/mfb/lim may all have come from the .job
      * file just read, and validating only the command line was validating the
@@ -1749,7 +1817,8 @@ static int bench_main_impl(int argc, char **argv)
     if (!cfg.pipeline) {
         static const char *pipeline_only[] = {
             "--target-rels", "--lambda0", "--lambda1", "--sq-side",
-            "--restart", "--stop-file", "--log", "--log-every", NULL
+            "--restart", "--stop-file", "--log", "--log-every",
+            "--slab-j", NULL
         };
         int nbad = 0;
         for (int i = 1; i < argc; i++)
@@ -1768,6 +1837,7 @@ static int bench_main_impl(int argc, char **argv)
         sqgen_t *qgen = NULL;
         uint32_t nq = 0, capq = 0;
         int prc;
+        int fb1_generated = 0;
         /* Options that belong to the measurement harness only. The pipeline
          * runs ONE configuration -- the one every gate was closed against:
          * single-level atomic fill, 4 B records, 16-bit cells, the fp32/fp64
@@ -2527,9 +2597,28 @@ resume_artifacts_ready:
                         cfg.allowance0, cfg.allowance0 - d0, d0, cfg.mfb0);
                 (void)sl1; (void)sl0;
             }
-            if (cfg.cadofb) { if (fb_load_cado(cfg.cadofb, cfg.scale, &fb1) != 0) return 1; }
-            else if (fb_load(fbpath, &fb1) != 0) return 1;
-            if (fb_fill_logp(&fb1, cfg.scale) != 0) return 1;
+            if (cfg.cadofb) {
+                if (fb_load_cado(cfg.cadofb, cfg.scale, &fb1) != 0) return 1;
+            } else if (fbpath_set) {
+                /* Explicit --fb retains the legacy GGNFS .afb.0 path for
+                 * sieve-only/debug use.  It remains unsuitable for relation
+                 * production because it carries no prime-power metadata. */
+                if (fb_load(fbpath, &fb1) != 0) return 1;
+                if (fb_fill_logp(&fb1, cfg.scale) != 0) return 1;
+            } else {
+                /* Production default: regenerate the complete algebraic FB on
+                 * the assigned GPU.  --fbbound is a truncation knob, not an
+                 * extension beyond the job's alim, matching the file-backed
+                 * path and the reporting below. */
+                const uint32_t genlim = fbbound < alim ? fbbound : alim;
+                fprintf(stderr,
+                        "bench: no --fb1 supplied; generating algebraic factor base on GPU through %u\n",
+                        genlim);
+                if (afb_build_gpu(&POLY, genlim, maxbits, cfg.scale, -1, 0, 1,
+                                  &fb1) != 0)
+                    return 1;
+                fb1_generated = 1;
+            }
         }
         if (cfg.cadofb && fb1.maxbits > 0 && fb1.maxbits != maxbits)
             fprintf(stderr,
@@ -2556,23 +2645,17 @@ resume_artifacts_ready:
              * entry, and refusing the run rejects a perfectly good job. This
              * guard used to test only for the entry's presence and did exactly
              * that on the first SNFS job it saw. */
-            /* The p = 2 test was, in practice, what forced --cadofb: a GGNFS
-             * .afb.0 has neither p = 2 nor prime powers, and the missing 2 was
-             * the symptom that got caught. Exempting polynomials with no root
-             * mod 2 removed that gate for exactly the SNFS jobs -- which still
-             * need the prime powers, and would otherwise run to completion
-             * with every algebraic norm under-divided by p^(k-1), exiting 0
-             * having quietly lost yield.
-             *
-             * So the requirement is stated directly rather than inferred from
-             * a symptom. */
-            if (!cfg.cadofb && (cfg.relations || cfg.candidates || cfg.cofactor)) {
+            /* Historically this p=2 check exposed incomplete legacy .afb.0
+             * input.  Relation-producing runs now either load a complete
+             * --fb1 file or generate the complete algebraic FB in-process; an
+             * explicitly requested legacy --fb is rejected directly below. */
+            if (fbpath_set && !cfg.cadofb &&
+                (cfg.relations || cfg.candidates || cfg.cofactor)) {
                 fprintf(stderr,
-                    "ERROR: relation-producing runs need --fb1 <fbgen output>.\n"
-                    "         The GGNFS .afb.0 format carries neither p = 2 nor"
-                    " prime powers, so\n"
-                    "         algebraic norms are under-divided and the yield is"
-                    " silently short.\n");
+                    "ERROR: relation-producing runs cannot use legacy --fb .afb.0 input.\n"
+                    "         It carries neither p = 2 metadata nor prime powers.\n"
+                    "         Omit --fb to generate the complete algebraic factor base on GPU,\n"
+                    "         or pass --fb1 <fbgen output>.\n");
                 return 1;
             }
             if (!n2 && !poly_has_root_mod2(&POLY)) {
@@ -2690,6 +2773,9 @@ resume_artifacts_ready:
                         fbbound >= alim ? " = full base to alim"
                                         : " (truncated below alim)",
                         fb0.n, bkthresh, rlim);
+            runlog_note("fb-source", "side1 %s",
+                        fb1_generated ? "generated in-process on GPU with exact CPU Hensel branches" :
+                        (cfg.cadofb ? "fbgen/CADO text file" : "legacy GGNFS .afb.0"));
             runlog_note("gate", "sq-side %d  scale %.4f/%.4f  allowance"
                         " %.2f/%.2f  lpb %u/%u  mfb %u/%u", cfg.sq_side,
                         cfg.scale, cfg.scale0, cfg.allowance, cfg.allowance0,
