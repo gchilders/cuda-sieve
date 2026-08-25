@@ -357,7 +357,44 @@ __device__ __forceinline__ int apply_keep(uint32_t x, uint32_t v,
  * neighbour (accumulated logs do exceed 255) and cannot be used for real.
  */
 template <int CELLBITS, int ATOMIC, int NORMMODE, bool SLABBED = false>
-__global__ void k_apply(const uint32_t *__restrict buckets,
+/* __launch_bounds__(512, 3): ptxas otherwise settles on 45-46 registers, which
+ * fits only TWO 512-thread blocks per SM and pins theoretical occupancy at
+ * 66.67%. ncu on a 5070 (sm_120) reports the limiter explicitly -- Block Limit
+ * Registers 2 against Block Limit Shared Mem 3 and Block Limit Warps 3 -- so
+ * registers, not the 32 KB of cells, are what cost the third block. Measured
+ * paired and idle: apply -12.6%, wall -4.6% on the C194 (finding 75).
+ *
+ * **The budget is 40 registers, not the 42 the naive division gives.** Three
+ * blocks need 65536/(512*3) = 42.67 per thread, but registers are allocated
+ * per warp in units of 256 -- 8 per thread -- so a 42-register kernel is
+ * charged 48, giving 65536/(48*512) = 2.67 -> two blocks and no gain at all.
+ * 40 is the first value that actually yields three, and it is where ptxas
+ * lands. Anyone reusing this recipe on another kernel must round DOWN to a
+ * multiple of 8 before believing the arithmetic.
+ *
+ * ptxas lands on 40 with NO spill for all nine instantiations, on sm_120 and
+ * sm_80 alike; total spill bytes across the whole TU stay at 0, as at HEAD.
+ * This is the mirror image of k_fill_l1, where the same annotation had to be
+ * REVERTED because a widened walk pushed it past the cap into 12 spill stores:
+ * check `-Xptxas -v` before assuming a cap is free, in both directions.
+ *
+ * **VALIDITY WINDOW -- the three-block premise is not universal.** Apply's
+ * dynamic shared memory is (1 << log_region) * 2 + nslice_pow2 * 2, and three
+ * blocks must fit the 100 KB per-SM budget. At the default --region 14 that
+ * allows nslice_pow2 <= 512, which is exactly where the C194 sits today
+ * (33792 B/block): one more slice tier doubles it to 1024, smem/block goes to
+ * 34816, and only two blocks fit -- the whole -12.6% evaporates silently, with
+ * no diagnostic. At --region 15 (~66 KB/block) only ONE block ever fits, so
+ * the cap constrains ptxas for no occupancy gain there. It costs nothing in
+ * either case, since there is no spill at 40, but do not assume the win
+ * survives a larger region or a factor base that cuts to more slices --
+ * re-measure occupancy with ncu if either changes.
+ *
+ * The 512 is a hard ceiling, not a hint: a launch with more than 512 threads
+ * per block fails outright, which is why --apply-threads is capped at
+ * APPLY_THREADS_MAX rather than the 1024 a block could otherwise carry. */
+__global__ __launch_bounds__(512, 3)
+void k_apply(const uint32_t *__restrict buckets,
                         const uint32_t *__restrict cnt, uint32_t cap,
                         int logI, int log_region,
                         const uint16_t *__restrict slice_logp, uint32_t nslice,
@@ -521,6 +558,14 @@ report spurious cell mismatches. Pricing builds only, never for relations."
      * survivors yet a smaller ABSOLUTE saving (8.00 vs 10.78 ms), so the win
      * tracks neither positions nor survivors. Do not quote -13% as the figure.
      * (An earlier contended-card pass reported -15.0%/-9.8%; superseded.)
+     *
+     * ncu profiling on 2026-08-25 (finding 75) ruled out the obvious causes
+     * without replacing them: all three geometries profile nearly identically
+     * (DRAM 8.5-8.9%, IPC 2.88-2.91, occupancy 66.3-66.5%) and per-launch
+     * instruction counts differ by 3% for the same 2^29 positions. It also
+     * showed this scan is only ~3% of the kernel's instructions, so the win
+     * was contention on the global atomics, not instruction count -- there is
+     * no more to get by shaving the scan itself.
      *
      * The store is only race-free across blocks when a block owns whole
      * survbits words -- log_region >= 5 -- so smaller regions keep the atomicOr

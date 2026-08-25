@@ -2,6 +2,18 @@
 # No CADO, no msieve, no GMP. Builds or loads factor bases directly.
 # Pattern copied from ~/msieve-s/gerbicz_bench/Makefile, which worked well.
 
+# Declared here, at the top, because it must not end up attached to whatever
+# rule happens to come first. Without it GNU make takes the default goal from
+# the first explicit rule in the file -- `$(OBJS) $(TEST_OBJS): $(DEFS_STAMP)
+# ...` further down -- whose first word is bench_main.o. A bare `make` then
+# compiled ONE object file, printed nothing alarming and exited 0, while
+# `bench` kept whatever binary was already on disk. That is indistinguishable
+# from a successful incremental build unless you check the binary's mtime, and
+# it silently invalidates any A/B measured right after it: the "new" binary is
+# the old one. Found 2026-08-25 (RESULTS finding 75), where it turned a real
+# -12.6% apply win into a flat result that was very nearly written off.
+.DEFAULT_GOAL := all
+
 NVCC      ?= nvcc
 CC        ?= gcc
 CXX       ?= g++
@@ -19,11 +31,14 @@ CXX       ?= g++
 # sm_80 is also the floor, and it is a tuning floor rather than an instruction
 # one. The only warp intrinsics used are __syncwarp, __shfl{,_up}_sync and
 # __ballot_sync (k_apply's threshold scan), which all long predate Ampere --
-# but k_fill_l1's and k_fill_l2's __launch_bounds__(512, 3) target 1536
-# threads/SM and its 3 x 33 KB of shared memory are Ampere-and-later tuning
-# numbers. The apply kernel's opt-in per-block shared-memory limit is queried
-# from the selected device at runtime rather than hardcoded. sm_75 still compiles
-# with ptxas warning that .minnctapersm is out of range on every fill kernel,
+# but k_fill_l1's, k_fill_l2's AND k_apply's __launch_bounds__(512, 3) target
+# 1536 threads/SM and 3 x 33 KB of shared memory, which are Ampere-and-later
+# tuning numbers. k_apply acquired that annotation on 2026-08-25 (RESULTS
+# finding 75); its opt-in per-block shared-memory LIMIT is still queried from
+# the selected device at runtime rather than hardcoded, but the three-block
+# occupancy target it now carries is not. sm_75 still compiles with ptxas
+# warning that .minnctapersm is out of range on every fill kernel -- and now on
+# k_apply too, Turing offering 1024 threads/SM against the annotation's 1536 --
 # and then oversubscribes Turing's 64 KB of shared memory in the fill path.
 # Below that nothing is possible anyway: CUDA 13 dropped Volta, so nvcc 13.2
 # rejects sm_70 outright.

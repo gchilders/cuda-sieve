@@ -511,7 +511,7 @@ typedef struct {
     int      cell_bits;     /* 16 = safe (doc default), 8 = unsafe, for cost   */
     int      norm_mode;     /* NORM_* below */
     int      apply_atomic;  /* 1 = smem atomicAdd, 0 = racy plain += (probe)   */
-    int      apply_threads; /* threads per apply block (0 = same as --threads) */
+    int      apply_threads; /* 0 = auto (APPLY_THREADS_DEFAULT), max APPLY_THREADS_MAX */
     int      small_sieve;   /* 1 = line-sieve p < bkthresh into the region      */
     int      side;          /* 1 = algebraic (special-q side), 0 = rational     */
     double   allowance;     /* bits of cofactor tolerated (lambda*lpb)         */
@@ -663,6 +663,13 @@ typedef struct {
  * data-driven (one block per super-bucket) and has no grid to tune. */
 #define FILL_BLOCKS_DEFAULT  1152
 #define FILL_THREADS_DEFAULT 32
+/* k_apply's block size. APPLY_THREADS_MAX is NOT a taste limit: it is the first
+ * argument of k_apply's __launch_bounds__, which is a hard ceiling -- a launch
+ * with more threads per block fails outright. Keep these three in step with the
+ * annotation in bench_kernels.cu; the validator in bench_main.cu enforces the
+ * max at parse time so the failure is a message rather than a launch error. */
+#define APPLY_THREADS_DEFAULT 512
+#define APPLY_THREADS_MAX     512
 
 /* k_fill_l1's grid, frozen at what it has always run. See the launch site. */
 #define FILL_L1_BLOCKS 144

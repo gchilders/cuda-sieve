@@ -264,7 +264,7 @@ static void usage(void)
 "  --cells N        16 | 8 bits per sieve cell [16]  (8 is unsafe; cost only)\n"
 "  --norm M         horner | const             [horner]\n"
 "  --apply-mode M   atomic | plain             [atomic]  (plain is racy)\n"
-"  --apply-threads N  threads per apply block  [512]\n"
+"  --apply-threads N  threads per apply block  [512] (max 512)\n"
 "  --reps N         timing repetitions         [3]\n"
 "  --verify         run the CPU cross-check (slow)\n"
 "  --no-smallsieve  skip the p < bkthresh line sieve\n"
@@ -1031,8 +1031,11 @@ static int bench_main_impl(int argc, char **argv)
                 return 1;
             }
         }
-        else if (!strcmp(argv[i], "--apply-threads") && i + 1 < argc)
-            cfg.apply_threads = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--apply-threads") && i + 1 < argc) {
+            if (parse_int_range_arg("--apply-threads", argv[++i], 0,
+                                    APPLY_THREADS_MAX, &cfg.apply_threads))
+                return 1;
+        }
         else if (!strcmp(argv[i], "--allowance") && i + 1 < argc) {
             if (parse_nonnegative_double_arg("--allowance", argv[++i],
                                              &cfg.allowance)) return 1;
@@ -1390,11 +1393,13 @@ static int bench_main_impl(int argc, char **argv)
      * leaves a partial warp whose lanes re-run warp-tier entries, double-adding
      * their logs. Neither is diagnosable from the output. */
     if (cfg.apply_threads != 0 &&
-        (cfg.apply_threads < 32 || cfg.apply_threads > 1024
+        (cfg.apply_threads < 32 || cfg.apply_threads > APPLY_THREADS_MAX
          || (cfg.apply_threads & 31))) {
         fprintf(stderr, "--apply-threads must be 0 (auto) or a multiple of 32 in"
-                " [32,1024]: the small sieve strides by threads/32, so under 32"
-                " hangs and a partial warp double-counts\n");
+                " [32,%d] (got %d): the small sieve strides by threads/32, so"
+                " under 32 hangs and a partial warp double-counts, and"
+                " k_apply's __launch_bounds__ makes %d a hard launch ceiling\n",
+                APPLY_THREADS_MAX, cfg.apply_threads, APPLY_THREADS_MAX);
         return 1;
     }
     if (((uint64_t)1 << cfg.logI) * cfg.J % ((uint64_t)1 << cfg.log_region)) {

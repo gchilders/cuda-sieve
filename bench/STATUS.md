@@ -4,7 +4,7 @@
 the order they were discovered, including the ones later refuted, because the
 refutations are the most useful part. That makes them bad at answering "what
 does this thing do today". This file answers only that, and holds nothing that
-is not current. **Last updated 2026-08-20.**
+is not current. **Last updated 2026-08-25.**
 
 ## Architecture
 
@@ -122,6 +122,16 @@ including the two points that were previously missing:
 
 So `2^29` is this job's optimum outright, not a memory compromise -- it is both
 the fastest point and a quarter of the `2^31` footprint.
+
+> **The ORDERING above is current; the ABSOLUTE numbers are not.** A paired
+> re-sweep on 2026-08-25 (finding 75), after `k_apply` got 12% faster, measures
+> the same points at 486.55 / 436.48 / **411.32** / 424.00 ms/q for that same
+> reference binary and 467.77 / 414.84 / **392.28** / 404.39 after the change
+> -- about 7% below this table, with the gap concentrated in cofactorisation
+> rather than in `fill` or `apply`. The two sweeps ran under different machine
+> conditions, so quote ms/q from finding 75 and treat this table as the shape.
+> `2^29` remains the optimum on both binaries, and the re-sweep adds `2^27`
+> (+15.8%), which brackets the minimum from below for the first time.
 
 **Settled 2026-08-25 by a second sweep at double the area.** An earlier draft
 claimed the two cards genuinely disagree; that was retracted as confounded
@@ -1505,8 +1515,14 @@ absent from every document in the repo.
 
     Item-0 verdict: **3.10× time and 3.14× energy** against the CPU box at the
     undervolt, from finding 58's equal-work 3.31× / 2.74× at stock.
-11. **Apply breakdown — ANSWERED 2026-08-17 (finding 60), and the answer is
-    "no cheap win".** Apply is where the milliseconds are — **54% of the sieve
+11. **Apply breakdown — ANSWERED 2026-08-17 (finding 60) as "no cheap win";
+    that conclusion is PARTLY WRONG, corrected 2026-08-25 (finding 75).** The
+    cheap win was occupancy, which this item never examined: one
+    `__launch_bounds__` was worth **apply −12.6%, wall −4.6%**. The diagnosis
+    below is still right and still worth reading — see the correction at the
+    end of the item for what it missed and why.
+
+    Apply is where the milliseconds are — **54% of the sieve
     chain** on the C194 at its deployment geometry, 21.94 ms against fill's
     15.47 — which is why this was ranked ahead of further fill tuning.
 
@@ -1532,6 +1548,27 @@ absent from every document in the repo.
     doing first. A `NORM_FAST_LOG2` build switch was added alongside the
     existing `NORM_CANCEL_TOL` so both prices can be re-measured on another job
     without editing the kernel.
+
+    > **PARTLY WRONG — CORRECTED 2026-08-25, finding 75.** "No cheap win" held
+    > only because every lever priced here was an *instruction-count* lever.
+    > The diagnosis above is right and still stands — apply is issue-limited
+    > with a balanced mix, 0.70 instructions per cycle per scheduler — but
+    > **occupancy was never examined**, and it was the cheap win.
+    >
+    > `k_apply` compiled to 45 registers, which fits two 512-thread blocks per
+    > SM and pins theoretical occupancy at 66.67%; shared memory would have
+    > allowed three. `__launch_bounds__(512, 3)` brings ptxas to 40 registers
+    > with **zero spill**, occupancy to 99.66%, and SM throughput from 72.9% to
+    > 84.7%. Measured paired and idle: **apply −12.6%, sieve −7.1%, wall −4.6%
+    > on the C194**, relations byte-identical, uniform across all three
+    > geometries tested.
+    >
+    > The lesson generalises past this kernel. An issue-limited kernel with no
+    > saturated pipe is *also* the signature of one starved of warps, and this
+    > item read that signature as "nothing left but algorithms". **Check
+    > `Block Limit Registers` against `Block Limit Shared Mem` before
+    > concluding a kernel is out of cheap headroom** — `ncu` prints the
+    > limiter and an estimated speedup outright, and here it said 33.33%.
 12. **Unattended operation — checkpoint, resume, clean stop, logging**
     *(added 2026-08-07, owner-stated requirement; scoped 2026-08-11)*. The GPU
     should not idle waiting on a human any more than it should idle waiting on
@@ -1837,9 +1874,26 @@ absent from every document in the repo.
 
     **What is NOT established.** No card older than the current sm_80 build
     floor has been qualified by this change. Lowering `GPU_ARCH_all` would still
-    require compilation and byte-comparison testing on that hardware; fill-kernel
-    launch-bounds/shared-memory tuning remains a separate constraint.
+    require compilation and byte-comparison testing on that hardware.
+    Launch-bounds/shared-memory tuning remains a separate constraint, and as of
+    2026-08-25 it is **no longer confined to the fill kernels**: `k_apply`
+    carries `__launch_bounds__(512, 3)` too (finding 75), so it targets 1536
+    threads/SM and three blocks of ~33 KB. On a 1024-thread/SM part such as
+    sm_75 that annotation both trips the `.minnctapersm` warning and cannot
+    reach its three-block target — on the kernel that is 54% of the sieve
+    chain. Qualify apply alongside fill, not after it.
 16. **Build wall time — MEASURED 2026-08-20, and the cause is `CF_LMAX=4`.**
+    **See first: the default-goal trap, fixed 2026-08-25 (finding 75).** Until
+    that date the Makefile had no `.DEFAULT_GOAL`, and its first explicit rule
+    is `$(OBJS) $(TEST_OBJS): ...` — so a bare `make` in `bench/` took its goal
+    from the first word of `$(OBJS)` and built **`bench_main.o` alone**, then
+    exited 0 without relinking `bench`. It looked exactly like a successful
+    incremental build and silently invalidated any measurement taken against
+    the binary afterwards, because the binary was the old one. `.DEFAULT_GOAL
+    := all` is now set above that rule. **A zero exit from `make` is not
+    evidence a build happened — check the binary's mtime before benchmarking
+    against it.**
+
     A full `make all` is ~12.5 min on this 16-thread box and about 30 on a
     busy Vast.ai 5090. The Makefile's timing table (`Makefile:43-55`) claims
     214 s and blames sm_120's ptxas. **That table was measured 2026-08-11

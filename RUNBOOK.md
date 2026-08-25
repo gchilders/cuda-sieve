@@ -218,6 +218,15 @@ today, and widening its walk made `ptxas` spill to local memory rather than
 lower occupancy. Do not delete the 32-bit walk helpers or the SLAB32 block in
 `verify_walk_slabs` that gates them.
 
+Since 2026-08-25 `k_apply` carries the same `__launch_bounds__(512, 3)` for the
+opposite reason: uncapped it compiled to 45 registers, which fits only two
+512-thread blocks per SM and held occupancy at 66.67% while shared memory would
+have allowed three. Capped it reaches 40 registers with no spill and ~100%
+occupancy, worth **−12.6% apply and −4.6% wall clock** on the C194
+(`bench/RESULTS.md` finding 75). **The 512 is a hard launch ceiling, not a
+hint**, which is why `--apply-threads` now refuses anything above 512; it
+accepted up to 1024 before this change. The default (512) is unaffected.
+
 `--no-td-verify` disables the dense TD reconstruction gate. In the pipeline the
 gate normally runs once on the first slab of the first q; in the standalone TD
 harness it disables that harness reconstruction check as well. It saves a

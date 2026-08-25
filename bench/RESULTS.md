@@ -1049,6 +1049,11 @@ than rediscovering it 7.6M times.
   **zero — an infinite loop on the device**, and a non-multiple of 32 leaves a
   partial warp whose lanes re-run warp-tier entries and double-add their logs.
   Now requires 0 or a multiple of 32 in [32,1024].
+  > **SUPERSEDED 2026-08-25 by finding 75:** the upper bound is now **512**,
+  > not 1024 — `k_apply` carries `__launch_bounds__(512, 3)` and that first
+  > argument is a hard launch ceiling. The flag is also parsed with
+  > `parse_int_range_arg` rather than `atoi` as of the same date, so malformed
+  > values are rejected instead of silently becoming 0 (auto).
 - **`1u << log_region` happened before `log_region` was bounded**; UBSan flags
   `--region 32`. Both `logI` and `log_region` are now bounded before anything
   shifts by them.
@@ -4650,6 +4655,12 @@ fastest point *and* uses a quarter of the `2^31` bucket array (1.30 vs
 5.20 GB). The old monolithic behaviour is not merely memory-hungry, it is
 **18% slower**.
 
+> **Re-swept 2026-08-25 (finding 75) after `k_apply` got 12% faster, and
+> `2^29` still wins.** The re-sweep is paired, extends down to `2^27` — which
+> finding 74 never sampled — and confirms the optimum is an interior minimum
+> bracketed on both sides. Its absolute numbers sit ~7% below this table's;
+> see the note there before comparing the two.
+
 > **RETRACTION AND RESOLUTION.** This finding first concluded that `2^30` being
 > 5.6% slower here against 4.6% faster on the L40 made finding 72 "a genuine
 > architecture split". **That reasoning was confounded** and was retracted:
@@ -4752,3 +4763,191 @@ larger L2, say — would cross later, which is exactly the L40's `2^30`
 behaviour. That is a mechanism for finding 72's split rather than a
 restatement of it, and it predicts the right knob: batch the recording pass and
 the crossing moves to smaller slabs on every card.
+
+## Finding 75 — `k_apply` was register-limited to 66.67% occupancy: one `__launch_bounds__` is worth −12.6% apply and −4.6% wall clock, uniformly across jobs
+
+**Date:** 2026-08-25, RTX 5070 (sm_120), **card otherwise idle**. Paired A/B,
+three repeats per geometry, relations byte-identical in nine of nine pairs.
+Reference binary is `8d9d77b` (finding 73/74 as committed); the only source
+difference is the annotation below plus the `--apply-threads` bound it forces.
+
+Finding 74 left `apply` as the largest sieve stage and the one nothing had
+moved: across the whole slab sweep it sat at 154–157 ms while `fill` fell 41%.
+Finding 73's ballot scan then took 13% off it on c147 but only 5.4% on c194,
+the job that matters. This finding is what `ncu` said when asked why.
+
+### It was never memory-bound
+
+Three geometries, `-k regex:k_apply`, HEAD binary:
+
+| | c147 unslab | c147 slab | c194 |
+|---|---:|---:|---:|
+| Compute (SM) throughput | 73.55% | 73.49% | 72.94% |
+| **DRAM throughput** | **8.52%** | **8.71%** | **8.90%** |
+| L2 throughput | 3.31% | 3.34% | 6.01% |
+| Executed IPC (of 4.0) | 2.90 | 2.88 | 2.91 |
+| Achieved occupancy | 66.33% | 66.44% | 66.45% |
+
+DRAM is idle. The kernel is issuing instructions at ~2.9 of 4 per cycle and
+that is the entire story. Any plan that reorganises the bucket record format
+or the read path is aimed at a bottleneck that does not exist here.
+
+### The limiter is registers, and `ncu` names it
+
+```
+Block Limit Registers            2      <-- binding
+Block Limit Shared Mem           3
+Block Limit Warps                3
+Theoretical Occupancy        66.67%
+OPT  Est. Local Speedup: 33.33% ... limited by the number of required registers
+```
+
+At 45 registers x 512 threads only two blocks fit per SM. Shared memory would
+allow three (33 KB x 3 = 99 KB of 100 KB — the budget `k_fill_l1` already
+exploits).
+
+**The budget is 40 registers, not the 42 the division gives.** Three blocks
+need `65536/(512*3) = 42.67` per thread, but registers are allocated per warp
+in units of 256 — 8 per thread — so a 42-register kernel is charged 48 and
+gets `65536/(48*512) = 2.67` → **two** blocks and no gain whatsoever. 40 is the
+first value that actually yields three, and it is where `ptxas` lands. Round
+DOWN to a multiple of 8 before believing this arithmetic on another kernel.
+
+`ptxas -v`, all nine instantiations the build emits:
+
+| instantiation | HEAD | `__launch_bounds__(512,3)` |
+|---|---:|---:|
+| `<16,1,1,1>` **production, slabbed** | 45 | **40** |
+| `<16,1,1,0>` production, unslabbed | 45 | **40** |
+| `<8,1,1,0>` / `<8,0,1,0>` | 46 | 40 |
+| `<16,0,1,0>` | 45 | 40 |
+| `<16,1,0,0>` / `<16,0,0,0>` | 40 | 40 |
+| `<8,1,0,0>` / `<8,0,0,0>` | 34 | 34 |
+| **total spill bytes, whole TU** | **0** | **0** |
+
+This is the exact mirror of `k_fill_l1`, where the same annotation had to be
+**reverted** because a widened walk pushed it past the cap into 12 spill
+stores. Same annotation, opposite sign. `-Xptxas -v` before and after, in both
+directions, is the only thing that distinguishes the two cases.
+
+Confirmed in the running binary — `ncu`, c194, before and after:
+
+| | HEAD | patched |
+|---|---:|---:|
+| Registers per thread | 45 | **40** |
+| Block Limit Registers | 2 | **3** |
+| Theoretical occupancy | 66.67% | **100%** |
+| Achieved occupancy | 66.45% | **99.66%** |
+| Compute (SM) throughput | 72.94% | **84.71%** |
+
+### End-to-end, paired
+
+| geometry | stage | ref | new | delta |
+|---|---|---:|---:|---:|
+| c147 unslabbed | apply | 8.72 | 7.67 | **−12.1%** |
+| | sieve | 17.57 | 16.50 | −6.1% |
+| | wall | 40.89 | 38.69 | −5.4% |
+| c147 slabbed | apply | 69.27 | 60.84 | **−12.2%** |
+| | sieve | 125.23 | 116.75 | −6.8% |
+| | wall | 176.01 | 167.16 | −5.0% |
+| **c194 (production)** | **apply** | **148.60** | **129.89** | **−12.6%** |
+| | **sieve** | **262.09** | **243.46** | **−7.1%** |
+| | **wall** | **402.47** | **383.76** | **−4.6%** |
+
+**The property finding 73 lacked is uniformity.** The ballot scan gave −13% on
+c147 and −5.4% on c194; this gives its full −12.6% on c194, the largest of the
+three. Repeat spread is under 0.05% (129.886 / 129.925 / 129.870). One
+annotation is worth more wall clock on the production job than everything in
+the finding 73/74 commit combined (−4.6% against −1.9%).
+
+`--apply-threads` is now capped at 512 rather than 1024: `__launch_bounds__`'s
+first argument is a hard launch ceiling, not a hint, so 1024 would fail the
+launch outright. The bound is validated in `bench_main.cu` with a message
+naming the cause.
+
+### What this does NOT explain
+
+Finding 73's c147-vs-c194 gap remains open and is now stranger, not clearer.
+The three profiles are nearly identical, and per-launch instruction counts
+differ by 3% for the same `2^29` positions (8.55G vs 8.80G warp instructions).
+The obvious causes are ruled out; no replacement is offered.
+
+One thing the instruction counts do settle: the threshold scan is only about
+**3% of the kernel's instructions**, yet removing its atomics bought 5–13%.
+That win was contention on global atomics, never instruction count — so there
+is no second helping of it available by shaving the scan further.
+
+### The build hid this for an hour, and would have buried it
+
+The first A/B of this change came back **dead flat on all three geometries**,
+with an `ncu` reading that still showed 45 registers. Both were artifacts of a
+build that never ran. `make` in `bench/` had no `.DEFAULT_GOAL`, and the first
+explicit rule in the Makefile is
+
+```make
+$(OBJS) $(TEST_OBJS): $(DEFS_STAMP) $(CF_LMAX_STAMP)
+```
+
+so make's default goal was the first word of `$(OBJS)` — **`bench_main.o`**. A
+bare `make` compiled one object file, printed nothing alarming, and exited 0,
+while `bench` kept the binary already on disk. The A/B then compared the
+reference binary against itself and reported, correctly, that nothing had
+changed.
+
+`.DEFAULT_GOAL := all` is now set immediately above that rule. Two lessons
+worth more than the fix:
+
+1. **A zero exit from `make` is not evidence a build happened.** The binary's
+   mtime is. `MAKE_EXIT=0` was checked and was true; the thing it stood proxy
+   for was false. This is the same shape as the `pgrep -f` self-match that
+   wasted an overnight run — trusting a status signal over the state it
+   represents.
+2. **A flat A/B deserves the same scrutiny as a surprising one.** A null result
+   feels like the safe conclusion and gets less checking, which is exactly what
+   makes it dangerous: a real −12.6% was one sentence away from being written
+   off as "measured, no effect."
+
+### The slab optimum is unchanged — re-swept paired, 2026-08-25
+
+`apply` was the flat stage across finding 74's sweep, so a 12% cut to it could
+in principle have moved the fill/apply balance that picked `2^29`. It does not.
+Same job and geometry as finding 74 (`c194`, `--logI 16 --J 32768 --qrange
+80000023: --nq 10`), both binaries interleaved at every point, two repeats
+each, relations byte-identical at all six points. `2^27` is new — finding 74
+stopped at `2^28` and never showed the lower turn.
+
+| `--slab-j` | slabs | local area | fill ref → new | apply ref → new | **complete ref** | **complete new** |
+|---:|---:|---|---:|---:|---:|---:|
+| 32768 | 1 | `2^31` | 186.85 → 185.93 | 149.86 → 130.80 | 486.55 (+18.3%) | 467.77 (+19.2%) |
+| 16384 | 2 | `2^30` | 136.48 → 135.19 | 150.83 → 131.13 | 436.48 (+6.1%) | 414.84 (+5.7%) |
+| 10923 | 3 | `2^29.42` | 113.34 → 115.17 | 149.25 → 132.72 | 412.17 (+0.2%) | 398.29 (+1.5%) |
+| **8192** | **4** | **`2^29`** | **108.89 → 109.40** | **150.52 → 132.44** | **411.32 best** | **392.28 best** |
+| 4096 | 8 | `2^28` | 109.10 → 109.60 | 149.76 → 131.21 | 424.00 (+3.1%) | 404.39 (+3.1%) |
+| 2048 | 16 | `2^27` | 125.31 → 125.39 | 150.70 → 131.84 | 473.18 (+15.0%) | 454.12 (+15.8%) |
+
+**`2^29` wins on both binaries, and the curve is barely perturbed** — the
+"vs best" column is within 1.3 points at every position. `SLAB_PERF_TARGET_LOG2
+29` stands unchanged.
+
+The reason is visible in the table: **`apply` is flat in slab size both before
+and after** (149.25–150.83 ref, 130.80–132.72 new, no trend). Slabbing has
+never moved `apply` and still does not; it moves `fill`, and `fill`'s shape is
+untouched. A stage that is constant in the swept parameter cannot relocate that
+parameter's optimum however much its constant changes.
+
+The `2^27` point also fills in the lower half of the curve for the first time:
+`fill` turns back up (109.60 → 125.39, +15%) once slabs get small enough that
+per-slab fixed costs dominate. The optimum is a genuine interior minimum
+bracketed on both sides, not the edge of the sampled range.
+
+The per-point deltas confirm the A/B independently at six slab sizes of this
+one geometry — not six geometries; the three-geometry claim above is the one
+that spans jobs. `apply` −11.1% to −13.1%, `fill` within ±1.6% of zero (it is a
+different kernel and should not move), wall −3.4% to −5.0%.
+
+> **Do not compare these absolute numbers against finding 74's table.** That
+> sweep reports 441.30 ms complete at `--slab-j 8192` where this one measures
+> 411.32 for the same binary lineage — about 7% apart, with the gap
+> concentrated in cofactorisation rather than in `fill` or `apply`. The two
+> sweeps were taken under different machine conditions. Within either sweep the
+> points are paired and comparable; across them only the *shape* is.
