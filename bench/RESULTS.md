@@ -3119,6 +3119,11 @@ agreement. Those are different quantities.
 intersects through the uncapped **bitmap**; the list is not on the yield path.
 The standalone's "list truncated" notice is its own display cap.
 
+> **2026-08-24:** the conclusion outlived the mechanism. Finding 73 deleted the
+> survivor list outright — it was write-only in both callers — so there is no
+> longer a cap or a truncation notice to rule out. `maxsurv` now names only the
+> intersect/compaction cap.
+
 ### Where it is
 
 Both funnels at q=250M, per (q, rho) pair:
@@ -3933,12 +3938,14 @@ whether the point should have been sieved at all.
 
 **This is a sieve measurement, not a relation-collection measurement, and the
 distinction is load-bearing.** What runs end-to-end is: transform → fill →
-apply → threshold → survivor list, per side. What does not exist at all is the
+apply → threshold → survivor bitmap, per side. What does not exist at all is the
 two-sided survivor intersection/compaction, GPU resieve/factor recovery/TD,
 GPU cofactorization, final relation output, and unique-relation accounting.
-The survivor *list* is also
-capped at 2^22 entries against one-sided sets of 18–30M — the count is exact
-and truncation is reported, but nothing consumes the list yet.
+~~The survivor *list* is also capped at 2^22 entries against one-sided sets of
+18–30M — the count is exact and truncation is reported, but nothing consumes
+the list yet.~~ **REMOVED 2026-08-24 (finding 73):** nothing ever consumed it,
+so the list and its cap are gone; the per-side survivor *count* remains, and
+the bitmap it was never a substitute for is what the pipeline actually reads.
 
 So: **kernel feasibility is demonstrated; GPU-resident relation-collection
 feasibility is not.** Any "3–4× whole-box speedup" is specifically the optional
@@ -4415,7 +4422,7 @@ card, where the failure mode is wrong answers rather than a crash.
   finish unevenly, so a few core-seconds of tail idle are charged to the CPU.
   At 45 min/band that is well under 1%.
 - No 130M CPU control.
-## Finding 71 — L40 moves the slab-speed optimum to `2^30`, while `2^29` remains the better generic memory/performance default
+## Finding 72 — L40 moves the slab-speed optimum to `2^30`, while `2^29` remains the better generic memory/performance default
 
 A matched `I=J=2^16` cofactor run on an NVIDIA L40 gives a different optimum
 from the RTX 3090 and RTX 5070: four `2^30`-position slabs are fastest, not
@@ -4444,3 +4451,304 @@ including `k_fill_atomic` L2 hit/write-miss counters, is needed before an
 L2-informed automatic slab target can be justified. Until then, the production
 planner keeps `2^29` as the performance/memory compromise and `--slab-j`
 remains the explicit per-device tuning override.
+
+## Finding 73 — the 32-bit saturating walk is the SLOW one, and the apply threshold scan was paying an atomic per survivor
+
+**Date:** 2026-08-24, RTX 5070, **card otherwise idle**. `oracle/c147.job` + `c147.roots1`
+(maxbits 14), `--pipeline --cofactor --logI 14 --qrange 15000000: --nq 5`,
+J 8192 (area `2^27`, unslabbed) and J 65536 (area `2^30`, 2 slabs). Reference
+binary built from the merge commit in a detached worktree; both binaries run
+back to back, three paired repeats unless stated.
+
+**Methodological note, worth more than the numbers.** These were first measured
+with an unrelated job holding the card at 100%. Pairing ref against new
+controls for a *stationary* competing load, and the sieve-total figures did
+survive it almost exactly (−9.8% then, −9.7% now). **Individual stage
+percentages did not.** Contention inflated the unslabbed fill win (−9.1% under
+load, −6.1% idle) and *deflated* the unslabbed apply win (−9.8% under load,
+−13.4% idle) — it moved them in **opposite directions**, because the two
+changes have different sensitivities to L2 pressure. A contended run is not a
+scaled idle run. Absolutes were ~2.4x inflated. Take stage-level A/B numbers on
+an idle card or do not quote them.
+
+**Relations are byte-identical in all six pairs** (648 and 1297 relations), and
+output is deterministic run-to-run, so the byte comparison is a real gate
+rather than one that passes by accident.
+
+### The headline
+
+ms/q, n=3 paired repeats, every comparison non-overlapping:
+
+| | unslabbed `2^27` | slabbed `2^30`, 2 slabs |
+|---|---:|---:|
+| fill | 8.718 → **8.190** (**−6.1%**) | 57.697 → 57.288 (−0.7%) |
+| apply | 10.540 → **9.125** (**−13.4%**) | 83.317 → **72.543** (**−12.9%**) |
+| **sieve, both sides** | 20.09 → **18.14** (**−9.7%**) | 141.83 → **130.65** (**−7.9%**) |
+| wall clock/q, complete | 44.69 → 42.01 (−6.0%) | 204.47 → 190.48 (−6.8%) |
+
+Idle-card repeats are tight — sd ~0.09 ms against ~0.75 under contention — so
+n=3 separates cleanly where the contended data needed n=8 and a Welch t.
+
+### The same change on c194 — a third of the win, and the reason is structural
+
+**Do not quote the c147 numbers as the result.** Repeating the identical paired
+A/B on `c194.job` + `c194.roots1.m16` at the production shape
+(`--logI 16 --J 32768`, which auto-plans to 4 slabs), n=7 paired, idle card:
+
+| stage | ref | new | | sd ref / new |
+|---|---:|---:|---:|---|
+| fill | 107.62 | 107.91 | **+0.3%** | 0.34 / 0.83 |
+| apply | 158.06 | 149.56 | **−5.4%** | 0.60 / 1.25 |
+| sieve, both sides | 271.79 | 263.61 | **−3.0%** | 0.71 / 2.15 |
+| **wall clock/q** | **408.34** | **400.66** | **−1.9%** | 0.82 / 4.01 |
+
+Relations byte-identical on all seven reps (1125 each) — and c194 is
+`lpba 33 / mfba 95`, so this is the 4-limb-plus-ECM cofactor path, which the
+c147 verification never touched.
+
+**The fill result is not job-dependent, it is GEOMETRY-dependent, and that part
+is fully explained.** The `pl_next64` conversion only changed the *unslabbed*
+path; the slabbed path was already 64-bit before this work. c147 at J 8192 is
+unslabbed, so it gains 6.1%. c194 at J 32768 is slabbed, so it gains nothing —
+as did c147 slabbed (−0.7%). **The fill win exists only below the `2^30`
+slabbing trigger.** Every production geometry at I16 and above is slabbed and
+sees no fill benefit at all.
+
+**The apply gap is NOT explained, and the obvious guesses are wrong.** −12.9% on
+c147 slabbed against −5.4% on c194, and the absolute saving falls (10.78 ms to
+8.00 ms) even though c194 has twice the area and 7x the two-sided survivors
+(237,256 against 34,769). So the win tracks neither positions nor survivors.
+Untested candidates: the per-side survivor counts the scan actually branches on
+rather than the two-sided figure, the small-prime line sieve's share of apply at
+`alim` 240M against 33.5M, or L2 behaviour at twice the region count.
+
+**Headline, stated honestly: wall clock −1.9% (c194) to −6.8% (c147 slabbed),
+sieve −3.0% to −9.7%.** c194 is the more representative job and it is the low
+end. Plan against −2%, not −7%.
+
+### `pl_next` costs a branch per increment; `pl_next64` costs an add
+
+`pl_next` routes every increment through `pl_add32_sat`:
+
+```c
+if (hi || x > UINT32_MAX - lo) return UINT32_MAX;
+```
+
+That is a **branch per increment, up to two per walk step**, in the hottest
+loop in the program. `pl_next64` is a plain 64-bit add — two IADDs, no control
+flow. On this hardware the wide add wins, and register pressure never became
+the binding constraint.
+
+**This was found by getting it backwards.** The first attempt converted the
+*slabbed* walk down to 32-bit on the theory that a 64-bit `x` plus two 64-bit
+increments crowded the register budget. It cost **+6.0% of fill** (116.8 →
+123.8 ms/q, n=4 vs n=5, non-overlapping ranges, I14/J65536). The move that pays
+is the opposite one: convert the *unslabbed* path up to 64-bit, which is where
+the −6.1% above comes from. The slabbed path was already correct and is
+correspondingly flat.
+
+**Every fill and resieve kernel was converted except one — see the
+`k_fill_l1` note below, which reverts it.**
+`k_fill_l1`, `k_fill_segmented` and `k_resieve_rewalk` are the A/B partners for
+`k_fill_atomic` and `k_resieve_scatter`; leaving them on `pl_next` would have
+charged ~6% of walk overhead to whichever bucketing strategy was under test.
+**Consequence: absolute fill numbers recorded before this finding are stale for
+every strategy.** What the conversion establishes is narrower than it first
+looks: the strategies now *call the same walk function*, which is a
+precondition for comparing them, not a demonstration that they compare cleanly.
+Only `k_fill_atomic` was A/B'd. `k_fill_l1`, `k_fill_segmented` and
+`k_resieve_rewalk` were converted unmeasured — and `k_fill_l1` in particular
+carries `__launch_bounds__(512, 3)`, which caps it near 40 registers, so
+widening its locals is not free by inspection. Findings 1-3 should not be
+re-derived against post-conversion numbers until those kernels are measured.
+
+**`k_fill_l1` was converted and then REVERTED — it is the one kernel that must
+keep the 32-bit walk.** It carries `__launch_bounds__(512, 3)`, which caps it at
+40 registers; HEAD fits in exactly 40 with no spill, and two extra 64-bit live
+values push it over, at which point ptxas honours the bound by spilling instead
+of dropping to 2 blocks/SM:
+
+| | registers | stack | spill st | spill ld |
+|---|---:|---:|---:|---:|
+| HEAD | 40 | 0 | 0 | 0 |
+| converted | 40 | 8 | 12 | 8 |
+
+The converted version *would have been* the only kernel in the build with any
+spill traffic — the shipped tree has zero spills anywhere, `k_fill_l1` included,
+because it was reverted. The conversion existed purely to keep the
+fill-strategy A/B honest, and buying that with local-memory traffic in one
+strategy defeats its own purpose. So `k_fill_l1`
+stays on `pl_next`, and the strategies are **not** all on the same walk after
+all. Say so when quoting them against each other.
+
+`pl_next`/`pl_first`/`pl_add32_sat` are therefore still a live device path, and
+`verify_walk_slabs`' SLAB32 block still guards a shipping kernel rather than
+only a CPU oracle.
+
+### The apply threshold scan: one store per 32 positions, not one atomic per survivor
+
+The scan gave every surviving position an `atomicOr` into `survbits` and an
+`atomicAdd` on a single global counter — and that `atomicAdd`'s **return value**
+was consumed by `surv[at] = x`, forcing a serialising `atom.global.add` on one
+address. `surv[]` was **write-only in both callers**: allocated, passed, stored
+into, never read, in the pipeline and in the standalone harness alike.
+
+A warp now covers 32 consecutive positions, which is exactly one `survbits`
+word, and stores it outright:
+
+```c
+const uint32_t mask = __ballot_sync(0xFFFFFFFFu, keep);
+if (lane == 0) { if (survbits) survbits[x >> 5] = mask; nlocal += __popc(mask); }
+```
+
+`nlocal` is committed once per warp as a non-returning add. The list is gone,
+with 32 MB of allocation. Adjacent lanes read the same shared word (CPW cells
+per word), which broadcasts; the alternative thread-per-word shape that
+`k_intersect_compact` uses would give a 16-way bank conflict here, so the
+ballot is not merely a stylistic choice.
+
+The store is only race-free across blocks when a block owns whole `survbits`
+words — `log_region >= 5` — so smaller regions keep the `atomicOr` form.
+
+### Two traps this left behind, both now guarded in the source
+
+1. **The `survbits` memset is load-bearing; the `d_two` one next to it is not.**
+   `k_intersect_compact` writes every word of `d_two` unconditionally, so
+   clearing it first is redundant (~268 MB/q at I16 × 4 slabs, below noise).
+   `survbits` is different: the small-region fallback still ORs into it.
+   Dropping that clear by analogy yields stale survivor bits from the previous
+   slab — extra two-sided survivors that look entirely plausible.
+2. **A slab-continuation gate that compares a value with itself.** The obvious
+   way to check the boundary step is `pl_next64(last) == x`, but the walk loop
+   assigns `x = pl_next64(x)` from exactly that predecessor, so it compares
+   `pl_next64(v)` with itself and cannot fail. `verify_walk_slabs` now checks
+   the 32-bit result against the wide one instead, which is the property that
+   can actually break.
+
+## Finding 74 — the 5070 slab sweep completed, and a second sweep at double the area proves slab SIZE controls: `2^29` is the optimum at both areas, so the L40 split is real after all
+
+**Date:** 2026-08-24, RTX 5070, **card otherwise idle**. `oracle/c194.job` +
+`c194.roots1.m16`, `--pipeline --cofactor --logI 16 --J 32768 --qrange
+80000023: --nq 10`, one binary, `--slab-j` swept. Two repeats per point, which
+agree to better than 0.2% throughout.
+
+Finding 72 left an open question: an L40 preferred `2^30` positions per slab
+while the 3090 and 5070 were reported at `2^29`, and the 5070 evidence covered
+only points at or below `2^29` — the disputed `2^30` and the old `2^31`
+behaviour had never been measured on this card. Both ends are now filled in.
+
+| `--slab-j` | slabs | local area | bucket array | fill | apply | sieve | **complete** | vs best |
+|---:|---:|---|---:|---:|---:|---:|---:|---:|
+| 32768 | 1 | `2^31` | 5.20 GB | 190.65 | 154.42 | 351.31 | **521.16** | +18.1% |
+| 16384 | 2 | `2^30` | 2.60 GB | 138.35 | 156.17 | 300.80 | **465.92** | +5.6% |
+| 10923 | 3 | `2^29.42` | 1.73 GB | 117.37 | 156.31 | 279.94 | **445.69** | +1.0% |
+| **8192** | **4** | **`2^29`** | **1.30 GB** | **111.68** | **156.61** | **274.58** | **441.30** | **best** |
+| 4096 | 8 | `2^28` | 0.65 GB | 112.22 | 156.39 | 274.99 | **454.44** | +3.0% |
+
+**The default is right for this job, on both axes at once:** `2^29` is the
+fastest point *and* uses a quarter of the `2^31` bucket array (1.30 vs
+5.20 GB). The old monolithic behaviour is not merely memory-hungry, it is
+**18% slower**.
+
+> **RETRACTION AND RESOLUTION.** This finding first concluded that `2^30` being
+> 5.6% slower here against 4.6% faster on the L40 made finding 72 "a genuine
+> architecture split". **That reasoning was confounded** and was retracted:
+> finding 72's L40 run is `I=J=2^16`, area `2^32`, while this sweep is area
+> `2^31`, so the two were compared at equal slab SIZE and unequal slab COUNT —
+> and this finding's own mechanism makes size and count separate terms. By
+> count, both cards appeared to optimise at four slabs, which suggested the
+> parameterisation itself was wrong.
+>
+> **The discriminating run was then done: the same 5070, same job, at `J 65536`
+> — area `2^32`, matching the L40's.** If count controlled, the optimum should
+> move to `2^30` (4 slabs). It did not.
+>
+> | `--slab-j` | slabs | local area | fill | apply | complete |
+> |---:|---:|---|---:|---:|---:|
+> | 32768 | 2 | `2^31` | 368.51 | 295.63 | 892.78 |
+> | 16384 | 4 | `2^30` | 265.65 | 296.60 | 795.78 |
+> | **8192** | **8** | **`2^29`** | **213.25** | **297.61** | **766.04** |
+> | 4096 | 16 | `2^28` | 216.32 | 297.50 | 801.33 |
+>
+> **The optimum stayed at `2^29` POSITIONS while the count doubled from 4 to 8.
+> Slab size controls; slab count does not.** The count hypothesis is dead and
+> the existing `2^29` parameterisation is right.
+>
+> Normalising fill to cost per `2^29` of area makes it unambiguous — two sweeps
+> at different total areas trace the same curve in slab size:
+>
+> | slab size | from area `2^31` | from area `2^32` |
+> |---|---:|---:|
+> | `2^31` | 47.66 | 46.06 |
+> | `2^30` | 34.59 | 33.21 |
+> | **`2^29`** | **27.92** | **26.66** |
+> | `2^28` | 28.05 | 27.04 |
+>
+> **And that restores finding 72's conclusion on sound evidence.** At the
+> matched area `2^32` the L40 optimises at `2^30` and this 5070 at `2^29`, so
+> the two cards really do differ and neither optimum generalises — the original
+> claim was right by a wrong route. One caveat survives: finding 72 does not
+> name the L40's job and this sweep is c194, so a job difference between the two
+> cards has not been excluded. Card-vs-card now needs the same job, not the same
+> area.
+
+### The curve has two mechanisms and they cross at 4 slabs
+
+**Fill is the locality term and it saturates.** 190.65 → 138.35 → 117.37 →
+111.68 → 112.22: a 41% improvement from `2^31` down to `2^29`, then nothing.
+Whatever working set fill is thrashing at `2^31` fits by `2^29`.
+
+**Apply does not care at all** — 154.42 to 156.61 across the entire 8x range,
+a 1.4% drift in the *wrong* direction. Slab size is not an apply parameter.
+
+**The per-slab tax is in trial division, and it is one stage.** Device TD
+totals are 57.30, 56.71, 57.71, 58.59, 66.61 ms — flat to 4 slabs, then +8 ms.
+Breaking that out:
+
+| stage | 1 slab | 2 | 3 | 4 | 8 |
+|---|---:|---:|---:|---:|---:|
+| resieve + scatter | 40.09 | 38.93 | 38.25 | 37.34 | 37.08 |
+| norms + trial division | 11.19 | 10.22 | 10.49 | 10.89 | 13.66 |
+| **record candidate factorisations** | **1.39** | **2.66** | **3.99** | **5.35** | **10.64** |
+
+`record candidate factorisations` is **linear in slab count at ~1.33 ms per
+slab** — it is the per-slab fixed cost, not resieve, which actually gets
+*faster* with smaller slabs (locality again, 40.09 → 37.08). It is the entire
+reason `2^28` loses.
+
+> **Mechanism, run down 2026-08-24 — and it is NOT what it looks like.** The
+> obvious reading is per-launch overhead that batching across slabs would
+> remove. Measured per *launch* (two per slab, one per side):
+>
+> | slabs | 1 | 2 | 3 | 4 | 8 |
+> |---|---:|---:|---:|---:|---:|
+> | ms per launch | 0.677 | 0.654 | 0.650 | 0.651 | 0.648 |
+>
+> **Dead flat at ~0.65 ms whether a launch carries 5,342 candidates or 577.**
+> The cause is that `k_td` gives one thread per candidate and each thread
+> marches the *entire* small-prime list — `nsm` is 6,726 / 6,542 on this job —
+> so a launch costs one thread's march regardless of how many candidates ride
+> along. It is latency-bound on `nsm`, not throughput-bound on `nacc`.
+>
+> Two things follow. **Sizing the k_td grid to `ceil(nacc/threads)` does not
+> help** — tried, byte-identical, zero measured effect, because it scales the
+> thread count and not the per-thread work. And **batching across slabs is the
+> weaker of the two available fixes**: it removes `nslab-1` launches (3.9 ms/q
+> at 4 slabs, 9.1 at 8), whereas splitting the `nsm` march across a warp per
+> candidate would cut every launch ~32x (~5.0 ms/q at 4 slabs, ~10.1 at 8) with
+> no cross-slab state, no per-candidate `j_base`, and no change to when
+> `cof_enqueue` runs. They compose.
+>
+> Neither moves the optimum: projecting the batch across the sweep leaves 4
+> slabs best at 421.6 ms/q against 8 slabs' 429.5. **This is ~0.9% at the
+> operating point.** Its value is decoupling slab size from cost so that small
+> slabs become affordable for memory reasons, which is an A=32-on-12-GB
+> concern, not a throughput one. Neither fix was built.
+
+**So the optimum is not a cache-size coincidence, it is a crossing.** Fill's
+locality gain runs out at `2^29`; the recording pass's per-slab cost starts to
+dominate at `2^28`. A card whose fill term keeps improving past `2^29` — a
+larger L2, say — would cross later, which is exactly the L40's `2^30`
+behaviour. That is a mechanism for finding 72's split rather than a
+restatement of it, and it predicts the right knob: batch the recording pass and
+the crossing moves to smaller slabs on every card.

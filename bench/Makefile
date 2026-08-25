@@ -17,8 +17,9 @@ CXX       ?= g++
 # process start if the cache is disabled or evicted.
 #
 # sm_80 is also the floor, and it is a tuning floor rather than an instruction
-# one. The only warp intrinsics used are __syncwarp and __shfl{,_up}_sync, which
-# long predate Ampere -- but k_fill_l2's __launch_bounds__(512, 3) targets 1536
+# one. The only warp intrinsics used are __syncwarp, __shfl{,_up}_sync and
+# __ballot_sync (k_apply's threshold scan), which all long predate Ampere --
+# but k_fill_l1's and k_fill_l2's __launch_bounds__(512, 3) target 1536
 # threads/SM and its 3 x 33 KB of shared memory are Ampere-and-later tuning
 # numbers. The apply kernel's opt-in per-block shared-memory limit is queried
 # from the selected device at runtime rather than hardcoded. sm_75 still compiles

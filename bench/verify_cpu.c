@@ -266,7 +266,7 @@ int verify_walk_slabs(int logI, uint32_t J, uint32_t slab_J, int nprimes)
     const uint32_t I = 1u << logI, Imask = I - 1u;
     const uint64_t xmax = (uint64_t)I * J;
     uint32_t p = 250000013u, checked = 0;
-    int saw_wide_increment = 0;
+    int saw_wide_increment = 0, saw_slab32 = 0;
     if (!slab_J || slab_J > J || nprimes <= 0) return -1;
 
     for (; checked < (uint32_t)nprimes && p < 250100000u; p += 2) {
@@ -310,6 +310,19 @@ int verify_walk_slabs(int logI, uint32_t J, uint32_t slab_J, int nprimes)
                 const uint32_t rows = J - jb < slab_J ? J - jb : slab_J;
                 const uint64_t sx = (uint64_t)I * rows;
                 uint64_t x = cur;
+                /* pl_next's saturation contract, exercised from a MID-WALK
+                 * start rather than only from pl_first. The U32 block at the
+                 * end of this function covers a walk that begins at the origin
+                 * of a rectangle; a slab continuation begins anywhere, which is
+                 * the case any future 32-bit-local kernel would rely on.
+                 * k_fill_atomic and k_resieve_scatter walk in 64 bits, but
+                 * k_fill_l1 still walks in 32 -- deliberately: its
+                 * __launch_bounds__(512, 3) caps it at 40 registers and a
+                 * 64-bit walk makes ptxas spill. So pl_next is a live device
+                 * path, not just a CPU oracle, and this gate protects it. */
+                const int has32 = (cur < sx) && (sx <= 0x80000000ull);
+                if (has32) saw_slab32 = 1;
+                uint32_t x32 = has32 ? (uint32_t)cur : 0u, last32 = x32;
                 while (x < sx) {
                     const uint64_t gx = base_x + x;
                     if (mono >= xmax || gx != mono) {
@@ -321,8 +334,55 @@ int verify_walk_slabs(int logI, uint32_t J, uint32_t slab_J, int nprimes)
                                 (unsigned long long)mono);
                         return -1;
                     }
+                    if (has32 && (uint64_t)x32 != x) {
+                        fprintf(stderr,
+                                "verify_walk_slabs SLAB32 p=%u r=%u logI=%d"
+                                " J=%u slabJ=%u: x32=%u x64=%llu\n",
+                                p, r, logI, J, slab_J, x32,
+                                (unsigned long long)x);
+                        return -1;
+                    }
+                    last32 = x32;
+                    x32 = pl_next(x32, &P, Imask);
                     mono = pl_next64(mono, &P, Imask);
                     x = pl_next64(x, &P, Imask);
+                }
+                if (has32) {
+                    if ((uint64_t)x32 < sx) {
+                        fprintf(stderr,
+                                "verify_walk_slabs SLAB32 did not leave the"
+                                " slab p=%u r=%u logI=%d slabJ=%u x32=%u"
+                                " sx=%llu\n", p, r, logI, slab_J, x32,
+                                (unsigned long long)sx);
+                        return -1;
+                    }
+                    /* The saturation contract AT the boundary. x is the exact
+                     * wide first hit past the slab; pl_next from the same
+                     * predecessor must reproduce it when it fits in 32 bits and
+                     * must saturate, not wrap, when it does not.
+                     *
+                     * The obvious spelling of this check -- comparing
+                     * pl_next64(last32) against x -- is a TAUTOLOGY: the loop
+                     * above assigns x = pl_next64(x) from the very value
+                     * last32 holds, so it compares pl_next64(v) with itself and
+                     * cannot fail. Compare the 32-bit result instead. */
+                    if (x > 0xFFFFFFFFull) {
+                        if (x32 != 0xFFFFFFFFu) {
+                            fprintf(stderr,
+                                    "verify_walk_slabs SLAB32 CONT p=%u r=%u"
+                                    " logI=%d slabJ=%u: wide next %llu did not"
+                                    " saturate, got %u\n", p, r, logI, slab_J,
+                                    (unsigned long long)x, x32);
+                            return -1;
+                        }
+                    } else if ((uint64_t)x32 != x) {
+                        fprintf(stderr,
+                                "verify_walk_slabs SLAB32 CONT p=%u r=%u"
+                                " logI=%d slabJ=%u: from last=%u got %u"
+                                " want %llu\n", p, r, logI, slab_J, last32,
+                                x32, (unsigned long long)x);
+                        return -1;
+                    }
                 }
                 if (base_x + x != mono) {
                     fprintf(stderr,
@@ -378,6 +438,17 @@ int verify_walk_slabs(int logI, uint32_t J, uint32_t slab_J, int nprimes)
         fprintf(stderr,
                 "verify_walk_slabs did not exercise a >32-bit lattice increment"
                 " at logI=%d J=%u slabJ=%u\n", logI, J, slab_J);
+        return -1;
+    }
+    /* Same fail-closed rule for the SLAB32 block: it self-disables when a slab
+     * exceeds the 32-bit local coordinate (sx > 2^31), which is silent. A case
+     * added later with I*slabJ = 2^32 would leave k_fill_l1's walk ungated
+     * while slabtest still reported success. */
+    if (!saw_slab32) {
+        fprintf(stderr,
+                "verify_walk_slabs SLAB32 block never ran at logI=%d J=%u"
+                " slabJ=%u (slab area exceeds 2^31?): the 32-bit walk is"
+                " UNGATED for this case\n", logI, J, slab_J);
         return -1;
     }
     return (int)checked;

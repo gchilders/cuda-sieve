@@ -152,7 +152,7 @@ typedef struct {
     uint32_t  CINIT, BOUND, tconst, nsurv;
     /* persistent across special-q */
     uint32_t *hsp, *hsrt, *hsg; uint16_t *hslp;
-    uint32_t *d_surv, *d_nsurv, *d_nproj;
+    uint32_t *d_nsurv, *d_nproj;
     unsigned long long *d_nlost;
     cudaEvent_t ev[4];
 } pside_t;
@@ -163,7 +163,7 @@ static void pside_free(pside_t *S)
     cudaFree(S->walk_cur); cudaFree(S->walk_next);
     cudaFree(S->survbits); cudaFree(S->slice); cudaFree(S->slice_logp);
     cudaFree(S->sp); cudaFree(S->srt); cudaFree(S->sg); cudaFree(S->slp);
-    cudaFree(S->d_surv); cudaFree(S->d_nsurv);
+    cudaFree(S->d_nsurv);
     cudaFree(S->d_nproj); cudaFree(S->d_nlost);
     if (S->hsp)  cudaFreeHost(S->hsp);
     if (S->hsrt) cudaFreeHost(S->hsrt);
@@ -219,7 +219,6 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
                           pside_t *S)
 {
     const uint32_t nbitword = xmax_alloc >> 5;
-    const uint32_t maxsurv = 1u << 22;
     uint16_t *hslice = NULL, *hlogp = NULL;
     int rc = -1;
 
@@ -298,7 +297,6 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
         SIDE_INIT_CK(cudaMalloc(&S->sg,  (size_t)fbs->n * 4));
         SIDE_INIT_CK(cudaMalloc(&S->slp, (size_t)fbs->n * 2));
     }
-    SIDE_INIT_CK(cudaMalloc(&S->d_surv, (size_t)maxsurv * 4));
     SIDE_INIT_CK(cudaMalloc(&S->d_nsurv, 4));
     SIDE_INIT_CK(cudaMalloc(&S->d_nproj, 4));
     SIDE_INIT_CK(cudaMalloc(&S->d_nlost, 8));
@@ -461,7 +459,6 @@ static int pipe_side_sieve_slab(const fb_t *fb, const bench_cfg_t *cfg,
     const int log_region = cfg->log_region;
     const uint32_t nregion = xmax >> log_region;
     const uint32_t nbitword = xmax >> 5;
-    const uint32_t maxsurv = 1u << 22;
     const int athr = cfg->apply_threads ? cfg->apply_threads : 512;
     int rc = -1;
 
@@ -476,11 +473,23 @@ static int pipe_side_sieve_slab(const fb_t *fb, const bench_cfg_t *cfg,
         d_cursor, d_bucket, cap, d_overflow, S->walk_cur, S->walk_next);
     SLAB_CK(cudaEventRecord(S->ev[2]));
     SLAB_CK(cudaMemset(S->d_nsurv, 0, 4));
+    /* Provably redundant on every production geometry: k_apply's warp-ballot
+     * path stores every word of the slab bitmap unconditionally, and this
+     * function has both inputs its guard tests (log_region and athr, above), so
+     * `if (cfg->log_region < 5 || (athr & 31))` would skip the clear safely.
+     * Measured cost of keeping it: ~512 MB of device writes per q at I16/J32768
+     * x 4 slabs x 2 sides, about 0.7 ms against ~440, i.e. 0.16%.
+     *
+     * It stays anyway, and the honest reason is not "avoiding coupling" -- the
+     * coupling already exists implicitly. It is that the guard would restate
+     * k_apply's launch-shape condition in a second place, where it can rot out
+     * of sync with the kernel's, and the payoff is 0.16%. Revisit if the clear
+     * ever shows up in a profile. */
     SLAB_CK(cudaMemset(S->survbits, 0, (size_t)nbitword * 4));
     k_apply<16, 1, NORM_HORNER, SLABBED><<<nregion, athr, S->apply_smem>>>(
         (const uint32_t *)d_bucket, d_cursor, cap, cfg->logI, log_region,
         S->slice_logp, S->nslice_pow2, S->N, S->CINIT, S->CINIT - S->BOUND,
-        S->tconst, NULL, S->d_surv, S->d_nsurv, maxsurv, NULL, 0xFFFFFFFFu,
+        S->tconst, NULL, S->d_nsurv, NULL, 0xFFFFFFFFu,
         S->sp, S->srt, S->sg, S->slp, S->nsmall, S->nblk, S->nwrp,
         0xFFFFFFFFu, NULL, S->survbits, cfg->not_both_even, j_base);
     SLAB_CK(cudaEventRecord(S->ev[3]));

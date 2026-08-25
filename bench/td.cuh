@@ -392,43 +392,21 @@ __global__ void k_resieve_scatter(const plat_t *__restrict plat,
         if (ispow && ispow[k]) continue;
         uint32_t p = primes[k];
 
-        if constexpr (SLABBED) {
-            uint64_t x = walk_cur[k];
-            while (x < xmax) {
-                uint32_t xs[UNROLL], hit[UNROLL];
-
-                #pragma unroll
-                for (int u = 0; u < UNROLL; u++) {
-                    if (x < xmax) { xs[u] = (uint32_t)x; x = pl_next64(x, &P, Imask); }
-                    else xs[u] = NONE;
-                }
-                #pragma unroll
-                for (int u = 0; u < UNROLL; u++) {
-                    uint32_t sb = xs[u] >> log_gran;
-                    hit[u] = (xs[u] == NONE) ? 0u
-                                             : ((summary[sb >> 5] >> (sb & 31u)) & 1u);
-                }
-                #pragma unroll
-                for (int u = 0; u < UNROLL; u++) {
-                    if (!hit[u]) continue;
-                    uint32_t xv = xs[u];
-                    if (!((bits[xv >> 5] >> (xv & 31u)) & 1u)) continue;
-                    uint32_t idx = td_rank(bits, gbase, xv);
-                    uint32_t slot = atomicAdd(&pcnt[idx], 1u);
-                    if (slot < K) plist[(size_t)idx * K + slot] = p;
-                    else ovf++;
-                }
-            }
-            continue;
-        }
-
-        uint32_t x = pl_first(&P, logI);
+        /* Resieve never carries walk state forward, so the only slab
+         * difference is WHERE the walk starts -- one loop serves both. The
+         * walk itself is 64-bit in both, for the reason measured in
+         * k_fill_atomic: pl_next's saturating add is a branch per increment
+         * and pl_next64's is not. The run-ahead buffer stays uint32 because
+         * every in-slab position is below 2^31. */
+        uint64_t x;
+        if constexpr (SLABBED) x = walk_cur[k];   /* may already be past xmax */
+        else                   x = pl_first64(&P, logI);
         while (x < xmax) {
             uint32_t xs[UNROLL], hit[UNROLL];
 
             #pragma unroll
             for (int u = 0; u < UNROLL; u++) {
-                if (x < xmax) { xs[u] = x; x = pl_next(x, &P, Imask); }
+                if (x < xmax) { xs[u] = (uint32_t)x; x = pl_next64(x, &P, Imask); }
                 else xs[u] = NONE;
             }
             /* every one of these is independent, so they issue together */

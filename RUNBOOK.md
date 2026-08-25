@@ -195,13 +195,28 @@ The remaining representation limits are:
 These are checked limits, not tuning advice, and there is no unsafe override.
 The non-pipeline harness still requires its whole `I*J` area to fit in `2^31`.
 
-The p-lattice **increments** themselves are 64-bit even when a slab-local
-position is 32-bit. This is required for correctness: realistic large factor-
-base primes can produce a reduced `(j << logI) +/- i` increment above `2^32`.
-The local walk saturates when the next exact hit lies outside the 32-bit local
-coordinate; the slabbed walk carries an exact 64-bit continuation between
-slabs. This avoids the latent uint32 wrap that older monolithic walks could
-turn into spurious sieve hits.
+The p-lattice **increments** are 64-bit, and were so even when positions were
+still 32-bit. This is required for correctness: realistic large factor-base
+primes can produce a reduced `(j << logI) +/- i` increment above `2^32`.
+The slabbed walk carries an exact 64-bit continuation between slabs. This
+avoids the latent uint32 wrap that older monolithic walks could turn into
+spurious sieve hits.
+
+Since 2026-08-24 the walk **position** is 64-bit in the production fill and
+resieve kernels too — `k_fill_atomic`, `k_resieve_scatter`, `k_fill_segmented`
+and `k_resieve_rewalk`. That is a performance choice, not a correctness one:
+the 32-bit form reaches its bound by saturating, which costs a branch per
+increment, and removing it was worth −6.1% of fill on an *unslabbed* geometry
+(`bench/RESULTS.md` finding 73; slabbed geometries were already 64-bit and gain
+nothing). Sieve positions still fit in 31 bits, so nothing about record layout,
+`--region`, or the `2^31` slab bound changes.
+
+**`k_fill_l1` is the exception and still walks in 32 bits**, so `pl_next`,
+`pl_first` and `pl_add32_sat` remain live device code. Its
+`__launch_bounds__(512, 3)` caps it at 40 registers, it fits in exactly 40
+today, and widening its walk made `ptxas` spill to local memory rather than
+lower occupancy. Do not delete the 32-bit walk helpers or the SLAB32 block in
+`verify_walk_slabs` that gates them.
 
 `--no-td-verify` disables the dense TD reconstruction gate. In the pipeline the
 gate normally runs once on the first slab of the first q; in the standalone TD

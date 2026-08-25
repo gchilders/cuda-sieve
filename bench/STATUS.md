@@ -109,14 +109,69 @@ regression/memory/performance tuning, while the `2^31` position bound and the
 actual largest direct-tested prime remain mandatory safety constraints. Raising
 `bkthresh` can therefore still make the planner choose smaller slabs.
 
-**Open investigation -- slab target on large-L2 GPUs.** The L40 result shows
-that the locality/overhead crossover can move to a larger slab even when
-`2^29` remains a good overall default. Do not infer an L2-size threshold from
-one card or add a model-specific exception yet. Collect matched `2^31`, `2^30`,
-`2^29`, and `2^28` runs on more large-L2 Ada/Hopper/Blackwell cards, and where
-possible profile `k_fill_atomic` L2 hit/write-miss traffic and the per-slab TD
-overhead. Revisit a cache-aware target only if those measurements show a stable
-architecture-level rule.
+**Open investigation -- slab target on large-L2 GPUs. NARROWED 2026-08-24
+(finding 74).** The 5070 now has the complete matched sweep on `c194` I16/J32768,
+including the two points that were previously missing:
+
+| local area | slabs | bucket array | complete ms/q | vs best |
+|---|---:|---:|---:|---:|
+| `2^31` | 1 | 5.20 GB | 521.16 | +18.1% |
+| `2^30` | 2 | 2.60 GB | 465.92 | +5.6% |
+| **`2^29`** | **4** | **1.30 GB** | **441.30** | **best** |
+| `2^28` | 8 | 0.65 GB | 454.44 | +3.0% |
+
+So `2^29` is this job's optimum outright, not a memory compromise -- it is both
+the fastest point and a quarter of the `2^31` footprint.
+
+**Settled 2026-08-25 by a second sweep at double the area.** An earlier draft
+claimed the two cards genuinely disagree; that was retracted as confounded
+(finding 72's L40 run is area `2^32`, this one area `2^31`, so "`2^30` per slab"
+meant 4 slabs there and 2 here), and by slab COUNT both cards appeared to
+optimise at four. The discriminating run — same 5070, same job, `J 65536`,
+area `2^32` — was then done:
+
+| local area | slabs | complete ms/q |
+|---|---:|---:|
+| `2^31` | 2 | 892.78 |
+| `2^30` | 4 | 795.78 |
+| **`2^29`** | **8** | **766.04** |
+| `2^28` | 16 | 801.33 |
+
+**The optimum stayed at `2^29` positions while the count doubled 4 -> 8, so slab
+SIZE is the controlling variable and the count hypothesis is dead.** Fill cost
+normalised per unit area traces the same curve at both total areas (27.92 vs
+26.66 ms per `2^29` at the optimum), which is the locality mechanism behaving as
+it should. The `2^29` default is correctly parameterised.
+
+That also restores finding 72's conclusion on sound evidence: at the matched
+area `2^32` the L40 prefers `2^30` and this 5070 prefers `2^29`, so the cards do
+differ and neither optimum generalises. **Remaining gap:** finding 72 does not
+name the L40's job and this sweep is c194, so card-vs-card still needs a matched
+JOB, not just a matched area.
+
+What finding 74 adds beyond another data point is the mechanism. The curve is
+two terms crossing: **fill** improves 41% from `2^31` to `2^29` and then
+saturates (190.65 -> 111.68 -> 112.22 ms), while the **`record candidate
+factorisations` pass grows linearly at ~1.33 ms per slab** (1.39 ms at 1 slab,
+10.64 at 8) and is what makes `2^28` lose. Apply is flat across the whole range.
+A card whose fill term keeps improving past `2^29` crosses later, which is
+exactly the L40's behaviour.
+
+The per-slab tax was then run down to its cause (finding 74's mechanism note):
+`k_td` gives one thread per candidate and each thread marches the whole
+small-prime list, so a recording launch costs ~0.65 ms flat -- 5,342 candidates
+or 577, it makes no difference. **Sizing the grid to the candidate count does
+not help and was measured not to.** The effective fix is to split that march
+across a warp per candidate (~32x on every launch); batching the pass across
+slabs is the weaker variant that only removes the surplus launches.
+
+**Neither was built, deliberately.** Both are worth about **0.9% at the 4-slab
+operating point**, and projecting either across the sweep leaves the optimum
+where it is. The reason to do it eventually is not throughput but memory: it
+decouples slab size from cost, which is what makes small slabs affordable for
+an A=32 job on a 12 GB card. Collecting matched sweeps on more large-L2
+Ada/Hopper parts remains worthwhile, but a cache-aware automatic target should
+wait until that tax is gone, since it is half of what the target balances.
 
 ### Why the lattice walk itself is wide
 
@@ -128,6 +183,21 @@ spurious sieve hits even before whole-area slabbing was needed. `plat_t` now
 stores 64-bit increments; the bounded local walk terminates instead of wrapping
 when its exact next hit leaves the 32-bit coordinate, and slab continuation is
 carried exactly in 64 bits between slab origins.
+
+**The walk POSITION is now 64-bit too, in every production fill and resieve
+kernel (`k_fill_l1` excepted, see below), and
+that is a speed decision rather than a correctness one (finding 73).** The
+32-bit form (`pl_next`) reaches its bound by saturating, which costs a branch
+per increment; `pl_next64` is a plain wide add. Measured idle at −6.1% of fill
+on an unslabbed geometry; converting the slabbed walk the other way — down to
+32-bit — cost +6.0% on a contended card and was not repeated. Positions
+themselves still fit in 31 bits, so records, bucket indices and bitmap offsets
+remain 32-bit; only the walk variable is wide. **`k_fill_l1` is the exception
+and keeps `pl_next`**: `__launch_bounds__(512, 3)` caps it at 40 registers, it
+fits in exactly 40 today, and widening its walk made ptxas spill (12 B stores /
+8 B loads) rather than lower occupancy — the only spill in the build. So the
+32-bit walk is still a shipping device path and `verify_walk_slabs` still gates
+a real kernel.
 
 This widening costs 8 additional bytes per uploaded full-FB entry. Slabbed
 runs additionally keep two 64-bit continuation values per entry (16 bytes per
@@ -1811,3 +1881,64 @@ absent from every document in the repo.
     own `.cu` would both parallelise across TUs and stop a sieve-kernel edit
     from recompiling the cofactor templates. That is the first experiment;
     instantiation count and register pressure are the obvious suspects.
+17. **`--mode twolevel` has a live race in `k_fill_l1` — FOUND 2026-08-24, NOT
+    fixed, benchmark-only.** `--mode atomic --verify` matches the CPU
+    per-region reference exactly (all 8192 regions). `--mode twolevel --verify`
+    does not, and **the answer changes every run**:
+
+    | binary | differing regions, three runs |
+    |---|---|
+    | merge commit `5e96cf0` (pre-slab-tuning) | 543 / 488 / 564 of 8192 |
+    | after the finding-73 walk change | 395 / 365 / 327 of 8192 |
+
+    The card was running an unrelated job at ~100% throughout, so these counts
+    are **scheduling-dependent and not reproducible figures** — the two columns
+    are not a before/after comparison and the gap between them means nothing.
+    What is robust is the shape: every run fails, no two runs agree, and the
+    total is always exact.
+
+    It is **pre-existing**: the unmodified merge commit fails it. Note that
+    `k_fill_l1` was converted by finding 73 and then **reverted** (it spilled
+    against its launch bound), so it is byte-identical to HEAD in the shipped
+    tree. The two columns below therefore measure *the same* `k_fill_l1` and
+    the gap between them is noise, not an effect — the table shows only that
+    every run fails and no two agree. `--mode atomic`, which does carry the
+    converted walk, is exact. **For bisecting: this race predates all of
+    finding 73's work; do not start from that range.** The record *total* is 77,382,815 every time, matching
+    the reference exactly; individual regions are wrong in **both** directions
+    (`gpu 9485 ref 9484` and `gpu 9529 ref 9530`). So records are conserved and
+    misfiled, which is why nothing downstream ever noticed.
+
+    **The mechanism, from code reading.** `k_fill_l1` reserves a whole run with
+    one `atomicAdd(&cnt[b], nrun)` and, when the run does not fit, gives the
+    space back with `atomicSub` — but the shared `buf` is never cleared and the
+    flush emits `buf[0 .. cnt[b])` unconditionally. A third thread can take a
+    slot *above* a failed thread's range after that thread subtracts, leaving a
+    **hole below the final count**:
+
+        cnt=58, L1_CAP=64
+        T_B add(8) -> slot 58, cnt 66   (66 > 64: will subtract)
+        T_A add(4) -> slot 66, cnt 70   (will subtract)
+        T_B sub(8) -> cnt 62
+        T_C add(2) -> slot 62, cnt 64   (fits: writes buf[62..64))
+        T_A sub(4) -> cnt 60
+        flush emits buf[0..60) -- slots [58,60) hold LAST cycle's records,
+        and T_C's real records at [62,64) are dropped after it advanced x.
+
+    Stale-but-valid positions are re-emitted while live ones are lost, one for
+    one. That reproduces the exact signature: conserved total, nondeterministic
+    per-region error, both directions. It needs three threads and a specific
+    interleaving, which is why it is a few hundred records in 77M.
+
+    `k_fill_l2` is immune and shows the shape of the fix: it reserves **one**
+    slot at a time and never subtracts, so slots fill densely from 0 and the
+    flush always writes a fully populated prefix. The fix for L1 is to write
+    the part of a run that fits and carry the remainder pending, rather than
+    reserving all-or-nothing — records within a run are independent, so
+    splitting one across two flushes is harmless.
+
+    **Priority is low and the reason is not "it is only a benchmark".** It is
+    that `k_fill_l1` is the two-level path, which finding 1 measured as losing
+    by 2.7x and which nothing in `--pipeline` reaches. But the verify gate is
+    not in `make check`, so this sat undetected; whoever revisits two-level
+    fan-out must fix this **before** trusting any number it produces.

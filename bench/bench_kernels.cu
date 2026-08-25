@@ -156,41 +156,55 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
          * kernel turns back into log p (and what resieve would use to recover
          * the prime itself), exactly as CADO's shorthint does */
         const uint32_t sl = slice[k];
-        if constexpr (SLABBED) {
-            uint64_t x = walk_cur[k];
-            for (; x < xmax; x = pl_next64(x, &P, Imask)) {
-                const uint32_t xl = (uint32_t)x;
-                const uint32_t b = xl >> log_region;
-                const uint32_t slot = atomicAdd(&cursor[b], 1u);
-                if (slot >= cap) { atomicAdd(overflow, 1u); continue; }
-                const size_t at = ((size_t)b * cap + slot) * RECBYTES;
-                if (RECBYTES == 2) {
-                    *(uint16_t *)(out + at) = (uint16_t)(xl & offmask);
-                } else if (RECBYTES == 4) {
-                    *(uint32_t *)(out + at) = (xl & offmask) | (sl << 16);
-                } else {
-                    *(uint64_t *)(out + at) = (uint64_t)(xl & offmask) | ((uint64_t)sl << 32);
-                }
-            }
-            /* x is the exact first hit at/after the slab end. It can be more
-             * than 2^32 beyond the next origin, so continuation state is wide. */
-            walk_next[k] = x - xmax;
-        } else {
-            uint32_t x = pl_first(&P, logI);
-            for (; x < xmax; x = pl_next(x, &P, Imask)) {
-                const uint32_t b = x >> log_region;
-                const uint32_t slot = atomicAdd(&cursor[b], 1u);
-                if (slot >= cap) { atomicAdd(overflow, 1u); continue; }
-                const size_t at = ((size_t)b * cap + slot) * RECBYTES;
-                if (RECBYTES == 2) {
-                    *(uint16_t *)(out + at) = (uint16_t)(x & offmask);
-                } else if (RECBYTES == 4) {
-                    *(uint32_t *)(out + at) = (x & offmask) | (sl << 16);
-                } else {
-                    *(uint64_t *)(out + at) = (uint64_t)(x & offmask) | ((uint64_t)sl << 32);
-                }
+        /* MEASURED 2026-08-24: the walk runs in 64 bits in BOTH specialisations,
+         * and the legacy 32-bit form is the slow one. pl_next routes every
+         * increment through pl_add32_sat -- `if (hi || x > UINT32_MAX - lo)` --
+         * which is a BRANCH per increment, up to two per step, in the hottest
+         * loop in the program. pl_next64 is a plain 64-bit add: two IADDs, no
+         * control flow. Converting the slabbed path to 32-bit cost 6.0% of fill
+         * (116.8 -> 123.8 ms/q, n=4 vs n=5, non-overlapping ranges, c147
+         * I14/J65536) -- that experiment ran on a CONTENDED card and its
+         * absolutes are ~2x the idle ones, so treat the 6.0% as directional
+         * only; it was not repeated once the card freed up. Converting the
+         * unslabbed path to 64-bit is what actually pays -- but ONLY there.
+         * The slabbed path was already 64-bit before this change, so it gains
+         * nothing: measured -6.1% on c147 I14/J8192 (unslabbed) against -0.7%
+         * on c147 I14/J65536 and +0.3% on c194 I16/J32768 (both slabbed).
+         * Every production geometry at I16 and above is slabbed, so this
+         * conversion buys real jobs nothing; it is kept because it also removes
+         * a duplicated loop and because sub-2^30 geometries do benefit.
+         *
+         * Correctness of the narrowing, which is the part to read before
+         * touching the walk width: local positions stay below 2^31 either way,
+         * so (uint32_t)x is exact for the record and the bucket index.
+         *
+         * What survives from the 32-bit attempt is the shape: one loop here
+         * instead of two. An explicit `x >= xmax` early-out does NOT survive --
+         * it was load-bearing only while x was 32-bit and could not hold the
+         * continuation. With a 64-bit x the loop below simply does not execute
+         * and the store after it writes the identical value, so the branch was
+         * pure added divergence. (An exhausted walk holds UINT64_MAX and decays
+         * by xmax per slab; pre-existing, and stays far above xmax for any
+         * reachable slab count.) */
+        uint64_t x;
+        if constexpr (SLABBED) x = walk_cur[k];   /* may already be past xmax */
+        else                   x = pl_first64(&P, logI);
+        for (; x < xmax; x = pl_next64(x, &P, Imask)) {
+            const uint32_t xl = (uint32_t)x;
+            const uint32_t b = xl >> log_region;
+            const uint32_t slot = atomicAdd(&cursor[b], 1u);
+            if (slot >= cap) { atomicAdd(overflow, 1u); continue; }
+            const size_t at = ((size_t)b * cap + slot) * RECBYTES;
+            if (RECBYTES == 2) {
+                *(uint16_t *)(out + at) = (uint16_t)(xl & offmask);
+            } else if (RECBYTES == 4) {
+                *(uint32_t *)(out + at) = (xl & offmask) | (sl << 16);
+            } else {
+                *(uint64_t *)(out + at) = (uint64_t)(xl & offmask) | ((uint64_t)sl << 32);
             }
         }
+        /* x is already the exact first hit at/after the slab end. */
+        if constexpr (SLABBED) walk_next[k] = x - xmax;
     }
 }
 
@@ -277,6 +291,52 @@ __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_regi
 
 /* ---- stage (A): apply -- accumulate logs into a shared-memory region ---- */
 
+/* One position's survivor test. Factored out because the threshold scan below
+ * has two shapes (warp-ballot and the small-region fallback) and a predicate
+ * that drifts between them would produce results that depend on --region and
+ * --apply-threads -- which the --verify gate does not vary, since it compares
+ * CELLS rather than survivor counts.
+ *
+ * las's `not_both_even` filter: x = j*I + (i + I/2) and I/2 is a power of two
+ * >= 2, so parity(i) == parity(x) and parity(j) == parity(x >> logI). Both even
+ * means (a,b) are both even and the relation is a duplicate of (a/2, b/2); las
+ * marks these 255 so they can never survive. Off by default so that every
+ * survivor count recorded before 2026-08-03 still reproduces. */
+/* The per-cell side effects that accompany the predicate: the gate-5 probe and
+ * the optional dump byte. They live here for the same reason apply_keep does --
+ * the threshold scan has two shapes and anything duplicated between them drifts.
+ * Splitting the predicate out but leaving these inline was the first version of
+ * this refactor and it left both explanatory comments stranded in the fallback,
+ * which is the branch that essentially never runs. */
+__device__ __forceinline__ void apply_cell_side_effects(
+        uint32_t x, uint32_t v, uint32_t CINIT,
+        uint32_t probe_x, uint32_t *__restrict probe_out,
+        uint8_t *__restrict dump)
+{
+    /* Gate 5's GPU half: this value has been through the root transform, the FK
+     * walk, the tiering, the bucket fill, the small sieve and this kernel's
+     * apply. probe_out[0] is the initialised norm, so the sieved log sum the
+     * PIPELINE actually produced is v - (CINIT - probe_out[0]). */
+    if (probe_out && x == probe_x) probe_out[1] = v;
+    /* las's byte: S = max(T - sum(logp), 0), and our cell holds
+     * CINIT - T + sum, so S = CINIT - cell. */
+    if (dump) {
+        int32_t sv = (int32_t)CINIT - (int32_t)v;
+        dump[x] = (uint8_t)(sv < 0 ? 0 : (sv > 255 ? 255 : sv));
+    }
+}
+
+template <bool SLABBED>
+__device__ __forceinline__ int apply_keep(uint32_t x, uint32_t v,
+                                          uint32_t THRESH, int logI,
+                                          uint32_t j_base, int not_both_even)
+{
+    uint32_t jpar = x >> logI;
+    if constexpr (SLABBED) jpar += j_base;
+    const int botheven = ((x & 1u) == 0u) && ((jpar & 1u) == 0u);
+    return (v >= THRESH) && !(not_both_even && botheven);
+}
+
 /* One block owns one bucket region for its entire life: it initialises the
  * cells to the log-norm bound in shared memory, accumulates every log p that
  * landed in the region, scans for survivors, and writes only the survivors
@@ -303,8 +363,8 @@ __global__ void k_apply(const uint32_t *__restrict buckets,
                         const uint16_t *__restrict slice_logp, uint32_t nslice,
                         norm_t N, uint32_t CINIT, uint32_t THRESH, uint32_t tconst,
                         uint8_t *__restrict dump,
-                        uint32_t *__restrict surv, uint32_t *__restrict nsurv,
-                        uint32_t maxsurv, uint16_t *__restrict dbg_cells,
+                        uint32_t *__restrict nsurv,
+                        uint16_t *__restrict dbg_cells,
                         uint32_t dbg_region,
                         const uint32_t *__restrict sp, const uint32_t *__restrict srt,
                         const uint32_t *__restrict sg, const uint16_t *__restrict slp,
@@ -442,42 +502,88 @@ report spurious cell mismatches. Pricing builds only, never for relations."
     }
     __syncthreads();
 
-    /* ---- threshold scan ---- */
+    /* ---- threshold scan ----
+     *
+     * A WARP covers 32 consecutive positions, which is exactly one survbits
+     * word, so the bitmap is written with ONE unconditional 32-bit store per
+     * group instead of one atomicOr per survivor. Adjacent lanes read the same
+     * shared word (CPW cells share a word), so the read broadcasts rather than
+     * conflicting.
+     *
+     * MEASURED idle, paired, relations byte-identical throughout:
+     *
+     *   c147 I14/J65536  n=3   apply 83.3  -> 72.5   -12.9%
+     *   c147 I14/J8192   n=3   apply 10.54 -> 9.13   -13.4%
+     *   c194 I16/J32768  n=7   apply 158.1 -> 149.6   -5.4%
+     *
+     * **c194 is the representative job and it gets less than half the c147
+     * win.** The gap is unexplained: c194 has 2x the area and 7x the two-sided
+     * survivors yet a smaller ABSOLUTE saving (8.00 vs 10.78 ms), so the win
+     * tracks neither positions nor survivors. Do not quote -13% as the figure.
+     * (An earlier contended-card pass reported -15.0%/-9.8%; superseded.)
+     *
+     * The store is only race-free across blocks when a block owns whole
+     * survbits words -- log_region >= 5 -- so smaller regions keep the atomicOr
+     * form. (The full-warp half of the guard is belt-and-braces: bench_main
+     * already rejects an --apply-threads that is not a multiple of 32, but this
+     * kernel is also launched directly by the standalone harness.) This is why
+     * the callers still clear survbits: the fast path makes the clear
+     * redundant, the fallback does not.
+     *
+     * **CALLER CONTRACT, unenforceable from inside the kernel.** The fast path
+     * OVERWRITES survbits words rather than OR-ing into them, which is correct
+     * only when (a) blockIdx.x maps 1:1 onto regions, so `xbase = b <<
+     * log_region` makes each block's words private, and (b) exactly one launch
+     * writes a given bitmap. Both callers satisfy this today (`<<<nregion,
+     * athr>>>`, one launch per side per slab). A caller that grid-strides
+     * regions -- the pattern k_purge uses -- or that accumulates two slabs into
+     * one bitmap would get a bitmap where only the last-written words are
+     * correct, and only when log_region >= 5, so it would pass --region 4 and
+     * fail the default --region 14. The kernel cannot check this: it never
+     * sees nregion.
+     *
+     * nsurv is accumulated per warp and committed once. The old per-survivor
+     * atomicAdd had its RETURN VALUE consumed by surv[at] = x, which forces a
+     * serialising atom.global.add on one address; the list it indexed was
+     * write-only in both callers and is gone, so what is left is a single
+     * non-returning red.global.add per warp.
+     */
     const uint32_t CMASK = (CELLBITS == 16) ? 0xFFFFu : 0xFFu;
-    for (uint32_t w = tid; w < nword; w += nth) {
-        const uint32_t word = S[w];
-        #pragma unroll
-        for (uint32_t c = 0; c < CPW; c++) {
-            const uint32_t v = (word >> (c * CELLBITS)) & CMASK;
-            if (probe_out && (xbase + w * CPW + c) == probe_x) {
-                /* Gate 5's GPU half: this value has been through the root
-                 * transform, the FK walk, the tiering, the bucket fill, the
-                 * small sieve and this kernel's apply. probe_out[0] is the
-                 * initialised norm, so the sieved log sum the PIPELINE actually
-                 * produced is v - (CINIT - probe_out[0]). */
-                probe_out[1] = v;
+    if (ncell >= 32u && nth >= 32u && (nth & 31u) == 0u) {
+        const uint32_t lane = tid & 31u;
+        const uint32_t ngrp = ncell >> 5;
+        uint32_t nlocal = 0;
+        for (uint32_t g = tid >> 5; g < ngrp; g += (nth >> 5)) {
+            const uint32_t off = (g << 5) + lane;
+            const uint32_t x   = xbase + off;
+            const uint32_t v   =
+                (S[off / CPW] >> ((off % CPW) * CELLBITS)) & CMASK;
+            const int keep = apply_keep<SLABBED>(x, v, THRESH, logI,
+                                                 j_base, not_both_even);
+            const uint32_t mask = __ballot_sync(0xFFFFFFFFu, keep);
+            if (lane == 0) {
+                if (survbits) survbits[x >> 5] = mask;
+                nlocal += __popc(mask);
             }
-            const uint32_t x = xbase + w * CPW + c;
-            /* las's `not_both_even` filter. x = j*I + (i + I/2) and I/2 is a
-             * power of two >= 2, so parity(i) == parity(x) and parity(j) ==
-             * parity(x >> logI). Both even means (a,b) are both even and the
-             * relation is a duplicate of (a/2, b/2); las marks these 255 so
-             * they can never survive. Off by default so that every survivor
-             * count recorded before 2026-08-03 still reproduces. */
-            const uint32_t jlocal = x >> logI;
-            uint32_t jpar = jlocal;
-            if constexpr (SLABBED) jpar += j_base;
-            const int botheven = ((x & 1u) == 0u) && ((jpar & 1u) == 0u);
-            if (v >= THRESH && !(not_both_even && botheven)) {
-                uint32_t at = atomicAdd(nsurv, 1u);
-                if (at < maxsurv) surv[at] = x;
-                if (survbits) atomicOr(&survbits[x >> 5], 1u << (x & 31u));
-            }
-            if (dump) {
-                /* las's byte: S = max(T - sum(logp), 0), and our cell holds
-                 * CINIT - T + sum, so S = CINIT - cell. */
-                int32_t sv = (int32_t)CINIT - (int32_t)v;
-                dump[x] = (uint8_t)(sv < 0 ? 0 : (sv > 255 ? 255 : sv));
+            apply_cell_side_effects(x, v, CINIT, probe_x, probe_out, dump);
+        }
+        if (lane == 0 && nlocal) atomicAdd(nsurv, nlocal);
+    } else {
+        /* Fallback: log_region < 5, or a launch whose block is not whole warps.
+         * survbits words are then shared between blocks, so the store has to be an
+         * atomicOr into a pre-cleared bitmap. */
+        for (uint32_t w = tid; w < nword; w += nth) {
+            const uint32_t word = S[w];
+            #pragma unroll
+            for (uint32_t c = 0; c < CPW; c++) {
+                const uint32_t v = (word >> (c * CELLBITS)) & CMASK;
+                const uint32_t x = xbase + w * CPW + c;
+                if (apply_keep<SLABBED>(x, v, THRESH, logI, j_base,
+                                        not_both_even)) {
+                    atomicAdd(nsurv, 1u);
+                    if (survbits) atomicOr(&survbits[x >> 5], 1u << (x & 31u));
+                }
+                apply_cell_side_effects(x, v, CINIT, probe_x, probe_out, dump);
             }
         }
     }
@@ -527,6 +633,19 @@ void k_fill_l1(const plat_t *__restrict plat,
     const uint64_t stride = bench_grid_product_u64(gridDim.x, nth);
     uint64_t k = bench_grid_product_u64(blockIdx.x, nth) + tid;
     plat_t P; P.inc_warp = PL_INVALID;
+    /* This walk stays 32-bit, unlike k_fill_atomic's. Converting it to
+     * pl_next64 was tried on 2026-08-24 and REVERTED: __launch_bounds__(512, 3)
+     * above caps this kernel at 40 registers, HEAD fits in exactly 40 with no
+     * spill, and the two extra 64-bit live values push it over -- ptxas honours
+     * the bound by spilling rather than by dropping to 2 blocks/SM.
+     *
+     *     HEAD:      40 regs, 0 stack,  0 spill st,  0 spill ld
+     *     converted: 40 regs, 8 stack, 12 spill st,  8 spill ld
+     *
+     * The conversion existed only to keep the fill-strategy A/B honest, and
+     * buying that with local-memory traffic in one strategy defeats its own
+     * purpose. If this kernel is ever revisited, raise or drop the launch bound
+     * first and re-measure; do not widen the walk underneath it. */
     uint32_t x = 0;
     int active = 0;
 
@@ -694,7 +813,7 @@ struct dev_bufs {
     plat_t   *plat;
     uint8_t  *out;
     uint16_t *slice, *slice_logp;
-    uint32_t *surv, *nsurv, *probe;
+    uint32_t *nsurv, *probe;
     uint16_t *dbg;
     uint32_t *sp, *srt, *sg;
     uint16_t *slp;
@@ -741,7 +860,8 @@ static float time_kernel(cudaEvent_t a, cudaEvent_t b)
  * inverting the lattice basis per survivor. x is 4 bytes; keep it.
  *
  * Bit-order note: bit k of word w is position x = 32*w + k, which is the
- * order k_apply writes with atomicOr(&survbits[x >> 5], 1u << (x & 31)).
+ * order k_apply writes one word per warp (atomicOr only in its small-region
+ * fallback).
  */
 __device__ __forceinline__ uint32_t bgcd(uint32_t u, uint32_t v)
 {
@@ -828,14 +948,19 @@ __global__ void k_resieve_rewalk(const plat_t *__restrict plat,
         plat_t P = plat[k];
         if (P.inc_warp == PL_INVALID) continue;
         uint32_t p = primes[k];
-        for (uint32_t x = pl_first(&P, logI); x < xmax; x = pl_next(x, &P, Imask)) {
+        for (uint64_t x = pl_first64(&P, logI); x < xmax; x = pl_next64(x, &P, Imask)) {
             probes++;
-            uint32_t sb = x >> 6;
+            const uint32_t xn = (uint32_t)x;   /* narrow ONCE: every probe
+                                                * below indexes with it, and a
+                                                * 64-bit index is pure extra
+                                                * address math on the dependent
+                                                * load this loop waits on. */
+            uint32_t sb = xn >> 6;
             if (!((summary[sb >> 5] >> (sb & 31u)) & 1u)) continue;
             pass1++;
-            if (!((bits[x >> 5] >> (x & 31u)) & 1u)) continue;
+            if (!((bits[xn >> 5] >> (xn & 31u)) & 1u)) continue;
             uint32_t slot = atomicAdd(nout, 1u);
-            if (slot < cap) { out_x[slot] = x; out_p[slot] = p; }
+            if (slot < cap) { out_x[slot] = xn; out_p[slot] = p; }
         }
     }
     if (probes) atomicAdd(nprobe, probes);
@@ -920,7 +1045,9 @@ __global__ void k_fill_segmented(const plat_t *__restrict plat,
         plat_t P = plat[k];
         if (P.inc_warp == PL_INVALID) continue;
         const uint32_t soff = k - kbeg;          /* < 65536 by construction */
-        for (uint32_t x = pl_first(&P, logI); x < xmax; x = pl_next(x, &P, Imask)) {
+        for (uint64_t x64 = pl_first64(&P, logI); x64 < xmax;
+             x64 = pl_next64(x64, &P, Imask)) {
+            const uint32_t x = (uint32_t)x64;
             uint32_t b = x >> log_region;
             uint32_t slot = atomicAdd(&cursor[b], 1u);
             if (slot >= cap) { atomicAdd(overflow, 1u); continue; }
@@ -2254,7 +2381,6 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
              * gating on it would check nothing. Use a mid-range region. */
             const uint32_t dbgreg = nregion / 2;
 
-            CK(cudaMalloc(&D.surv, (size_t)maxsurv * 4));
             CK(cudaMalloc(&D.probe, 8));
             CK(cudaMemset(D.probe, 0, 8));
             CK(cudaMalloc(&D.nsurv, 4));
@@ -2299,7 +2425,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                         (const uint32_t *)D.out, D.cursor, cap,                \
                         cfg->logI, log_region, D.slice_logp, nslice_pow2,      \
                         N, CINIT, CINIT - BOUND, tconst, D.dumpbuf,            \
-                        D.surv, D.nsurv, maxsurv,                              \
+                        D.nsurv,                                               \
                         D.dbg, dbgreg, D.sp, D.srt, D.sg, D.slp,             \
                         nsmall, nblk, nwrp, probe_x, D.probe,                  \
                         D.survbits, cfg->not_both_even, 0u);                   \
@@ -2762,9 +2888,8 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                        (int)CINIT - (int)pr[1]);
             }
             CK(cudaMemcpy(&hs, D.nsurv, 4, cudaMemcpyDeviceToHost));
-            printf("  survivors: %u of %u positions (1 in %.3e)%s\n", hs, xmax,
-                   hs ? (double)xmax / hs : 0.0,
-                   hs > maxsurv ? "  ** list truncated **" : "");
+            printf("  survivors: %u of %u positions (1 in %.3e)\n", hs, xmax,
+                   hs ? (double)xmax / hs : 0.0);
 
             if (cfg->verify && CB == 16) {
                 uint32_t *hrec = (uint32_t *)malloc((size_t)cap * 4);
@@ -2839,7 +2964,7 @@ after_apply:
     cudaFree(D.primes); cudaFree(D.roots); cudaFree(D.plat); cudaFree(D.cursor);
     cudaFree(D.out); cudaFree(D.overflow); cudaFree(D.nproj); cudaFree(D.nlost);
     cudaFree(D.l1); cudaFree(D.l1cnt); cudaFree(D.slice); cudaFree(D.slice_logp);
-    cudaFree(D.surv); cudaFree(D.nsurv); cudaFree(D.dbg); cudaFree(D.probe);
+    cudaFree(D.nsurv); cudaFree(D.dbg); cudaFree(D.probe);
     cudaFree(D.sp); cudaFree(D.srt); cudaFree(D.sg); cudaFree(D.slp); cudaFree(D.dumpbuf); cudaFree(D.survbits);
     return td_failed ? -1 : 0;
 }
