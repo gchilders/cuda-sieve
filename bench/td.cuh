@@ -619,6 +619,189 @@ __global__ void k_td(const int64_t *__restrict A, const int64_t *__restrict B,
     if (nhit && hits) atomicAdd(nhit, hits);
 }
 
+/* ---- the recording pass, one WARP per candidate ------------------------ *
+ *
+ * `k_td` is the right shape for the two dense passes, which run over every
+ * survivor and are throughput-bound on `n`. It is the WRONG shape for the
+ * recording pass, and slabbing is what made that visible.
+ *
+ * That pass runs `SELECT=1` over the ~1,900-5,300 joint candidates, and one
+ * thread per candidate means one thread marching the entire `nsm` entry list
+ * (6,726 on a c194). Measured per launch across a slab sweep it costs a dead
+ * flat ~0.65 ms whether the launch carries 5,342 candidates or 577 -- it is
+ * latency-bound on `nsm`, not throughput-bound on `nacc`, which is why sizing
+ * the grid to `ceil(nacc/threads)` was tried and measured nothing (RESULTS
+ * finding 74). Two launches per slab then made the pass grow at ~1.33 ms per
+ * slab, and that per-slab tax is the entire reason the slab-size curve turns
+ * back up below 2^29 positions.
+ *
+ * Here a whole warp takes one candidate and the 32 lanes stride the entry
+ * list, so the march is ~32x shorter for the same candidate. Three things make
+ * that cheap rather than delicate:
+ *
+ *   - the norm stays in ONE lane. `bn_t` is 256 bits and the divisions are
+ *     inherently sequential on N, so shuffling it between lanes would cost
+ *     more than it saves. Lane 0 owns N, `nf` and the factor list; the other
+ *     lanes only ever evaluate the congruence. Their idling is free: the
+ *     serial part was one thread's work before this change too.
+ *   - the hit mask comes back from `__ballot_sync` in ASCENDING LANE ORDER,
+ *     and lane index is entry index within the 32-entry chunk. Walking it with
+ *     __ffs therefore divides factors out in exactly the entry order `k_td`
+ *     produces, so the recorded factor lists -- and every relation built from
+ *     them -- stay byte-identical. That is the acceptance test for this
+ *     kernel, not an incidental property.
+ *   - the shared tile is unchanged and still block-wide: every warp in the
+ *     block walks the same entry list, so one staged tile serves all of them
+ *     and the `__syncthreads` pair stays uniform (`iters` is computed from the
+ *     warp count, so every warp makes the same number of passes).
+ *
+ * No hit buffer is needed. `k_td` buffers into `hitp[TD_MAXHIT]` because a hit
+ * is a per-lane event there while the division is a whole-warp one; here the
+ * ballot has already done the compaction, and lane 0's division loop skips
+ * empty chunks in a single predicate.
+ *
+ * DIVIDE=0 and the dense SELECT=0 form have no counterpart here on purpose:
+ * this kernel exists for the one launch that was paying the tax, and leaving
+ * the diagnostics on `k_td` keeps a second, independent implementation of the
+ * same predicate in the tree -- which is what `--verify`'s recording pass
+ * compares against. */
+template <bool SLABBED = false>
+__global__ void k_td_record_warp(const int64_t *__restrict A,
+                                 const int64_t *__restrict B,
+                                 const uint32_t *__restrict X,
+                                 const uint32_t *__restrict sel,
+                                 uint32_t n, int logI,
+                                 const tdpoly_t *__restrict P,
+                                 uint32_t sq,
+                                 const uint32_t *__restrict plist,
+                                 const uint32_t *__restrict pcnt, uint32_t K,
+                                 const tdsmall_t *__restrict sm, uint32_t nsm,
+                                 bn_t *__restrict cof,
+                                 uint8_t *__restrict cofbits,
+                                 uint32_t *__restrict flags,
+                                 uint32_t *__restrict fac,
+                                 uint32_t *__restrict faccnt,
+                                 uint32_t fmax, uint32_t j_base)
+{
+    __shared__ tdsmall_t tile[TD_TILE];
+
+    const uint32_t Imask = (1u << logI) - 1;
+    const int32_t  Ihalf = (int32_t)(1u << (logI - 1));
+    const uint32_t lane  = threadIdx.x & 31u;
+    const uint32_t wpb   = blockDim.x >> 5;            /* warps per block */
+    const uint64_t nwarp = (uint64_t)gridDim.x * wpb;
+    const uint64_t w0    = (uint64_t)blockIdx.x * wpb + (threadIdx.x >> 5);
+    const uint64_t iters = ((uint64_t)n + nwarp - 1) / nwarp;
+    const int deg = P->deg;
+
+    for (uint64_t it = 0; it < iters; it++) {
+        const uint64_t tt = w0 + it * nwarp;
+        const bool active = (tt < n);          /* warp-uniform, see below */
+        const bool leader = active && lane == 0;
+        const uint32_t t = (uint32_t)tt;
+        const uint32_t s = active ? sel[t] : 0u;
+        uint32_t myflags = 0;
+        uint32_t nf = 0;
+        uint32_t *myfac = leader ? fac + (size_t)t * fmax : NULL;
+        bn_t N;
+
+        /* Everything that touches N runs on lane 0 alone. The other lanes are
+         * masked off for exactly the stretch that used to be the whole
+         * kernel's serial cost, so this costs nothing they were not already
+         * waiting through. */
+        if (leader) {
+            const int64_t a = A[s], b = B[s];
+            const uint64_t ua = (uint64_t)(a < 0 ? -a : a);
+            const uint64_t ub = (uint64_t)(b < 0 ? -b : b);
+            const int sa = (a < 0) ? -1 : 1, sb = (b < 0) ? -1 : 1;
+
+            /* ---- exact norm ---- */
+            bns_t acc; bns_zero(&acc);
+            for (int k = 0; k <= deg; k++) {
+                bn_t term = P->c[k];
+                int sg = P->sign[k];
+                if (bn_is_zero(&term)) continue;
+                for (int e = 0; e < k; e++) {
+                    if (bn_mul_u64(&term, ua)) myflags |= TDF_NORM_OVERFLOW;
+                    sg *= sa;
+                }
+                for (int e = 0; e < deg - k; e++) {
+                    if (bn_mul_u64(&term, ub)) myflags |= TDF_NORM_OVERFLOW;
+                    sg *= sb;
+                }
+                if (bns_addmag(&acc, &term, sg)) myflags |= TDF_NORM_OVERFLOW;
+            }
+            N = acc.m;
+
+            /* ---- the special-q, on its own side ---- */
+            if (sq) td_divide_out<1>(&N, sq, bn_recip_u32(sq), myfac, &nf, fmax);
+
+            /* ---- large primes recovered by the resieve ---- */
+            uint32_t c = pcnt[s];
+            if (c > K) { c = K; myflags |= TDF_LIST_TRUNCATED; }
+            for (uint32_t k = 0; k < c; k++) {
+                const uint32_t p = plist[(size_t)s * K + k];
+                td_divide_out<1>(&N, p, bn_recip_u32(p), myfac, &nf, fmax);
+            }
+        }
+
+        /* ---- small primes, direct test, 32 entries at a time ---- */
+        {
+            const uint32_t x = active ? X[s] : 0u;
+            const int32_t  i = (int32_t)(x & Imask) - Ihalf;
+            const uint32_t jlocal = x >> logI;
+            uint32_t jglobal = jlocal;
+            if constexpr (SLABBED) jglobal += j_base;
+            const uint32_t hi = (uint32_t)(Ihalf - i);      /* in (0, 2^logI] */
+
+            for (uint32_t base = 0; base < nsm; base += TD_TILE) {
+                const uint32_t cnt = min((uint32_t)TD_TILE, nsm - base);
+                __syncthreads();
+                for (uint32_t k = threadIdx.x; k < cnt; k += blockDim.x)
+                    tile[k] = sm[base + k];
+                __syncthreads();
+                if (!active) continue;
+                for (uint32_t c = 0; c < cnt; c += 32) {
+                    const uint32_t e = c + lane;
+                    bool hit = false;
+                    if (e < cnt) {
+                        const uint32_t m = tile[e].m, g = tile[e].g;
+                        uint32_t jp = jlocal;
+                        hit = true;
+                        if (g > 1) {
+                            if (jglobal % g) hit = false;
+                            else jp = jglobal / g;
+                        }
+                        if (hit && tile[e].magic) {
+                            const uint32_t w = tile[e].rt * jp + hi;
+                            if (td_mod_magic(w, m, tile[e].magic, tile[e].sh)
+                                != tile[e].cst) hit = false;
+                        }
+                    }
+                    /* Ascending lane order == ascending entry order == the
+                     * order k_td divides in. Do not reorder this loop. */
+                    uint32_t mask = __ballot_sync(0xffffffffu, hit);
+                    if (lane == 0) {
+                        while (mask) {
+                            const uint32_t z = c + (uint32_t)__ffs(mask) - 1u;
+                            mask &= mask - 1u;
+                            td_divide_out<1>(&N, tile[z].m * tile[z].g,
+                                             tile[z].recip, myfac, &nf, fmax);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (leader) {
+            cof[t] = N;
+            cofbits[t] = (uint8_t)bn_bits(&N);
+            faccnt[t] = nf;
+            if (myflags) atomicOr(flags, myflags);
+        }
+    }
+}
+
 /* ---- cofactor classification ------------------------------------------- */
 
 /* Applies CADO's check_leftover_norm per survivor. This is the stage that

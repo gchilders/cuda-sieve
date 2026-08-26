@@ -5066,3 +5066,256 @@ hardcoded number for another.
 > the sweep. The win came from the axis that was being held fixed as a control.
 > This is the second time in two days that the mechanism was wrong and the
 > measurement was still worth taking (finding 73's 32-bit walk was the first).
+
+## Finding 77 — the per-slab recording tax was `nsm`, not launches: one warp per candidate cuts the fixed cost 11.5x and turns the pass from `O(nsm)` into `O(nacc)`
+
+**Date:** 2026-08-26, RTX 5070 (sm_120), **card otherwise idle**. `oracle/c194.job`
++ `c194.roots1.m16`, `--pipeline --cofactor --logI 16 --J 32768
+--qrange 80000023: --nq 10`, `--slab-j` swept. One binary throughout: the old
+path is `--td-record-scalar`, the new one is the default, so every pair below is
+the same build, the same q, and the same factor base. **Relations are
+byte-identical in every pair taken, at every slab count and on every job.**
+
+Finding 74 diagnosed this and did not build it. The diagnosis held.
+
+### The fix, and what it actually replaces
+
+`k_td` gives one thread per candidate and each thread marches the entire
+small-prime list. For the two dense passes that is right — they run over ~233K
+survivors and are throughput-bound on `n`. For the **recording** pass it is not:
+that pass runs `SELECT=1` over the ~5,300 joint candidates, so a launch costs
+one thread's march of `nsm` (6,726 / 6,542 here) no matter how many candidates
+ride along. Finding 74 measured exactly that — a dead-flat 0.65 ms per launch
+from 5,342 candidates down to 577 — and predicted a ~32x win from splitting the
+march across a warp per candidate.
+
+`k_td_record_warp` (`td.cuh`) does that. One warp owns one candidate; the 32
+lanes stride the entry list; `__ballot_sync` returns the hit mask in ascending
+lane order, which **is** ascending entry order, so lane 0 walks it with `__ffs`
+and divides in exactly the order `k_td` produces. That ordering is the whole
+correctness argument and it is why the relations stay byte-identical rather than
+merely equivalent. `bn_t` never leaves lane 0 — the divisions are sequential on
+N and shuffling 256 bits between lanes would cost more than it saves — so the
+other 31 lanes only ever evaluate the congruence. Their idling is free: the
+serial part was one thread's work before the change too.
+
+The shared `TD_TILE` staging is unchanged and still block-wide, which is what
+keeps the entry read at one L2 hit per block rather than one per warp. The
+`hitp[TD_MAXHIT]` buffer is gone — the ballot has already done the compaction —
+and with it 192 bytes of stack frame. 68 registers, **0 spill stores, 0 spill
+loads**, 32 B stack against `k_td<1,1,1>`'s 224 B.
+
+### The prediction was 32x. The measured number is 11.5x, and the reason is worth more than the number
+
+Per **launch** (two per slab, one per side). The candidates/launch column is
+`nacc / nslab` with `nacc` the band mean of 5,342.5/q — candidates are not
+distributed exactly evenly across slabs, so it is the right axis but not an
+exact per-launch count; the fit residuals below bound how much that matters:
+
+| slabs | candidates/launch | scalar | warp |
+|---:|---:|---:|---:|
+| 1 | 5,342 | 0.673 ms | 0.351 ms |
+| 2 | 2,671 | 0.661 ms | 0.206 ms |
+| **4** | **1,336** | **0.653 ms** | **0.131 ms** |
+| 8 | 668 | 0.652 ms | 0.091 ms |
+| 16 | 334 | 0.651 ms | 0.076 ms |
+
+The scalar column is flat, reconfirming finding 74 on this binary. **The warp
+column is not flat, and that is the result.** Least squares over those five
+points:
+
+```
+warp launch = 56.6 us  +  55 ns per candidate      (residuals <= 2.5 us)
+scalar launch = 653 us +  ~0 per candidate
+```
+
+So the pass stopped being `O(nsm)` and became `O(nacc)` with a small floor. The
+32x applies to the *march*, which is no longer what a launch mostly costs; what
+remains is the serial lane-0 work — norm, resieve divisions, small-prime
+divisions — plus staging the tile, and that part is per candidate, real, and
+was always there.
+
+**The number that matters for slabbing is the FIXED term, because that is what
+multiplies by slab count.** Two launches per slab:
+
+| | per-slab tax |
+|---|---:|
+| scalar | 1,306 us |
+| warp | **113 us** |
+| | **11.5x** |
+
+### The paired sweep: the optimum holds at `2^29` and the curve below it flattens
+
+Three repeats per cell, means; `fill` is the control and does not move.
+
+| local area | slabs | record scal | record warp | Δ | fill scal | fill warp | wall scal | wall warp | Δwall |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `2^31` | 1 | 1.347 | 0.702 | −47.8% | 180.57 | 180.54 | 425.57 | 424.80 | −0.18% |
+| `2^30` | 2 | 2.643 | 0.825 | −68.8% | 126.25 | 126.42 | 373.57 | 371.87 | −0.46% |
+| **`2^29`** | **4** | **5.222** | **1.047** | **−80.0%** | 98.87 | 98.84 | **349.69** | **345.87** | **−1.09%** |
+| `2^28` | 8 | 10.425 | 1.459 | −86.0% | 99.46 | 99.43 | 361.71 | 351.86 | −2.72% |
+| `2^27` | 16 | 20.838 | 2.443 | −88.3% | 115.16 | 115.02 | 405.25 | 387.58 | −4.36% |
+
+At the production operating point the arms do not overlap: warp's worst wall
+(346.14) beats scalar's best (348.93). `fill` agrees to 0.2% in every row, which
+is the control working.
+
+**`2^29` is still the optimum on both binaries.** What changed is the shape below
+it — measured against each mode's own best:
+
+| local area | scalar | warp |
+|---|---:|---:|
+| `2^31` | +21.7% | +22.8% |
+| `2^30` | +6.8% | +7.5% |
+| **`2^29`** | **best** | **best** |
+| `2^28` | +3.4% | **+1.7%** |
+| `2^27` | +15.9% | **+12.1%** |
+
+Halving the slab now costs 1.7% instead of 3.4%, which is the point: it is the
+memory decoupling item 8 wants, not a throughput win.
+
+### The tax changed hands, and the new holder is the DENSE trial-division pass
+
+This is the part that was not predicted. Warp-path stage totals, 4 → 8 → 16
+slabs:
+
+| stage | 4 | 8 | 16 | per slab |
+|---|---:|---:|---:|---|
+| record candidate factorisations | 1.04 | 1.43 | 2.43 | **0.12 ms** |
+| **norms + trial division, both sides** | **10.34** | **13.18** | **21.83** | **~0.96 ms** |
+| fill | 98.90 | 99.59 | 115.20 | turns up at 16 |
+
+`norms + trial division` is `k_td<1,0,0>` — the same kernel, dense over
+survivors — and it has the same disease. But the arithmetic is one step subtler
+than "it goes latency-bound below `2^29`", and getting it right is what names the
+fix.
+
+`k_td` puts the `nsm` march **inside** its grid-stride loop, so a launch costs
+`iters` marches, and `iters = ceil(n / (blocks*threads))`. With the default
+`288 x 256` = 73,728 threads and 237,256 two-sided survivors per q:
+
+| slabs | survivors/launch | `iters` | total `nsm` marches | measured TD |
+|---:|---:|---:|---:|---:|
+| 1 | 237,256 | 4 | 8 | 10.71 ms |
+| 2 | 118,628 | 2 | 8 | 9.76 ms |
+| 4 | 59,314 | **1** | 8 | 10.34 ms |
+| 8 | 29,657 | 1 | **16** | 13.18 ms |
+| 16 | 14,828 | 1 | **32** | 21.83 ms |
+
+**The cost is flat exactly while the march count is, and rises exactly when it
+does.** From 1 to 4 slabs the split is free because `iters` falls in lockstep
+with it — twice as many launches, each doing half as many marches. At 4 slabs
+`iters` hits its floor of **1** and has no further give, so from there every
+halving of the slab doubles the total march count. That is the whole shape of
+the column, and it is why the turn-up lands at 8 slabs rather than wherever the
+cache happens to run out.
+
+Finding 74 saw this column turn up at 8 slabs (11.19 / 10.22 / 10.49 / 10.89 /
+13.66) and attributed the whole per-slab effect to the recording pass; it was
+two passes with one mechanism, and removing the smaller one is what made the
+larger one legible.
+
+#### The model's own prediction, tested — confirmed one way, falsified the other
+
+The model says the knee sits at `blocks*threads`, not at a slab size. Raising the
+grid should make `iters` bottom out sooner, shorten the flat region, and — above
+237,256 threads — remove it entirely. That is two runs rather than a kernel
+rewrite, so it was run before building anything: three grids x five slab counts,
+n=2, idle card, `--blocks` sweeping the whole pipeline's grid while the recording
+pass (whose grid is derived from `nacc`) rides along as a control.
+
+| slabs | predicted marches b288 / b512 / b1024 | TD b288 | b512 | b1024 | spread |
+|---:|---|---:|---:|---:|---:|
+| 1 | 8 / **4** / **2** | 10.85 | 9.56 | 9.15 | **−15.6%** |
+| 2 | 8 / **4** / 4 | 9.87 | 9.43 | 9.32 | −5.5% |
+| 4 | 8 / 8 / 8 | 10.49 | 10.38 | 10.43 | −0.6% |
+| 8 | 16 / 16 / 16 | 13.39 | 13.31 | 13.38 | −0.0% |
+| 16 | 32 / 32 / 32 | 21.82 | 21.96 | 22.36 | +2.5% |
+
+**Confirmed, and strongly: where the march count is held equal, the grid does not
+matter.** Across a 3.5x range of `--blocks`, the three bottom rows agree to 0.6%,
+0.0% and 2.5%. Thread count is emphatically not the lever once `iters` is 1 —
+which is the part of the model that identifies what the fix has to change.
+
+**Falsified: the cost is not proportional to the march count.** The model has
+b1024 doing a quarter of b288's marches at one slab and predicts roughly a
+quarter of the cost; the measurement gives **−15.6%**, not −75%. Compare that
+against the other direction, where doubling the marches 8 → 16 (4 → 8 slabs) cost
+**+28%**. A march is not a fixed quantum of work, and the growth from 4 to 16
+slabs is only partly the march count — per-launch efficiency falls as well, since
+14,828 survivors leave 80% of a 73,728-thread grid idle.
+
+No replacement model is offered. The march count predicts the *shape* — flat
+while it is flat, rising where it rises, knee in the right place — and does not
+predict magnitudes, and inventing a second model to fit five points would be
+fitting noise.
+
+**The decision this settles is the useful part.** `--blocks` is NOT a cheap
+substitute for item 18. At one slab it is worth a real but small −1.7 ms on this
+stage (−0.4% of wall); at every slabbed geometry — which is the entire case item
+18 exists for — it is worth **nothing measurable**, because `iters` is already 1
+and there is nothing left for a bigger grid to remove. The lanes-per-item kernel
+change is the only thing that moves this, or nothing does.
+
+> **Method note, the second in three days.** Finding 76's hypothesis was killed
+> by the first cell of its sweep; this one was half killed by a sweep run
+> specifically to try to kill it, before any code was written on the strength of
+> it. The two-run version of "test the prediction first" cost 30 runs and saved a
+> kernel rewrite aimed at the wrong quantity.
+
+The fix is not the same, though, and should not be applied blind: warp-per-item
+would *lose* on the dense pass wherever survivors exceed the thread count, which
+is the common case at large slabs. What it wants is lanes-per-item chosen from
+`n` against the grid — 1 lane when `n >= nthreads`, up to 32 when it is far
+below. That is a bigger change to a hotter kernel than this one was, and it is
+worth doing only for the same reason: it buys small slabs, not throughput.
+
+The second term is `fill`, which stops improving at `2^29`, is flat to `2^28`
+and is **16% worse at `2^27`** (115.20 against 98.90). Finding 74 called fill
+saturated; over a wider sweep it reverses. That is the factor-base re-entry
+every slab pays, and it is a floor on how small a slab can usefully get no
+matter what happens to trial division.
+
+### Correctness
+
+Byte-identical relations, `--td-record-scalar` against default, one binary:
+
+| job | geometry | slabs | relations | result |
+|---|---|---:|---:|---|
+| c194 | I16 J32768, 30 q | 1 | 3,349 | identical |
+| c194 | I16 J32768, 30 q | 4 | 3,349 | identical |
+| c194 | I16 J32768, 30 q | 16 | 3,349 | identical |
+| c147 | I14 J8192, 5 q | 1 | 648 | identical |
+| c147 | I14 J65536, 5 q | 2 | 1,297 | identical |
+| **AS276** | **I17 J16384 (A=32), 3 q** | **4** | **246** | **identical** |
+
+The three c194 runs also agree with each other as sorted sets, so slab count
+does not move the relation population either. `--check-relations` rebuilds
+**3,349 of 3,349** norms exactly from the warp path's factor lists. `make check`
+passes end to end, `cofcheck.sh` included.
+
+AS276 is the motivating case and shows the biggest absolute saving, because its
+`nsm` is larger: **record 9.234 → 1.256 ms/q (−86%)** at 4 slabs, 4-limb
+algebraic side, 3-limb rational, no width flags. That is ~8 ms/q returned on the
+job that item 8 exists for.
+
+### Block size: 256 threads, and 128 is worse
+
+`TD_RECORD_THREADS` is a compile-time constant because the grid is derived from
+it and `nacc`, so there is nothing a runtime flag could choose that the
+candidate count does not already fix. It is a **bracketed interior minimum**,
+n=2 at the 4-slab operating point, `DEFS=-DTD_RECORD_THREADS=N` pricing builds:
+
+| threads/block | warps (candidates) per block | record |
+|---:|---:|---:|
+| 128 | 4 | 1.220 ms (+16.5%) |
+| **256** | **8** | **1.047 ms** |
+| 512 | 16 | 1.240 ms (+18.4%) |
+
+Both directions lose and the two arms are within 0.013 ms of each other, which
+is the shape of two costs crossing rather than a plateau. Below 256 the 16 KB
+`TD_TILE` staging is shared across too few candidates and its per-candidate cost
+rises; above it, 68 registers x 512 threads admits only one block per SM, so the
+staging is amortised better but there is far less to hide its latency behind.
+The value either way is small — the whole pass is 0.3% of wall at the operating
+point now — so this was swept once and left at 256.

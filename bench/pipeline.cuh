@@ -1027,15 +1027,38 @@ static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
     CK(cudaEventRecord(E[12]));
     k_gather_ab<<<blocks, threads>>>(C->d_a, C->d_b, C->d_sel, nacc,
                                      C->d_ca, C->d_cb);
+    /* One warp per candidate, and a grid sized to the candidate count -- which
+     * is what makes the grid sizing worth doing here and not in `k_td`. There
+     * the per-thread cost is the whole `nsm` march and more threads cannot
+     * shorten it; here more warps do, right up to one warp per candidate.
+     * Beyond that point extra blocks only re-stage the same shared tile out of
+     * L2, so the grid is capped at the candidates present. */
+    static_assert(TD_RECORD_THREADS >= 32 && TD_RECORD_THREADS <= 1024 &&
+                  (TD_RECORD_THREADS % 32) == 0,
+                  "TD_RECORD_THREADS must be a whole number of warps: "
+                  "k_td_record_warp maps one warp to one candidate and its "
+                  "__ballot_sync assumes a full, converged warp.");
+    const int rthreads = TD_RECORD_THREADS;
+    const int rblocks  = (int)((nacc + (uint32_t)(rthreads / 32) - 1u) /
+                               (uint32_t)(rthreads / 32));
     for (int si = 0; si < 2; si++) {
         const int side = si ? 0 : 1;
-        k_td<1, 1, 1, SLABBED><<<blocks, threads>>>(
-            C->d_a, C->d_b, C->d_x, C->d_sel, nacc, cfg->logI, C->d_poly[side],
-            side == cfg->sq_side ? (uint32_t)L->q : 0u,
-            C->d_plist[side], C->d_pcnt[side], PIPE_K,
-            C->d_sm[side], C->nsm[side],
-            C->d_ccof[side], C->d_cbits[side], C->d_flags, NULL,
-            C->d_cfac[side], C->d_cfn[side], TD_FMAX, j_base);
+        if (cfg->td_record_scalar)
+            k_td<1, 1, 1, SLABBED><<<blocks, threads>>>(
+                C->d_a, C->d_b, C->d_x, C->d_sel, nacc, cfg->logI, C->d_poly[side],
+                side == cfg->sq_side ? (uint32_t)L->q : 0u,
+                C->d_plist[side], C->d_pcnt[side], PIPE_K,
+                C->d_sm[side], C->nsm[side],
+                C->d_ccof[side], C->d_cbits[side], C->d_flags, NULL,
+                C->d_cfac[side], C->d_cfn[side], TD_FMAX, j_base);
+        else
+            k_td_record_warp<SLABBED><<<rblocks, rthreads>>>(
+                C->d_a, C->d_b, C->d_x, C->d_sel, nacc, cfg->logI, C->d_poly[side],
+                side == cfg->sq_side ? (uint32_t)L->q : 0u,
+                C->d_plist[side], C->d_pcnt[side], PIPE_K,
+                C->d_sm[side], C->nsm[side],
+                C->d_ccof[side], C->d_cbits[side], C->d_flags,
+                C->d_cfac[side], C->d_cfn[side], TD_FMAX, j_base);
     }
     CK(cudaEventRecord(E[13]));
     CK(cudaEventSynchronize(E[13])); CK(cudaGetLastError());

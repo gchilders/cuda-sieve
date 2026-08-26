@@ -512,6 +512,11 @@ typedef struct {
     int      norm_mode;     /* NORM_* below */
     int      apply_atomic;  /* 1 = smem atomicAdd, 0 = racy plain += (probe)   */
     int      apply_threads; /* 0 = auto (APPLY_THREADS_DEFAULT), max APPLY_THREADS_MAX */
+    /* A/B switch for the candidate recording pass: 1 restores the old
+     * thread-per-candidate k_td launch. Kept because the acceptance test for
+     * the warp kernel is byte-identical relations against this path, and that
+     * comparison is worth being able to make in one binary. */
+    int      td_record_scalar;
     int      small_sieve;   /* 1 = line-sieve p < bkthresh into the region      */
     int      side;          /* 1 = algebraic (special-q side), 0 = rational     */
     double   allowance;     /* bits of cofactor tolerated (lambda*lpb)         */
@@ -702,6 +707,20 @@ typedef struct {
  * max at parse time so the failure is a message rather than a launch error. */
 #define APPLY_THREADS_DEFAULT 512
 #define APPLY_THREADS_MAX     512
+
+/* k_td_record_warp's block size. Must be a multiple of 32 -- the kernel maps
+ * one warp to one candidate -- and is a compile-time constant because the grid
+ * is derived from it and from `nacc` at each launch, so there is nothing for a
+ * user flag to choose that the candidate count does not already fix.
+ *
+ * 256 is a MEASURED interior minimum, not a guess: 128 / 256 / 512 threads
+ * measure 1.220 / 1.047 / 1.240 ms on c194 at the 4-slab operating point
+ * (RESULTS finding 77). Both neighbours lose by ~17%. Below 256 the 16 KB
+ * TD_TILE staging is shared across too few candidates; above it, 68 registers
+ * x 512 threads admits only one block per SM. */
+#ifndef TD_RECORD_THREADS
+#define TD_RECORD_THREADS 256
+#endif
 
 /* k_fill_l1's grid, frozen at what it has always run. See the launch site. */
 #define FILL_L1_BLOCKS 144

@@ -4,7 +4,7 @@
 the order they were discovered, including the ones later refuted, because the
 refutations are the most useful part. That makes them bad at answering "what
 does this thing do today". This file answers only that, and holds nothing that
-is not current. **Last updated 2026-08-25.**
+is not current. **Last updated 2026-08-26.**
 
 ## Architecture
 
@@ -19,6 +19,10 @@ per special-q:
   (repeat for the other side)
   device  k_intersect_compact   both-sides bitmap AND, gcd filter, rank scan
           trial division, classification, resieve
+                               (the candidate RECORDING pass is
+                               k_td_record_warp, one warp per candidate;
+                               the two dense passes are k_td, one thread
+                               per survivor -- see the slab section)
           cofactorisation (Pollard rho and ECM)
   host    emit relations
 ```
@@ -161,27 +165,65 @@ JOB, not just a matched area.
 
 What finding 74 adds beyond another data point is the mechanism. The curve is
 two terms crossing: **fill** improves 41% from `2^31` to `2^29` and then
-saturates (190.65 -> 111.68 -> 112.22 ms), while the **`record candidate
-factorisations` pass grows linearly at ~1.33 ms per slab** (1.39 ms at 1 slab,
-10.64 at 8) and is what makes `2^28` lose. Apply is flat across the whole range.
-A card whose fill term keeps improving past `2^29` crosses later, which is
-exactly the L40's behaviour.
+saturates (190.65 -> 111.68 -> 112.22 ms; finding 77 extends the sweep and
+finds it *reverses* below that, not merely saturates), while the **`record
+candidate factorisations` pass grows linearly at ~1.33 ms per slab** (1.39 ms
+at 1 slab, 10.64 at 8) and is what makes `2^28` lose. Apply is flat across the
+whole range. A card whose fill term keeps improving past `2^29` crosses later,
+which is exactly the L40's behaviour. **The recording half of that crossing was
+removed on 2026-08-26 (finding 77) and the dense trial-division pass took its
+place; see below.**
 
 The per-slab tax was then run down to its cause (finding 74's mechanism note):
 `k_td` gives one thread per candidate and each thread marches the whole
 small-prime list, so a recording launch costs ~0.65 ms flat -- 5,342 candidates
 or 577, it makes no difference. **Sizing the grid to the candidate count does
 not help and was measured not to.** The effective fix is to split that march
-across a warp per candidate (~32x on every launch); batching the pass across
-slabs is the weaker variant that only removes the surplus launches.
+across a warp per candidate; batching the pass across slabs is the weaker
+variant that only removes the surplus launches.
 
-**Neither was built, deliberately.** Both are worth about **0.9% at the 4-slab
-operating point**, and projecting either across the sweep leaves the optimum
-where it is. The reason to do it eventually is not throughput but memory: it
-decouples slab size from cost, which is what makes small slabs affordable for
-an A=32 job on a 12 GB card. Collecting matched sweeps on more large-L2
-Ada/Hopper parts remains worthwhile, but a cache-aware automatic target should
-wait until that tax is gone, since it is half of what the target balances.
+**BUILT 2026-08-26 -- finding 77.** `k_td_record_warp` gives one warp per
+candidate and takes the hit mask from `__ballot_sync`, whose ascending lane
+order is ascending entry order, so factors are divided out in exactly the order
+`k_td` produces and **relations are byte-identical at every slab count on
+c194, c147 and AS276**. Batching across slabs was not built and is not needed.
+
+The pass is now `O(nacc)` rather than `O(nsm)`: measured across the sweep, a
+launch costs **56.6 us fixed + 55 ns per candidate**, against the old flat
+653 us. The **per-slab fixed tax is 1,306 -> 113 us, 11.5x**, and the operating
+point gains **wall -1.09%** (349.69 -> 345.87 ms/q, arms non-overlapping) with
+`fill` unmoved as the control. Finding 74's ~32x projection applied to the
+march alone; what remains per launch is the serial norm-and-division work,
+which is per candidate and was always real. `--td-record-scalar` restores the
+old path for A/B.
+
+`2^29` remains the optimum, as projected. What the change buys is the shape
+below it: `2^28` now costs **+1.7% instead of +3.4%**, and `2^27` +12.1%
+instead of +15.9% -- the memory decoupling that makes small slabs affordable
+for an A=32 job on a 12 GB card, which was always the reason to do this rather
+than throughput.
+
+**The tax then changed hands.** Below `2^29` the two terms that now grow are
+the DENSE `norms + trial division` pass (10.34 / 13.18 / 21.83 ms at 4 / 8 / 16
+slabs) and `fill`, which does not merely saturate but **reverses** -- 98.90 /
+99.59 / 115.20 over the same range. The dense pass has the same disease, and
+the arithmetic names its fix: `k_td` runs the `nsm` march inside its grid-stride
+loop, so a launch costs `ceil(n/(blocks*threads))` marches. From 1 to 4 slabs
+`iters` falls 4 -> 2 -> 1 in lockstep with the split, the total march count
+stays at 8, and the cost is flat. At 4 slabs `iters` bottoms out at 1, and every
+halving after that doubles the marches -- 16 then 32 -- which is the column
+exactly. Its fix is NOT this one applied again: warp-per-item would lose
+wherever survivors exceed the thread count, which is the common case at large
+slabs. It wants lanes-per-item chosen from `n` against the grid -- and NOT a
+bigger grid, which was tested on 2026-08-26 and is worth 0.0-2.5% at every
+slabbed geometry (item 18). `fill`'s reversal is factor-base re-entry and is a
+floor on slab size regardless. Both are item 18.
+
+Collecting matched sweeps on more large-L2 Ada/Hopper parts remains worthwhile.
+A cache-aware automatic target is now less blocked than it was -- the recording
+tax it had to balance against is 11.5x smaller -- but the dense-TD term has
+replaced it in that role, so the same argument for waiting still applies, with a
+different term named.
 
 ### Why the lattice walk itself is wide
 
@@ -1489,6 +1531,13 @@ absent from every document in the repo.
    14-16 GB whole-area footprint, which is what stops a like-for-like
    comparison against NFS@Home's own `I16e -J 16` geometry for this job.
 
+   **The per-slab cost side of that footprint improved on 2026-08-26**
+   (finding 77): halving the slab now costs +1.7% rather than +3.4%, and on
+   AS276 itself the recording pass fell 9.234 -> 1.256 ms/q. That does not lift
+   either remaining blocker, but it is what makes trading slab size for VRAM
+   cheap enough to be worth doing. Item 18 is the next term in the same
+   direction.
+
    **Neither remaining blocker binds a C195 at NFS@Home's geometry.** They
    sieve `2^15 × 2^14` and would prefer `2^15 × 2^15` — `2^30`, half the
    current area limit — so no A=32 work is required for that class of job at
@@ -2019,3 +2068,79 @@ absent from every document in the repo.
     by 2.7x and which nothing in `--pipeline` reaches. But the verify gate is
     not in `make check`, so this sat undetected; whoever revisits two-level
     fan-out must fix this **before** trusting any number it produces.
+18. **Lanes-per-item for the DENSE trial-division pass — the per-slab tax that
+    replaced the recording one. NOT BUILT, opened 2026-08-26 by finding 77.**
+
+    `k_td<1,0,0>` ("norms + trial division, both sides") gives one thread per
+    survivor and each thread marches the whole `nsm` list — and because that
+    march sits INSIDE the grid-stride loop, a launch costs
+    `iters = ceil(n/(blocks*threads))` of them. Measured on the warp binary,
+    c194 I16 J32768, default grid `288 x 256` = 73,728 threads, 237,256
+    two-sided survivors/q:
+
+    | slabs | survivors/launch | `iters` | total marches | TD |
+    |---:|---:|---:|---:|---:|
+    | 1 | 237,256 | 4 | 8 | 10.71 |
+    | 2 | 118,628 | 2 | 8 | 9.76 |
+    | 4 | 59,314 | **1** | 8 | 10.34 |
+    | 8 | 29,657 | 1 | **16** | 13.18 |
+    | 16 | 14,828 | 1 | **32** | 21.83 |
+
+    **Splitting the slab is free only while `iters` can absorb it.** It falls
+    4 -> 2 -> 1 across the first two halvings and the cost does not move; at 4
+    slabs it is pinned at 1 and every halving after that doubles the march
+    count. That is the entire column, and it is the same disease item 77
+    removed from the recording pass — ~0.96 ms per slab past the knee, against
+    the recording pass's 0.12. **It is now the larger of the two, by 8x.**
+
+    **The cheap version of this was tested first and does NOT work.** If the
+    knee is at `blocks*threads`, raising `--blocks` should move it — two runs
+    rather than a kernel rewrite. Three grids x five slab counts, idle card
+    (finding 77):
+
+    | slabs | TD b288 | b512 | b1024 |
+    |---:|---:|---:|---:|
+    | 1 | 10.85 | 9.56 | **9.15** |
+    | 4 | 10.49 | 10.38 | 10.43 |
+    | 8 | 13.39 | 13.31 | 13.38 |
+    | 16 | 21.82 | 21.96 | 22.36 |
+
+    **Where `iters` is already 1 — every slabbed geometry, which is this item's
+    entire case — a 3.5x grid range is worth 0.0 to 2.5%, i.e. nothing.** Only
+    the unslabbed row moves, and only by −15.6% of one stage (−0.4% of wall).
+    So `--blocks` is not a substitute: it is the kernel change or nothing.
+
+    It also falsified half the model. Cutting the march count 4x at one slab
+    bought 15.6%, not 75%, so cost is NOT proportional to marches; the march
+    count predicts the shape and not the magnitude. What survives, and what
+    this item rests on, is the confirmed half: **at equal march count the grid
+    does not matter**, so threads are not the lever and lanes-per-item is.
+
+    **Do not just apply finding 77's fix again.** One warp per survivor would
+    lose wherever survivors exceed the thread count, which is the ordinary
+    case at large slabs and at 1 slab is every job. What this wants is
+    L lanes per item with L chosen on the host from `n` against the grid —
+    `L = clamp(nthreads/n, 1, 32)` rounded to a power of two — so the kernel
+    degenerates to today's behaviour at L=1 and spreads the march only when
+    there are idle threads to spread it over. `__ballot_sync` gives the hit
+    mask for a full warp; at L<32 it needs masking to the item's lane group,
+    and the divisions go to the group's first lane rather than lane 0.
+
+    The ordering argument that makes finding 77 byte-identical carries over
+    unchanged and is the acceptance test here too: ascending lane order within
+    a group is ascending entry order.
+
+    **Value, stated honestly: nothing at the operating point.** At `2^29` this
+    pass is already near its floor (10.34 against 10.71 at one slab), so the
+    prize is entirely below `2^29` — about 2.8 ms at 8 slabs and 11.5 at 16.
+    Like item 77's, the reason to build it is that it decouples slab size from
+    cost for an A=32 job on a 12 GB card (item 8), not throughput. It is a
+    bigger and riskier change than the recording pass was, because this kernel
+    IS the hot dense path, so it should be measured against the unslabbed case
+    as carefully as against the slabbed one.
+
+    **The other term below `2^29` is `fill`, and it is not a launch-shape
+    problem.** It stops improving at `2^29`, is flat to `2^28` and is 16% worse
+    at `2^27` (98.90 / 99.59 / 115.20). That is the factor-base re-entry every
+    slab pays, and it puts a floor under useful slab size no matter what
+    happens here.

@@ -234,6 +234,10 @@ static void usage(void)
 "  --no-td-verify   skip dense TD reconstruction (first q in pipeline; TD\n"
 "                   harness otherwise). Saves peak memory; incompatible with --cofgate\n"
 "  --verbose-q      print a line per special-q instead of a band summary\n"
+"  --td-record-scalar  pipeline: record candidate factorisations with one\n"
+"                   THREAD per candidate instead of one WARP. The\n"
+"                   pre-2026-08-26 path, kept for A/B only -- it is ~5x\n"
+"                   slower per launch and emits identical relations\n"
 "\n"
 "RUNTIME\n"
 #ifdef HAVE_BOINC
@@ -868,6 +872,7 @@ static int bench_main_impl(int argc, char **argv)
     cfg.reps = 3; cfg.verify = 0;
     cfg.stage = STAGE_BOTH; cfg.cell_bits = 16; cfg.norm_mode = NORM_HORNER;
     cfg.apply_atomic = 1; cfg.apply_threads = 0; cfg.allowance = 3.5 * 32.0;
+    cfg.td_record_scalar = 0;
     cfg.small_sieve = 1; cfg.side = 1;
     cfg.scale = 1.0; cfg.dump = NULL; cfg.cadofb = NULL;
     cfg.probe_i = 0; cfg.probe_j = 0xFFFFFFFFu;
@@ -1035,6 +1040,9 @@ static int bench_main_impl(int argc, char **argv)
             if (parse_int_range_arg("--apply-threads", argv[++i], 0,
                                     APPLY_THREADS_MAX, &cfg.apply_threads))
                 return 1;
+        }
+        else if (!strcmp(argv[i], "--td-record-scalar")) {
+            cfg.td_record_scalar = 1;
         }
         else if (!strcmp(argv[i], "--allowance") && i + 1 < argc) {
             if (parse_nonnegative_double_arg("--allowance", argv[++i],
