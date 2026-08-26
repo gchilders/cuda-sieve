@@ -4951,3 +4951,118 @@ different kernel and should not move), wall −3.4% to −5.0%.
 > concentrated in cofactorisation rather than in `fill` or `apply`. The two
 > sweeps were taken under different machine conditions. Within either sweep the
 > points are paired and comparable; across them only the *shape* is.
+
+## Finding 76 — `k_fill_atomic` is L2-bound, its 50% occupancy ceiling is benign, and the block-count default was tuned for the wrong job: `1152 → 4608` is −8.6% fill, −5.7% wall
+
+**Date:** 2026-08-25, RTX 5070, **card otherwise idle**. `oracle/c194.job`,
+`--logI 16 --J 32768 --qrange 80000023: --nq 10`, one binary, `--fill-blocks`
+swept, `--fill-threads 32` throughout unless stated. Relations byte-identical
+at every point of every sweep below.
+
+Finding 75 left `fill` as 27.9% of wall and the only large stage never
+occupancy-profiled — `k_fill_l1` and `k_fill_l2` carry `__launch_bounds__`
+while the shipping kernel carries none.
+
+### The hypothesis was wrong: occupancy is not the lever
+
+`ncu` on `k_fill_atomic`, c194:
+
+| | value |
+|---|---:|
+| L2 cache throughput | **68.69%** |
+| DRAM throughput | 24.66% |
+| L2 hit rate | 93.60% |
+| Compute (SM) throughput | **9.41%** |
+| Executed IPC | **0.22** / 4.0 |
+| Warp cycles per issued instruction | **101.07** |
+| Avg. active threads per warp | 20.59 / 32 |
+| **Block Limit SM** | **24** ← binding |
+| Block Limit Warps / Registers / Shared | 48 / 64 / 32 |
+| Theoretical occupancy | **50%** |
+
+The opposite character to `k_apply`: memory-bound with the SMs idle, against
+issue-bound with memory idle. Occupancy is capped at 50% because 32-thread
+blocks are one warp each and at most 24 blocks are resident per SM — nothing to
+do with registers (64) or shared memory (32).
+
+**That ceiling was predicted to be the bottleneck, and is not.** The kernel is a
+pure grid-stride over the global thread index (`bench_kernels.cu:109-110`), so
+`576x64` assigns every thread exactly the same primes as `1152x32` at double
+the occupancy. It is **slower**. Holding total threads at 73728:
+
+| block width | resident warps/SM | occupancy | fill |
+|---:|---:|---:|---:|
+| **32** | 24 | **50%** | **101.84** |
+| 64 | 48 | 100% | 106.70 |
+| 128 | 48 | 100% | 105.67 |
+| 256 | 48 | 100% | 107.30 |
+
+Every 100%-occupancy configuration loses to the 50% one, and the same holds at
+147456 threads (32thr 99.85 against 64thr 102.64). On an L2-bound kernel at
+68.7% of its bandwidth ceiling, extra resident warps add contention on the
+constrained resource rather than hiding the 101-cycle stall. **The 50% ceiling
+is benign — `FILL_THREADS_DEFAULT 32` is correct and should not be "fixed".**
+
+### The real lever is total threads, and the default was tuned on the wrong job
+
+n=4, paired:
+
+| `--fill-blocks` | fill | ± | Δfill | sieve | Δsieve | wall | Δwall |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1152 (old default) | 108.34 | 1.02 | — | 244.62 | — | 419.51 | — |
+| 2304 | 101.84 | 0.37 | −6.0% | 238.13 | −2.7% | 404.19 | −3.7% |
+| **4608 (new default)** | **99.01** | 0.36 | **−8.6%** | **235.11** | **−3.9%** | **395.67** | **−5.7%** |
+| 9216 | 99.85 | 0.16 | −7.8% | 235.78 | −3.6% | 396.12 | −5.6% |
+| 18432 | 101.87 | 0.39 | −6.0% | 237.82 | −2.8% | 405.37 | −3.4% |
+
+A bracketed interior minimum. Wall clock is the noisy column here — 1152 spans
+35 ms across four repeats of *identical* configuration, against 13 ms for the
+others — but the arms do not overlap: 4608's worst wall (400.67) beats 1152's
+best (402.91), so the win survives the cofactorisation variance.
+
+**Confirmed with the new default compiled in**, n=3 paired against an explicit
+`--fill-blocks 1152`, relations byte-identical, arms again non-overlapping
+(new max 401.06 against old min 410.80):
+
+| stage | old 1152 | new 4608 | delta |
+|---|---:|---:|---:|
+| fill | 108.77 | 99.22 | **−8.8%** |
+| sieve | 246.14 | 235.48 | −4.3% |
+| wall | 416.60 | 399.21 | **−4.2%** |
+
+**Quote the wall figure as −4 to −6%, not −5.7%.** The two runs disagree by
+1.5 points on wall (−5.7% swept, −4.2% confirmed) because the 1152 arm draws a
+long cofactorisation tail at different rates — its spread is 2-3x the 4608
+arm's in both runs. `fill` is the stable measurement at −8.6% / −8.8%, and
+`sieve` at −3.9% / −4.3%; wall inherits noise neither of them has.
+
+`bench.h` predicted this in the sentence that shipped with the old constant:
+*"The optimum plausibly moves with bucket and record count, which is not yet
+measured."* 1152 was measured at 77.4M records; production runs far more.
+
+### What the retune does NOT establish
+
+| geometry | 1152 | 2304 | 4608 | 9216 | best |
+|---|---:|---:|---:|---:|---|
+| c147 unslabbed | — | −1.3% | −2.0% | **−2.9%** | 9216, still improving |
+| c147 slabbed | — | +1.2% | +0.8% | +0.9% | **1152** |
+| **c194 (production)** | — | −6.0% | **−8.6%** | −7.8% | **4608** |
+
+**There is no single right constant.** c147 is nearly flat across an 8x block
+range, but its two geometries disagree in *direction* despite sharing a factor
+base: unslabbed wants more blocks, slabbed wants fewer (+0.8% at 4608 — small,
+but ~2.7σ against a 0.15 ms spread). No mechanism explains why, and no
+primes-per-thread formula fits, so none is offered.
+
+The old constant was also validated on three cards (5070/4090/5090); **4608 is
+measured on a 5070 only.** It is a better default for the I16 production class,
+chosen deliberately at the cost of ~0.8% on c147-slabbed, and it is an argument
+FOR the startup autotuner in STATUS item 2 rather than against it — the
+autotuner is what gets every geometry its own optimum instead of trading one
+hardcoded number for another.
+
+> **Method note.** The hypothesis that motivated this finding — that the 50%
+> occupancy ceiling was fill's bottleneck — was falsified by the first cell of
+> the sweep. The win came from the axis that was being held fixed as a control.
+> This is the second time in two days that the mechanism was wrong and the
+> measurement was still worth taking (finding 73's 32-bit walk was the first).

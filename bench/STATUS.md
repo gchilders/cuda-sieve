@@ -549,6 +549,18 @@ one-sided-tuning error the finding was written to expose. Corrected in place.)*
 
 ### Performance accounting
 
+**`k_fill_atomic` is L2-bound, measured 2026-08-25 (finding 76).** ncu on a
+5070: L2 throughput 68.7%, DRAM 24.7%, SM throughput 9.4%, IPC 0.22 of 4.0,
+101 warp-cycles per issued instruction. Its theoretical occupancy is 50%,
+capped by `Block Limit SM` = 24 because 32-thread blocks are one warp each --
+not by registers (limit 64) or shared memory (32). **That ceiling is benign.**
+Raising block width to reach 100% occupancy is measurably SLOWER at matched
+total threads (101.84 ms at 32 threads against 106.70 at 64), because extra
+resident warps contend for the resource that is actually scarce. This is the
+opposite character to `k_apply`, which is issue-bound with DRAM at 8.5% and
+where occupancy was worth -12.6% (finding 75). The two large sieve kernels
+need opposite tuning; do not carry a conclusion from one to the other.
+
 Three-to-four-limb Montgomery multiplication expands the CIOS inner product
 from `3*3 = 9` to `4*4 = 16` limb multiply-adds. That suggests roughly a
 1.8–2x cofactor-stage cost from width alone, subject to register pressure. A
@@ -1004,7 +1016,18 @@ absent from every document in the repo.
    two architectures predict differently — Blackwell's flatness fitting "idle
    capacity" and Ada's degradation not. That distinction is gone: at 32 threads
    all three cards flatten, so one prediction covers them all.
-2. **Startup fill autotune.** `--fill-threads` is done; the autotuner is not.
+2. **Startup fill autotune. STRONGER CASE 2026-08-25 (finding 76).** The
+   two-axis sweep that item warned about has now been run on the production
+   shape, and it moved the block default 1152 -> 4608 (**fill -8.6%, wall
+   -5.7%** on c194). It also showed why one constant cannot serve: c147
+   unslabbed prefers MORE blocks than 4608, c147 slabbed prefers 1152, and
+   c194 prefers 4608 -- two of those share a factor base and still disagree on
+   direction. The new default is right for the I16 production class and costs
+   c147-slabbed ~0.8%; the autotuner is what removes that trade entirely. The
+   thread axis needs no sweep: 32 is optimal at every block count measured, and
+   raising it to buy occupancy makes fill slower (see below).
+
+   `--fill-threads` is done; the autotuner is not.
    Sweep both axes, since holding one fixed is how the old default was reached.
    Opt-in for the standalone benchmark, where reproducibility is the point;
    default-on is defensible for `--pipeline`, where a per-job knee cannot be

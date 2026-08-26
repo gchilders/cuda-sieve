@@ -244,7 +244,7 @@ static void usage(void)
 #endif
 "  --threads N      threads per block, multiple of 32  [256]\n"
 "  --blocks N       0 = auto (6 per SM)        [0]\n"
-"  --fill-blocks N  fill only; 0 = auto (1152, absolute -- NOT per SM) [0]\n"
+"  --fill-blocks N  fill only; 0 = auto (4608, absolute -- NOT per SM) [0]\n"
 "  --fill-threads N fill only; 0 = auto (32), else a multiple of 32 in\n"
 "                   [32,1024]. Independent of --threads: fill wants many\n"
 "                   narrow blocks, the other kernels do not.            [0]\n"
@@ -1771,8 +1771,12 @@ static int bench_main_impl(int argc, char **argv)
         /* L2 size rides on the card name, on BOTH branches. The fill geometry
          * is an absolute block count that is the same on every card measured,
          * which is itself the interesting thing -- L2 capacity does not explain
-         * it (finding 51 already killed capacity, and 1152 x 32 fits cards with
-         * 48, 72 and 96 MB alike). It is printed so a sweep log carries the
+         * it (finding 51 already killed capacity, and the 1152 x 32 this
+         * paragraph was written for fit cards with 48, 72 and 96 MB alike).
+         * The count is now 4608 (finding 76, retuned on the c194 production
+         * shape) and that value is measured on a 5070 ONLY, so the
+         * same-on-every-card claim above stands for 1152 and is UNTESTED for
+         * 4608 -- which is a further reason to print it. It is printed so a sweep log carries the
          * number instead of someone reconstructing it later from a card name.
          * Printing it only in the default branch would hide it from exactly the
          * --blocks A/B that wants it -- the defect the paragraph above this

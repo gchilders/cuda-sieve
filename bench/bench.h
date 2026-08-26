@@ -651,9 +651,41 @@ typedef struct {
  * write-combining decay was that finding's surviving candidate, and one
  * geometry fitting cards with 48, 72 and 96 MB of L2 argues against both.
  *
- * Measured at logI 14, J 8192, 8192 buckets, 77.4M records, on k_fill_atomic.
- * The optimum plausibly moves with bucket and record count, which is not yet
- * measured -- override with --fill-blocks/--fill-threads for a new job shape.
+ * The paragraphs above were measured at logI 14, J 8192, 8192 buckets, 77.4M
+ * records, on k_fill_atomic, and warned that "the optimum plausibly moves with
+ * bucket and record count, which is not yet measured". It does, and it has now
+ * been measured: see the next block.
+ *
+ * RETUNED 2026-08-25 (finding 76), 1152 -> 4608, on the PRODUCTION shape --
+ * c194 I16/J32768, 32768 buckets, 4 slabs, RTX 5070 idle, n=4 paired:
+ *
+ *   blocks   1152     2304     4608     9216    18432
+ *   fill    108.34   101.84    99.01    99.85   101.87  ms/q
+ *            (+-1.02)                                    -8.6% at the minimum
+ *
+ * A bracketed interior minimum; sieve -3.9% and wall -5.7%, with the 4608 and
+ * 1152 wall arms NOT overlapping (400.67 worst against 402.91 best). Relations
+ * byte-identical at every point.
+ *
+ * THE THREAD AXIS DID NOT MOVE -- 32 is still right, and for a reason worth
+ * keeping. Occupancy is NOT the lever here. k_fill_atomic is L2-bound (ncu:
+ * L2 68.7%, DRAM 24.7%, SM 9.4%, IPC 0.22 of 4, 101 warp-cycles per issued
+ * instruction), and its 32-thread blocks cap theoretical occupancy at 50% via
+ * Block Limit SM = 24 -- one warp per block, 24 blocks per SM. Raising block
+ * width to reach 100% occupancy makes it SLOWER: at a fixed 73728 threads,
+ * 32/64/128/256 threads measure 101.84 / 106.70 / 105.67 / 107.30 ms. More
+ * resident warps put more concurrent traffic on the constrained resource. The
+ * 50% ceiling is benign; do not "fix" it.
+ *
+ * KNOWN LIMIT OF THIS RETUNE. 1152 was validated on three cards (5070, 4090,
+ * 5090); 4608 is measured on a 5070 only, and only on c194. The c147 shapes
+ * are nearly flat across an 8x block range but do not agree on direction:
+ * unslabbed prefers MORE blocks (-2.9% at 9216, still improving), slabbed
+ * prefers 1152 (+0.8% at 4608, small but ~2.7 sigma). No mechanism explains
+ * why two geometries over the same factor base disagree, so no formula is
+ * offered. This is a better default for the I16 production class, not a
+ * universal optimum -- which is the argument for the startup autotuner in
+ * STATUS item 2, not against it.
  *
  * Applies to k_fill_atomic, the shipping path, and to nothing else by default.
  * k_fill_l1 takes an explicit --fill-blocks but defaults to FILL_L1_BLOCKS
@@ -661,7 +693,7 @@ typedef struct {
  * algorithm in the experimental section and stays on the per-SM grid; pushing
  * an unmeasured constant onto it would be inventing a number. k_fill_l2 is
  * data-driven (one block per super-bucket) and has no grid to tune. */
-#define FILL_BLOCKS_DEFAULT  1152
+#define FILL_BLOCKS_DEFAULT  4608
 #define FILL_THREADS_DEFAULT 32
 /* k_apply's block size. APPLY_THREADS_MAX is NOT a taste limit: it is the first
  * argument of k_apply's __launch_bounds__, which is a hard ceiling -- a launch
