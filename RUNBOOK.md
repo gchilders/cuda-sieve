@@ -484,9 +484,18 @@ prompts, or pass flags for a repeatable run:
 ```sh
 cd bench
 ./testsieve.sh --poly c194.job --fb1 c194.roots1 \
-    --qmin 20000000 --qmax 200000000 --points 5 \
-    --target-rels 300000000 --geom 15,16384 --geom 15,32768
+    --qmin 20 --qmax 200 --points 5 \
+    --target-rels 300 --geom 15,16384 --geom 15,32768
 ```
+
+**`--qmin`, `--qmax` and `--target-rels` are in millions.** That run sieves
+`[2e7, 2e8)` and reports where 3e8 relations are met. Fractions work
+(`--qmin 2.5`), and a value that still looks like an absolute count is
+*rejected* with the translation rather than silently multiplied — the old
+`--qmin 20000000` would otherwise have meant 2e13 and projected a band nobody
+asked for. The units stop there: `--width`, `--rlim` and `--alim` are absolute,
+and so is `bench`'s own `--target-rels`, which is a different flag on a
+different program and unchanged.
 
 Each geometry's block ends with its measured device memory, so the sizing
 question and the yield question are answered by the same run. On the **c183** at
@@ -523,12 +532,57 @@ considering and read the number off.
 
 When `--fb1` is omitted, `fbase` is the managed cache stem. Before sieving,
 the script compares its embedded polynomial, `lim`, and `maxbits` metadata with
-the selected job and geometry, rebuilding it with `fbgen` when it is missing
-or stale. Geometry sweeps use stable per-`logI` names such as `fbase.m15`,
-because prime-power depth is part of the factor base. Supplying `--fb1`, even
-as `--fb1 fbase`, makes that path caller-managed and the script never
-overwrites it. Rebuilds use up to 256 online CPUs by default; use
-`--fb-threads N` to cap that.
+the selected job and geometry, rebuilding it when it is missing or stale.
+Geometry sweeps use stable per-`logI` names such as `fbase.m15`, because
+prime-power depth is part of the factor base. Supplying `--fb1`, even as
+`--fb1 fbase`, makes that path caller-managed and the script never overwrites
+it.
+
+**Rebuilds go to the GPU when `fbgen_gpu` is built.** `--fb-backend` selects
+`gpu`, `cpu`, or `auto` (the default). The two generators are intended to write
+byte-identical files, so the backend is deliberately *not* part of the cache
+identity: the header check is unchanged, and a cache built by either generator
+validates and is reused by the other.
+
+**Know what gates that.** `make fbgpucheck` sweeps polynomial degrees 1..8 and
+the CAP=6/CAP=8 boundary, but only at `--maxbits` 1, 14 and 15. `testsieve.sh`
+accepts `logI` 2..20 and names its caches `fbase.m$logI`, and `oracle/README.md`
+documents `.m16` in active use — so above 15 the byte identity is expectation,
+not gate. Spot checks at maxbits 16, 17 and 20 on c147 came back identical, and
+the header check would not catch it if they ever stopped being. If you are
+mixing generators across a geometry sweep above `logI` 15, build all the caches
+with one backend, or extend `fbgpucheck.sh` past 15. Measured on a 5070, c147 at its job
+`alim` of 3.35e7 and `maxbits` 15 — 2,061,655 entries, 29.4 MB:
+
+| generator | wall | CPU |
+| --- | --- | --- |
+| `fbgen_gpu` | 0.52 s | 0.27 s |
+| `fbgen --threads 16` | 2.75 s | 33.5 s |
+
+and `cmp` on the two files reported no difference. A five-times wall-clock
+saving is not what decides a campaign — this is a one-off of seconds against a run of
+days, and the *point* of moving it is that it stops being a reason to hand-manage
+`--fb1` caches at all — but 33.5 CPU-seconds becoming 0.27 does matter on a
+shared box, and it scales: BOINC-sized limits are 600e6 and up.
+
+`auto` will not start the build itself, because `make fbgen_gpu` is a
+multi-architecture CUDA compile of minutes and this script's unit of work is a
+few seconds a sample point. If the binary is absent it says how to get it
+(`make GPU_ARCH=native fbgen_gpu`) and uses the CPU generator. `--fb-backend
+gpu` is the explicit request: it builds the binary if needed, and if generation
+fails it stops rather than quietly answering with the CPU path. Under `auto` a
+GPU failure — a busy card, no card — falls back and says so, and stays on the
+CPU for every later factor base in the run rather than retrying a card already
+known to be unavailable. `--fb-device N` picks the CUDA device for generation
+(default 0); note it is separate from the device `bench` sieves on, which comes
+through `--extra "--device N"`. `--fb-threads N` caps the CPU generator's
+threads and has no effect on the GPU one; it defaults to the online CPU count
+capped at 256, and a value outside [1,256] is rejected.
+
+Neither backend runs `make`. Build the generator once with `make
+GPU_ARCH=native fbgen_gpu`: a bare `make fbgen_gpu` would rewrite `.arch.stamp`
+to the fat gencode list at Makefile-parse time and silently invalidate every
+CUDA object in a tree built with `GPU_ARCH=native`.
 
 The displayed `n-yield` and every projected quantity use the same
 normalization as `~/code/test-sieve`: expected pairs are `width / ln(q0)`, and

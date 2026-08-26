@@ -199,8 +199,10 @@ current band again.
 - [`bench/testsieve.sh`](bench/testsieve.sh) test-sieves a job at several q,
   normalizes each yield to the expected special-q-pair count, and projects the
   whole run — relations, days, energy, and where a relation target is met —
-  across geometries and factor-base bounds. Run it without arguments for
-  interactive setup.
+  across geometries and factor-base bounds. Its `--qmin`, `--qmax` and
+  `--target-rels` are given in millions (`--qmin 20` is q = 2e7); its managed
+  factor-base cache is rebuilt on the GPU when `fbgen_gpu` is built. Run it
+  without arguments for interactive setup.
 - [`bench/STATUS.md`](bench/STATUS.md) is the current architecture, validation,
   known-defect, and open-experiment summary.
 - [`bench/RESULTS.md`](bench/RESULTS.md) is the chronological benchmark lab

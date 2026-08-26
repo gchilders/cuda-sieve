@@ -7,7 +7,19 @@
 # different binaries and J is fixed at I/2. Ours takes I and J at run time, so
 # geometry is a sweepable axis here, and so are the factor-base bounds.
 #
-# UNITS, STATED ONCE. `bench` processes **(q, rho) pairs** -- one special-q and
+# UNITS, STATED ONCE, TWICE OVER.
+#
+# First, the command line. `--qmin`, `--qmax` and `--target-rels` are given in
+# MILLIONS: `--qmin 20` is q = 20000000 and `--target-rels 300` is 3e8
+# relations. These are the three options whose natural values run to eight and
+# nine digits, and typing them out in full was both tedious and easy to get
+# wrong by a factor of ten. Fractions are allowed (`--qmin 2.5`), and a value
+# that still looks like an absolute count is rejected rather than silently
+# multiplied. Everything else on the command line -- `--width`, `--rlim`,
+# `--alim` -- is an ordinary absolute number, and so is `bench`'s own
+# `--target-rels`, which is a different flag on a different program.
+#
+# Second, the measurement. `bench` processes **(q, rho) pairs** -- one special-q and
 # one root of it. Short q intervals contain a noisy number of those pairs, so
 # raw relation counts (and projections made directly from them) are misleading.
 # As in ~/code/test-sieve, every sample is normalized to the expected number of
@@ -23,12 +35,15 @@ usage: ./testsieve.sh --poly JOB.job [--fb1 FB] [options]
   --poly PATH        the job file (required)
   --fb1 PATH         custom caller-managed algebraic factor base
                      [omit for checked/rebuilt fbase.mLOGI cache]
-  --fb-threads N     threads when rebuilding the default factor base [all CPUs]
-  --qmin N           band start                          [20000000]
-  --qmax N           band end, for the projection        [10 x qmin]
-  --points N         sample points across the band       [5]
-  --width N          q-interval sieved at each point     [2000]
-  --target-rels N    also report where the target is met [job-sized guess off]
+  --fb-backend B     gpu, cpu, or auto: which generator rebuilds the default
+                     factor base                                        [auto]
+  --fb-device N      CUDA device for the GPU factor-base generator        [0]
+  --fb-threads N     CPU-backend threads when rebuilding it, 1..256  [all CPUs]
+  --qmin M           band start, IN MILLIONS                       [20 = 2e7]
+  --qmax M           band end for the projection, IN MILLIONS     [10 x qmin]
+  --points N         sample points across the band                        [5]
+  --width N          q-interval sieved at each point (absolute)        [2000]
+  --target-rels M    also report where the target is met, IN MILLIONS   [off]
   --side a|r         sieve algebraic or rational side              [a]
   --sq-side 1|0      numeric alias for --side (bench convention)
   --geom "logI,J"    geometry to test; repeat for several   [15,16384]
@@ -36,6 +51,19 @@ usage: ./testsieve.sh --poly JOB.job [--fb1 FB] [options]
   --extra "FLAGS"    passed through to bench verbatim
   --keep             keep the relation files and logs
   -i, --interactive  prompt for parameters (no arguments does this too)
+
+--qmin, --qmax and --target-rels are in MILLIONS; --width, --rlim and --alim
+are absolute. `--qmin 20 --qmax 200 --target-rels 300` sieves [2e7, 2e8) and
+reports where 3e8 relations are reached.
+
+--fb-backend auto uses ./fbgen_gpu when it is already built and the CPU
+./fbgen otherwise; the two produce byte-identical files, so a cache built by
+either is valid for the other. Neither setting ever runs `make` -- build the
+generator once with `make GPU_ARCH=native fbgen_gpu`. --fb-backend gpu differs
+from auto only in refusing to fall back to the CPU generator.
+
+The backend is resolved on the first cache that actually needs rebuilding, so a
+run that finds every cache valid neither selects nor mentions a generator.
 
 Each point sieves a WIDTH-wide q interval, so wider costs more and measures
 better; the default holds roughly a hundred (q, rho) pairs at q ~ 2e7, which
@@ -52,7 +80,9 @@ POLY=
 FB=fbase
 FB_MANAGED=1
 FB_THREADS=${FB_THREADS:-}
-QMIN=20000000
+FB_BACKEND=auto
+FB_DEVICE=
+QMIN=20
 QMAX=
 POINTS=5
 WIDTH=2000
@@ -77,6 +107,8 @@ while [ $# -gt 0 ]; do
         --poly) POLY=$2; shift 2 ;;
         --fb1) FB=$2; FB_MANAGED=0; shift 2 ;;
         --fb-threads) FB_THREADS=$2; shift 2 ;;
+        --fb-backend) FB_BACKEND=$2; shift 2 ;;
+        --fb-device) FB_DEVICE=$2; shift 2 ;;
         --qmin) QMIN=$2; shift 2 ;;
         --qmax) QMAX=$2; shift 2 ;;
         --points) POINTS=$2; shift 2 ;;
@@ -122,6 +154,70 @@ canonical_decimal() {
     printf '%s' "$n"
 }
 
+# Scale a millions-denominated option to its absolute value: 20 -> 20000000.
+#
+# Entirely string arithmetic, on purpose. The raw argument is matched against a
+# literal decimal BEFORE anything expands it, for the same reason the integer
+# checks below run before their $(( )): bash arithmetic expands array
+# subscripts, so `--qmin 'a[$(cmd)]'` reaching a $(( )) would execute cmd. It
+# also keeps 2.5 exact, which a float round-trip through awk or python would
+# not guarantee for every input.
+# Divide a decimal string by a million by moving the point, so the hint in the
+# out-of-range message below is the operator's own number translated exactly --
+# fraction included. `20000000.5` must come back as `20.0000005`, not `20`: the
+# whole value of that message is that the suggestion can be pasted verbatim.
+shift_point_left_6() {   # $1 = decimal string, e.g. 500000 or 20000000.5
+    local v=$1 int frac
+    int=${v%%.*}
+    frac=""
+    [ "$v" = "$int" ] || frac=${v#*.}
+    while [ "${#int}" -lt 7 ]; do int="0$int"; done
+    frac="${int: -6}$frac"
+    int=$(canonical_decimal "${int:0:${#int}-6}")
+    while [ -n "$frac" ] && [ "${frac%0}" != "$frac" ]; do frac=${frac%0}; done
+    if [ -z "$frac" ]; then printf '%s' "$int"; else printf '%s.%s' "$int" "$frac"; fi
+}
+
+scale_millions() {   # $1 = option name, for the error text; $2 = raw argument
+    local opt=$1 raw=$2 int frac rest hint scaled
+    if ! [[ "$raw" =~ ^([0-9]+)(\.([0-9]*))?$ ]]; then
+        echo "$opt takes a number in millions, e.g. 20 for 20000000" >&2
+        return 1
+    fi
+    int=$(canonical_decimal "${BASH_REMATCH[1]}")
+    frac=${BASH_REMATCH[3]}
+    # Digits past the millionth have nowhere to go. Silently truncating them
+    # would make 2.0000004 and 2 the same band without saying so.
+    rest=${frac:6}
+    if [[ "$rest" == *[1-9]* ]]; then
+        echo "$opt $raw is not a whole number of units (millions have six decimal places)" >&2
+        return 1
+    fi
+    frac=${frac:0:6}
+    while [ "${#frac}" -lt 6 ]; do frac="${frac}0"; done
+    scaled=$(canonical_decimal "${int}${frac}")
+    # Muscle memory from before this units change is the failure mode that
+    # matters: `--qmin 20000000` would silently become 2e13 and sieve a band
+    # nowhere near the intended one, and every number downstream -- yield,
+    # days, the target crossing -- would be a confident answer to the wrong
+    # question.
+    #
+    # THE TEST IS ON THE SCALED VALUE, not on how many digits were typed. A
+    # digit-count rule has a blind spot exactly one digit wide underneath it:
+    # `--qmin 500000` is six digits, passes such a rule, and means q = 5e11 --
+    # the same mistake, silently accepted. Nothing this script projects reaches
+    # 1e10: q is bounded well under it by lim (a uint32), and a relation target
+    # of ten billion is an order of magnitude past the largest job anyone here
+    # is costing. Past that ceiling it is a units error, not a value.
+    if [ "$scaled" -gt 10000000000 ]; then
+        hint=$(shift_point_left_6 "$raw")
+        echo "$opt $raw is in MILLIONS, so it means $scaled -- past this script's" \
+             "1e10 ceiling. Did you mean $opt $hint?" >&2
+        return 1
+    fi
+    printf '%s' "$scaled"
+}
+
 if [ "$INTERACTIVE" = 1 ]; then
     echo "Interactive test-sieve setup (press Enter to accept a default)."
     POLY=$(prompt_value "Job file" "${POLY:-input.job}")
@@ -132,22 +228,22 @@ if [ "$INTERACTIVE" = 1 ]; then
         FB_MANAGED=0
     fi
     if [ "$FB_MANAGED" = 1 ]; then
+        FB_BACKEND=$(prompt_value "Factor-base generator (gpu/cpu/auto)" "$FB_BACKEND")
         [ -n "$FB_THREADS" ] || FB_THREADS=$(default_fb_threads)
-        FB_THREADS=$(prompt_value "Factor-base build threads" "$FB_THREADS")
+        FB_THREADS=$(prompt_value "Factor-base build threads (CPU backend only)" \
+                                  "$FB_THREADS")
     fi
-    QMIN=$(prompt_value "Band start q" "$QMIN")
-    # Same reason as the validation block below: this $(( )) must not see an
-    # unvalidated answer.
-    if ! [[ "$QMIN" =~ ^[0-9]+$ ]] || [ "$QMIN" -le 1 ]; then
-        echo "qmin must be an integer greater than 1" >&2; exit 2
-    fi
-    QMIN=$(canonical_decimal "$QMIN")
-    qmax_default=${QMAX:-$((QMIN * 10))}
-    QMAX=$(prompt_value "Band end q" "$qmax_default")
+    QMIN=$(prompt_value "Band start q, in millions" "$QMIN")
+    # No arithmetic on the answers here any more. The 10x default for qmax is
+    # deferred to the shared validation block below, which computes it from an
+    # already-scaled qmin, so an empty answer here is not a value to fill in --
+    # it is the default itself, and pressing Enter passes it straight through.
+    read -r -p "Band end q, in millions [${QMAX:-10 x qmin}]: " answer
+    QMAX=${answer:-$QMAX}
     POINTS=$(prompt_value "Sample points" "$POINTS")
-    WIDTH=$(prompt_value "q-interval width per point" "$WIDTH")
+    WIDTH=$(prompt_value "q-interval width per point (absolute)" "$WIDTH")
 
-    read -r -p "Target relations [none]: " answer
+    read -r -p "Target relations, in millions [${TARGET:-none}]: " answer
     TARGET=${answer:-$TARGET}
 
     side_default=a
@@ -176,18 +272,39 @@ fi
 
 if [ -z "$POLY" ] || [ -z "$FB" ]; then usage; exit 2; fi
 [ ${#GEOMS[@]} -gt 0 ] || GEOMS=("15,16384")
-# Validate BEFORE the $(( )) below. Bash arithmetic expands array subscripts,
-# so `--qmin 'a[$(cmd)]'` executes cmd inside $(( )) -- and the ^[0-9]+$ test
-# used to run afterwards, which is too late to matter.
-if ! [[ "$QMIN" =~ ^[0-9]+$ ]] || [ "$QMIN" -le 1 ]; then
-    echo "qmin must be an integer greater than 1" >&2; exit 2
+case "$FB_BACKEND" in
+    gpu|cpu|auto) ;;
+    *) echo "fb-backend must be gpu, cpu, or auto" >&2; exit 2 ;;
+esac
+if [ -n "$FB_DEVICE" ] && ! [[ "$FB_DEVICE" =~ ^[0-9]+$ ]]; then
+    echo "fb-device must be a nonnegative integer" >&2; exit 2
 fi
-QMIN=$(canonical_decimal "$QMIN")
-if [ -n "$QMAX" ] && ! [[ "$QMAX" =~ ^[0-9]+$ ]]; then
-    echo "qmax must be an integer" >&2; exit 2
+[ -z "$FB_DEVICE" ] || FB_DEVICE=$(canonical_decimal "$FB_DEVICE")
+# --fb1 means the caller manages the factor base and this script never
+# generates one, so every generator option is dead. Saying so is the difference
+# between "I asked for the GPU and got it" and "I asked for the GPU and nothing
+# was generated at all", which the exit status cannot distinguish.
+if [ "$FB_MANAGED" = 0 ]; then
+    [ "$FB_BACKEND" = auto ] ||
+        echo "[testsieve] --fb-backend is ignored with --fb1:" \
+             "a caller-managed factor base is never generated" >&2
+    [ -z "$FB_DEVICE" ] ||
+        echo "[testsieve] --fb-device is ignored with --fb1:" \
+             "a caller-managed factor base is never generated" >&2
 fi
-[ -n "$QMAX" ] || QMAX=$((QMIN * 10))
-QMAX=$(canonical_decimal "$QMAX")
+# Scale BEFORE the $(( )) below. scale_millions validates by regex against the
+# raw string, so the qmin it returns is a plain decimal integer by the time the
+# 10x default multiplies it; bash arithmetic expands array subscripts, and
+# `--qmin 'a[$(cmd)]'` reaching a $(( )) would execute cmd.
+QMIN=$(scale_millions --qmin "$QMIN") || exit 2
+if [ "$QMIN" -le 1 ]; then
+    echo "qmin must be greater than 1; got $QMIN" >&2; exit 2
+fi
+if [ -n "$QMAX" ]; then
+    QMAX=$(scale_millions --qmax "$QMAX") || exit 2
+else
+    QMAX=$((QMIN * 10))
+fi
 if [ "$QMAX" -le "$QMIN" ]; then
     echo "qmax must be greater than qmin" >&2; exit 2
 fi
@@ -197,10 +314,9 @@ if ! [[ "$POINTS" =~ ^[0-9]+$ && "$WIDTH" =~ ^[0-9]+$ ]] ||
 fi
 POINTS=$(canonical_decimal "$POINTS")
 WIDTH=$(canonical_decimal "$WIDTH")
-if [ -n "$TARGET" ] && ! [[ "$TARGET" =~ ^[0-9]+$ ]]; then
-    echo "target-rels must be a nonnegative integer" >&2; exit 2
+if [ -n "$TARGET" ]; then
+    TARGET=$(scale_millions --target-rels "$TARGET") || exit 2
 fi
-[ -z "$TARGET" ] || TARGET=$(canonical_decimal "$TARGET")
 for bound_name in RLIM ALIM; do
     bound=${!bound_name}
     if [ -n "$bound" ]; then
@@ -243,6 +359,102 @@ MANAGE_FB=$FB_MANAGED
 declare -A FB_BY_LOGI=() SEEN_LOGI=()
 for geom in "${GEOMS[@]}"; do SEEN_LOGI[${geom%%,*}]=1; done
 
+# WHICH GENERATOR BUILDS THE CACHE. `fbgen_gpu` is the production GPU factor
+# base generator -- the same engine `bench` runs in-process when --fb1 is
+# omitted (bench/FBGEN_GPU.md) -- and its --out file is intended to be
+# byte-identical to native CPU `fbgen` output. That byte identity is what makes
+# this a backend choice rather than a format choice: the cache-header
+# validation below is unchanged, and a cache built by either generator
+# validates and is reused by the other, including across machines.
+#
+# NEITHER SETTING RUNS `make`. An earlier version had --fb-backend gpu build
+# the binary for you, which was worse than it looked: a bare `make fbgen_gpu`
+# parses the Makefile with the default GPU_ARCH=all, and the $(shell ...) at
+# Makefile:124 rewrites .arch.stamp at parse time. Every CUDA object in the
+# tree depends on that stamp, so a tree built the documented fast way
+# (`make GPU_ARCH=native bench`) would be silently invalidated -- the operator
+# asked for a factor base and paid for it with a full multi-architecture
+# rebuild on their next make. Build the generator yourself, once. This script
+# only ever runs it.
+#
+# ONE DECISION, TWO FACTS. FB_BACKEND_USED is which binary runs now and may be
+# demoted at runtime; FB_FALLBACK_OK is policy and is fixed at selection. The
+# earlier code re-read the raw $FB_BACKEND at fallback time, which meant the
+# resolved state and the policy could disagree -- and did: the fallback did not
+# demote, so every later geometry retried a generator already known to fail.
+FB_BACKEND_USED=cpu
+FB_FALLBACK_OK=1
+FB_BACKEND_RESOLVED=0
+select_fb_backend() {
+    FB_BACKEND_RESOLVED=1
+    case "$FB_BACKEND" in
+        cpu) FB_BACKEND_USED=cpu; FB_FALLBACK_OK=1 ;;
+        gpu)
+            [ -x ./fbgen_gpu ] || {
+                echo "--fb-backend gpu needs ./fbgen_gpu, which is not built." >&2
+                echo "Build it with: make GPU_ARCH=native fbgen_gpu" >&2
+                exit 1
+            }
+            FB_BACKEND_USED=gpu
+            FB_FALLBACK_OK=0
+            ;;
+        auto)
+            FB_FALLBACK_OK=1
+            if [ -x ./fbgen_gpu ]; then
+                FB_BACKEND_USED=gpu
+            else
+                FB_BACKEND_USED=cpu
+                echo "[testsieve] ./fbgen_gpu is not built; using the CPU factor-base generator"
+                echo "            (build it once with: make GPU_ARCH=native fbgen_gpu)"
+            fi
+            ;;
+    esac
+}
+
+# One entry point so the cache-rebuild site does not have to know which
+# generator ran. fbgen_gpu stages FILE.part and only atomically replaces FILE
+# on success, so a failure here cannot leave a truncated cache behind for the
+# header check to accept next time.
+#
+# THE BACKEND IS RESOLVED HERE, on the first call, and this function is only
+# called for a cache that is actually stale. Resolving it up front instead put
+# a two-line "fbgen_gpu is not built" advisory at the top of every repeat run
+# whose caches were all valid and whose generators were therefore never going
+# to run -- build advice for a build that would not have been used.
+#
+# The announcement is inside this function for the same reason: printed at the
+# call site it had to name a generator before one had been chosen, and could
+# never reflect a fallback that happens two lines later.
+build_fb() {   # $1 = maxbits (the geometry's logI), $2 = destination file
+    local logI=$1 dest=$2
+    [ "$FB_BACKEND_RESOLVED" = 1 ] || select_fb_backend
+    if [ "$FB_BACKEND_USED" = gpu ]; then
+        echo "[testsieve] rebuilding stale or missing factor base on the GPU: $dest"
+        if ./fbgen_gpu --poly "$POLY" --lim "$EFFECTIVE_ALIM" \
+                --maxbits "$logI" ${FB_DEVICE:+--device "$FB_DEVICE"} \
+                --out "$dest"; then
+            return 0
+        fi
+        # A card that is busy, too small, or absent should not cost the
+        # operator the run: the CPU generator produces the same bytes, just
+        # more slowly. An explicit --fb-backend gpu asked a question that a
+        # silent CPU fallback would answer wrongly, so that one stops.
+        if [ "$FB_FALLBACK_OK" = 0 ]; then
+            echo "fbgen_gpu failed and --fb-backend gpu leaves no fallback" >&2
+            return 1
+        fi
+        # Demote for good. A card that just failed will fail again, and a
+        # geometry sweep would otherwise pay for one doomed CUDA context per
+        # logI and print a GPU banner over CPU work every time.
+        FB_BACKEND_USED=cpu
+        echo "[testsieve] fbgen_gpu failed; falling back to the CPU generator" \
+             "for this and every later factor base" >&2
+    fi
+    echo "[testsieve] rebuilding stale or missing factor base on the CPU: $dest"
+    ./fbgen --poly "$POLY" --lim "$EFFECTIVE_ALIM" \
+        --maxbits "$logI" --threads "$FB_THREADS" --out "$dest"
+}
+
 if [ "$MANAGE_FB" = 1 ]; then
     [ -n "$FB_THREADS" ] || FB_THREADS=$(default_fb_threads)
     if ! [[ "$FB_THREADS" =~ ^[0-9]+$ ]]; then
@@ -252,6 +464,10 @@ if [ "$MANAGE_FB" = 1 ]; then
     if [ "$FB_THREADS" -eq 0 ] || [ "$FB_THREADS" -gt 256 ]; then
         echo "fb-threads must be an integer in [1,256]" >&2; exit 2
     fi
+    # The CPU generator is built unconditionally even when the GPU one will do
+    # the work. It is three C files and a second of compile, it is the fallback
+    # path, and the metadata probe below runs it at lim=2 -- a probe worth no
+    # CUDA context, on a binary that must exist anyway.
     [ -x ./fbgen ] || make fbgen
     [ -x ./fbgen ] || { echo "could not build ./fbgen" >&2; exit 1; }
 
@@ -300,9 +516,7 @@ if [ "$MANAGE_FB" = 1 ]; then
         if [ "$cache_valid" = 1 ]; then
             echo "[testsieve] factor-base cache valid: $cache_fb"
         else
-            echo "[testsieve] rebuilding stale or missing factor base: $cache_fb"
-            ./fbgen --poly "$POLY" --lim "$EFFECTIVE_ALIM" \
-                --maxbits "$logI" --threads "$FB_THREADS" --out "$cache_fb" || exit 1
+            build_fb "$logI" "$cache_fb" || exit 1
         fi
     done
     echo
@@ -319,6 +533,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Echo the ABSOLUTE band, not the millions that were typed. The command line
+# is in millions for the typing; the run is in q, and every other number below
+# -- q0, exp-rel, the target crossing -- is absolute. Printing the scaled value
+# back is also the cheapest confirmation that the units landed as intended.
 echo "[testsieve] $(basename "$POLY")  band [$QMIN, $QMAX)  $POINTS points x ${WIDTH}-wide q intervals"
 echo "            yields normalized to WIDTH/ln(q0) expected (q, rho) pairs"
 echo "            sieve side: $([ "$SQ_SIDE" = 1 ] && echo algebraic || echo rational)"
