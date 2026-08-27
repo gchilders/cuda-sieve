@@ -50,6 +50,8 @@ usage: ./testsieve.sh --poly JOB.job [--fb1 FB] [options]
   --rlim N/--alim N  override the job's factor-base bounds
   --extra "FLAGS"    passed through to bench verbatim
   --keep             keep the relation files and logs
+  --normscan-samples N  (q,rho) drawn for the exact-norm width survey
+                     that runs per geometry before sieving   [400000]
   -i, --interactive  prompt for parameters (no arguments does this too)
 
 --qmin, --qmax and --target-rels are in MILLIONS; --width, --rlim and --alim
@@ -93,6 +95,8 @@ ALIM=
 EXTRA=
 KEEP=0
 GEOMS=()
+NORMSCAN_SAMPLES=400000
+NORMSCAN_FLAGGED=()
 INTERACTIVE=0
 # Only prompt when there is a human to prompt. With stdin closed or redirected
 # -- a Makefile, cron, CI -- every `read` returns EOF instantly, so this used to
@@ -128,6 +132,7 @@ while [ $# -gt 0 ]; do
         --alim) ALIM=$2; shift 2 ;;
         --extra) EXTRA=$2; shift 2 ;;
         --keep) KEEP=1; shift ;;
+        --normscan-samples) NORMSCAN_SAMPLES=$2; shift 2 ;;
         -i|--interactive) INTERACTIVE=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown option $1" >&2; usage; exit 2 ;;
@@ -367,21 +372,60 @@ for geom in "${GEOMS[@]}"; do SEEN_LOGI[${geom%%,*}]=1; done
 # validation below is unchanged, and a cache built by either generator
 # validates and is reused by the other, including across machines.
 #
-# NEITHER SETTING RUNS `make`. An earlier version had --fb-backend gpu build
-# the binary for you, which was worse than it looked: a bare `make fbgen_gpu`
-# parses the Makefile with the default GPU_ARCH=all, and the $(shell ...) at
-# Makefile:124 rewrites .arch.stamp at parse time. Every CUDA object in the
-# tree depends on that stamp, so a tree built the documented fast way
-# (`make GPU_ARCH=native bench`) would be silently invalidated -- the operator
-# asked for a factor base and paid for it with a full multi-architecture
-# rebuild on their next make. Build the generator yourself, once. This script
-# only ever runs it.
+# NEITHER SETTING RUNS `make`, and the advice it prints instead has to name the
+# arch THIS TREE was built for. An earlier version had --fb-backend gpu build
+# the binary: a bare `make fbgen_gpu` parses the Makefile with the default
+# GPU_ARCH=all, and the $(shell ...) at Makefile:124 rewrites .arch.stamp at
+# parse time -- every CUDA object depends on that stamp, so a tree built
+# `make GPU_ARCH=native bench` was silently invalidated and the operator paid
+# for a full fat rebuild on their next make.
+#
+# The printed instruction had the SAME defect pointing the other way: it said
+# `make GPU_ARCH=native fbgen_gpu` unconditionally, which on a default (fat)
+# tree -- what `make all` produces -- rewrites the stamp just as surely.
+# Verified 2026-08-27 on a fat tree: that command moved .arch.stamp from
+# 86f70f29 to 882b8e71, under `make -n`, because the $(shell) runs at parse
+# time whether or not anything is built.
+#
+# gpu_arch_arg reconstructs a GPU_ARCH whose expansion is byte-identical to the
+# stamp, so the suggested command cannot move it. It returns failure rather
+# than guessing when the stamp is missing or unreadable, and the caller then
+# says nothing about arch at all.
 #
 # ONE DECISION, TWO FACTS. FB_BACKEND_USED is which binary runs now and may be
 # demoted at runtime; FB_FALLBACK_OK is policy and is fixed at selection. The
 # earlier code re-read the raw $FB_BACKEND at fallback time, which meant the
 # resolved state and the policy could disagree -- and did: the fallback did not
 # demote, so every later geometry retried a generator already known to fail.
+
+# GPU_ARCH that reproduces the arch this tree was ALREADY built for.
+# .arch.stamp holds the expanded -gencode flags, not the GPU_ARCH value, so this
+# reconstructs a value whose expansion is byte-identical. Prints it (possibly
+# empty, meaning "the default already matches"), or returns 1 when it cannot
+# tell -- callers must then omit the arch rather than guess, because a wrong
+# value rewrites the stamp and invalidates every CUDA object in the tree.
+gpu_arch_arg() {
+    local stamp=.arch.stamp n cc
+    [ -r "$stamp" ] || return 1
+    n=$(tr ' ' '\n' < "$stamp" | grep -c -- '^-gencode$')
+    case "$n" in
+        1)  cc=$(sed -n 's/.*compute_\([0-9][0-9]*\).*/\1/p' "$stamp")
+            [ -n "$cc" ] || return 1
+            printf 'GPU_ARCH=%s ' "$cc" ;;
+        0)  return 1 ;;
+        *)  # >1 gencode can only be the default fat list: GPU_ARCH accepts
+            # all|native|<cc>, and the latter two expand to exactly one.
+            printf '' ;;
+    esac
+}
+
+# The build command to suggest for ./fbgen_gpu, arch-correct for this tree.
+fbgen_gpu_build_hint() {
+    local a
+    if a=$(gpu_arch_arg); then printf 'make %sfbgen_gpu' "$a"
+    else printf 'make fbgen_gpu'; fi
+}
+
 FB_BACKEND_USED=cpu
 FB_FALLBACK_OK=1
 FB_BACKEND_RESOLVED=0
@@ -392,7 +436,7 @@ select_fb_backend() {
         gpu)
             [ -x ./fbgen_gpu ] || {
                 echo "--fb-backend gpu needs ./fbgen_gpu, which is not built." >&2
-                echo "Build it with: make GPU_ARCH=native fbgen_gpu" >&2
+                echo "Build it with: $(fbgen_gpu_build_hint)   (or plain: make all)" >&2
                 exit 1
             }
             FB_BACKEND_USED=gpu
@@ -405,7 +449,7 @@ select_fb_backend() {
             else
                 FB_BACKEND_USED=cpu
                 echo "[testsieve] ./fbgen_gpu is not built; using the CPU factor-base generator"
-                echo "            (build it once with: make GPU_ARCH=native fbgen_gpu)"
+                echo "            (it is part of \`make all\`; to build just it: $(fbgen_gpu_build_hint))"
             fi
             ;;
     esac
@@ -617,6 +661,37 @@ for geom in "${GEOMS[@]}"; do
     [ "$MANAGE_FB" = 0 ] || geom_fb=${FB_BY_LOGI[$logI]}
     area=$(python3 -c "import math;print('2^%.4g'%math.log2((1<<$logI)*$J))")
     printf '  --- logI %s, J %s  (area %s) ---\n' "$logI" "$J" "$area"
+    # Exact-norm width for THIS geometry over the WHOLE projected band, before
+    # any sieving. Per geometry because the answer moves with it -- the 2,1139+
+    # septic needs 250 bits at 15e and 257 at 16e -- and over the whole band
+    # because the overflowing lattices are a ~1e-5 tail: the per-point sieve
+    # windows below are far too short to contain one, and a client in a group
+    # sieve is shorter still. This is the moment the width can still be changed,
+    # since the fix is a rebuild and every client has to carry it.
+    if [ -x ./normscan ]; then
+        NS_OUT=$(./normscan --poly "$POLY" --sq-side "$SQ_SIDE" \
+                     --logI "$logI" --J "$J" --qmin "$QMIN" --qmax "$QMAX" \
+                     --samples "$NORMSCAN_SAMPLES" 2>&1)
+        NS_RC=$?
+        echo "$NS_OUT" | sed 's/^/  /'
+        # ONLY 0 IS A PASS. 2 = will overflow, 3 = too little margin, 1 = the
+        # survey could not run (bad poly, no special-q in range, out of memory),
+        # 64 = bad usage. `-le 1` treated 1 as a pass, so a normscan that failed
+        # to load the polynomial certified the width silently -- the exact
+        # outcome this block exists to prevent. An error is "not surveyed", not
+        # "surveyed and fine".
+        #
+        # None of them aborts the test sieve: the geometry sweep is still worth
+        # having, and refusing to measure would hide the yield numbers that say
+        # whether this geometry is even the one to rebuild for. Recorded and
+        # repeated at the end.
+        if [ "$NS_RC" -ne 0 ]; then
+            ns_why=$(echo "$NS_OUT" | grep -oE '(REFUSE|WARNING).*' | head -1)
+            [ -n "$ns_why" ] || ns_why="normscan could not survey this geometry (exit $NS_RC)"
+            NORMSCAN_FLAGGED+=("logI $logI, J $J: $ns_why")
+        fi
+        echo
+    fi
     printf '  %-12s %-8s %-9s %-10s %-12s %-9s %-8s %-8s %-8s\n' \
            q0 pairs exp-pairs n-yield exp-rel rel/pair ms/pair rel/s board_W
     PREV="$TMP/prev.txt"
@@ -770,6 +845,16 @@ if len(data) > 1:
         print("\n  no board-power samples: the energy columns are not meaningful")
 EOF
 
+if [ "${#NORMSCAN_FLAGGED[@]}" -gt 0 ]; then
+    echo
+    echo "  *** EXACT-NORM WIDTH: these geometries were NOT cleared for this binary:"
+    for f in "${NORMSCAN_FLAGGED[@]}"; do echo "      $f"; done
+    echo "  *** Such special-q are SKIPPED with a warning, and 100 skips ends the"
+    echo "  *** run: a REFUSE here costs relations at best and a stopped band at"
+    echo "  *** worst. The fix is a rebuild, so it has to happen before work is"
+    echo "  *** distributed -- a client cannot rebuild itself."
+    [ "$projection_status" -ne 0 ] || projection_status=4
+fi
 echo
 echo "--- $(basename "$POLY") (source job plus selected sieve side) ---"
 cat -- "$POLY" || [ "$projection_status" -ne 0 ] || projection_status=1

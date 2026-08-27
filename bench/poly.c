@@ -734,10 +734,25 @@ void norm_setup(norm_t *N, const poly_t *P, const qlat_t *L,
      * reduces without the skew at q=10^8 has to be able to say so. The zero-term
      * and deg-1 filters above are what make it quiet; the gate would have made
      * it silent. */
-    if (nclamp && P->deg > 1)
-        printf("  ** q=%llu algebraic (deg %d): %d normalised term(s) flushed"
-               " to zero -- terms are unbalanced **\n",
-               (unsigned long long)L->q, P->deg, nclamp);
+    /* RATE-LIMITED, because the caller may not be a band loop. This fires per
+     * norm_setup call and is deliberately not gated on norm_verbose (above), so
+     * on a job where it fires at all it fires on EVERY q: a long band prints it
+     * millions of times, and normscan -- which calls norm_setup twice per
+     * sample, 800,000 times at the default --samples -- would bury its own
+     * verdict under it, into a shell variable testsieve captures whole. A
+     * handful of instances proves the defect; the rest are noise. The counter
+     * is per-process and never reset, which is what makes the bound hold. */
+    if (nclamp && P->deg > 1) {
+        static int nclamp_reported = 0;
+        enum { NCLAMP_REPORT_MAX = 5 };
+        if (nclamp_reported < NCLAMP_REPORT_MAX) {
+            printf("  ** q=%llu algebraic (deg %d): %d normalised term(s)"
+                   " flushed to zero -- terms are unbalanced **\n",
+                   (unsigned long long)L->q, P->deg, nclamp);
+            if (++nclamp_reported == NCLAMP_REPORT_MAX)
+                printf("  ** (further unbalanced-term warnings suppressed) **\n");
+        }
+    }
     if (!norm_verbose) return;
     printf("  norm setup: deg %d, A=%.4e B=%.4e, log2(maxnorm)=%.2f, scale=%.3f%s\n",
            P->deg, A, B, N->log2M - N->bias, N->scale,
@@ -834,5 +849,5 @@ void qlat_build(qlat_t *L, uint64_t q, uint64_t rho, double skew)
             b0 -= m * a0; b1 -= m * a1;
         }
     }
-    L->a0 = a0; L->a1 = a1; L->b0 = b0; L->b1 = b1; L->q = q;
+    L->a0 = a0; L->a1 = a1; L->b0 = b0; L->b1 = b1; L->q = q; L->rho = rho;
 }

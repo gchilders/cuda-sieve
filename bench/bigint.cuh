@@ -1,18 +1,52 @@
 /* Fixed-width big integers for exact norms and trial division.
  *
- * WHY 256 BITS. Measured on the real lattice for this job (q=120000053,
- * rho=112625526, skew 1.154e8), over the corners of the sieve area plus 20K
- * interior points:
+ * WHY 384 BITS, AND WHY IT IS A KNOB. The width is BN_LIMBS 32-bit limbs, set
+ * by the Makefile variable of the same name; 12 limbs = 384 bits is the
+ * default. Nothing here assumes a particular value beyond an even limb count
+ * (cf_bn_divmod_u64 steps the array in 64-bit pairs).
  *
- *     max |a| = 41 bits      max |F(a,b)| = 224 bits
- *     max |b| = 15 bits      max |G(a,b)| = 132 bits
+ * 8 limbs was the original width, measured on a quintic: over the corners of
+ * the sieve area plus 20K interior points at q=120000053, rho=112625526,
+ * skew 1.154e8, max |F(a,b)| was 224 bits and the largest individual
+ * homogeneous term c_k a^k b^(5-k) also 224, so a 6-term sum stayed under 227
+ * and 256 bits left ~28 spare.
  *
- * and the largest individual homogeneous term c_k a^k b^(5-k) is also 224 bits,
- * so a 6-term sum stays under 227. Eight 32-bit limbs give 256, i.e. ~28 bits
- * of headroom over the worst term. That headroom is a property of THIS
- * polynomial and lattice shape, not a general guarantee -- `bn_mul_u64`
- * reports overflow rather than wrapping so a different job cannot corrupt a
- * norm silently.
+ * That headroom was a property of THAT polynomial. A large octic blows it:
+ * for the Cunningham 2,1139+ SNFS form (deg 8, skew 1.256) the exact algebraic
+ * norm runs 232-292 bits depending on the q-lattice, and the tail is driven by
+ * the SHAPE of the reduced basis rather than by the sieve area -- shrinking
+ * logI/J does not escape it, and neither does a tighter estimate, since
+ * norm_exact_bound_bits sits only 2-3 bits above the true maximum term.
+ * Measured: a 2000-q band at 8 limbs died after 116 q needing 260.75 bits,
+ * having written no relations, and could not resume past that q because the
+ * checkpoint names it. The same band at 12 limbs completed, and all 4015
+ * relations rebuilt both norms exactly.
+ *
+ * WHAT THE EXTRA LIMBS COST, measured A/B on AS276 (C208, deg 5, logI 15,
+ * three runs each): the norm-and-trial-division kernel goes 1.138 -> 1.593 ms
+ * (+40%) and the warp recorder 0.234 -> 0.284 ms (+21%), which is +0.45 ms on
+ * a 90 ms special-q -- under the +-0.8 ms run-to-run spread of the wall clock.
+ * Registers go 58 -> 78 on k_td and 68 -> 80 on k_td_record_warp with NO spill,
+ * and k_apply, k_classify, k_cof_enqueue and k_rel_pack are untouched. The
+ * divide-down does not scale with BN_LIMBS at all, because td_divide_out loops
+ * on bn_top: the added limbs are leading zeros and are skipped.
+ *
+ * MEMORY, which the timing A/B does not show. sizeof(bn_t) goes 32 -> 48 bytes
+ * and it is allocated per survivor (d_cof[2]) and per candidate (d_ccof[2] plus
+ * the pinned h_ccof[2]), so the cost scales with the survivor count, not with
+ * the band. Measured on AS276 at 39,042 survivors/q the growth is ~2 MB and
+ * both widths report the same `trial division context 0.09 GB` and `cofactor
+ * queue 0.15 GB`. A job with far more survivors per q would see proportionally
+ * more, and the pipeline's steady-state figure is what operators size cards
+ * from, so re-measure rather than assume it stays invisible.
+ *
+ * A WIDER BUILD MUST BE BYTE-IDENTICAL on any job the narrower one could run.
+ * Every value that fit is represented identically, so this is a real gate, and
+ * it is the one that qualified 12 limbs: same relation file md5, same survivor,
+ * candidate and split/dead/stuck counts as the 8-limb binary on AS276.
+ *
+ * `bn_mul_u64` reports overflow rather than wrapping, so a job too big for
+ * whatever width was built cannot corrupt a norm silently.
  *
  * WHY MAGNITUDE + SIGN rather than two's complement. Trial division is the
  * only consumer, and it divides magnitudes; a sign-magnitude representation
@@ -32,7 +66,47 @@
  * here rather than relying on an includer having pulled platform.h in. */
 #include "platform.h"
 
-#define BN_LIMBS 8                      /* 8 x 32 = 256 bits */
+#ifndef BN_LIMBS
+#define BN_LIMBS 12                     /* 12 x 32 = 384 bits */
+#endif
+#if (BN_LIMBS) < 4 || (BN_LIMBS) > 16 || ((BN_LIMBS) & 1)
+#error "BN_LIMBS must be an even limb count in 4..16 (cf_bn_divmod_u64 steps in 64-bit pairs)"
+#endif
+
+/* Bytes bn_to_dec needs, including the NUL. 32 bits is 9.633 decimal digits,
+ * so ten per limb is a bound with room to spare. NOT a literal 80: that was
+ * sized for 256 bits (78 digits) and silently became a stack overrun the
+ * moment the width moved -- 384 bits is 116 digits. Only cofactors, which are
+ * bounded by mfb, reach it today, which is exactly why it would not have
+ * failed in testing. */
+#define BN_DEC_MAX (BN_LIMBS * 10 + 2)
+
+/* Narrowest build width that would hold a `bits`-bit magnitude, for the
+ * "rebuild with make BN_LIMBS=N" advice on the refusal paths. Returns 0 when
+ * no legal width suffices, so a caller does not print an instruction the
+ * Makefile would reject.
+ *
+ * floor(bits/32) + 1, THEN rounded up to even -- not ceil(bits/32). The
+ * distinction only shows at an exact multiple of 32, and there ceil is wrong:
+ * norm_fits_exact demands a strict `bits < 32*L`, so a 256.0-bit norm does NOT
+ * fit 8 limbs and advising 8 would send the operator through a nine-minute
+ * rebuild back to the same refusal. Even because cf_bn_divmod_u64 steps the
+ * limb array in 64-bit pairs. */
+static inline int bn_limbs_for_bits(double bits)
+{
+    int L;
+    if (!(bits >= 0.0)) return 0;               /* NaN included */
+    /* MATCH norm_fits_exact's PREDICATE, which is `bound + 1e-3 < 32*L`
+     * (poly.c) -- the millibit keeps a downward rounding of the float log2M
+     * from certifying a width that does not hold. Sizing against the bare
+     * bound instead returned the width the caller already has whenever bits
+     * landed in [32L - 1e-3, 32L): the refusal message then said "rebuild with
+     * BN_LIMBS=12" to an operator already running 12 limbs. */
+    bits += 1e-3;
+    if (bits >= 32.0 * 16) return 0;
+    L = ((int)(bits / 32.0) + 2) & ~1;
+    return (L < 4) ? 4 : L;
+}
 
 #if defined(__CUDACC__)
 #define BN_FN __host__ __device__ static inline
@@ -291,10 +365,10 @@ static inline int bn_from_dec(bn_t *x, const char *s, int *sign_out)
     return 0;
 }
 
-/* Writes into buf (needs 80 bytes for 256 bits) and returns it. */
+/* Writes into buf, which must hold BN_DEC_MAX bytes, and returns it. */
 static inline char *bn_to_dec(const bn_t *x, char *buf)
 {
-    char tmp[80];
+    char tmp[BN_DEC_MAX];
     int n = 0;
     bn_t w = *x;
     if (bn_is_zero(&w)) { buf[0] = '0'; buf[1] = 0; return buf; }

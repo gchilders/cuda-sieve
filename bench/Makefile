@@ -161,6 +161,29 @@ CF_LMAX_STAMP := .cflmax.stamp
 $(shell [ "$$(cat $(CF_LMAX_STAMP) 2>/dev/null)" = '$(CF_LMAX)' ] || printf '%s' '$(CF_LMAX)' > $(CF_LMAX_STAMP))
 CF_LMAX_DEF := -DCF_LMAX=$(CF_LMAX)
 
+# Width of the exact-norm big integer, in 32-bit limbs. 12 = 384 bits. 8 (256)
+# was the previous default and covers the quintic/sextic corpus with ~28 bits
+# to spare, but a large octic needs 232-292 depending on the q-lattice and dies
+# mid-band without them. See "WHY 384 BITS" in bigint.cuh for the measurement
+# and for what the extra limbs cost.
+#
+# ITS OWN VARIABLE, NOT A DEFS VALUE, for the reason spelled out for CF_LMAX
+# above: DEFS marks a PRICING build and bench refuses to emit relations from
+# one. This changes only the declared width of a magnitude type -- every value
+# that fit the narrower build is represented identically in the wider one, and
+# trial division loops on bn_top rather than on BN_LIMBS -- so a wider binary
+# is shippable and must produce byte-identical relations on any job that ran
+# in the narrower one. That equality is the A/B gate for this knob.
+#
+# Even values only: cf_bn_divmod_u64 steps the limb array in 64-bit pairs.
+BN_LIMBS ?= 12
+ifeq ($(filter 4 6 8 10 12 14 16,$(BN_LIMBS)),)
+$(error BN_LIMBS must be an even limb count in 4..16 -- got "$(BN_LIMBS)")
+endif
+BN_LIMBS_STAMP := .bnlimbs.stamp
+$(shell [ "$$(cat $(BN_LIMBS_STAMP) 2>/dev/null)" = '$(BN_LIMBS)' ] || printf '%s' '$(BN_LIMBS)' > $(BN_LIMBS_STAMP))
+CF_LMAX_DEF += -DBN_LIMBS=$(BN_LIMBS)
+
 # Optional BOINC application build.  Keep BOINC dependencies out of the default
 # executable; HAVE_BOINC=1 adds the compile-time API gate and the libraries.
 # BOINC_CPPFLAGS should point at directories containing boinc_api.h and its
@@ -260,7 +283,7 @@ $(shell { [ -f $(DEFS_STAMP) ] && [ "$$(cat $(DEFS_STAMP))" = '$(DEFS)' ]; } || 
 # without going through $(OBJS). Those two escaped the stamp, so
 # `make DEFS=... dumpcmp` reported "up to date" and linked a binary built
 # without the define -- the exact hole the stamp exists to close.
-$(OBJS) $(TEST_OBJS): $(DEFS_STAMP) $(CF_LMAX_STAMP)
+$(OBJS) $(TEST_OBJS): $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
 
 GIT_STAMP := .git.stamp
 GIT_RAW  := $(shell git -C . describe --always --abbrev=8 2>/dev/null)
@@ -279,7 +302,22 @@ LINK_STAMP := .link.stamp
 LINK_SIGNATURE := CUDART_LINK=$(CUDART_LINK)
 $(shell [ "$$(cat $(LINK_STAMP) 2>/dev/null)" = '$(LINK_SIGNATURE)' ] || printf '%s' '$(LINK_SIGNATURE)' > $(LINK_STAMP))
 
-all: bench fbtest fbgen sqgentest dumpcmp mkcofbatch
+# fbgen_gpu IS in `all`, and normscan with it. Both were left out on the
+# reasoning that bench already compiles fbgen_gpu.cu as fbgen_gpu_lib.o, so
+# building the standalone tool compiles that translation unit twice -- true, but
+# it reasons about SERIAL cost, and the second compile is not on the critical
+# path. Measured 2026-08-27, clean tree, -j8:
+#
+#     make -j8 all              667.1 s
+#     make -j8 all fbgen_gpu    648.6 s     <- marginal cost -18.5 s, i.e. noise
+#
+# fbgen_gpu.o is ~105 s and disappears inside bench_kernels.o's ~750 s ptxas
+# window. Leaving it out bought nothing and cost every fresh clone the slower
+# factor-base path (10.6 s vs 3.4 s at alim 200M, 16 threads vs the GPU), plus a
+# testsieve message telling the operator to run `make GPU_ARCH=native
+# fbgen_gpu`, which on a default fat tree rewrites .arch.stamp and invalidates
+# every CUDA object -- the exact hazard that message exists to avoid.
+all: bench fbtest fbgen fbgen_gpu sqgentest normscan dumpcmp mkcofbatch
 
 # -ldl for runlog.o, which dlopen()s libnvidia-ml at run time rather than
 # linking it: the heartbeat's GPU columns must not become a build dependency,
@@ -305,20 +343,19 @@ fbgen: fbgen.c poly.o primes.o
 	$(CC) $(CFLAGS) -o $@ fbgen.c poly.o primes.o -lm -pthread
 
 # Standalone GPU factor-base generator and benchmark.  It can either price the
-# ordinary-root kernels or write a reusable native roots file with --out.  Keep
-# it out of `all` because bench already compiles the same CUDA translation unit
-# as fbgen_gpu_lib.o; users who want the cached-file utility can build this
-# target explicitly without forcing every production build to compile it twice.
+# ordinary-root kernels or write a reusable native roots file with --out.
+# In `all` since 2026-08-27; see the note there for why compiling this
+# translation unit twice turned out to be free.
 fbgen_gpu: fbgen_gpu.o fbgen_lib.o fb_load.o fb_cado.o poly.o primes.o platform.o $(ARCH_STAMP) $(LINK_STAMP)
 	$(NVCC) $(NVCC_ARCH) --cudart $(CUDART_LINK) -o $@ \
 		fbgen_gpu.o fbgen_lib.o fb_load.o fb_cado.o poly.o primes.o platform.o -lm
 
-fbgen_gpu.o: $(ARCH_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP)
+fbgen_gpu.o: $(ARCH_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
 
 # Same CUDA root generator, linked into production bench without the standalone
 # benchmark main().  The generated algebraic FB is now the pipeline default
 # when no --fb1/--cadofb file is supplied.
-fbgen_gpu_lib.o: fbgen_gpu.cu bench.h $(ARCH_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP)
+fbgen_gpu_lib.o: fbgen_gpu.cu bench.h $(ARCH_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
 	$(NVCC) $(NVCC_FLAGS) -DFBGEN_GPU_LIBRARY -c $< -o $@
 
 # The same exact root finder drives on-the-fly special-q generation in bench.
@@ -332,20 +369,26 @@ fbgen_lib.o: fbgen.c bench.h
 sqgentest: sqgentest.c fbgen_lib.o poly.o primes.o
 	$(CC) $(CFLAGS) -Wl,--gc-sections -o $@ $^ -ldl -lm
 
-dumpcmp: dumpcmp.c $(DEFS_STAMP) $(CF_LMAX_STAMP)
+# Planning-time norm-width survey. Same objects the siever uses -- sqgen for
+# (q,rho), qlat_build/norm_setup for the bound -- so it cannot drift from what
+# pipe_side_prepare_q will actually enforce. CPU only, no CUDA.
+normscan: normscan.c fbgen_lib.o poly.o primes.o $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
+	$(CC) $(CFLAGS) -Wl,--gc-sections -o $@ normscan.c fbgen_lib.o poly.o primes.o -ldl -lm
+
+dumpcmp: dumpcmp.c $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
 # CPU-only checkpoint-format gate. In particular, BOINC output paths may
 # contain whitespace after filename resolution, so candidate identity must not
 # depend on the checkpoint parser's ordinary whitespace tokenisation.
-ckpttest: ckpttest.c ckpt.h bench.h platform.o $(DEFS_STAMP) $(CF_LMAX_STAMP)
+ckpttest: ckpttest.c ckpt.h bench.h platform.o $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
 	$(CC) $(CFLAGS) -o $@ ckpttest.c platform.o -ldl -lm
 
-stoptest: stoptest.c platform.h platform.o $(DEFS_STAMP) $(CF_LMAX_STAMP)
+stoptest: stoptest.c platform.h platform.o $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
 	$(CC) $(CFLAGS) -o $@ stoptest.c platform.o -ldl -lm
 
 # joins the two per-side --emit-cof files into cofactorisation batch input
-mkcofbatch: mkcofbatch.c $(DEFS_STAMP) $(CF_LMAX_STAMP)
+mkcofbatch: mkcofbatch.c $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
 %.o: %.cu
@@ -360,7 +403,7 @@ mkcofbatch: mkcofbatch.c $(DEFS_STAMP) $(CF_LMAX_STAMP)
 -include $(OBJS:.o=.d) $(TEST_OBJS:.o=.d) fbgen_gpu.d
 
 clean:
-	rm -f bench fbtest fbgen fbgen_gpu sqgentest dumpcmp mkcofbatch ckpttest stoptest slabtest *.o *.d $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP) $(GIT_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP)
+	rm -f bench fbtest fbgen fbgen_gpu sqgentest normscan dumpcmp mkcofbatch ckpttest stoptest slabtest *.o *.d $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP) $(GIT_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
 
 .PHONY: all clean check ckptcheck stopcheck cofcheck fbgencheck fbgpucheck sqgencheck walkcheck slabcheck
 

@@ -1397,7 +1397,7 @@ static int td_gate_cofactors_part(const char *path, uint32_t n,
         if (lo == tab + n || lo->a != key.a || lo->b != key.b) { absent++; continue; }
         found++;
         {
-            char buf[80];
+            char buf[BN_DEC_MAX];
             bn_to_dec(&hcof[lo->idx], buf);
             if (!strcmp(buf, side ? c1 : c0)) match++;
             else if (match + 8 > found)      /* show the first few only */
@@ -1891,7 +1891,7 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
 
             if (cfg->emit_cof && !fo) { perror(cfg->emit_cof); rc = -1; }
             else if (fo) {
-                char buf[80];
+                char buf[BN_DEC_MAX];
                 for (uint32_t k = 0; k < n; k++) {
                     int64_t a = ha[k], b = hb[k];
                     if (b < 0) { a = -a; b = -b; }
@@ -2034,10 +2034,16 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     memset(&N, 0, sizeof(N));
     norm_setup(&N, POLY, L, cfg->logI, cfg->J, cfg->scale, cfg->side == 1);
     if (cfg->td && !norm_fits_exact(&N, BN_LIMBS * 32)) {
-        fprintf(stderr,
-                "  exact degree-%d norm may require %.2f bits;"
+        const double bits = norm_exact_bound_bits(&N);
+        const int need = bn_limbs_for_bits(bits);
+        fprintf(stderr, "  exact degree-%d norm may require %.2f bits;"
                 " the trial-division type holds %d\n",
-                POLY->deg, norm_exact_bound_bits(&N), BN_LIMBS * 32);
+                POLY->deg, bits, BN_LIMBS * 32);
+        if (need)
+            fprintf(stderr, "  rebuild with `make BN_LIMBS=%d`\n", need);
+        else
+            fprintf(stderr, "  no supported BN_LIMBS is wide enough"
+                    " (the maximum is 16, i.e. 512 bits)\n");
         return -1;
     }
 

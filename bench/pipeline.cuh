@@ -310,6 +310,28 @@ done:
     return rc;
 }
 
+/* pipe_side_prepare_q's third return value: this special-q cannot be sieved at
+ * this build's BN_LIMBS, but the band continues. Negative values stay reserved
+ * for real failures, so `< 0` remains "the band is over". An enum, not a
+ * #define, so it does not leak an unscoped macro out of this header. */
+enum { PIPE_Q_SKIP = 1 };
+
+/* Skips that end the run. Past this the build is simply too narrow for the job
+ * and the band would emit systematically deficient output; ./normscan says so
+ * up front and names the width to rebuild with.
+ *
+ * An ABSOLUTE count, and deliberately so: a build that normscan has cleared for
+ * the band should skip ZERO q, because the projection sits well under the limit.
+ * Any skip at all means the width was chosen without the survey or the band
+ * moved; a hundred means it was chosen wrongly. Note the two ways this net has
+ * holes -- nqskip is not checkpointed, so a resumed band starts counting again,
+ * and a work unit of a few hundred q can never reach the cap. Both are
+ * acceptable only because normscan is supposed to make the whole situation
+ * unreachable; neither should be relied on as the primary defence. */
+#ifndef PIPE_SKIP_MAX
+#define PIPE_SKIP_MAX 100
+#endif
+
 /* Per-special-q work that is independent of the slab: transform the small
  * line-sieve tables, set up the norm over the FULL J range, and transform the
  * bucketed factor base once.  In SLABBED mode k_transform also seeds the first
@@ -325,6 +347,9 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
     uint16_t *tlp = NULL;
     double h0 = host_ms();
     int rc = -1;
+    /* PIPE_Q_SKIP is a THIRD outcome, distinct from both success and failure:
+     * this one special-q cannot be sieved at this build's width, but the band
+     * can continue past it. See the norm-width check below. */
 
 #define PERQ_CK(x) do { if (CUDA_CHECKED(x)) goto done; } while (0)
     if (cfg->small_sieve && fbs && fbs->n) {
@@ -406,10 +431,53 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
         {
             const double bits = norm_exact_bound_bits(&S->N);
             if (!norm_fits_exact(&S->N, BN_LIMBS * 32)) {
-                fprintf(stderr,
-                        "  exact side-%d degree-%d norm may require %.2f bits;"
-                        " the trial-division type holds %d\n",
-                        side, P.deg, bits, BN_LIMBS * 32);
+                /* SKIP THIS q, DO NOT KILL THE BAND.
+                 *
+                 * Aborting here was strictly the worst option available. It is
+                 * not even a clean stop: the checkpoint records the failing
+                 * (q,rho), so "rerun to resume" returns to this exact q and the
+                 * band can never advance -- and under BOINC the work unit fails,
+                 * is reissued, and fails identically on the next client. Against
+                 * that, one special-q out of the tens of millions in a band is a
+                 * rounding error in yield.
+                 *
+                 * WHAT THIS COSTS, because it is not free. "A wider build is
+                 * byte-identical to a narrower one on any job the narrower one
+                 * could run" was true before this change, and it is the property
+                 * that qualified BN_LIMBS 12 -- the 8- and 12-limb relation files
+                 * were diffed. Skipping weakens it to "byte-identical on any job
+                 * normscan clears at the narrower width", which is still
+                 * checkable, but only because normscan now exists to certify that
+                 * condition up front. Do not weaken it further.
+                 *
+                 * Loud, counted, and fatal in bulk: every skip prints, the total
+                 * lands in the band summary, and PIPE_SKIP_MAX of them ends the
+                 * run. A hundred skips is not a tail any more, it is the wrong
+                 * build for the job, and quietly emitting a whole band of
+                 * deficient output would be worse than stopping. */
+                const int need = bn_limbs_for_bits(bits);
+                /* NAMES rho, NOT JUST q. A q carries up to deg roots and it is
+                 * the (q,rho) LATTICE that overflows, not the q: on the 2,1139+
+                 * octic, (600002827, 369315816) needs 260.75 bits while
+                 * (600002827, 272545945) needs 238.20 and sieves normally.
+                 * Printing q alone leaves no way to reproduce or exclude the
+                 * pair -- and the log position cannot supply it either, because
+                 * this goes to stderr unbuffered while the per-q sieve lines go
+                 * to stdout block-buffered, so in a redirected run this line
+                 * surfaces above its own iteration's header. */
+                runlog_warn("  ** SKIPPED q=%llu rho=%llu: exact side-%d"
+                            " degree-%d norm may require %.2f bits; the"
+                            " trial-division type holds %d",
+                            (unsigned long long)L->q,
+                            (unsigned long long)L->rho, side, P.deg, bits,
+                            BN_LIMBS * 32);
+                if (need)
+                    runlog_warn("     rebuild with `make BN_LIMBS=%d` to sieve it"
+                                " (run ./normscan over the band first)", need);
+                else
+                    runlog_warn("     no supported BN_LIMBS is wide enough"
+                                " (the maximum is 16, i.e. 512 bits)");
+                rc = PIPE_Q_SKIP;
                 goto done;
             }
         }
@@ -1204,6 +1272,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     unsigned long long *d_pre = NULL;
     uint64_t est1, est0, est;
     uint32_t cap, nqdone = 0, bound1 = 0, bound0 = 0;
+    unsigned long long nqskip = 0;   /* special-q passed over on norm width */
     size_t optin_smem_limit = 0;
     double acc_isect = 0, acc_host = 0, acc_wall = 0;
     /* The three sieve stages, broken out because the band total alone cannot be
@@ -1552,7 +1621,6 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             }
         }
         cur = &checked;
-        last_q = *cur;
 
         /* A cofactor queue can first fill in slab 1, 2, ... of q0. Such a
          * flush contains a partial q and is not a resume point. Seed a safe
@@ -1613,14 +1681,52 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                    (unsigned long long)cur->q,
                    (unsigned long long)cur->rho);
 
-        if (pipe_side_prepare_q<SLABBED>(fb1, fbs1, &Lq, POLY, cfg, 1,
-                                              cfg->scale, blocks, &S1,
-                                              &ts1[0], &th1) ||
-            pipe_side_prepare_q<SLABBED>(fb0, fbs0, &Lq, POLY, cfg, 0,
-                                              cfg->scale0, blocks, &S0,
-                                              &ts0[0], &th0) ||
-            pipe_td_prepare_q(&C, fbs1, fbs0, &Lq, cfg, &tm)) {
-            rc = -1; break;
+        {
+            /* SHORT-CIRCUITS ON FAILURE, like the `||` chain this replaced.
+             * Running side 0 after side 1 has already failed launches more CUDA
+             * work against a sticky error, and CUDA_CHECKED then reports side 0
+             * for side 1's fault. A SKIP short-circuits too -- one side being
+             * unfittable is enough to pass over the q, and the warning naming
+             * the side has already been printed by the side that raised it. */
+            const int p1 = pipe_side_prepare_q<SLABBED>(fb1, fbs1, &Lq, POLY, cfg, 1,
+                                                        cfg->scale, blocks, &S1,
+                                                        &ts1[0], &th1);
+            const int p0 = (p1 != 0) ? p1
+                         : pipe_side_prepare_q<SLABBED>(fb0, fbs0, &Lq, POLY, cfg, 0,
+                                                        cfg->scale0, blocks, &S0,
+                                                        &ts0[0], &th0);
+            if (p1 == PIPE_Q_SKIP || p0 == PIPE_Q_SKIP) {
+                if (++nqskip >= (unsigned long long)PIPE_SKIP_MAX) {
+                    /* A POLICY STOP, NOT A CRASH. Falling out with rc = -1
+                     * skipped the post-loop cofactor flush (guarded on rc == 0)
+                     * and threw away every relation queued since the last one,
+                     * then reported the band as FAILED with no checkpoint. This
+                     * is a deliberate stop on a known condition, so it drains
+                     * and checkpoints exactly like the stop-file path. */
+                    runlog_warn("  ** %llu special-q skipped for norm width;"
+                                " this build is too narrow for the job."
+                                " Run ./normscan and rebuild.", nqskip);
+                    if (cfg->cofactor && Q.n &&
+                        cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim,
+                                   cfg->lpb, cfg->cof_rounds, cfg->cof_budget,
+                                   blocks, cfg->threads, fr)) { rc = -1; break; }
+                    pipe_try_checkpoint(POLY, cfg, &ck, fr, fc, cur,
+                                        base_rel + (cfg->cofactor ? Q.nrel
+                                            : (unsigned long long)acc_rel),
+                                        base_nq + nqdone, &ckpt_written,
+                                        &ckpt_warned);
+                    stopped = 1;
+                    break;
+                }
+                continue;              /* next q; nqdone is not incremented */
+            }
+            if (p1 < 0 || p0 < 0 || pipe_td_prepare_q(&C, fbs1, fbs0, &Lq, cfg, &tm)) {
+                rc = -1; break;
+            }
+            /* AFTER the skip check, not before: last_q names the band's final
+             * progress point and feeds the BOINC fraction, and a skipped q was
+             * never sieved. */
+            last_q = *cur;
         }
 
         /* Only the area-dependent part lives inside this loop. For
@@ -1667,7 +1773,13 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             tv_before = tv;
             {
                 uint32_t n = 0;
-                const int do_verify = qi == 0 && cfg->td_verify && hn_s != 0 &&
+                /* nqdone, NOT qi: these gates run on the first q actually
+                 * SIEVED. Keyed on the loop index they were silently disabled
+                 * for the whole band by a single skipped q at qi == 0 --
+                 * --cofgate would then report success having never found any
+                 * reference overlap, and --td-verify would reconstruct nothing
+                 * while still reporting a pass. */
+                const int do_verify = nqdone == 0 && cfg->td_verify && hn_s != 0 &&
                     (!td_verified || cfg->cofgate);
                 if (pipe_td_perq<SLABBED>(&C, &Lq, cfg, &S1, &S0, d_two, xmax,
                                           j_base, blocks, cfg->threads, do_verify,
@@ -1675,7 +1787,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                                           !want_host, cofgate_found)) {
                     rc = -1; break;
                 }
-                if (qi == 0 && cfg->td_verify && !td_verified && hn_s != 0)
+                if (nqdone == 0 && cfg->td_verify && !td_verified && hn_s != 0)
                     td_verified = 1;
                 if (n != hn_s) {
                     fprintf(stderr,
@@ -1734,7 +1846,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 const uint32_t *f0 = C.h_cfac[0] + (size_t)k * TD_FMAX;
                 const uint32_t *f1 = C.h_cfac[1] + (size_t)k * TD_FMAX;
                 const int b0 = C.h_cbits[0][k], b1 = C.h_cbits[1][k];
-                char buf[80];
+                char buf[BN_DEC_MAX];
                 if (c0 > TD_FMAX || c1 > TD_FMAX) {
                     fprintf(stderr, "  q=%llu: a candidate has %u/%u factors,"
                             " more than the %d recorded; raise TD_FMAX\n",
@@ -1804,7 +1916,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             fprintf(stderr, "  pipeline: no survivors at this q\n");
             rc = -1; break;
         }
-        if (qi == 0 && cfg->cofgate &&
+        if (nqdone == 0 && cfg->cofgate &&
             (!cofgate_found[0] || !cofgate_found[1])) {
             fprintf(stderr,
                     "  trial-division cofactor gate found no reference overlap"
@@ -1985,17 +2097,17 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                         (int)fmod(floor(eta / 60.0), 60.0);
                     printf("    q=%llu  %u q  %llu rel%s  %.0f rel/s  %.1f%%"
                            "  ETA %.0fh %02dm%s",
-                           (unsigned long long)cur->q, qi + 1, rels, queued,
+                           (unsigned long long)cur->q, nqdone, rels, queued,
                            rps, 100.0 * frac, eta_hours, eta_minutes, end);
                 } else if (rps > 0.0) {
                     printf("    q=%llu  %u q  %llu rel%s  %.0f rel/s  %.1f%%"
                            "  ETA inf%s",
-                           (unsigned long long)cur->q, qi + 1, rels, queued,
+                           (unsigned long long)cur->q, nqdone, rels, queued,
                            rps, 100.0 * frac, end);
                 } else {
                     printf("    q=%llu  %u q  %llu rel%s  -- rel/s  %.1f%%"
                            "  ETA --h --m%s",
-                           (unsigned long long)cur->q, qi + 1, rels, queued,
+                           (unsigned long long)cur->q, nqdone, rels, queued,
                            100.0 * frac, end);
                 }
             }
@@ -2045,7 +2157,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                     "q=%llu nq=%llu rel=%llu cand=%u rel/s=%.1f pct=%.2f %s"
                     " ms/q=%.2f acc/wall=%.3f %s %s load=%.2f",
                     (unsigned long long)cur->q,
-                    base_nq + (unsigned long long)(qi + 1), rels,
+                    base_nq + (unsigned long long)nqdone, rels,
                     cfg->cofactor ? Q.n : 0u, rps, 100.0 * frac, eta_s,
                     nqdone ? acc_wall / nqdone : 0.0, accwall, gpu, pwr,
                     load[0]);
@@ -2223,6 +2335,15 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 " %s cannot be\n  resumed automatically; move it aside or pass"
                 " --restart.\n", nqdone, rtmp);
 
+    /* OUTSIDE the `if (nqdone)` below, because the case that most needs saying
+     * is a band where skips left nqdone == 0: guarded, the one run that
+     * produced nothing but skips would have reported nothing at all. A band
+     * runs for days and scrolls, so this has to survive in the summary and not
+     * only in the per-q warnings. Silent is the one thing this must not be. */
+    if (nqskip)
+        printf("\n  ** %llu special-q SKIPPED: exact norm wider than %d bits."
+               " Run ./normscan over the band and rebuild wider. **\n",
+               nqskip, BN_LIMBS * 32);
     if (nqdone) {
         const double N = nqdone;
         const double dev = (tm.rank + tm.emit + tm.summary + tm.resieve + tm.td

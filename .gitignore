@@ -32,6 +32,7 @@ bench/fbtest
 bench/fbgen
 bench/fbgen_gpu
 bench/sqgentest
+bench/normscan
 bench/dumpcmp
 bench/mkcofbatch
 bench/ckpttest
@@ -47,6 +48,7 @@ bench/.link.stamp
 bench/.git.stamp
 bench/.defs.stamp
 bench/.cflmax.stamp
+bench/.bnlimbs.stamp
 *.d
 
 # All per-job working state lives under work/: poly, factor base, relations,
