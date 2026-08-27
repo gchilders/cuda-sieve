@@ -645,11 +645,20 @@ __global__ void k_td(const int64_t *__restrict A, const int64_t *__restrict B,
  *     lanes only ever evaluate the congruence. Their idling is free: the
  *     serial part was one thread's work before this change too.
  *   - the hit mask comes back from `__ballot_sync` in ASCENDING LANE ORDER,
- *     and lane index is entry index within the 32-entry chunk. Walking it with
- *     __ffs therefore divides factors out in exactly the entry order `k_td`
- *     produces, so the recorded factor lists -- and every relation built from
- *     them -- stay byte-identical. That is the acceptance test for this
- *     kernel, not an incidental property.
+ *     and lane index is entry index within the 32-entry chunk, so walking it
+ *     with __ffs divides factors out in the same entry order `k_td` uses. That
+ *     is a CONVENIENCE, not the correctness argument -- an earlier version of
+ *     this comment claimed otherwise and was wrong. `td_divide_out` loops
+ *     until p no longer divides, so an entry consumes the whole power of its
+ *     prime whichever entry reaches it first, and distinct primes commute:
+ *     the recorded multiset is order-invariant. Both emitters sort before
+ *     writing anyway (`cf_emit_sorted`, cofac.cuh:1613; `std::sort`,
+ *     pipeline.cuh:1002), so relation TEXT cannot see the order either.
+ *     Order is load-bearing in exactly one place -- when `nf` exceeds `fmax`
+ *     the tail is dropped, so which factors survive depends on it -- and that
+ *     path is a hard error the host reports as "raise TD_FMAX". A
+ *     lanes-per-item rewrite of the dense pass (STATUS item 18) is therefore
+ *     NOT constrained to preserve this order.
  *   - the shared tile is unchanged and still block-wide: every warp in the
  *     block walks the same entry list, so one staged tile serves all of them
  *     and the `__syncthreads` pair stays uniform (`iters` is computed from the
@@ -663,8 +672,17 @@ __global__ void k_td(const int64_t *__restrict A, const int64_t *__restrict B,
  * DIVIDE=0 and the dense SELECT=0 form have no counterpart here on purpose:
  * this kernel exists for the one launch that was paying the tax, and leaving
  * the diagnostics on `k_td` keeps a second, independent implementation of the
- * same predicate in the tree -- which is what `--verify`'s recording pass
- * compares against. */
+ * same predicate in the tree.
+ *
+ * WHAT COVERS THIS KERNEL, precisely -- `--verify` does NOT. pipe_td_verify
+ * launches `k_td<1,1,0>` into its own d_fac/d_faccnt (pipeline.cuh:796) and
+ * runs BEFORE the `if (!nacc) return 0;` that guards phase 3, so it never
+ * reads C->d_cfac[side], the only array this kernel writes. A --verify run
+ * staying green says nothing about the warp path. The actual gates are
+ * out-of-process: cofcheck.sh's A/B against `--td-record-scalar` at two slab
+ * shapes, and `--check-relations` rebuilding norms from the emitted factor
+ * lists. Anyone adding an in-binary gate for this kernel has to compare
+ * d_cfac after phase 3, not before it. */
 template <bool SLABBED = false>
 __global__ void k_td_record_warp(const int64_t *__restrict A,
                                  const int64_t *__restrict B,
@@ -696,7 +714,12 @@ __global__ void k_td_record_warp(const int64_t *__restrict A,
 
     for (uint64_t it = 0; it < iters; it++) {
         const uint64_t tt = w0 + it * nwarp;
-        const bool active = (tt < n);          /* warp-uniform, see below */
+        /* Warp-uniform: `tt` derives from `w0`, which is built from
+         * (threadIdx.x >> 5), so every lane of a warp shares it. The
+         * unconditional __ballot_sync below depends on this -- if `active`
+         * were ever per-lane, lanes that took the `continue` would still be
+         * named in the mask. Do not derive `tt` from a per-lane quantity. */
+        const bool active = (tt < n);
         const bool leader = active && lane == 0;
         const uint32_t t = (uint32_t)tt;
         const uint32_t s = active ? sel[t] : 0u;
@@ -779,7 +802,9 @@ __global__ void k_td_record_warp(const int64_t *__restrict A,
                         }
                     }
                     /* Ascending lane order == ascending entry order == the
-                     * order k_td divides in. Do not reorder this loop. */
+                     * order k_td divides in. Convenient for diffing factor
+                     * arrays, but NOT required: see the header -- the multiset
+                     * is order-invariant and both emitters sort. */
                     uint32_t mask = __ballot_sync(0xffffffffu, hit);
                     if (lane == 0) {
                         while (mask) {

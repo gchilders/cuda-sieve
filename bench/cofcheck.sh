@@ -400,29 +400,40 @@ else
 fi
 
 # The candidate RECORDING pass, one warp per candidate against one thread per
-# candidate (RESULTS finding 77). This is the acceptance test that change was
-# built to pass, and it is a byte comparison rather than a count because the
-# warp kernel's whole correctness argument is ORDER: __ballot_sync returns the
-# hit mask in ascending lane order, which is ascending entry order, so factors
-# must be divided out in exactly the sequence k_td produces. A reordering emits
-# the same factors in a different order -- every count, every norm rebuild and
-# every relation total still passes, and only a byte compare fails.
+# candidate (RESULTS finding 77). What this compares is the FACTOR MULTISET and
+# the relation total, not the division order -- an earlier version of this
+# comment claimed the byte compare caught a reordering, and it does not:
+# td_divide_out consumes the whole power of a prime per call so distinct
+# entries commute, and both emitters sort before writing (cf_emit_sorted,
+# std::sort). Reversing the ballot walk still passes here, by design and not by
+# oversight. What WOULD fail is a wrong predicate, a dropped entry, a missed
+# multiplicity, or a slab-indexing bug -- which is what this is for.
+#
+# The count is pinned as well as compared. Both arms share the survivor bound,
+# the intersect, the classifier and the cofactoriser, so a defect in any of
+# them moves both files together and an equality-only test would still pass.
 #
 # Both slab shapes, because the two kernels index j differently: unslabbed uses
 # the local row directly, slabbed adds j_base, and the recording pass is the one
 # place that runs once per slab per side.
+#
+# Counts come out of command substitution and every branch is guarded, because
+# `set -e` at the top turns a bare failing run into an abort partway through the
+# suite rather than a FAIL line -- see the note above.
 for sj in 0 4096; do
     case $sj in
         0) sjarg=""            ; shape="unslabbed" ;;
         *) sjarg="--slab-j $sj"; shape="4 slabs"   ;;
     esac
-    run --cofactor $sjarg --relations $TMP/rw.txt >/dev/null
-    run --cofactor $sjarg --td-record-scalar --relations $TMP/rs.txt >/dev/null
-    if [ -s $TMP/rw.txt ] && cmp -s $TMP/rw.txt $TMP/rs.txt; then
-        printf 'PASS   %-34s %s, byte-identical\n' "warp vs thread recording" "$shape"
+    nw=$(run --cofactor $sjarg --relations $TMP/rw.txt \
+         | grep 'total relations' | tail -1 | awk '{print $NF}') || true
+    ns=$(run --cofactor $sjarg --td-record-scalar --relations $TMP/rs.txt \
+         | grep 'total relations' | tail -1 | awk '{print $NF}') || true
+    if [ "$nw" = "37" ] && [ "$ns" = "37" ] && cmp -s $TMP/rw.txt $TMP/rs.txt; then
+        printf 'PASS   %-34s %s, 37 relations, identical\n' "warp vs thread recording" "$shape"
     else
-        printf 'FAIL   %-34s %s, warp and thread paths differ\n' \
-               "warp vs thread recording" "$shape"; fail=1
+        printf 'FAIL   %-34s %s, expected 37/37 identical, got %s/%s\n' \
+               "warp vs thread recording" "$shape" "${nw:-none}" "${ns:-none}"; fail=1
     fi
 done
 

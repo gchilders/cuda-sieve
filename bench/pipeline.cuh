@@ -2492,6 +2492,15 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                 cfg->logI, cfg->J, pmax, cfg->slab_j);
         return -1;
     }
+    /* The A/B record path leaves no other trace: the stage label is the same on
+     * both branches and the checkpoint job text does not carry the flag, so a
+     * sweep log that mixes the two kernels would have no tell. Finding 78's
+     * method note is what this is for -- an entire sweep was discarded there
+     * over a harness mixup caught only by row ordering. */
+    if (cfg->td_record_scalar)
+        printf("  recording pass: SCALAR (one thread per candidate,"
+               " --td-record-scalar) -- the pre-finding-77 path, for A/B only\n");
+
     if (plan.enabled) {
         const uint32_t perf_jmax = slab_perf_jmax(cfg->logI, cfg->J);
         if (!cfg->slab_j && perf_jmax != 0xffffffffu)

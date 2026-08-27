@@ -716,8 +716,17 @@ typedef struct {
  * 256 is a MEASURED interior minimum, not a guess: 128 / 256 / 512 threads
  * measure 1.220 / 1.047 / 1.240 ms on c194 at the 4-slab operating point
  * (RESULTS finding 77). Both neighbours lose by ~17%. Below 256 the 16 KB
- * TD_TILE staging is shared across too few candidates; above it, 68 registers
- * x 512 threads admits only one block per SM. */
+ * TD_TILE staging is shared across too few candidates.
+ *
+ * The occupancy half of that explanation is ARCH-LOCAL and does not generalise
+ * across the fat binary. Measured with -Xptxas -v: **sm_120 68 registers /
+ * 32 B stack, sm_86 60 registers / 64 B stack** (k_td<1,1,1> is 62 regs /
+ * 256 B there). At 68 x 512 = 34,816 only one block fits sm_120's register
+ * file; at 60 x 512 = 30,720 two blocks fit sm_86's 65,536. So "512 loses
+ * because occupancy drops to one block" holds on this card and NOT on the
+ * sm_80/86/89/90 gencode targets, where 512 may well be fine. The 256 default
+ * is kept because it was measured, not because the mechanism is universal --
+ * re-measure before assuming it transfers (STATUS item 2). */
 #ifndef TD_RECORD_THREADS
 #define TD_RECORD_THREADS 256
 #endif

@@ -5092,9 +5092,26 @@ march across a warp per candidate.
 `k_td_record_warp` (`td.cuh`) does that. One warp owns one candidate; the 32
 lanes stride the entry list; `__ballot_sync` returns the hit mask in ascending
 lane order, which **is** ascending entry order, so lane 0 walks it with `__ffs`
-and divides in exactly the order `k_td` produces. That ordering is the whole
-correctness argument and it is why the relations stay byte-identical rather than
-merely equivalent. `bn_t` never leaves lane 0 — the divisions are sequential on
+and divides in exactly the order `k_td` produces.
+
+> **CORRECTION, 2026-08-26 (code review).** The sentence that stood here — "that
+> ordering is the whole correctness argument, and it is why the relations stay
+> byte-identical rather than merely equivalent" — **was wrong.** `td_divide_out`
+> loops until `p` no longer divides, so an entry consumes the whole power of its
+> prime whichever entry reaches it first, and distinct primes commute: the
+> recorded multiset is order-invariant. Both emitters sort before writing
+> (`cf_emit_sorted`, cofac.cuh:1613; `std::sort`, pipeline.cuh:1002), so the
+> relation text cannot see the order either. Reversing the ballot walk would
+> still produce byte-identical files. Order matters in exactly one place — when
+> `nf` exceeds `fmax` the tail is dropped — and that is a hard error the host
+> reports as "raise TD_FMAX". **The byte-identical result below stands and is
+> still strong evidence** (it pins the factor multiset, the multiplicities, the
+> predicate and the slab indexing across 3,349 relations and six configurations);
+> it simply does not test ordering, and nothing needs it to. The practical
+> consequence: **a lanes-per-item rewrite of the dense pass (item 18) is not
+> constrained to preserve entry order**, which the old claim would have forced.
+
+`bn_t` never leaves lane 0 — the divisions are sequential on
 N and shuffling 256 bits between lanes would cost more than it saves — so the
 other 31 lanes only ever evaluate the congruence. Their idling is free: the
 serial part was one thread's work before the change too.
@@ -5315,7 +5332,482 @@ n=2 at the 4-slab operating point, `DEFS=-DTD_RECORD_THREADS=N` pricing builds:
 Both directions lose and the two arms are within 0.013 ms of each other, which
 is the shape of two costs crossing rather than a plateau. Below 256 the 16 KB
 `TD_TILE` staging is shared across too few candidates and its per-candidate cost
-rises; above it, 68 registers x 512 threads admits only one block per SM, so the
+rises; above it, 68 registers x 512 threads admits only one block per SM (an
+**sm_120-only** figure -- sm_86 compiles this kernel to 60 registers and 64 B of
+stack against k_td<1,1,1>'s 62 / 256 B, where two blocks of 512 do fit, so the
+occupancy argument does not transfer to the other gencode targets), so the
 staging is amortised better but there is far less to hide its latency behind.
 The value either way is small — the whole pass is 0.3% of wall at the operating
 point now — so this was swept once and left at 256.
+
+## Finding 78 — `fill`'s per-slab floor is bandwidth on the factor base, not "re-entry": 42 B/entry x 22.1M entries = 929 MB per slab, and the slope the docs implied is 1.7x too steep
+
+**Date:** 2026-08-26, RTX 5070 (sm_120), **card otherwise idle** (verified 0%,
+29.1 W, no compute apps before the sweep; a first attempt was discarded, see the
+method note). `oracle/c194.job` + `c194.roots1.m16`, `--pipeline --cofactor
+--logI 16 --J 32768 --qrange 80000023: --nq 10`, **total area held fixed at
+`2^31`** and `--slab-j` swept so that only the slab COUNT moves. Three repeats.
+
+Findings 74 and 77 both attributed `fill`'s reversal below `2^29` to "the
+factor-base re-entry every slab pays" (STATUS:219, STATUS:2144, RESULTS:5275).
+That phrase was never measured — it was inferred from the shape of three points.
+It is directionally right and quantitatively wrong.
+
+### The sweep
+
+| `--slab-j` | slabs | local area | fill | apply | dense TD | **complete** |
+|---:|---:|---:|---:|---:|---:|---:|
+| 32768 | 1 | `2^31` | 184.17 | 131.19 | 10.91 | 439.63 |
+| 16384 | 2 | `2^30` | 130.02 | 132.87 | 9.96 | 386.25 |
+| 8192 | **4** | **`2^29`** | **99.85** | 131.63 | 10.39 | **355.65** |
+| 4096 | 8 | `2^28` | 100.17 | 131.99 | 13.34 | 361.11 |
+| 2048 | 16 | `2^27` | 115.97 | 132.29 | 22.03 | 396.27 |
+| 1024 | 32 | `2^26` | 128.07 | 135.54 | 41.83 | 460.30 |
+| 512 | 64 | `2^25` | 166.15 | 137.22 | 82.05 | 611.05 |
+
+`apply` is flat across a 64x range in slab count and is the control. `2^29`
+remains the optimum, now bracketed four doublings below instead of one.
+
+### The prediction, written down first, and what happened to it
+
+**H1, "fixed per-slab re-entry":** once locality saturates, `fill = A*n + C`.
+Fitting on the only points the docs had, n=8 and n=16, gives **A = 1.975 ms per
+slab**, C = 84.37 — and predicts 147.57 at 32 slabs and 210.77 at 64.
+
+**H2, "it bends over":** the excess tracks entries that contribute nothing to
+this slab, that count is bounded by `|FB|`, so growth decelerates.
+
+| | n=32 | n=64 |
+|---|---:|---:|
+| H1 predicted | 147.57 | 210.77 |
+| **actual** | **128.07** | **166.15** |
+| error | **−13.2%** | **−21.2%** |
+
+**H1 as stated is falsified and H2 is the right shape.** The local slope in the
+4/8/16 window is 1.975 ms/slab; the asymptotic slope over 8..64 is **1.178
+ms/slab**. Anyone extrapolating the floor from the three points the docs had
+overestimates it by about 1.7x.
+
+### The mechanism, with a number that lands
+
+`k_fill_atomic` (bench_kernels.cu:134) is launched with `fb->n` **every slab**
+and, before it can know whether a prime hits, unconditionally streams per entry:
+
+| | bytes |
+|---|---:|
+| `plat[k]` (`plat_t` = 2x`uint64` + 2x`uint32`) | 24 |
+| `slice[k]` (`uint16`) | 2 |
+| `walk_cur[k]` read | 8 |
+| `walk_next[k]` write | 8 |
+| **total** | **42** |
+
+x **22,121,650** bucketed entries (13,153,734 algebraic + 8,967,916 rational)
+= **929 MB per slab**, independent of slab size. At 85% of the 5070's 672 GB/s
+that is **1.63 ms/slab gross**. Measured net slope is 1.178, the difference
+being that the area term keeps improving slightly as the slab shrinks and
+partly cancels the fixed cost — which is also why the point-to-point slope
+wobbles (0.08 / 1.98 / 0.76 / 1.19) while the endpoints fit cleanly.
+
+So it is **bandwidth on the factor base, not launch overhead and not a "walk
+re-entry" cost.** `--blocks` could never have touched it, and neither can
+batching.
+
+### The obvious fix does not pay, and the arithmetic is why
+
+The kernel reads `plat[k]` and `slice[k]` *before* it reads `walk_cur[k]`, yet
+the hit test is `walk_cur[k] < xmax` and a missing prime's entire body is
+`walk_next[k] = walk_cur[k] - xmax`. Reordering — read the 8-byte walk state
+first, early-out, and touch the 26 bytes of `plat`+`slice` only on a hit — costs
+a non-hitting entry 16 B instead of 42. `k_transform` already writes
+`walk_cur[k] = UINT64_MAX` for invalid entries (bench_kernels.cu:118), so even
+the `PL_INVALID` test is available without reading `plat`.
+
+It is not worth building. A prime `p > xmax` does not skip the slab, it hits
+with probability `xmax/p`, so the skip fraction is far below the naive
+`1 - pi(xmax)/pi(L)`:
+
+| slabs | `xmax` | entries with no hit | MB/slab now | if reordered | saved |
+|---:|---:|---:|---:|---:|---:|
+| 8 | `2^28` | 0.0% | 929 | 929 | 0.00 ms |
+| 16 | `2^27` | 7.1% | 929 | 888 | 0.07 ms |
+| 32 | `2^26` | 29.3% | 929 | 761 | 0.29 ms |
+| 64 | `2^25` | 52.0% | 929 | 630 | 0.52 ms |
+
+At 64 slabs that is 33 ms of the 66 ms excess — half — but at **16 slabs, the
+worst case a 12 GB card actually reaches for an A=32 job, it is 1.1 ms of 16.1**,
+i.e. nothing. The floor is bandwidth on entries that genuinely do hit, and it is
+close to irreducible without narrowing `plat_t`, which the 64-bit increment
+requirement (plattice.cuh:30) forbids.
+
+### What this does to item 18's ceiling
+
+The two terms are near-equal partners below `2^29`, and item 18 can only touch
+one of them:
+
+| slabs | fill excess | dense TD excess | complete vs `2^29` | item 18 best case |
+|---:|---:|---:|---:|---:|
+| 8 | +0.31 | +2.95 | +1.5% | −0.8% |
+| 16 | +16.11 | +11.64 | +11.4% | **−2.9%** |
+| 32 | +28.21 | +31.44 | +29.4% | −6.8% |
+| 64 | +66.30 | +71.65 | +71.8% | −11.7% |
+
+Item 18's own TD numbers are confirmed — it projected ~2.8 ms at 8 slabs and
+~11.5 at 16, against 2.95 and 11.64 measured. What is new is the other column:
+**at 16 slabs, fill's irreducible excess is larger than the entire prize item 18
+is chasing**, so the ceiling on lanes-per-item at the realistic A=32 geometry is
+about 3% of wall, not the open-ended "buys small slabs" the item implies.
+
+### Method note, the third in four days
+
+The first attempt at this sweep produced fill=306 ms at one slab against 182 on
+a clean re-run. Cause: a backgrounded script had been launched with a trailing
+`&` *and* the harness's own background flag, so it survived a reported "exit 0"
+and a second copy ran on top of it. Every number in that log was contended and
+all of it was discarded rather than reported. The tell was the ordering — rows
+interleaved out of sequence in a single output file. **A sweep whose rows do not
+arrive in the order the loop emits them is not a slow sweep, it is two sweeps.**
+
+## Finding 78b — `--blocks` is not a default worth changing, on slabbed OR unslabbed geometries
+
+**Date:** 2026-08-26, same session and same idle card. Finding 77 closed off
+`--blocks` for slabbed geometries (0.0–2.5% across a 3.5x range) but left one
+cell open: the unslabbed row moved −15.6% of the dense TD stage. Whether that is
+worth taking as a default was untested. Three repeats, two jobs.
+
+**c194 I16 J32768 forced to 1 slab** (`--slab-j 32768`):
+
+| `--blocks` | dense TD | wall | complete |
+|---:|---:|---:|---:|
+| 288 (auto) | 10.929 | 384.24 | 440.39 |
+| 512 | 9.681 (−11.4%) | 380.85 (−0.88%) | 437.75 (−0.60%) |
+| 1024 | 9.291 (**−15.0%**) | 382.27 (−0.51%) | 438.57 (−0.41%) |
+
+**c147 I14 J8192** (natively unslabbed, `--nq 20`):
+
+| `--blocks` | dense TD | wall | complete |
+|---:|---:|---:|---:|
+| 288 (auto) | 0.501 | 21.45 | 24.73 |
+| 512 | 0.512 (+2.1%) | 21.37 (−0.39%) | 24.63 (−0.42%) |
+| 1024 | 0.529 (**+5.6%**) | 21.76 (+1.45%) | 25.11 (+1.52%) |
+
+The stage win on c194 is real and reproduces exactly (−15.0% against finding
+77's −15.6%, and the three reps per arm do not overlap: 10.889–10.972 against
+9.154–9.446). **It does not survive into wall time.** 1.6 ms of 384 is −0.51%,
+against a rep-to-rep wall spread of 1.8–2.9% within a single arm — and the sign
+flips between reps. On the small unslabbed job it **reverses**: b1024 is worst
+on every column, because 1024x256 = 262K threads already exceeds the survivor
+count and the extra blocks are idle.
+
+**Verdict: leave `--blocks` on auto (6/SM).** This is the third measurement
+pointing the same way and it strengthens item 18's core claim rather than
+weakening it — **threads are not the lever.** Adding threads helps only where
+`iters > 1` and hurts where `n` is already below the grid, which is exactly the
+regime lanes-per-item exists to serve.
+
+## Finding 79 — the `2^29` slab target is not a slab-size constant at all: it is 32,768 bucket regions, and `SLAB_PERF_TARGET_LOG2` is silently coupled to `log_region`
+
+**Date:** 2026-08-26, RTX 5070, **card otherwise idle**. Same job and harness as
+findings 77/78: `oracle/c194.job` + `c194.roots1.m16`, `--pipeline --cofactor
+--logI 16 --J 32768 --qrange 80000023: --nq 10`, total area fixed at `2^31`.
+`--region` x `--slab-j` swept jointly, two repeats.
+
+Findings 74–78 all treat `2^29` positions/slab as the tuned quantity, and
+`slab.h:38` hardcodes it as `SLAB_PERF_TARGET_LOG2`. The question this answers is
+whether the optimum is really a *slab area*, or whether it is a *bucket region
+count* that only looks like an area because `log_region` has never moved.
+
+### The discriminator, stated before the runs
+
+`nregion = slab_area >> log_region`. At the known optimum (region 14, area
+`2^29`) that is **32,768**.
+
+- **H_nregion** — the optimum is a fixed region count, so the optimal *area*
+  halves with each halving of the region: `2^29` / `2^28` / `2^27` for regions
+  14 / 13 / 12.
+- **H_area** — the optimum is a property of the slab area, and `--region` does
+  not move it: `2^29` for all three.
+
+Judged on `fill`, not on `complete`: `--region` also resizes `k_apply`'s shared
+tile, so `complete` carries a confounder that `fill` does not.
+
+### fill (ms), mean of two reps — the minimum is the diagonal
+
+| region | `2^31` | `2^30` | `2^29` | `2^28` | `2^27` | `2^26` |
+|---:|---:|---:|---:|---:|---:|---:|
+| **14** | 183.37 | 130.06 | **100.20** | 100.47 | 116.69 | 128.28 |
+| **13** | 327.57 | 188.52 | 133.75 | **104.20** | 107.99 | 133.26 |
+| **12** | 663.47 | 336.35 | 194.74 | 140.73 | **115.71** | 125.28 |
+
+| region | optimal area | **nregion at the optimum** |
+|---:|---:|---:|
+| 14 | `2^29` | **32,768** |
+| 13 | `2^28` | **32,768** |
+| 12 | `2^27` | **32,768** |
+
+**H_nregion confirmed 3 for 3, as predicted in advance.** The tuned quantity is
+`32,768 bucket regions`. `2^29` is simply what that means when `log_region` is
+14 — it has never been a slab-size constant, and the two findings that named it
+one (74, 78) were reading a derived number as a primitive.
+
+### But region 14 stays the default, because apply pulls the other way
+
+At each region's own fill optimum:
+
+| region | area | fill | apply | **complete** |
+|---:|---:|---:|---:|---:|
+| **14** | `2^29` | 100.20 | **131.81** | **360.96** |
+| 13 | `2^28` | 104.20 | 200.81 (+52%) | 443.35 (+23%) |
+| 12 | `2^27` | 115.71 | 338.83 (+157%) | 618.25 (+71%) |
+
+`k_apply` launches one block per region, so halving the region doubles the block
+count and re-enters the fused small-prime line sieve twice as often. Its cost
+tracks `nregion` directly, in the opposite direction to fill's preference for
+holding `nregion` fixed by shrinking the slab. **Region 14 is the joint optimum
+on this card and the current defaults are right** — which is precisely why the
+coupling below went unnoticed: at the default the two constants agree.
+
+### The latent defect this exposes
+
+`slab_perf_jmax` (slab.h:69) computes `rows = 2^29 / I` with no reference to
+`cfg->log_region`. Verified directly — auto planning picks **8192 rows at every
+region**:
+
+```
+--region 14: j-slabbing: 4 slabs, up to 8192 rows/slab   bucket array 32768 x 10658
+--region 13: j-slabbing: 4 slabs, up to 8192 rows/slab   bucket array 65536 x 5457
+--region 12: j-slabbing: 4 slabs, up to 8192 rows/slab   bucket array 131072 x 2856
+```
+
+so anyone who moves `--region` gets a slab target that is wrong by the same
+factor:
+
+| region | auto picks | fill | correct target | fill | penalty |
+|---:|---:|---:|---:|---:|---:|
+| 14 | `2^29` | 100.20 | `2^29` | 100.20 | — |
+| 13 | `2^29` | 133.75 | `2^28` | 104.20 | **+28.4%** |
+| 12 | `2^29` | 194.74 | `2^27` | 115.71 | **+68.3%** |
+
+**This is latent, not a live production regression** — `--region` defaults to 14,
+production never moves it, and moving it loses on `complete` anyway. But the
+constant is written as though it were independent when it is not.
+`SLAB_PERF_TARGET_LOG2` should be expressed as a region count and the row target
+derived as `(SLAB_PERF_REGIONS << log_region) / I`, so the two cannot drift.
+**Not built** — it is a behaviour-preserving refactor at the default and should
+be taken with the autotune work (item 2), not on its own.
+
+### What caps it at 32,768 is still not identified
+
+Two candidates, and this sweep does not separate them:
+
+- **L2 write frontier.** 32,768 append streams x one 128 B line = ~4 MB live.
+  That fits the 3090's 6 MB L2 and would *not* fit at 65,536 streams (8 MB),
+  which would explain the 3090. It does not explain the 5070, which has **48 MB**
+  of L2 and still stops at 32,768.
+- **Cursor atomic contention.** fill launches `FILL_BLOCKS_DEFAULT x
+  FILL_THREADS_DEFAULT` = 4608 x 32 = **147,456 threads** against 32,768
+  cursors — 4.5 threads per cursor. This is a launch-geometry property and is
+  independent of L2, which would explain the 3090/5070 agreement across an 8x
+  L2 range.
+
+**The separating test is a `--fill-blocks` sweep**, which changes the thread
+count without changing the cache footprint: if the optimal `nregion` tracks
+thread count, it is contention; if it does not move, it is the cache. That is
+one sweep and it is the obvious next one.
+
+It also reframes the open "cache-aware automatic target" question in STATUS:
+the card-dependent quantity to autotune is **`nregion`**, not slab size. The
+L40's preference for `2^30` at region 14 is a preference for **65,536 regions**,
+and stated that way it is a single number to measure per card rather than a
+per-job geometry decision.
+
+## Finding 80 — it is not cursor contention: a 16x sweep of fill threads does not move the optimum at all, and `fill = L(nregion) + 1.178 x nslab` collapses both sweeps
+
+**Date:** 2026-08-26, RTX 5070, **card otherwise idle**. Same job/harness as
+77–79. **Slab area pinned at `2^29`** (4 slabs) so finding 78's per-slab
+factor-base re-stream is constant across the entire sweep; `nregion` moved by
+`--region` alone; `--fill-threads` left at 32 so threads = `blocks x 32`.
+Two repeats. `--region 16` is not testable at `logI 16`: `k_apply` asks for
+131,328 B of shared memory against the device's 101,376 B opt-in ceiling.
+
+Finding 79 left two candidate causes for the `nregion` optimum. This separates
+them: `--fill-blocks` changes the thread count without changing the cache
+footprint.
+
+### fill (ms) — the argmin does not move
+
+| blocks | threads | r15 (nr 16,384) | r14 (nr 32,768) | r13 (nr 65,536) | r12 (nr 131,072) |
+|---:|---:|---:|---:|---:|---:|
+| 1152 | 36,864 | **103.62** | 107.90 | 138.81 | 197.81 |
+| 2304 | 73,728 | **98.07** | 101.52 | 135.95 | 196.64 |
+| 4608 | 147,456 | **95.39** | 99.40 | 134.15 | 193.67 |
+| 9216 | 294,912 | **96.11** | 100.02 | 135.26 | 195.49 |
+| 18432 | 589,824 | **98.25** | 101.86 | 136.89 | 197.18 |
+
+**Contention is falsified.** Across a **16x** range in thread count — 4.0 down
+to 0.25 threads per cursor — the argmin is region 15 in all five arms. Threads
+move the *level* of the curve but not its *position*. The 4.5-threads-per-cursor
+coincidence in finding 79 was a coincidence.
+
+The level effect is a shallow interior minimum at **4608 blocks in every region
+arm** (1152/2304/**4608**/9216/18432 loses, wins, loses in all four columns), so
+blocks and region are separable with no interaction — an independent
+confirmation of the `FILL_BLOCKS_DEFAULT 4608` retune, on a geometry it was not
+tuned against.
+
+### The collapse
+
+Subtracting finding 78's re-stream term and grouping by `nregion` alone — points
+drawn from **two independent sweeps**, differing in region size, slab area and
+slab count:
+
+| `nregion` | `fill − 1.178 x nslab`, each measurement | mean | spread |
+|---:|---|---:|---:|
+| 8,192 | 95.6 97.8 | 96.70 | 2.4% |
+| **16,384** | 87.6 89.1 90.7 91.0 | **89.61** | 3.9% |
+| 32,768 | 94.7 94.8 95.5 96.9 | 95.45 | 2.3% |
+| 65,536 | 127.7 129.0 129.4 131.3 | 129.37 | 2.8% |
+| 131,072 | 182.2 186.2 189.0 190.0 | 186.83 | 4.2% |
+| 262,144 | 326.4 334.0 | 330.19 | 2.3% |
+| 524,288 | 662.3 | 662.29 | — |
+
+**`fill = L(nregion) + 1.178 x nslab` holds to 2.3–4.2%** over configurations
+whose slab counts differ by 32x. The locality term depends on the region count
+and on nothing else; the rest is the re-stream. Above 32,768 regions `L`
+roughly doubles per doubling of `nregion` — each additional open write stream
+costs a full extra memory transaction.
+
+### Correction to finding 79
+
+Finding 79 reported the optimum as `nregion = 32,768`. That was the argmin of a
+grid that did not contain the cell `(area 2^29, region 15)`. **`L` is minimised
+at `nregion = 16,384`** (89.61 against 95.45). At `--region 14` the two are a
+near-tie in *system* terms — 100.20 vs 100.47 in finding 79's table — because
+reaching 16,384 regions there requires doubling the slab count, and the 5.8 ms
+of locality gain is cancelled by 4.7 ms of extra re-stream. That near-tie is not
+a coincidence, it is the two terms of the model crossing.
+
+The finding-79 diagonal was real but was reading the *reachable* optimum. The
+mechanism statement stands and is strengthened: the tuned quantity is a region
+count, not a slab area.
+
+### What is still open, and it is not answerable by timing
+
+**L2 capacity is also falsified.** The write frontier at the optimum is
+`16,384 x 128 B = 2 MB`, and at the old figure `4 MB` — against this card's
+**48 MB** of L2. Capacity is not the binding resource here, and an 8x L2 range
+(3090's 6 MB against this 5070's 48 MB) reportedly produces the same optimum,
+which capacity cannot explain either.
+
+What remains is **L2 set and sector geometry** — associativity-bound rather than
+capacity-bound. Append streams that collide in the same sets evict each other's
+partial 32 B sectors and force read-modify-write, and the number of streams that
+survive is a function of ways and sectoring, which is roughly generation-
+invariant while capacity is not. That fits the 3090/5070 agreement.
+
+**It is not resolvable with more timing sweeps** — three have now been spent
+narrowing it. The next step is `ncu` counters on `k_fill_atomic` at
+`nregion` 16,384 / 32,768 / 65,536: L2 write hit rate, and sectors per write
+request. If sectors/request climbs at the knee, it is RMW on evicted partial
+lines and the mechanism is settled.
+
+**Best fill measured anywhere in either sweep is `(area 2^29, region 15)` at
+95.39 ms**, against the default's 99.40. It is not worth taking: `k_apply` costs
++41% at region 15 (184 vs 131 ms) and `complete` is 417 vs 367. The defaults
+remain correct.
+
+## Finding 81 — settled by `ncu`: the `nregion` knee is read-modify-write on partially-filled bucket lines. L2 reads are flat, DRAM reads rise 135%
+
+**Date:** 2026-08-26, RTX 5070 (sm_120, CC 12.0), Nsight Compute 2026.1.1.
+`k_fill_atomic` profiled directly, 8 launches per configuration. Slab area
+pinned at `2^29` (4 slabs), `--fill-blocks 4608`, `--region` swept 15/14/13/12
+= `nregion` 16,384 / 32,768 / 65,536 / 131,072. `--cofactor` dropped: it does
+not touch fill and it tripled profiling time.
+
+**The controlled comparison is exact.** Across the four configurations the
+kernel reads the same `plat`/`slice`/`walk_cur` arrays over the same `fb->n`
+at the same slab count, and writes the same total number of bucket records.
+Only the number of open append streams changes. `dram__sectors_op_read` was
+`n/a` under its Volta-era name; the CC 12.0 spelling is `dram__sectors_op_read`
+(not `dram__sectors_read`), which is worth knowing before assuming a counter is
+unsupported.
+
+### The result
+
+| `nregion` | L2 read sectors *(requested)* | DRAM read sectors *(fetched)* |
+|---:|---:|---:|
+| 16,384 | 23,449,366 | 18,518,388 |
+| 32,768 | 23,450,025 (+0.0%) | 23,349,104 (**+26.1%**) |
+| 65,536 | 24,210,058 (+3.2%) | 33,036,496 (**+78.4%**) |
+| 131,072 | 23,413,638 (−0.2%) | 43,520,750 (**+135.0%**) |
+
+**The kernel requests identical data at every point — L2 read sectors are flat
+within 3% — while DRAM read traffic more than doubles.** Those extra reads are
+lines nobody asked for. In a stream that only writes the bucket array, DRAM
+reads caused by writing are read-modify-write, and there is no other
+explanation available: the read side of the kernel is provably constant.
+
+**H_RMW confirmed.** Bucket records are 4 B, a sector is 32 B, so eight
+consecutive appends fill one sector. Past the knee a region's write frontier is
+evicted before those eight arrive, and the next append to that line has to
+re-fetch it.
+
+### Write traffic against the theoretical floor
+
+583M records/slab x 4 B = **2.333 GB** is the minimum bucket-write traffic per
+slab (both sides, `Σ xmax/p` over both factor bases):
+
+| `nregion` | measured DRAM writes | vs the floor |
+|---:|---:|---:|
+| **16,384** | 2.679 GB | **1.15x** |
+| 32,768 | 2.996 GB | 1.28x |
+| 65,536 | 3.578 GB | 1.53x |
+| 131,072 | 4.569 GB | **1.96x** |
+
+At the locality optimum the scatter is within 15% of perfect. At 131,072 regions
+it costs nearly double, because evicted partial lines are written back and
+re-fetched repeatedly.
+
+### It accounts for the timing, quantitatively
+
+Per q (4 slabs x 2 sides), against finding 80's locality term:
+
+| `nregion` | DRAM read | DRAM write | total | x16k | fill (ms) | `L` (ms) | `L` x16k | eff GB/s |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 16,384 | 4.12 | 10.72 | 14.84 | 1.000 | 95.39 | 89.61 | 1.000 | 155.5 |
+| 32,768 | 5.39 | 11.98 | 17.37 | 1.171 | 99.40 | 95.45 | 1.065 | 174.8 |
+| 65,536 | 7.77 | 14.31 | 22.08 | 1.488 | 134.15 | 129.37 | 1.444 | 164.6 |
+| 131,072 | 10.44 | 18.28 | 28.71 | 1.935 | 193.67 | 186.83 | 2.085 | 148.3 |
+
+**Traffic ratio 1.00 / 1.17 / 1.49 / 1.94 against locality ratio 1.00 / 1.07 /
+1.44 / 2.09**, with effective bandwidth flat within ±9%. fill is DRAM-traffic-
+bound at every point measured, so the cost *is* the traffic, and `L(nregion)`
+from finding 80 is a traffic curve rather than a latency or occupancy one.
+~150–175 GB/s against the card's 672 GB/s peak is ~25%, which is what a
+scattered atomic-append stream costs.
+
+### Why the 3090 and the 5070 agree
+
+Confirmed as an associativity/sectoring effect, not a capacity one. What binds
+is how many append frontiers can stay resident without evicting each other,
+which is a function of ways and sector geometry — roughly generation-invariant.
+Total L2 capacity is not involved: the frontier at the optimum is ~2 MB against
+this card's 48 MB. That is why a 6 MB 3090 and a 48 MB 5070 land in the same
+place, and it means **the L40's preference for 65,536 regions needs its own
+explanation** — capacity was never the reason, so "the L40 has more L2" is not
+one. That remains open and is now the only open part of this question.
+
+### No action follows at the operating point
+
+The default (`region 14`, `nregion 32,768`) already runs at 1.28x the write
+floor, and the best reachable point — `region 15`, 1.15x — is worth ~4 ms of
+fill against **+53 ms of apply**. Confirmed again: the defaults are correct.
+
+What this does change is the autotuner's objective (item 2). `L(nregion)` is a
+DRAM-traffic curve, and traffic is predictable from `nregion` alone without
+timing anything — so a startup autotune can price a candidate geometry from
+counters, or from the model in finding 80, rather than by running trial fills.
+
+**Three sweeps and one profile, and the mechanism is closed.** The timing
+sweeps could bound it (contention out, capacity out) but could not identify it;
+one `ncu` run on a controlled pair did, because it separates what the kernel
+asked for from what the memory system actually moved.
