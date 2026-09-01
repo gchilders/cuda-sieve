@@ -23,9 +23,25 @@ fail=0
 # every case behaves the same on both -- see the ECM skip below. --help's
 # --device line already says "CUDA device" or "HIP device" depending on which
 # was built, so it doubles as a free, zero-maintenance build-type probe.
-IS_HIP=0
-if ./bench --help 2>&1 | grep -q 'select HIP device'; then
+#
+# Checked for EITHER string, not just HIP's, and refused outright if neither
+# matches: a BOINC-linked binary runs bench_boinc_init() before it ever
+# reaches argument parsing (see main() in bench_main_hip.cpp), so if that
+# ever fails (a stale lock, a broken BOINC shared-memory segment, anything),
+# --help prints NOTHING and a naive "grep for HIP, else assume CUDA" would
+# silently leave IS_HIP=0 on an actual HIP build -- reopening exactly the
+# --ecm-b1 400000 crash-capable case below with no diagnostic at all.
+HELP_OUT=$(./bench --help 2>&1) || true
+if printf '%s' "$HELP_OUT" | grep -q 'select HIP device'; then
     IS_HIP=1
+elif printf '%s' "$HELP_OUT" | grep -q 'select CUDA device'; then
+    IS_HIP=0
+else
+    echo "cofcheck.sh: ./bench --help printed neither \"select HIP device\"" >&2
+    echo "  nor \"select CUDA device\" -- cannot tell which build this is," >&2
+    echo "  refusing to guess. Output was:" >&2
+    printf '%s\n' "$HELP_OUT" >&2
+    exit 1
 fi
 
 # The relation-count cases pin the survivor bound EXPLICITLY, to the values the

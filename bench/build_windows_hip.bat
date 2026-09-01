@@ -140,7 +140,14 @@ for %%F in (fb_load.c verify_cpu.c poly.c primes.c rfb.c fb_cado.c platform.c) d
 
 cl %CFLAGS% /std:c11 -DBENCH_GIT_DESC=\"%GIT_DESC%\" -DBENCH_DEFS=\"%DEFS%\" /c runlog.c || exit /b 1
 cl %CFLAGS% /std:c11 -DFBGEN_LIBRARY /c fbgen.c /Fofbgen_lib.obj || exit /b 1
-cl %CXXFLAGS% /std:c++17 /c boinc_support.cpp || exit /b 1
+rem Suffixed /Fo, not the bare boinc_support.obj build_windows.bat (CUDA)
+rem also compiles from the same source in this same directory: the two
+rem builds pass different flags (-DBENCH_HIP_BUILD selects "ATI" over
+rem "NVIDIA" in the compiled object), so a bare shared filename means
+rem whichever script compiles it last silently wins for BOTH exes the next
+rem time either is linked without a fresh recompile -- a real hazard found
+rem by code review, not yet exercised by any build order used so far.
+cl %CXXFLAGS% /std:c++17 /c boinc_support.cpp /Foboinc_support_hip.obj || exit /b 1
 
 echo Building HIP objects with hipcc (cl.exe as host compiler)...
 hipcc %HIPFLAGS% -c bench_main_hip.cpp -o bench_main_hip.obj || exit /b 1
@@ -151,7 +158,7 @@ echo Linking bench_hip.exe...
 hipcc %HIP_ARCH% %HIP_DEVLIB% -o bench_hip.exe ^
     bench_main_hip.obj bench_kernels_hip.obj fbgen_gpu_hip_lib.obj fb_load.obj verify_cpu.obj poly.obj ^
     primes.obj rfb.obj fb_cado.obj platform.obj runlog.obj fbgen_lib.obj ^
-    boinc_support.obj || exit /b 1
+    boinc_support_hip.obj || exit /b 1
 
 echo Built %CD%\bench_hip.exe (GFX_ARCH=%GFX_ARCH% CF_LMAX=%CF_LMAX% build=%GIT_DESC%)
 echo NOTE: bench_hip.exe needs C:\rocm\bin on PATH (libamdhip64.dll etc.) to

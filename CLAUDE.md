@@ -9,6 +9,18 @@ distribution to BOINC volunteers on Windows and Linux.
 - Build from an x64 Native Tools Command Prompt for VS 2022.
 - fp64 is very slow here and memory is a UMA carveout: this box is a
   CORRECTNESS vehicle only. Never draw performance conclusions from it.
+  **Acknowledged, deliberate exception**: HIP_TUNING_PLAN.md item 6/7's
+  slab-size work had no other AMD hardware to measure on, so it does draw a
+  performance number from this box (SLAB_PERF_TARGET_LOG2=27 in slab.h) and
+  ships it as the HIP build's static default. This is why item 7 (startup
+  auto-calibration) exists at all -- so a discrete card measures and picks
+  its OWN value at runtime instead of trusting this one -- and why
+  HIP_TUNING_PLAN.md's own opening section caveats the number as
+  "directionally suggestive for RDNA generally, not a substitute for a run
+  on an actual RX 6800/7900/9070." The static default is still this box's
+  number in every case calibration doesn't reach (below the trigger, or an
+  explicit --slab-j) -- flagged here explicitly rather than silently, code
+  review having found it in tension with the rule above.
 
 ## Ground rules
 - Do not modify the CUDA build. The HIP port lives alongside it.

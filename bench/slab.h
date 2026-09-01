@@ -62,12 +62,30 @@ typedef struct {
  * + 1 keeps the same clean-split-at-boundary property this constant pair
  * was designed around, just recentered on gfx1103's own working set. */
 #if defined(BENCH_HIP_BUILD)
-#define SLAB_PERF_TRIGGER_LOG2 28u
 #define SLAB_PERF_TARGET_LOG2  27u
 #else
-#define SLAB_PERF_TRIGGER_LOG2 30u
 #define SLAB_PERF_TARGET_LOG2  29u
 #endif
+/* Computed, not a second hand-maintained literal: the comment above proves
+ * TRIGGER = TARGET + 1 is a required invariant, not a coincidence, and
+ * spelling both out by hand is exactly how this session's own TRIGGER/TARGET
+ * desync bug happened once already (TARGET dropped to 27, TRIGGER left at
+ * the old 30). Changing the policy now only ever means changing TARGET. */
+#define SLAB_PERF_TRIGGER_LOG2 (SLAB_PERF_TARGET_LOG2 + 1u)
+
+/* The confirmed-safe ceiling for ANYTHING that probes slab sizes at runtime
+ * (currently just pipeline_hip.cuh's startup auto-calibration): 2^30 and
+ * above measured as a real system-crash risk on gfx1103 (Windows Event
+ * Viewer Kernel-Power id 41, two unclean reboots, no softer id 4101
+ * recovery -- see HIP_TUNING_PLAN.md's SAFETY FINDING). This is deliberately
+ * NOT derived from SLAB_PERF_TARGET_LOG2/TRIGGER_LOG2 above -- those are a
+ * performance policy that a future build profile could legitimately want to
+ * raise (e.g. a bigger-L2 discrete card), whereas this ceiling is a hardware
+ * safety fact that must not move just because the performance target did.
+ * Calibration's own candidate list is asserted against this at compile time
+ * (see pipeline_hip.cuh) specifically so the two can never silently drift
+ * apart the way TRIGGER/TARGET already did once. */
+#define SLAB_PERF_MAX_SAFE_LOG2 29u
 
 static inline uint32_t slab_row_quantum(int logI)
 {

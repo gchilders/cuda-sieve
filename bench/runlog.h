@@ -76,6 +76,14 @@ void runlog_record(const char *fmt, ...);
  * needs no trailing newline. */
 void runlog_warn(const char *fmt, ...);
 
+/* Set (and restored) only around a throwaway pass that must not be able to
+ * write anything a reader could mistake for the real run's own diagnostics --
+ * currently just the HIP pipeline's slab-size calibration probes. Suppresses
+ * runlog_warn()'s stderr half only; the log-file half is already inert there
+ * since a throwaway pass runs with no --log path configured. Zero by
+ * default and never set by any CUDA-side code, so this is a no-op there. */
+extern int g_runlog_quiet;
+
 /* Bind the telemetry to the card THIS process selected, by PCI bus ID in
  * NVML's "domain:bus:device.function" form -- from cudaDeviceProp, never from
  * a CUDA ordinal. NVML enumerates by PCI order while CUDA can be reordered by

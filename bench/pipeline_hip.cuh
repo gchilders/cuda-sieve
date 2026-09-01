@@ -2641,7 +2641,14 @@ static uint32_t calibrate_slab_rows(const fb_t *fb1, const fb_t *fbs1,
                                     const poly_t *POLY,
                                     const bench_cfg_t *cfg, uint32_t pmax)
 {
-    static const uint32_t CAND_LOG2[3] = {27u, 28u, 29u};
+    static constexpr uint32_t CAND_LOG2[3] = {27u, 28u, 29u};
+    /* Tied to slab.h's own named ceiling, not just a comment promising the
+     * two agree: a future change to either this array or
+     * SLAB_PERF_MAX_SAFE_LOG2 without the other now fails the build instead
+     * of silently reopening the crash-risk boundary (see slab.h). */
+    static_assert(CAND_LOG2[2] <= SLAB_PERF_MAX_SAFE_LOG2,
+                  "calibration candidate exceeds the confirmed-safe slab-size"
+                  " ceiling -- see SLAB_PERF_MAX_SAFE_LOG2 in slab.h");
     const uint32_t I = 1u << cfg->logI;
     const uint32_t quantum = slab_row_quantum(cfg->logI);
     double best_ms = -1.0;
@@ -2662,7 +2669,7 @@ static uint32_t calibrate_slab_rows(const fb_t *fb1, const fb_t *fbs1,
         slab_plan_t cplan;
         bench_cfg_t ccfg;
         double t0, t1, ms;
-        int k, dup = 0;
+        int k, dup = 0, rc_cal;
 
         rows -= rows % quantum;
         if (!rows || slab_make_plan(cfg->logI, cfg->J, pmax, rows, &cplan))
@@ -2706,11 +2713,33 @@ static uint32_t calibrate_slab_rows(const fb_t *fb1, const fb_t *fbs1,
         ccfg.stopfile  = NULL; ccfg.logpath   = NULL;
         ccfg.cofgate   = NULL; ccfg.emit_cof  = NULL;
         ccfg.cofactor  = 0;
+        ccfg.td_verify = 0;
         ccfg.nq_max = 1; ccfg.slab_j = rows;
 
+        /* Dispatch on cplan.enabled exactly like run_pipeline() itself does
+         * below, not unconditionally <true>: near the trigger a candidate's
+         * forced row count can clamp down to an unslabbed plan (nslab==1),
+         * and the real run would time THAT with the <false> specialization
+         * (slab bookkeeping compiled out entirely, per this file's own top
+         * comment) -- timing every candidate as <true> would bias a winner
+         * measured with slab overhead the real run for that plan never pays.
+         *
+         * g_runlog_quiet suppresses only this throwaway pass's mid-band
+         * warnings (bucket overflow, norm overflow, etc.): they are real
+         * conditions but tell a BOINC volunteer's stderr.txt reader nothing
+         * about the task that actually ran, since this pass's output is
+         * discarded either way -- reset unconditionally right after so the
+         * real run below is never silenced by a candidate that happened to
+         * warn. */
         t0 = host_ms();
-        if (run_pipeline_impl<true>(fb1, fbs1, fb0, fbs0, qlist, 1, NULL,
-                                    POLY, &ccfg, &cplan))
+        g_runlog_quiet = 1;
+        rc_cal = cplan.enabled
+            ? run_pipeline_impl<true>(fb1, fbs1, fb0, fbs0, qlist, 1, NULL,
+                                      POLY, &ccfg, &cplan)
+            : run_pipeline_impl<false>(fb1, fbs1, fb0, fbs0, qlist, 1, NULL,
+                                       POLY, &ccfg, &cplan);
+        g_runlog_quiet = 0;
+        if (rc_cal)
             continue;
         t1 = host_ms();
         ms = t1 - t0;
@@ -2755,6 +2784,30 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                 cfg->logI, cfg->J, pmax, forced_j);
         return -1;
     }
+#ifdef HAVE_BOINC
+    /* Paired with the "BOINC: running on HIP device" line in
+     * bench_main_hip.cpp: that line answers "which card ran this task",
+     * this one answers "what slab size did auto-calibration pick for it".
+     * Both go to stderr, not the printf lines below on stdout, because
+     * stderr.txt is the only per-task output a real BOINC client keeps --
+     * the whole reason to add this is to see, across the volunteer fleet's
+     * actual cards, whether gfx1103's 2^27-2^29 sweet spot (HIP_TUNING_PLAN.md
+     * item 6) generalises or whether a bigger-L2 discrete card picks
+     * something else, without needing to reproduce every card by hand.
+     *
+     * Gated on there having been an actual slab decision to report --
+     * cfg->slab_j set, or the geometry large enough for auto-slabbing to be
+     * eligible at all -- rather than printing unconditionally. Without this,
+     * every job below the trigger (which never calls calibrate_slab_rows or
+     * even considers a non-trivial jmax) would still log "static default",
+     * indistinguishable from a real static-default decision and diluting
+     * exactly the fleet-wide aggregate this line exists to produce. */
+    if (cfg->slab_j || slab_perf_jmax(cfg->logI, cfg->J) != 0xffffffffu)
+        fprintf(stderr, "BOINC: slab plan: %u rows/slab, %u slab%s%s\n",
+                plan.jmax, plan.nslab, plan.nslab == 1 ? "" : "s",
+                calibrated_j ? " (auto-calibrated)"
+                : cfg->slab_j ? " (--slab-j forced)" : " (static default)");
+#endif
     /* The A/B record path leaves no other trace: the stage label is the same on
      * both branches and the checkpoint job text does not carry the flag, so a
      * sweep log that mixes the two kernels would have no tell. Finding 78's
