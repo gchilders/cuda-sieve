@@ -13,16 +13,31 @@ rem calls vcvars64.bat itself, so it does NOT need to be run from an
 rem "x64 Native Tools Command Prompt".
 rem
 rem Knobs:
-rem   GFX_ARCH  gfx1103 (default) | any --offload-arch value
+rem   GFX_ARCH  gfx1103 (default, this box's Radeon 780M) | all (RDNA
+rem             fat binary, see below) | any --offload-arch value
 rem   CF_LMAX   4 (default, 128-bit cofactors) | 3 (96-bit)
 rem   DEFS      extra -D's for pricing experiments (dash form: reaches hipcc too)
 rem
 rem   build_windows_hip.bat clean
 rem
-rem Unlike build_windows.bat, there is no GPU_ARCH=all fat-binary option and
-rem no GPU_ARCH=native probe: this is a single-machine correctness port for
-rem one known GPU (gfx1103, this box's Radeon 780M), not a distribution
-rem build. See CLAUDE.md.
+rem GFX_ARCH=all builds one fat binary covering RDNA1 through RDNA4 --
+rem consumer/wavefront32 parts only (this codebase assumes warp width 32
+rem throughout; CDNA's wavefront64 compute cards, e.g. MI100/MI200/MI300,
+rem are excluded on purpose, matching CLAUDE.md's ground rule, not just
+rem left out for convenience):
+rem   gfx1010/1012        RDNA1: RX 5700/5700XT/5600XT, RX 5500/5500XT
+rem   gfx1030/1031/1032/1034  RDNA2: RX 6800-6900 series, 6700(XT), 6600
+rem                        series, 6500XT/6400
+rem   gfx1100/1101/1102/1103  RDNA3: RX 7900 series, 7800XT/7700XT, 7600
+rem                        series, and the 780M/880M iGPU family (this box)
+rem   gfx1150/1151         RDNA3.5: Strix Point/Strix Halo iGPUs
+rem   gfx1200/1201         RDNA4: RX 9060 series, RX 9070(XT)
+rem UNLIKE the CUDA build's fat binary, there is no PTX-style forward-
+rem compatible fallback here: HIP embeds real machine code per listed arch,
+rem and only an EXACT match runs. A GPU whose gfx ID isn't in this list
+rem (a future RDNA5 card, for instance) will not run this binary at all,
+rem no matter how similar its ISA. Re-run with the new gfx ID added when
+rem that happens. See CLAUDE.md for how this list was chosen and verified.
 rem ---------------------------------------------------------------------------
 
 if /I "%~1"=="clean" goto :do_clean
@@ -54,7 +69,11 @@ where hipcc >nul 2>nul || (
 
 rem ---- GFX_ARCH ------------------------------------------------------------
 if not defined GFX_ARCH set "GFX_ARCH=gfx1103"
-set "HIP_ARCH=--offload-arch=%GFX_ARCH%"
+if /I "%GFX_ARCH%"=="all" (
+    set "HIP_ARCH=--offload-arch=gfx1010 --offload-arch=gfx1012 --offload-arch=gfx1030 --offload-arch=gfx1031 --offload-arch=gfx1032 --offload-arch=gfx1034 --offload-arch=gfx1100 --offload-arch=gfx1101 --offload-arch=gfx1102 --offload-arch=gfx1103 --offload-arch=gfx1150 --offload-arch=gfx1151 --offload-arch=gfx1200 --offload-arch=gfx1201"
+) else (
+    set "HIP_ARCH=--offload-arch=%GFX_ARCH%"
+)
 
 rem TheRock's Windows ROCm distribution puts the device bitcode library at
 rem <ROCM_PATH>\lib\llvm\amdgcn\bitcode, not <ROCM_PATH>\amdgcn\bitcode where
@@ -105,9 +124,14 @@ rem MUST ship alongside bench.exe, or copy them next to it before running.
 rem This mirrors the same problem already noted for the planned Linux HIP
 rem build ($ORIGIN rpath); on Windows the fix is "ship the DLLs", not a
 rem linker flag.
-set "CFLAGS=/nologo /O2 /W3 /MT -D_CRT_SECURE_NO_WARNINGS %CF_LMAX_DEF% %DEFS%"
-set "CXXFLAGS=/nologo /O2 /W3 /MT /EHsc -D_CRT_SECURE_NO_WARNINGS %CF_LMAX_DEF% %DEFS%"
-set "HIPFLAGS=-O2 -std=c++17 %HIP_ARCH% %HIP_DEVLIB% -D_CRT_SECURE_NO_WARNINGS %CF_LMAX_DEF% %DEFS%"
+rem BENCH_HIP_BUILD: not used by any CUDA-side code -- boinc_support.cpp
+rem reads it (only under HAVE_BOINC) to pick BOINC's "ATI" vendor string
+rem instead of "NVIDIA" when checking a client GPU assignment. Defined here
+rem unconditionally (harmless when HAVE_BOINC is off) so it doesn't need to
+rem be threaded through as a separate knob.
+set "CFLAGS=/nologo /O2 /W3 /MT -D_CRT_SECURE_NO_WARNINGS -DBENCH_HIP_BUILD %CF_LMAX_DEF% %DEFS%"
+set "CXXFLAGS=/nologo /O2 /W3 /MT /EHsc -D_CRT_SECURE_NO_WARNINGS -DBENCH_HIP_BUILD %CF_LMAX_DEF% %DEFS%"
+set "HIPFLAGS=-O2 -std=c++17 %HIP_ARCH% %HIP_DEVLIB% -D_CRT_SECURE_NO_WARNINGS -DBENCH_HIP_BUILD %CF_LMAX_DEF% %DEFS%"
 
 echo Building host C objects with cl.exe... (GFX_ARCH=%GFX_ARCH% CF_LMAX=%CF_LMAX% build=%GIT_DESC%)
 for %%F in (fb_load.c verify_cpu.c poly.c primes.c rfb.c fb_cado.c platform.c) do (

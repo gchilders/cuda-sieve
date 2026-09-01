@@ -183,21 +183,38 @@ extern "C" int bench_boinc_gpu_device(void)
     if (aid.gpu_device_num < 0) return -1;
 
     /* The index is an ordinal within ONE coprocessor's device list, not a
-     * machine-wide GPU number. An index taken from the AMD or Intel list
-     * carries no information about CUDA ordinals: acting on it would run this
-     * task on an NVIDIA card the client never reserved for it, colliding with
-     * whatever the client did place there -- the exact failure this function
-     * exists to prevent. Refuse it and let CUDA's default device stand, with
-     * the misconfiguration on the record in the uploaded stderr. */
-    if (aid.gpu_type[0] && strncmp(aid.gpu_type, "NVIDIA", 6) != 0) {
+     * machine-wide GPU number. An index taken from the wrong vendor's list
+     * carries no information about this build's own device ordinals: acting
+     * on it would run this task on a card the client never reserved for it,
+     * colliding with whatever the client did place there -- the exact
+     * failure this function exists to prevent. Refuse it and let this
+     * build's default device stand, with the misconfiguration on the record
+     * in the uploaded stderr.
+     *
+     * BENCH_HIP_BUILD (defined only by build_windows_hip.bat and
+     * build_windows_hip_boinc.bat) selects the vendor string this build
+     * expects: "ATI" is BOINC's own standardized vendor name for AMD GPUs
+     * (see coproc.h -- kept from BOINC's pre-rebrand naming), "NVIDIA" for
+     * the CUDA build. This #if, not a runtime check, because a single
+     * binary is always built for one GPU vendor here -- there is no
+     * multi-vendor bench.exe that needs to decide this at runtime. */
+#if defined(BENCH_HIP_BUILD)
+#define BENCH_GPU_VENDOR "ATI"
+#else
+#define BENCH_GPU_VENDOR "NVIDIA"
+#endif
+    if (aid.gpu_type[0] && strncmp(aid.gpu_type, BENCH_GPU_VENDOR,
+                                    sizeof(BENCH_GPU_VENDOR) - 1) != 0) {
         fprintf(stderr,
-                "BOINC: this is a CUDA application but the client assigned a"
+                "BOINC: this is a %s application but the client assigned a"
                 " '%s' device (index %d); ignoring the assignment. The app"
-                " version's plan class is not an NVIDIA one.\n",
-                aid.gpu_type, aid.gpu_device_num);
+                " version's plan class is not a %s one.\n",
+                BENCH_GPU_VENDOR, aid.gpu_type, aid.gpu_device_num,
+                BENCH_GPU_VENDOR);
         return -1;
     }
     return aid.gpu_device_num;
+#undef BENCH_GPU_VENDOR
 #else
     return -1;
 #endif

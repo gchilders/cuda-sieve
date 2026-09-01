@@ -250,10 +250,10 @@ static void usage(void)
 "\n"
 "RUNTIME\n"
 #ifdef HAVE_BOINC
-"  --device N       select CUDA device N, used only when the BOINC client did\n"
-"                   not assign one; its assignment wins  [CUDA's default]\n"
+"  --device N       select HIP device N, used only when the BOINC client did\n"
+"                   not assign one; its assignment wins  [HIP's default]\n"
 #else
-"  --device N       select CUDA device N  [CUDA's default device]\n"
+"  --device N       select HIP device N  [HIP's default device]\n"
 #endif
 "  --threads N      threads per block, multiple of 32  [256]\n"
 "  --blocks N       0 = auto (6 per SM)        [0]\n"
@@ -934,7 +934,7 @@ static int bench_main_impl(int argc, char **argv)
     const char *cofac_in = NULL;
     const char *check_rel = NULL;
     int blocking_sync = 0;
-    int cuda_device = -1;       /* -1 = ask BOINC, else CUDA's default */
+    int cuda_device = -1;       /* -1 = ask BOINC, else HIP's default */
     /* Which values the COMMAND LINE supplied. Precedence is
      *      explicit flag  >  job file  >  derived  >  refuse
      * and these are what distinguishes the first level from the rest. A
@@ -1552,7 +1552,7 @@ static int bench_main_impl(int argc, char **argv)
     /* --check-relations is pure host code -- it re-derives both norms from the
      * polynomial and divides. It cannot run before this point because lpb0/lpb
      * may have just come from the .job file, and it must run before the device
-     * query below, because a fatal "cannot query the CUDA device" on a machine
+     * query below, because a fatal "cannot query the HIP device" on a machine
      * with no GPU is exactly what stops an emitted relation file from being
      * verified on the box that has the file rather than the card. */
     if (check_rel)
@@ -1598,22 +1598,22 @@ static int bench_main_impl(int argc, char **argv)
             if (cuda_device >= 0 && cuda_device != boinc_device)
                 fprintf(stderr,
                         "BOINC: ignoring --device %d; the client assigned this"
-                        " task CUDA device %d\n", cuda_device, boinc_device);
+                        " task HIP device %d\n", cuda_device, boinc_device);
             cuda_device = boinc_device;
-            fprintf(stderr, "BOINC: client assigned CUDA device %d\n",
+            fprintf(stderr, "BOINC: client assigned HIP device %d\n",
                     cuda_device);
         }
 #ifdef HAVE_BOINC
         else if (cuda_device < 0) {
             /* Distinguishes "the client assigned device 0" from "the client
              * assigned nothing", which is what tells a project whether its app
-             * version's plan class actually declares an NVIDIA coprocessor.
+             * version's plan class actually declares an AMD coprocessor.
              * Without that declaration the client sets neither this field nor
              * --device, and every task on the host lands on the same card no
              * matter what the application does. */
             fprintf(stderr,
                     "BOINC: no usable GPU assignment in init_data.xml; using"
-                    " CUDA's default device\n");
+                    " HIP's default device\n");
         }
 #endif
     }
@@ -1718,7 +1718,7 @@ static int bench_main_impl(int argc, char **argv)
      * failure here is fatal rather than a default.
      *
      * The current device is the one selected by --device or by the BOINC
-     * assignment, or CUDA's default when there is neither. The line below
+     * assignment, or HIP's default when there is neither. The line below
      * prints the actual selection. */
     {
         hipDeviceProp_t prop;
@@ -1726,7 +1726,7 @@ static int bench_main_impl(int argc, char **argv)
         int auto_blocks, effective_fill_blocks;
         if (hipGetDevice(&dev) != hipSuccess ||
             hipGetDeviceProperties(&prop, dev) != hipSuccess) {
-            fprintf(stderr, "bench: cannot query the CUDA device -- refusing to"
+            fprintf(stderr, "bench: cannot query the HIP device -- refusing to"
                     " fall back to a hardcoded grid width\n");
             return 1;
         }
@@ -1741,7 +1741,7 @@ static int bench_main_impl(int argc, char **argv)
         /* The one line that answers "did this task actually run on the card the
          * client gave it?". The grid: line below carries the same ordinal, but
          * on stdout, which the client discards with the slot directory. */
-        fprintf(stderr, "BOINC: running on CUDA device %d of %d: %s\n",
+        fprintf(stderr, "BOINC: running on HIP device %d of %d: %s\n",
                 dev, ndev, prop.name);
 #endif
         {

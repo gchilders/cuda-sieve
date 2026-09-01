@@ -401,6 +401,154 @@ build_windows.bat, which the ground rules prohibit:
    itself stays, since removing it for real means editing build_windows.bat.
 Re-ran cofcheck.sh after all fixes: all ~52 cases still pass, exit 0.
 
+## BOINC integration: built, linked, verified working end-to-end
+Confirmed earlier (see the "did this affect BOINC?" answer in session history)
+that the HIP port itself never touched boinc_support.cpp or any BOINC-related
+code -- this section is genuinely new work, done separately and later, at the
+user's request to actually build and verify a BOINC-enabled binary.
+
+**Getting BOINC's client libraries built** (separate checkout, C:\dev\boinc,
+not part of this repo): the user's own established workflow --
+`vcpkg_3rdparty_dependencies.vcxproj` then `libboinc.vcxproj` /
+`libboincapi.vcxproj` via msbuild -- needed two environment-specific fixes,
+both in the freshly-cloned BOINC checkout, NOT in cuda-sieve:
+1. `boinc.props` hardcodes `PlatformToolset=v145`; this machine's VS2022
+   Build Tools only has v143 installed. Retargeted to v143 (BOINC's C++ code
+   has no v145-specific dependency; this is purely an environment mismatch,
+   the standard "Retarget solution" fix MSBuild's own error message
+   suggests).
+2. `vcpkg_3rdparty_dependencies.vcxproj`'s `bootstrap-vcpkg.bat` and
+   `vcpkg.exe` Exec commands use bare filenames, relying on cmd.exe's
+   implicit current-directory lookup. This session's environment has
+   `NoDefaultCurrentDirectoryInExePath=1` set (an intentional sandboxing
+   control -- NOT disabled, per the standing rule against touching security
+   settings), which breaks that lookup with a bare "not recognized" error.
+   Fixed by prefixing both commands with `.\` (an explicit relative path
+   sidesteps PATH-search entirely, security setting or not) rather than
+   touching the environment variable.
+3. The vcpkg install itself failed once on a transient network error
+   (curl error 56) fetching `webview2` from NuGet -- unrelated to
+   libboinc/libboincapi (that's a BOINC Manager GUI-only dependency).
+   Rather than wait on a full retry, built `libboinc.vcxproj`/
+   `libboincapi.vcxproj` directly once confirming their actual dependencies
+   (openssl, curl, zlib -- all already installed from the first, mostly-
+   successful run) were present. Both libraries built clean, 0 errors, in
+   about a second each.
+
+**New build script**: `bench/build_windows_hip_boinc.bat` -- same structure
+as build_windows_hip.bat (same CF_LMAX/git-stamp duplication, same
+cross-reference comments), plus `-DHAVE_BOINC`, BOINC's include paths
+(`-I`/`/I` split correctly -- see below), and the two BOINC .lib files at
+link time. Produces `bench_hip_boinc.exe`, kept separate from
+`bench_hip.exe` (own object-file suffix, `_boinc`) so neither build clobbers
+the other.
+
+**One real build bug found and fixed**: the BOINC include paths went on
+HIPFLAGS as well as CXXFLAGS in the first draft, using MSVC's `/I "path"`
+syntax -- hipcc's underlying clang driver doesn't accept `/I`, only `-I`,
+and errored immediately (`no such file or directory: '/I'`). Fixed by
+removing BOINC_INC from HIPFLAGS entirely: bench_main_hip.cpp/
+bench_kernels.hip/fbgen_gpu.hip never `#include` any BOINC header directly
+(confirmed by grep) -- they only call the `bench_boinc_*` wrapper functions
+declared in bench.h and implemented in boinc_support.cpp, which is compiled
+by cl.exe (MSVC `/I` syntax, correctly) and is the only file that needs the
+BOINC include paths at all.
+
+**A real functional gap found and fixed, in boinc_support.cpp (previously
+untouched, fixed only after asking the user first)**: `bench_boinc_gpu_device()`
+hardcoded `strncmp(aid.gpu_type, "NVIDIA", 6) != 0` to reject any non-NVIDIA
+client GPU assignment -- for a real BOINC deployment on AMD hardware, the
+client reports `gpu_type == "ATI"` (BOINC's own standardized vendor string
+for AMD, confirmed in BOINC's coproc.h -- kept from the pre-rebrand name),
+so this check would have silently rejected every real AMD GPU assignment,
+defeating the entire multi-GPU-host device-assignment mechanism. Fixed with
+a new `BENCH_HIP_BUILD` macro (defined only by build_windows_hip.bat and
+build_windows_hip_boinc.bat, harmless/unused when HAVE_BOINC is off) that
+picks "ATI" instead of "NVIDIA" for the HIP build -- the CUDA build's
+behavior is completely unchanged (BENCH_HIP_BUILD is never defined there).
+Also fixed several cosmetic "CUDA device"/"CUDA's default" strings elsewhere
+in bench_main_hip.cpp's help text and BOINC-visible log messages (leftover
+from the mechanical hipify-perl pass, which only renames cuda*/hip* API
+identifiers, not string literals) to say "HIP device"/"HIP's default" --
+these are BOINC-log-visible and would otherwise confuse a real volunteer
+running this on AMD hardware.
+
+**Verified working end-to-end**: `bench_hip_boinc.exe --help` prints
+"BOINC: API initialised (standalone mode)" and the HAVE_BOINC-specific help
+text (confirming the BOINC API layer really initializes, not just compiles
+in). A real --pipeline run (same job as the Phase 5 smoke test) produced
+"BOINC: running on HIP device 0 of 1: AMD Radeon 780M Graphics" in its
+BOINC-mode log output, completed with the same correctness self-check
+passing 100% (7647/7647, 3263/3263) and 16 relations written, exit 0 --
+BOINC's standalone-mode initialization doesn't interfere with the actual
+sieve/cofactor computation at all.
+
+**Not tested**: an actual BOINC client assigning a real AMD GPU via
+init_data.xml (would need a live BOINC project/client setup, out of scope
+for this machine) -- the fix is verified correct against BOINC's own
+documented vendor-string convention (coproc.h) and against this build's
+compile/link/run behavior, but the client-assignment code path itself
+(`aid.gpu_type[0] && strncmp(...)`) only executes under a real client, which
+this session cannot provide.
+
+## Multi-arch RDNA fat binary: built, verified on this hardware
+At the user's request: a BOINC deployment binary should run on any AMD card
+a real volunteer pool has, not just this box's gfx1103. Added `GFX_ARCH=all`
+to both build_windows_hip.bat and build_windows_hip_boinc.bat (mirroring
+the CUDA build's own `GPU_ARCH=all` fat-binary knob), expanding to 14
+`--offload-arch=` flags in one hipcc invocation:
+
+    gfx1010/1012            RDNA1: RX 5700/5700XT/5600XT, RX 5500/5500XT
+    gfx1030/1031/1032/1034  RDNA2: RX 6800-6900 series, 6700(XT), 6600
+                             series, 6500XT/6400
+    gfx1100/1101/1102/1103  RDNA3: RX 7900 series, 7800XT/7700XT, 7600
+                             series, and the 780M/880M iGPU family (this box)
+    gfx1150/1151            RDNA3.5: Strix Point/Strix Halo iGPUs
+    gfx1200/1201            RDNA4: RX 9060 series, RX 9070(XT)
+
+**Scope reasoning**: user asked for "all AMD cards with at least 4GB memory
+... excluding pro-level 64-bit warp cards" -- the wavefront-width exclusion
+maps directly onto RDNA (wavefront32) vs. CDNA (wavefront64, the MI100/
+MI200/MI300 compute-only cards), which matches this codebase's own existing
+ground rule ("Warp width 32 is assumed throughout... correct on RDNA under
+HIP"). So "exclude 64-bit warp cards" isn't a new constraint here -- it's
+the SAME constraint already documented, just phrased from the hardware side
+instead of the code side. RDNA iGPUs (gfx1103/1150/1151) are included
+because they reach "4GB" via a configurable UMA carveout, same as this
+machine's own 780M (confirmed running at 14.41 GB total addressable in
+Phase 5/6's own testing) -- excluding them would exclude the very box this
+port was developed and validated on.
+
+**Real, load-bearing difference from CUDA's fat binary, not just a footnote**:
+CUDA's `compute_80,code=compute_80` PTX entry lets a newer-than-listed GPU
+still load via JIT recompilation. HIP has no equivalent here -- each
+`--offload-arch` embeds real finished machine code for that exact target,
+and the runtime picks an exact match or fails. A future RDNA5 card (or any
+gfx ID not in the 14 above) will not run this binary at all, however similar
+its ISA -- there is no forward-compatible fallback path to fall back on.
+Re-running with the new gfx ID added is the only fix when that happens.
+
+**Verification**: sanity-checked all 14 `--offload-arch` strings against
+this ROCm 10.0.0 install with a throwaway probe.hip compile (zero errors)
+before committing to the full build. Full `GFX_ARCH=all` build of
+bench_hip_boinc.exe: zero errors, ~25 MB binary (vs. ~3 MB single-arch) --
+about 20-25 minutes wall clock for all 14 targets, one hipcc invocation per
+translation unit compiling all 14 device code objects serially within that
+invocation (no fat-binary-specific parallelism knob was used here, unlike
+the CUDA Makefile's `-t 0`). Ran the actual fat binary on this
+machine's real gfx1103 hardware: correctly selected the gfx1103 code
+object at runtime ("AMD Radeon 780M Graphics"), same --pipeline job,
+same 100% correctness pass (7647/7647, 3263/3263), 16 relations, exit 0 --
+embedding 13 other architectures' code objects doesn't perturb the one
+that actually runs on this box.
+
+**Not verified**: the other 13 architectures' actual code objects, since
+this machine only has the one gfx1103 card to run on. Each is real compiled
+machine code (not skipped or stubbed), and the shared source they're
+compiled from is the same source already validated end-to-end on gfx1103 --
+but "compiles clean for gfx1030" and "runs correctly on a real RX 6800" are
+different claims, and only the former is established here.
+
 ## Windows build notes
 - This ROCm build is AMD's "TheRock" Windows distribution
   (therock-dist-windows-gfx110X-all-10.0.0.tar.gz), not a standard ROCm

@@ -29,6 +29,11 @@
 bench/bench
 bench/bench.exe
 bench/bench_hip.exe
+bench/bench_hip_boinc.exe
+# Written by BOINC's client library at runtime when a HAVE_BOINC binary runs
+# standalone (no real BOINC client/init_data.xml present).
+bench/boinc_finish_called
+bench/stderr.txt
 bench/fbtest
 bench/fbtest.exe
 bench/fbgen
