@@ -665,6 +665,33 @@ than trusting one static constant:
   slab auto-calibration: selected 2^28 (8192 rows/slab)
 ```
 
+**A second bug found and fixed, this time from a direct correctness question
+about small total sieve areas**: at total area exactly 2^28 positions (the
+trigger boundary itself), `slab_make_plan()`'s own forced-row clamp (a
+forced request above `J` is silently clamped down to `J`) makes the 2^29
+candidate land on the exact same actual plan as the 2^28 candidate -- both
+end up unslabbed at `J` rows. The diagnostic printf was reporting the
+pre-clamp requested value (misleadingly logging "8192 rows/slab" for a pass
+that had actually run identically to the 4096-row one), and the loop wasted
+a full extra GPU pass re-measuring a config already timed under a different
+name. Not a wrong final answer -- re-clamping is idempotent, so even a
+mislabeled winner reproduces the same real plan in the real run afterward --
+but wasteful and misleading. **Fixed**: track each candidate's actual
+applied `cplan.jmax` (not the pre-clamp local `rows`) for both the printed
+line and the stored winner, and skip a candidate outright once its actual
+`jmax` matches one already tested. Verified directly at the two boundary
+areas: 2^27 (below trigger) correctly skips calibration entirely with no
+diagnostic output at all; 2^28 (at the trigger) now dedups correctly:
+
+```
+    2^27 (2048 rows/slab): 865.7 ms
+    2^28 (4096 rows/slab): 717.4 ms
+    2^29: same effective slab size as an earlier candidate (4096 rows/slab), skipped
+  slab auto-calibration: selected 2^28 (4096 rows/slab)
+```
+
+cofcheck.sh re-verified: still 52/53, same single pre-existing exception.
+
 **One open interaction, accepted as-is per user decision, not fixed here**:
 the sole remaining `cofcheck.sh` failure after the cofactor fix is the
 already-documented, out-of-scope `--ecm-b1 400000` case (see the safety

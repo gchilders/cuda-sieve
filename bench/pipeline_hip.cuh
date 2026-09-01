@@ -2646,7 +2646,8 @@ static uint32_t calibrate_slab_rows(const fb_t *fb1, const fb_t *fbs1,
     const uint32_t quantum = slab_row_quantum(cfg->logI);
     double best_ms = -1.0;
     uint32_t best_rows = 0, best_log2 = 0;
-    int ncand = 0;
+    uint32_t tested_jmax[3] = {0, 0, 0};
+    int ncand = 0, ntested = 0;
 
     if (cfg->slab_j || !nq || !quantum ||
         slab_perf_jmax(cfg->logI, cfg->J) == 0xffffffffu)
@@ -2661,10 +2662,28 @@ static uint32_t calibrate_slab_rows(const fb_t *fb1, const fb_t *fbs1,
         slab_plan_t cplan;
         bench_cfg_t ccfg;
         double t0, t1, ms;
+        int k, dup = 0;
 
         rows -= rows % quantum;
         if (!rows || slab_make_plan(cfg->logI, cfg->J, pmax, rows, &cplan))
             continue;
+
+        /* slab_make_plan() clamps a forced row count down to J (near the
+         * trigger, J itself can be smaller than a candidate's raw target),
+         * so two nominally different candidates can land on the identical
+         * actual plan -- e.g. at area == 2^28 exactly, both the 2^28 and
+         * 2^29 candidates clamp to the same unslabbed J. Skip the repeat
+         * rather than spending a whole extra GPU pass measuring a config
+         * already timed under a different name. */
+        for (k = 0; k < ntested; k++)
+            if (tested_jmax[k] == cplan.jmax) { dup = 1; break; }
+        if (dup) {
+            printf("    2^%u: same effective slab size as an earlier"
+                   " candidate (%u rows/slab), skipped\n",
+                   CAND_LOG2[i], cplan.jmax);
+            continue;
+        }
+        tested_jmax[ntested++] = cplan.jmax;
 
         /* Throwaway pass: no output path means no relation/candidate file is
          * ever opened (see the `cfg->relations`/`cfg->candidates` guards
@@ -2695,10 +2714,14 @@ static uint32_t calibrate_slab_rows(const fb_t *fb1, const fb_t *fbs1,
             continue;
         t1 = host_ms();
         ms = t1 - t0;
-        printf("    2^%u (%u rows/slab): %.1f ms\n", CAND_LOG2[i], rows, ms);
+        /* cplan.jmax, not the pre-clamp `rows`: near the trigger, the two
+         * can differ (see the dedup comment above), and it is what was
+         * actually just measured that must be reported and, if it wins,
+         * reused for the real run below. */
+        printf("    2^%u (%u rows/slab): %.1f ms\n", CAND_LOG2[i], cplan.jmax, ms);
         ncand++;
         if (best_ms < 0 || ms < best_ms) {
-            best_ms = ms; best_rows = rows; best_log2 = CAND_LOG2[i];
+            best_ms = ms; best_rows = cplan.jmax; best_log2 = CAND_LOG2[i];
         }
     }
     if (ncand < 2 || !best_rows) {
