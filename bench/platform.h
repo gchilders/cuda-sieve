@@ -155,11 +155,33 @@ static __forceinline bench_u128_t bench_mul_u64_wide(uint64_t a, uint64_t b)
 static __forceinline uint64_t bench_div_u128_u64(uint64_t hi, uint64_t lo,
                                                   uint64_t d, uint64_t *rem)
 {
-#if defined(_M_X64)
+/* !defined(__clang__): hipcc's clang, even in MSVC-compatible host mode
+ * (_MSC_VER/_M_X64 both defined there), does not implement the _udiv128
+ * intrinsic -- confirmed via probe_headers.hip -- though it does implement
+ * __umulh/_umul128 above, which is why only this one function needs the
+ * exclusion. Real cl.exe never defines __clang__, so the CUDA/MSVC build
+ * is unaffected. */
+#if defined(_M_X64) && !defined(__clang__)
     return _udiv128(hi, lo, d, rem);
 #else
     /* The CUDA sieve's Windows target is x64.  Keep a compile-time fallback
-     * for other MSVC targets rather than exposing __int128 syntax to cl. */
+     * for other MSVC targets rather than exposing __int128 syntax to cl.
+     *
+     * hi < d is a REQUIRED precondition (the true quotient must fit 64
+     * bits): the real _udiv128 path above enforces it with a hardware #DE
+     * fault on violation. This shift-and-subtract loop has no such built-in
+     * check and would otherwise silently return a truncated, WRONG
+     * quotient on violation (traced: d=3,hi=5,lo=0 yields q=15,r=3, where
+     * q*d+r=48, not the true 80). Fail the same way the hardware path does
+     * -- loudly, not silently -- so this fallback (taken under hipcc, and
+     * on any non-x64 MSVC target) isn't a weaker safety net than the real
+     * intrinsic for the same precondition violation. */
+    if (hi >= d) {
+        fprintf(stderr, "bench_div_u128_u64: overflow, hi=%llu >= d=%llu "
+                "(quotient does not fit 64 bits)\n",
+                (unsigned long long)hi, (unsigned long long)d);
+        abort();
+    }
     uint64_t q = 0, r = hi;
     for (int i = 63; i >= 0; --i) {
         const uint64_t carry = r >> 63;
@@ -239,5 +261,50 @@ static inline char *bench_strdup(const char *s)
     if (p) memcpy(p, s, n);
     return p;
 }
+
+/* open_memstream is a POSIX/glibc extension; MinGW-w64's runtime (and
+ * MSVC's) has no implementation at all. Windows-only portability gap, not a
+ * CUDA/HIP one -- the CUDA/Linux build never touches this. fbgen's CLI
+ * worker threads (fbgen.c:worker_main, FBGEN_LIBRARY-excluded) only read the
+ * accumulated buffer AFTER fclose() returns, never mid-write, so a
+ * tmpfile()-backed stream slurped into a malloc'd buffer at close time is a
+ * correct substitute for this one call site -- not a general-purpose
+ * open_memstream replacement (no support for a caller reading the buffer
+ * pointer/size before closing, which real open_memstream allows and this
+ * usage never needs). */
+#ifdef _WIN32
+static inline FILE *bench_open_memstream(char **bufp, size_t *sizep)
+{
+    (void)bufp; (void)sizep;
+    return tmpfile();
+}
+
+static inline int bench_close_memstream(FILE *f, char **bufp, size_t *sizep)
+{
+    /* bench_tell/bench_seek (above), not plain ftell/fseek: a bare `long` is
+     * 32 bits on 64-bit Windows, which is exactly the trap bench_tell/
+     * bench_seek exist to avoid elsewhere in this file (they wrap
+     * _ftelli64/_fseeki64). Using plain ftell/fseek here would silently
+     * reintroduce the same 32-bit ceiling right next to the fix for it. */
+    int64_t len;
+    char *buf;
+    if (fflush(f) || (len = bench_tell(f)) < 0 || bench_seek(f, 0)) {
+        fclose(f);
+        return -1;
+    }
+    buf = (char *)malloc((size_t)len + 1);
+    if (!buf) { fclose(f); return -1; }
+    if (len > 0 && fread(buf, 1, (size_t)len, f) != (size_t)len) {
+        free(buf);
+        fclose(f);
+        return -1;
+    }
+    buf[len] = '\0';
+    if (fclose(f)) { free(buf); return -1; }
+    *bufp = buf;
+    *sizep = (size_t)len;
+    return 0;
+}
+#endif
 
 #endif

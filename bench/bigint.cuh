@@ -108,7 +108,7 @@ static inline int bn_limbs_for_bits(double bits)
     return (L < 4) ? 4 : L;
 }
 
-#if defined(__CUDACC__)
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #define BN_FN __host__ __device__ static inline
 #else
 #define BN_FN static inline
@@ -231,8 +231,16 @@ BN_FN int bn_top(const bn_t *x)
     return -1;
 }
 
-/* 64x64 -> high 64. The GPU has an instruction; the host has __int128. */
-#if defined(__CUDA_ARCH__)
+/* 64x64 -> high 64. The GPU has an instruction; the host has __int128.
+ *
+ * The device-compile check MUST come before the _MSC_VER check below: hipcc
+ * on Windows defines _MSC_VER in its device compile pass too (confirmed via
+ * probe_macros.hip), so without __HIP_DEVICE_COMPILE__ checked first, HIP
+ * device code would fall into the _MSC_VER branch and call
+ * bench_mulhi_u64 -- a host-only function -- from device code. HIP-clang
+ * never defines __CUDA_ARCH__ on the AMD backend; __HIP_DEVICE_COMPILE__ is
+ * its analogue. */
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
 #define BN_MULHI64(a, b) __umul64hi((a), (b))
 #elif defined(_MSC_VER)
 #define BN_MULHI64(a, b) bench_mulhi_u64((a), (b))

@@ -94,7 +94,7 @@ static inline void td_magic_build(uint32_t m, uint32_t *magic, uint32_t *sh)
  * half uses the single __umulhi instruction. Keeping the quotient/remainder
  * expression here prevents the regression test from validating a copied
  * formula instead of the code the kernel actually executes. */
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #define TD_MOD_HD static __host__ __device__ __forceinline__
 #else
 #define TD_MOD_HD static inline
@@ -103,7 +103,10 @@ TD_MOD_HD uint32_t td_mod_magic(uint32_t w, uint32_t m,
                                 uint32_t magic, uint32_t sh)
 {
     uint32_t q;
-#ifdef __CUDA_ARCH__
+/* HIP-clang never defines __CUDA_ARCH__ on the AMD backend; without also
+ * checking __HIP_DEVICE_COMPILE__ this silently falls through to the slower
+ * host-side division below even inside device code (see CLAUDE.md). */
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
     q = __umulhi(w, magic) >> sh;
 #else
     q = (uint32_t)(((uint64_t)w * magic) >> 32) >> sh;
@@ -112,7 +115,7 @@ TD_MOD_HD uint32_t td_mod_magic(uint32_t w, uint32_t m,
 }
 #undef TD_MOD_HD
 
-#if defined(__CUDACC__)
+#if defined(__CUDACC__) || defined(__HIPCC__)
 
 /* Move the direct-test congruence origin forward by delta_j global rows. This
  * is deliberately a separate tiny kernel: it performs one 64-bit modulo per
@@ -805,7 +808,17 @@ __global__ void k_td_record_warp(const int64_t *__restrict A,
                      * order k_td divides in. Convenient for diffing factor
                      * arrays, but NOT required: see the header -- the multiset
                      * is order-invariant and both emitters sort. */
+                    /* HIP requires a genuine 64-bit mask (static_assert on
+                     * sizeof(MaskT)==8); CUDA's 32-bit 0xffffffffu literal
+                     * fails to compile under hipcc. Confirmed via probe.hip.
+                     * Kept CUDA on its original literal rather than relying
+                     * on implicit 64->32 truncation, to leave its build
+                     * byte-for-byte unchanged. */
+#if defined(__HIPCC__)
+                    uint32_t mask = __ballot_sync(0xffffffffffffffffull, hit);
+#else
                     uint32_t mask = __ballot_sync(0xffffffffu, hit);
+#endif
                     if (lane == 0) {
                         while (mask) {
                             const uint32_t z = c + (uint32_t)__ffs(mask) - 1u;
@@ -903,5 +916,5 @@ __global__ void k_gather_ab(const int64_t *__restrict A,
     }
 }
 
-#endif  /* __CUDACC__ */
+#endif  /* __CUDACC__ || __HIPCC__ */
 #endif  /* CUDA_SIEVE_TD_CUH */

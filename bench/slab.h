@@ -10,7 +10,7 @@
 
 #include <stdint.h>
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #define SLAB_HD __host__ __device__ static inline
 #else
 #define SLAB_HD static inline

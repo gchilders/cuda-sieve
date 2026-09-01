@@ -704,11 +704,20 @@ typedef struct {
  * data-driven (one block per super-bucket) and has no grid to tune. */
 #define FILL_BLOCKS_DEFAULT  4608
 #define FILL_THREADS_DEFAULT 32
-/* k_apply's block size. APPLY_THREADS_MAX is NOT a taste limit: it is the first
- * argument of k_apply's __launch_bounds__, which is a hard ceiling -- a launch
- * with more threads per block fails outright. Keep these three in step with the
- * annotation in bench_kernels.cu; the validator in bench_main.cu enforces the
- * max at parse time so the failure is a message rather than a launch error. */
+/* k_apply's block size. On the CUDA build, APPLY_THREADS_MAX is NOT a taste
+ * limit: it is the first argument of k_apply's __launch_bounds__ in
+ * bench_kernels.cu, which is a hard ceiling -- a launch with more threads per
+ * block fails outright. Keep these three in step with that annotation; the
+ * validator in bench_main.cu enforces the max at parse time so the failure is
+ * a message rather than a launch error.
+ *
+ * NOT TRUE ON THE HIP BUILD: bench_kernels.hip drops __launch_bounds__
+ * entirely (its 2nd argument means something different under HIP -- see
+ * CLAUDE.md), so nothing in the compiled HIP kernel enforces this ceiling.
+ * APPLY_THREADS_MAX there is only the CLI-level soft cap bench_main_hip.cpp
+ * validates at parse time -- keep it in step with bench_kernels.hip's
+ * comments too, even though there's no compiler backstop to keep it honest
+ * on that side. */
 #define APPLY_THREADS_DEFAULT 512
 #define APPLY_THREADS_MAX     512
 
@@ -747,7 +756,7 @@ typedef struct {
 /* Keep the widening operation available to CPU-only correctness gates too.
  * Casting either operand after the multiplication would be too late: the
  * 32-bit product may already have wrapped to zero. */
-#if defined(__CUDACC__)
+#if defined(__CUDACC__) || defined(__HIPCC__)
 static __host__ __device__ __forceinline__ uint64_t
 bench_grid_product_u64(uint32_t a, uint32_t b)
 #else
@@ -757,7 +766,7 @@ static inline uint64_t bench_grid_product_u64(uint32_t a, uint32_t b)
     return (uint64_t)a * (uint64_t)b;
 }
 
-#if defined(__CUDACC__)
+#if defined(__CUDACC__) || defined(__HIPCC__)
 /* CUDA's grid dimensions are 32-bit, but their product need not fit in 32
  * bits. Keep the cast BEFORE multiplication in one shared helper so a future
  * grid-stride kernel cannot reintroduce a zero or wrapped stride. */

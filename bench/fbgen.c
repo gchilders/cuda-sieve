@@ -14,6 +14,7 @@
  * This distinction matters at ramified roots and at projective prime powers.
  */
 #include "bench.h"
+#include "platform.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -864,7 +865,11 @@ static void *worker_main(void *arg)
     worker_t *w = (worker_t *)arg;
     FILE *stream;
     size_t i;
+#ifdef _WIN32
+    stream = bench_open_memstream(&w->data, &w->size);
+#else
     stream = open_memstream(&w->data, &w->size);
+#endif
     if (!stream) { w->failed = errno ? errno : EIO; return NULL; }
     for (i = w->begin; i < w->end; i++) {
         entry_vec_t L;
@@ -880,7 +885,12 @@ static void *worker_main(void *arg)
         free(L.v);
         if (ferror(stream)) { w->failed = errno ? errno : EIO; break; }
     }
+#ifdef _WIN32
+    if (bench_close_memstream(stream, &w->data, &w->size) && !w->failed)
+        w->failed = errno ? errno : EIO;
+#else
     if (fclose(stream) && !w->failed) w->failed = errno ? errno : EIO;
+#endif
     return NULL;
 }
 

@@ -21,7 +21,7 @@
 
 #include <stdint.h>
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #define PL_FN __host__ __device__ static inline
 #else
 #define PL_FN static inline

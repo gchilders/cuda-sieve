@@ -26,7 +26,7 @@
 
 typedef struct { uint32_t v[M_LIMBS]; } m128_t;
 
-#if defined(__CUDACC__)
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #define PRP_FN __host__ __device__ static inline
 #else
 #define PRP_FN static inline
