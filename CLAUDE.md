@@ -549,7 +549,7 @@ compiled from is the same source already validated end-to-end on gfx1103 --
 but "compiles clean for gfx1030" and "runs correctly on a real RX 6800" are
 different claims, and only the former is established here.
 
-## Performance tuning: plan written, items 1-3 done
+## Performance tuning: plan written, items 1-3 and 5 done
 See `bench/HIP_TUNING_PLAN.md` for the full plan and item 1's (`
 __launch_bounds__` sweep) results. Short version: added a real diagnostic
 tool (`bench_dump_kernel_attrs()`, env-var gated) since this ROCm/Windows
@@ -597,6 +597,20 @@ blocks/CU, vs 1 for the other five) and the SMALLEST width penalty (1.42x)
 -- HIP-clang traded spill traffic for occupancy on this one instantiation,
 and it paid off rather than costing extra. No code change; cofcheck.sh
 still passes (no kernel code touched, only the diagnostic).
+
+Item 5 (grid-width re-derivation) turned out narrower than planned: the
+`multiProcessorCount * 6` constant only feeds the COFACTOR kernels' grid
+width (traced to pipeline_hip.cuh:1275), not k_apply/fill (those use a
+geometry-derived `nregion`, unrelated). Swept `--blocks` across two
+cofactor cases with very different occupancy (item 3's 1-block/CU and
+4-blocks/CU instantiations) -- no single value is optimal for both (12
+best for one, 48 best for the other), but the current default (36) lands
+within 1-3.3% of optimal for both. No change: the inherited NVIDIA constant
+works on gfx1103 not because the occupancy reasoning transfers (it doesn't
+-- 1 or 4 blocks/CU here, nothing like NVIDIA's 6), but because these
+kernels' sensitivity to total grid size is fairly flat above ~36-48
+regardless of per-block occupancy. cofcheck.sh still passes (no code
+touched, only measured via the existing --blocks override).
 
 ## Windows build notes
 - This ROCm build is AMD's "TheRock" Windows distribution

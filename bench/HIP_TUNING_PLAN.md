@@ -204,6 +204,73 @@ This is real engineering work, not a quick pass — expect it to look like
 the port itself did: several rounds of measure/change/re-verify against
 cofcheck.sh, not one sweep that lands everything at once.
 
+## Item 5 results: grid-width re-derivation -- DONE, no change needed
+
+**A scope correction, found while tracing the code**: `bench_main_hip.cpp`'s
+`ab = prop.multiProcessorCount * 6u` (the constant this item was written to
+re-derive) does NOT feed k_apply's or the fill kernels' launch
+configuration at all -- those use `nregion`, a geometry-derived value
+(sieve area / region size) unrelated to this constant. Tracing
+`cfg.blocks` (what `auto_blocks` initializes) to its actual consumer:
+`pipeline_hip.cuh:1275`, `const int blocks = cfg->blocks ? cfg->blocks :
+48*6;` -- this is **specifically the grid width for the cofactor kernels**
+(`k_cofac` and its `k_cof_*` support kernels via `cf_run_rounds_dyn`), not
+a general "how many blocks does this GPU want" constant. The item's
+original framing (re-derive the multiplier for AMD's CU structure in
+general) was too broad; the real question is narrower: is 36 (gfx1103's
+6 CUs x the inherited NVIDIA constant 6) a good cofactor-kernel grid width
+on this hardware.
+
+**Method**: swept `--blocks` (an existing CLI override) across two
+representative cofactor cases from item 3 -- `ecm4` (4-limb ECM, no
+stage2: 1 block/CU occupancy) and `ecms2_4` (4-limb ECM with stage2: 4
+blocks/CU, the best-occupancy instantiation found) -- since item 3 already
+showed these two have very different occupancy characteristics, a single
+grid width might not suit both. 29-special-q band, `oracle/c183.poly`,
+reading the cofactorisation queue's own device-time instrumentation.
+
+| `--blocks` | ecm4 (1 blk/CU) | ecms2_4 (4 blk/CU) |
+|---:|---:|---:|
+| 6  | 176.67 ms | 138.55 ms |
+| 12 | **124.40 ms** | 93.15 ms |
+| 18 | 137.44 ms | 87.58 ms |
+| 24 | 130.80 ms | 83.76 ms |
+| 36 (current default) | 125.65 ms | 80.06 ms |
+| 48 | 125.88 ms | **77.45 ms** |
+| 60 | 125.46 ms | -- |
+| 72 | 128.07 ms | 78.39 ms |
+| 96 | 128.26 ms | 81.13 ms |
+| 144 | 127.48 ms | 78.02 ms |
+
+**Two different shapes, one workable default**: `ecm4` is best around
+`--blocks 12` (too few, at 6, costs 42% -- too many past ~36 costs little,
+2-3%); `ecms2_4` keeps improving out to `--blocks 48` (best measured,
+77.45 ms) before flattening/going slightly noisy through 144. No single
+value in this sweep is simultaneously optimal for both shapes -- 12 is
+~20% worse than 48 for `ecms2_4`, and 48 is ~1% worse than 12 for `ecm4`.
+**The current default (36) lands within 1% of optimal for `ecm4` and
+within 3.3% of optimal for `ecms2_4`** -- close to both, best at neither,
+which is exactly what a reasonable fixed default should look like when the
+true optimum is workload-shape-dependent.
+
+**Conclusion: no change.** The inherited NVIDIA constant (6, times
+gfx1103's 6 CUs = 36) turns out to be a workable choice on this hardware
+too, but not because the reasoning that produced it (an NVIDIA per-SM
+occupancy target) transfers -- it doesn't, per item 3's occupancy numbers,
+which are 1 or 4 blocks/CU here, nothing like 6. It works because the
+actual sensitivity of these cofactor kernels to total grid size is fairly
+forgiving above a floor (~12+ blocks) and fairly flat above ~36-48,
+regardless of per-block occupancy, so a fixed middle-of-the-road value
+serves both shapes adequately. Making this workload-adaptive (e.g. scaling
+`--blocks` from the measured per-kernel occupancy) could recover the
+missing ~1-20% in the worse case for each shape, but doing that safely
+means threading the specific kernel instantiation's occupancy number
+through to grid-sizing logic that today has no idea which `k_cofac`
+variant is about to run -- a real code change, not a constant tweak, and
+not justified by a result this close to the existing default. cofcheck.sh's
+full suite still passes (no kernel or grid-sizing code was touched for
+this item, only measured with the existing `--blocks` override).
+
 ## Item 1 results: __launch_bounds__ sweep -- DONE
 
 **Baseline** (544 special-q, `oracle/c183.poly`, `--logI 14`, default
