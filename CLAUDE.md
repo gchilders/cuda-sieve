@@ -549,7 +549,7 @@ compiled from is the same source already validated end-to-end on gfx1103 --
 but "compiles clean for gfx1030" and "runs correctly on a real RX 6800" are
 different claims, and only the former is established here.
 
-## Performance tuning: plan written, items 1-3 and 5 done
+## Performance tuning: plan written, items 1-3 and 5 done, plus a real change (item 6)
 See `bench/HIP_TUNING_PLAN.md` for the full plan and item 1's (`
 __launch_bounds__` sweep) results. Short version: added a real diagnostic
 tool (`bench_dump_kernel_attrs()`, env-var gated) since this ROCm/Windows
@@ -611,6 +611,76 @@ works on gfx1103 not because the occupancy reasoning transfers (it doesn't
 kernels' sensitivity to total grid size is fairly flat above ~36-48
 regardless of per-block occupancy. cofcheck.sh still passes (no code
 touched, only measured via the existing --blocks override).
+
+**Item 6 (new, user-directed): j-slab performance target -- this one WAS
+wrong.** Asked directly whether slab.h's `SLAB_PERF_TARGET_LOG2 = 29`
+(2^29-position auto j-slab target) still holds on gfx1103 -- it doesn't.
+Swept `--slab-j` at a large geometry (`--logI 16 --J 65536`, area 2^32) to
+force auto-slabbing: 2^27 beats the old default (2^29) by **45.6%** at a
+33-special-q sample (3889 vs 5664 ms/q) -- by far the largest effect found
+in this whole tuning pass, and directionally exactly what the constant's
+own comment predicts (it names L2 cache size as the reason NVIDIA cards
+differ from each other; gfx1103's 2 MB L2 is smaller than any of them).
+2^30 (what a big-L2 NVIDIA card prefers) is catastrophic here (3.3x worse
+than 2^27). **Changed** `SLAB_PERF_TARGET_LOG2` to be `BENCH_HIP_BUILD`-
+gated (27 for HIP, 29 unchanged for CUDA) -- a value swap behind an
+existing marker in an already-shared file, not a fork. Also fixed
+pipeline_hip.cuh's status line, which printed a hardcoded "2^29" that
+would otherwise have silently gone wrong; it now prints the actual
+constant. cofcheck.sh still passes. **Follow-up, done**: SLAB_PERF_TRIGGER_LOG2 needed to move too, by a
+derivable amount (TRIGGER = TARGET+1 is not a CUDA coincidence --
+slab_perf_jmax()'s math makes that ratio produce a clean 2-way split
+exactly at the trigger boundary). Fixed to 28 for HIP, confirmed the gap
+it was leaving (a 2^28-position sieve ran unsplit under the old inherited
+trigger, 14% slower than the 2-way split the new trigger now produces
+automatically).
+
+**CRITICAL SAFETY FINDING, found while re-verifying this fix**: this
+session had already caused TWO unclean system reboots today (confirmed via
+Windows Event Viewer, Kernel-Power events at 9:06 PM and 11:17 PM) -- with
+no softer "driver recovered" event (ID 4101) alongside either one. Unlike
+a discrete NVIDIA card, this iGPU/driver combination appears to hang the
+WHOLE SYSTEM, not just reset the GPU driver, when a single kernel launch
+runs too long. This retroactively explains the wild run-to-run instability
+already noted for the largest slab sizes tested (2^30: ~998 ms per single
+fill-kernel launch, right at typical TDR thresholds; 2^31: ~3167 ms/launch,
+well past it) -- those specific measurements were likely contaminated by
+actual driver hangs, not clean compute time. This means the slab target
+fix (27) is a STABILITY fix on this hardware, not just a 45.6% throughput
+win -- CUDA's inherited 2^29 default was already close to the edge here.
+Do not repeat the large-geometry sweep points (rows 16384/32768 at --logI
+16) -- confirmed risky, not just suspected. A separate, unrelated,
+NOT-fixed risk was also flagged: cofcheck.sh's `--ecm-b1 400000` case
+drives a long single k_cofac launch (duration set by ECM parameters, not
+slab geometry) that may be its own crash risk independent of anything in
+this session's slab work. Full details in HIP_TUNING_PLAN.md.
+
+**Item 7 (new, user-directed): startup slab-size auto-calibration -- DONE.**
+Item 6 found gfx1103's optimum (2^27) is cache-size-driven, not a HIP-vs-CUDA
+property -- meaning a discrete AMD card with a bigger L2 could want something
+else in {2^27, 2^28, 2^29}. Rather than trust one static constant, added
+calibration to `run_pipeline()` (pipeline_hip.cuh): when auto-slabbing would
+apply and `--slab-j` wasn't forced, time all three candidates against the
+real `qlist[0]` (never touching the streaming generator's state -- confirmed
+by reading `run_pipeline_impl`'s loop and all three call sites that populate
+`qlist`/`qgen`) and use whichever wins. Candidates are bounded to {2^27,
+2^28, 2^29} ONLY -- 2^30 and above are excluded on purpose, per the safety
+finding above. **A real bug found and fixed**: the first version left inline
+`--cofactor` (ECM/rho) running during the 3 throwaway calibration passes,
+since nulling the output paths alone doesn't disable it -- this tripled ECM's
+cost for no benefit (its timing is flat regardless of slab size) and broke
+5 cofcheck.sh cases that grep for cofactor-method diagnostic lines expecting
+exactly one occurrence. Fixed by forcing `cofactor = 0` in the calibration
+scratch config. Verified: cofcheck.sh passes 52/53, matching the
+pre-calibration baseline with one exception -- the already-flagged
+`--ecm-b1 400000` case (previous paragraph) failed the same
+already-documented way (a caught `cofac_hip.cuh` device error, not a crash)
+with calibration enabled, having passed on the baseline; possibly calibration's
+extra GPU load beforehand makes that pre-existing, unrelated issue somewhat
+more likely to surface, but per user decision this is accepted and documented
+rather than chased further -- fixing it belongs to the separate ECM-kernel
+issue, not to this item. Full design/verification detail in
+HIP_TUNING_PLAN.md's Item 7.
 
 ## Windows build notes
 - This ROCm build is AMD's "TheRock" Windows distribution

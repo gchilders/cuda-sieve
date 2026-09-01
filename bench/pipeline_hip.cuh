@@ -2613,6 +2613,104 @@ done:
     return rc;
 }
 
+/* Auto-calibrate the j-slab size against the real first special-q, rather
+ * than trusting a single build-wide constant. SLAB_PERF_TARGET_LOG2 (see
+ * slab.h) is itself a measurement on ONE piece of hardware -- gfx1103's small
+ * L2 and shared-DDR5 UMA made 2^27 the winner here, 45.6% faster than the
+ * CUDA-tuned 2^29, but a discrete AMD card with a much larger L2 could easily
+ * land somewhere else on that same curve. There is no way to know without
+ * asking the hardware in front of it, and doing so costs one extra special-q
+ * at startup -- negligible against a run measured in hours.
+ *
+ * Bounded to {2^27, 2^28, 2^29} ONLY, deliberately: this session confirmed
+ * (Event Viewer, Kernel-Power id 41, no id 4101 recovery) that a single
+ * kernel launch anywhere near 2^30-2^31 positions can hang this machine's
+ * GPU driver badly enough to take down the whole OS, not just the process.
+ * See the SAFETY FINDING in HIP_TUNING_PLAN.md. Calibration must never probe
+ * a size this hardware has already shown can crash the box, so 2^30 and
+ * above are not candidates here no matter what a future card might prefer.
+ *
+ * Skipped entirely when the caller passes an explicit --slab-j (a
+ * regression/testing knob, not something auto-tuning should override) or
+ * when the geometry is too small to trigger performance slabbing at all --
+ * calibrating a sieve that already fits under the trigger in one pass would
+ * only add the extra q's cost for no possible benefit. */
+static uint32_t calibrate_slab_rows(const fb_t *fb1, const fb_t *fbs1,
+                                    const fb_t *fb0, const fb_t *fbs0,
+                                    const qsel_t *qlist, uint32_t nq,
+                                    const poly_t *POLY,
+                                    const bench_cfg_t *cfg, uint32_t pmax)
+{
+    static const uint32_t CAND_LOG2[3] = {27u, 28u, 29u};
+    const uint32_t I = 1u << cfg->logI;
+    const uint32_t quantum = slab_row_quantum(cfg->logI);
+    double best_ms = -1.0;
+    uint32_t best_rows = 0, best_log2 = 0;
+    int ncand = 0;
+
+    if (cfg->slab_j || !nq || !quantum ||
+        slab_perf_jmax(cfg->logI, cfg->J) == 0xffffffffu)
+        return 0;
+
+    printf("\n  slab auto-calibration: probing 2^27/2^28/2^29-position slabs"
+           " against q=%llu (this run's first special-q)...\n",
+           (unsigned long long)qlist[0].q);
+    for (int i = 0; i < 3; i++) {
+        const uint64_t rows64 = ((uint64_t)1 << CAND_LOG2[i]) / I;
+        uint32_t rows = rows64 > 0xffffffffull ? 0xffffffffu : (uint32_t)rows64;
+        slab_plan_t cplan;
+        bench_cfg_t ccfg;
+        double t0, t1, ms;
+
+        rows -= rows % quantum;
+        if (!rows || slab_make_plan(cfg->logI, cfg->J, pmax, rows, &cplan))
+            continue;
+
+        /* Throwaway pass: no output path means no relation/candidate file is
+         * ever opened (see the `cfg->relations`/`cfg->candidates` guards
+         * throughout run_pipeline_impl), so this cannot write, checkpoint,
+         * or otherwise disturb real state -- it only spends GPU time. qgen
+         * is passed as NULL and nq as 1, so the loop processes exactly
+         * qlist[0] and stops; qlist and the real qgen are never touched.
+         *
+         * cofactor is forced OFF here, not just output-less: inline ECM/rho
+         * runs regardless of whether a relations/candidates path is set, and
+         * it is the wrong thing to be timing anyway -- the cross-q cofactor
+         * queue's cost does not depend on slab geometry at all (measured
+         * flat at ~975-1220 ms across all three candidates below, while only
+         * fill moved), so paying for it three extra times bought nothing but
+         * tripled the ECM cost of every calibrated run and, in cofcheck.sh,
+         * literally doubled the "cofactor method"/B2-derivation lines a
+         * caller might grep for exactly once. */
+        ccfg = *cfg;
+        ccfg.relations = NULL; ccfg.candidates = NULL;
+        ccfg.stopfile  = NULL; ccfg.logpath   = NULL;
+        ccfg.cofgate   = NULL; ccfg.emit_cof  = NULL;
+        ccfg.cofactor  = 0;
+        ccfg.nq_max = 1; ccfg.slab_j = rows;
+
+        t0 = host_ms();
+        if (run_pipeline_impl<true>(fb1, fbs1, fb0, fbs0, qlist, 1, NULL,
+                                    POLY, &ccfg, &cplan))
+            continue;
+        t1 = host_ms();
+        ms = t1 - t0;
+        printf("    2^%u (%u rows/slab): %.1f ms\n", CAND_LOG2[i], rows, ms);
+        ncand++;
+        if (best_ms < 0 || ms < best_ms) {
+            best_ms = ms; best_rows = rows; best_log2 = CAND_LOG2[i];
+        }
+    }
+    if (ncand < 2 || !best_rows) {
+        printf("  slab auto-calibration: inconclusive, using the built-in"
+               " default\n");
+        return 0;
+    }
+    printf("  slab auto-calibration: selected 2^%u (%u rows/slab)\n",
+           best_log2, best_rows);
+    return best_rows;
+}
+
 extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                             const fb_t *fb0, const fb_t *fbs0,
                             const qsel_t *qlist, uint32_t nq, sqgen_t *qgen,
@@ -2622,12 +2720,16 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     uint32_t pmax1 = fb_max_td_prime(fbs1);
     uint32_t pmax0 = fb_max_td_prime(fbs0);
     uint32_t pmax = pmax1 > pmax0 ? pmax1 : pmax0;
+    const uint32_t calibrated_j = calibrate_slab_rows(fb1, fbs1, fb0, fbs0,
+                                                       qlist, nq, POLY, cfg,
+                                                       pmax);
+    const uint32_t forced_j = calibrated_j ? calibrated_j : cfg->slab_j;
 
-    if (slab_make_plan(cfg->logI, cfg->J, pmax, cfg->slab_j, &plan)) {
+    if (slab_make_plan(cfg->logI, cfg->J, pmax, forced_j, &plan)) {
         fprintf(stderr,
                 "  pipeline: cannot make a safe slab plan for logI=%d J=%u"
                 " (largest direct-test prime %u, requested --slab-j %u)\n",
-                cfg->logI, cfg->J, pmax, cfg->slab_j);
+                cfg->logI, cfg->J, pmax, forced_j);
         return -1;
     }
     /* The A/B record path leaves no other trace: the stage label is the same on
@@ -2642,9 +2744,19 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     if (plan.enabled) {
         const uint32_t perf_jmax = slab_perf_jmax(cfg->logI, cfg->J);
         if (!cfg->slab_j && perf_jmax != 0xffffffffu)
+            /* SLAB_PERF_TARGET_LOG2 printed directly rather than a literal
+             * "2^29" here: that literal was silently wrong for this HIP
+             * build the moment slab.h's target became BENCH_HIP_BUILD-gated
+             * (see slab.h and HIP_TUNING_PLAN.md) -- this build's real auto
+             * target is 2^27, not 2^29. Deriving it from the same constant
+             * the planner itself uses means the message can't drift out of
+             * sync with the actual policy again. Calibration, when it ran
+             * and produced a different winner, is reported separately above
+             * and takes precedence over this static figure. */
             printf("  j-slabbing: %u slab%s, up to %u rows/slab"
-                   " (auto <=2^29-position target; safety bounds may reduce it further)\n",
-                   plan.nslab, plan.nslab == 1 ? "" : "s", plan.jmax);
+                   " (auto <=2^%u-position target; safety bounds may reduce it further)\n",
+                   plan.nslab, plan.nslab == 1 ? "" : "s", plan.jmax,
+                   SLAB_PERF_TARGET_LOG2);
         else
             printf("  j-slabbing: %u slab%s, up to %u rows/slab"
                    " (<=2^31 local-position safety bound)\n",

@@ -204,6 +204,128 @@ This is real engineering work, not a quick pass — expect it to look like
 the port itself did: several rounds of measure/change/re-verify against
 cofcheck.sh, not one sweep that lands everything at once.
 
+## Item 6 (new, not in the original list): j-slab performance target -- CHANGED
+
+Not one of the original five items -- added after the user asked directly
+whether `slab.h`'s `SLAB_PERF_TARGET_LOG2 = 29` (2^29 positions/slab, the
+auto-mode j-slabbing target above the 2^30-position trigger) is still right
+on gfx1103. It documents its own provenance clearly: "Two independent
+benchmarks (Ampere RTX 3090 and Blackwell RTX 5070) found this working set
+near the fill/TD crossover; an L40 with a larger L2 cache instead preferred
+2^30." Since the stated reason 2^29 wins is cache-size-dependent, and
+gfx1103's L2 (2 MB) is far smaller than any of those three cards', this was
+a good candidate to actually be wrong here, not just untested.
+
+**It was wrong, by a lot.** Needed a large enough sieve to make auto-mode
+j-slabbing trigger at all (area >= 2^30 positions) -- used `--logI 16 --J
+65536` (area 2^32) against `oracle/c183.poly`, with `--slab-j` (an existing
+CLI override) sweeping the actual chunk size directly:
+
+| slab-j (rows) | positions/slab | wall ms/q (7-q sample) | wall ms/q (33-q sample) |
+|---:|---:|---:|---:|
+| 1024 | 2^26 | 4364.74 | -- |
+| **2048** | **2^27** | **3915.17** | **3889.34** |
+| 3072 | ~2^27.5 | 4193.10 | -- |
+| 4096 | 2^28 | 4744.03 | -- |
+| 8192 (old default) | 2^29 | 5646.64 | 5663.54 |
+| 16384 | 2^30 (the L40's preferred point) | 12794.33 | -- |
+| 32768 | 2^31 | 16919.51 | -- |
+
+2^27 beat 2^29 by **45.6%** at the larger, more stable sample (33 special-q:
+3889 vs 5664 ms/q) -- not a marginal or noise-level difference, the largest
+effect size found anywhere in this tuning pass. 2^30 (what a big-L2 NVIDIA
+card wants) is catastrophic here: 3.3x worse than 2^27. This tracks the
+comment's own stated reasoning exactly -- gfx1103's 2 MB L2 is closer in
+spirit to "smaller than the working set" than any of the three NVIDIA cards
+this constant was tuned against, so a *smaller* target chunk makes sense,
+not a coincidence.
+
+**Change made**: `SLAB_PERF_TARGET_LOG2` in `slab.h` is now
+`BENCH_HIP_BUILD`-gated -- `27` for the HIP build, `29` unchanged for CUDA.
+`slab.h` is a shared, unforked file (like the other low-churn headers), so
+this is a value swap behind an existing build-time marker, not a fork --
+the CUDA build's behavior is provably unchanged (`BENCH_HIP_BUILD` is never
+defined there). Also fixed `pipeline_hip.cuh`'s j-slabbing status line,
+which printed a literal `"2^29"` string that would otherwise have gone
+silently wrong the moment the target became build-specific; it now prints
+`SLAB_PERF_TARGET_LOG2` itself, so the message can't drift from the actual
+policy again on either build. cofcheck.sh's full suite still passes (slab
+count changes how work is chunked, not what it computes -- the suite
+already independently tests "warp vs thread recording... 4 slabs...
+identical" for exactly this invariant).
+
+**Follow-up, done**: `SLAB_PERF_TRIGGER_LOG2` needed to move too, and by a
+derivable amount, not a guess. `slab_perf_jmax()` computes `rows =
+TARGET/I` independent of J, so CUDA's own `TRIGGER = TARGET + 1` (2^30 =
+2*2^29) is not a coincidence: a sieve at exactly the trigger gets `nslab =
+ceil(J / (TARGET/I)) = ceil(2) = 2` -- a clean minimal split, by
+construction. Leaving TRIGGER at 30 while only dropping TARGET to 27 broke
+that invariant (8:1 instead of 2:1) and silently reopened the same problem
+at a smaller size. Confirmed directly: a sieve at exactly 2^28 positions
+(inside the resulting gap) ran unsplit under the old trigger (fill 123.6
+ms) vs. a forced 2-way split into 2^27 chunks (fill 64.7 ms, 14% faster
+overall) that a corrected trigger produces automatically. Fixed
+`SLAB_PERF_TRIGGER_LOG2` to `28` (`= TARGET_LOG2 + 1`) under
+`BENCH_HIP_BUILD`, restoring the same clean-split-at-boundary property,
+recentered on gfx1103's own working set. Verified the corrected trigger
+actually fires automatically at the 2^28 boundary (fill 65.3 ms, matching
+the manually-forced split).
+
+## IMPORTANT SAFETY FINDING: long single-kernel launches crash this machine
+
+While validating the trigger fix, `cofcheck.sh` failed once
+("large B1 with derived B2" -- normally PASS) with no immediately obvious
+cause; two re-runs both passed cleanly. Investigating why turned up
+something more serious than a flaky test: **this session had already
+caused two unclean system reboots today** (Windows Event Viewer, Kernel-
+Power/unclean-shutdown events at 9:06 PM and 11:17 PM), with no softer
+"display driver stopped responding and recovered" event (ID 4101) logged
+alongside either one. On a discrete NVIDIA card, a kernel that runs too
+long typically trips Windows' TDR (Timeout Detection and Recovery) and the
+driver resets cleanly. **On this iGPU/driver combination, a long enough
+single kernel launch appears to hang the whole system instead of
+recovering.**
+
+This retroactively explains the wild run-to-run instability seen earlier
+at the largest slab sizes in the region/slab sweeps above. The quantity
+that actually matters for this risk is PER-LAUNCH kernel duration, not
+total time across a q:
+
+| slab-j (rows) | fill total | slabs | **fill per launch** |
+|---:|---:|---:|---:|
+| 8192 (old CUDA default) | 2925 ms | 8 | ~366 ms -- safe |
+| 16384 (2^30) | 3990 ms | 4 | **~998 ms -- right at the edge** |
+| 32768 (2^31) | 6334 ms | 2 | **~3167 ms -- past typical TDR thresholds** |
+
+The inconsistent numbers measured for 16384/32768 across separate runs
+earlier in this document (e.g. 12794 vs 6953 ms/q at 2^30) were most
+likely contaminated by actual driver hangs/recovery partway through, not
+clean compute measurements -- treat those specific data points as
+qualitatively "much worse, dangerously so," not as precise numbers.
+
+**This reframes the whole slab fix**: `SLAB_PERF_TARGET_LOG2 = 27` for HIP
+is not just a 45.6% throughput win, it is a stability requirement on this
+hardware. CUDA's inherited default (2^29, ~366 ms/launch) was already
+closer to the edge than comfortable; anything at 2^30 or above is a real
+crash risk here, confirmed against actual system logs, not inferred from
+timing alone.
+
+**A separate, NOT fixed risk, flagged for whoever picks this up next**: the
+`cofcheck.sh` test that uses `--ecm-b1 400000` drives a single long-running
+`k_cofac` (cofactor) kernel launch whose duration comes from ECM's own
+parameters (B1/rounds/curves), entirely independent of slab planning (item
+5 already established `k_cofac`'s grid comes from `--blocks`, not slab
+geometry). This is a pre-existing risk on this hardware that the slab fix
+does not address and did not introduce. If cofactor-kernel-duration crashes
+ever recur, the fix belongs in `--cof-rounds`/ECM curve-batching, not here.
+
+**Practical guidance for future sessions on this machine**: do not run
+`--slab-j` values (or unbounded/auto-slabbed geometries) that produce
+multi-hundred-millisecond-or-longer single kernel launches without a clear
+reason, and do not repeat the specific large-geometry sweep points above
+(rows 16384/32768 at `--logI 16`) -- they are now confirmed, not just
+suspected, to risk a full system crash on this hardware.
+
 ## Item 5 results: grid-width re-derivation -- DONE, no change needed
 
 **A scope correction, found while tracing the code**: `bench_main_hip.cpp`'s
@@ -472,3 +594,91 @@ an AMD-specific performance cliff. cofcheck.sh's full suite still passes
 ever needs revisiting, `CF_ECM_NBABY` is the knob STATUS.md itself already
 names as the lever for ECM stage 2's live-state footprint, on either
 platform.
+
+## Item 7 (new): startup slab-size auto-calibration -- DONE
+
+Item 6 found that gfx1103's optimum (2^27) is 45.6% faster than the CUDA
+default (2^29), and reasoned that the cause -- a 2 MB L2 much smaller than
+any of the NVIDIA cards the CUDA constant was tuned on -- is a cache-size
+effect, not a HIP-vs-CUDA one. That means a discrete AMD card with a larger
+L2 could just as easily want something else in the {2^27, 2^28, 2^29} range,
+and there is no way to know without asking the hardware in front of it. The
+user proposed testing the actual candidates against the real first special-q
+at startup and picking the fastest, estimating it could cost "only a few
+seconds" -- this item is that feature.
+
+**Design**: lives in `run_pipeline()` (`pipeline_hip.cuh`), right before the
+plan-building `slab_make_plan()` call it already had. Gated on `!cfg->slab_j`
+(an explicit `--slab-j` bypasses calibration entirely, unchanged) and on
+`slab_perf_jmax()` actually applying to this geometry (no point calibrating
+a sieve too small to perf-slab at all). Candidates are **{2^27, 2^28, 2^29}
+positions/slab only** -- deliberately excluding 2^30 and above, which the
+safety finding above confirmed can hang this machine's GPU driver badly
+enough to crash the whole OS. Each candidate is timed with a real,
+throwaway call to `run_pipeline_impl<true>()` against `qlist[0]` (`nq=1`,
+`qgen=NULL`), then the real run proceeds with whichever candidate won,
+built via a fresh `slab_make_plan()` call rather than by mutating the
+caller's `cfg`.
+
+**Why `qlist[0]` is safe to reuse, not a guess**: read `run_pipeline_impl`'s
+own per-q loop (`if (qi < nq) cur = &qlist[qi]; else if (qgen) ...`) and
+`bench_main_hip.cpp`'s three call sites that populate `qlist`/`qgen` before
+calling `run_pipeline()` (the `--qrange` streaming case, the `--qlist` file
+case, and the single `--q`/`--rho` case). In all three, `qlist[0]` is
+always populated with the real first special-q before `qgen` (if any) ever
+supplies q1 onward -- `qgen` is never consulted for `qi == 0`. Calibration
+therefore never calls `sqgen_next()` and never advances the real streaming
+generator's state; it only reads `qlist[0]`, which is `const` all the way
+through and shared, unmutated, with the real run that follows.
+
+**A real bug found and fixed while verifying against cofcheck.sh**: the
+first version left `--cofactor` on in the calibration passes' scratch
+config, reasoning that `NULL`ing `relations`/`candidates` was enough to make
+them side-effect-free. It was not -- inline ECM/rho cofactorisation runs
+regardless of whether an output path is set, so each of the 3 throwaway
+passes also ran the *entire* cofactor stage against the real q, printing its
+own "cofactor method"/"B2 derived" diagnostic lines and paying ECM's cost 3
+extra times. Two costs, not one: it broke `cofcheck.sh` cases that grep for
+those lines expecting exactly one occurrence (5 cases failed: B2-derivation,
+auto-method resolution, `--cof-rho`/`--cof-ecm` override, and the 4-limb
+width case), and it made calibration far more expensive than intended --
+the cofactor queue's own cost was measured completely flat across all three
+slab candidates (~975-1220 ms regardless of slab size, only `fill` moved),
+so none of that spend bought any information relevant to the decision being
+made. **Fix**: `ccfg.cofactor = 0` in the calibration scratch config, so it
+exercises only the sieve/TD/classify stages slab size actually affects.
+
+**Verified**: `cofcheck.sh`'s full suite passes 52/53 after the fix -- the
+same result as the pre-calibration baseline, with one exception noted below.
+On the correctness-gate job itself (`oracle/c183.poly`, the default
+geometry `cofcheck.sh` uses, q=120000053), calibration picked **2^28**, not
+the static 2^27 default -- a genuinely different answer for this job's
+smaller factor-base/geometry than the large `--logI 16 --J 65536` job item
+6's sweep used, which is exactly the point of calibrating per-job rather
+than trusting one static constant:
+
+```
+  slab auto-calibration: probing 2^27/2^28/2^29-position slabs against q=120000053...
+    2^27 (4096 rows/slab): 1082.1 ms
+    2^28 (8192 rows/slab): 938.4 ms
+    2^29 (16384 rows/slab): 2197.7 ms
+  slab auto-calibration: selected 2^28 (8192 rows/slab)
+```
+
+**One open interaction, accepted as-is per user decision, not fixed here**:
+the sole remaining `cofcheck.sh` failure after the cofactor fix is the
+already-documented, out-of-scope `--ecm-b1 400000` case (see the safety
+finding above -- a real device error, `hipDeviceSynchronize(): unspecified
+launch failure` at `cofac_hip.cuh:1698`, in a file this item never touches).
+That case passed on the pre-calibration baseline build but failed the same
+way twice with calibration enabled. It is plausible calibration's three
+extra GPU passes immediately before the real run add enough memory/thermal
+pressure to make this already-marginal ECM kernel configuration (B1=400000,
+B2=10000000, 320000 giant steps) more likely to fail -- or it may simply be
+the same pre-existing flakiness this exact case was already flagged for
+before any of today's work. Either way: it is a clean, caught failure (error
+printed, resumable checkpoint written, process exits normally), confirmed
+via Event Viewer to NOT be a system crash, and it belongs to the same
+already-flagged, separate `cofac_hip.cuh`/ECM-kernel issue, not to this
+item's slab-calibration code. Flagged here for whoever eventually looks at
+that kernel, not addressed by this item.

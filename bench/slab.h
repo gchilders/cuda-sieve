@@ -33,9 +33,41 @@ typedef struct {
  * fill/TD crossover; an L40 with a larger L2 cache instead preferred 2^30 for
  * maximum throughput. This is a generic performance/memory tuning cap, not a
  * universal speed optimum. Explicit --slab-j overrides it, while the 2^31
- * position and direct-TD bounds below remain mandatory. */
+ * position and direct-TD bounds below remain mandatory.
+ *
+ * gfx1103 (HIP build) does NOT confirm 2^29 -- it is measurably worse here,
+ * not just "not proven better". Swept 2^26..2^31-position slabs at logI=16,
+ * J=65536 (33-special-q sample, oracle/c183.poly): 2^27 gave 3889 ms/q,
+ * 2^29 (this constant's CUDA-tuned value) gave 5664 ms/q -- 2^29 is 45.6%
+ * SLOWER than 2^27 on this hardware, and 2^30 (the L40's preferred point)
+ * is catastrophic here (12794 ms/q, 3.3x worse than 2^27). Consistent with
+ * gfx1103's small 2 MB L2 (vs. tens of MB on the NVIDIA cards this was
+ * tuned against) and its UMA/shared-DDR5 memory subsystem -- a smaller
+ * working set matters much more here. BENCH_HIP_BUILD-gated rather than
+ * changed outright, so the CUDA build's own tuned value is untouched; see
+ * HIP_TUNING_PLAN.md for the full sweep data.
+ *
+ * TRIGGER moves too, and not by guesswork: TRIGGER_LOG2 = TARGET_LOG2 + 1
+ * on the CUDA side is not a coincidence -- slab_perf_jmax() computes rows =
+ * TARGET/I independent of J, so a sieve at EXACTLY the trigger (area ==
+ * 2*TARGET) gets nslab = ceil(J / (TARGET/I)) = ceil(2) = 2: a clean
+ * minimal split right at the boundary, by construction. Leaving TRIGGER at
+ * 30 while only dropping TARGET to 27 breaks that invariant (an 8:1 ratio
+ * instead of 2:1) and silently reopens the exact problem TARGET was fixed
+ * for, just at a smaller size: confirmed by testing a sieve at exactly
+ * 2^28 positions (inside the resulting gap) with the old inherited trigger
+ * -- it runs unsplit (fill 123.6 ms) since 2^28 < 2^30, versus a forced
+ * 2-way split into 2^27 chunks (fill 64.7 ms, 14% faster overall) that
+ * TRIGGER=28 would have produced automatically. Restoring TRIGGER = TARGET
+ * + 1 keeps the same clean-split-at-boundary property this constant pair
+ * was designed around, just recentered on gfx1103's own working set. */
+#if defined(BENCH_HIP_BUILD)
+#define SLAB_PERF_TRIGGER_LOG2 28u
+#define SLAB_PERF_TARGET_LOG2  27u
+#else
 #define SLAB_PERF_TRIGGER_LOG2 30u
 #define SLAB_PERF_TARGET_LOG2  29u
+#endif
 
 static inline uint32_t slab_row_quantum(int logI)
 {
