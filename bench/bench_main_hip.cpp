@@ -19,6 +19,17 @@
 #include <errno.h>
 #include <limits.h>
 #include <ctype.h>
+#ifdef _WIN32
+#include <windows.h>
+/* RegOpenKeyExA/RegEnumKeyExA/RegQueryValueExA/RegCloseKey, used only by
+ * bench_log_amd_driver_version() below -- explicit rather than relying on
+ * whichever build script's link line happens to already carry -lAdvapi32
+ * for an unrelated reason (build_windows_hip_boinc.bat does today; a plain
+ * build_windows_hip.bat rebuild without that flag should not silently lose
+ * this diagnostic). Respected by lld-link (hipcc's linker here) the same
+ * way as link.exe. */
+#pragma comment(lib, "advapi32.lib")
+#endif
 
 /* HIP_TUNING_PLAN.md item 1/3 diagnostics -- defined in bench_kernels.hip,
  * where the kernel templates they inspect are visible. */
@@ -852,6 +863,68 @@ static int boinc_discard_bad_resume(const resume_recovery_t *r,
     return 1;
 }
 
+/* Best-effort, independent of HIP: read the installed AMD display driver's
+ * version/date straight from the registry. Called only after HIP itself has
+ * already failed to find any device at all, so this is the only diagnostic
+ * left to give -- BOINC's own client-side GPU detection (OpenCL/ADL-based,
+ * separate from HIP) already proved a real AMD adapter is present when it
+ * assigned this task, which is why "no ROCm-capable device is detected" is a
+ * driver/runtime problem, not a missing-hardware one. AMD publishes no
+ * minimum-driver-version guarantee for ROCm/HIP on Windows at all (checked
+ * directly against their own docs this session), so the only way to learn
+ * where that boundary actually falls is to log every real failing host's
+ * driver version and see what accumulates in stderr.txt across the fleet. */
+static void bench_log_amd_driver_version(void)
+{
+#ifdef _WIN32
+    static const char *const class_key =
+        "SYSTEM\\CurrentControlSet\\Control\\Class\\"
+        "{4d36e968-e325-11ce-bfc1-08002be10318}";
+    HKEY hClass;
+    DWORD i;
+    int logged = 0;
+
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, class_key, 0, KEY_READ, &hClass)
+        != ERROR_SUCCESS) {
+        fprintf(stderr, "BOINC: could not open the display-adapter registry"
+                " key to report a driver version\n");
+        return;
+    }
+    for (i = 0; ; i++) {
+        char sub[16], desc[256], ver[64], date[64];
+        DWORD subLen = sizeof sub, sz;
+        HKEY hSub;
+
+        if (RegEnumKeyExA(hClass, i, sub, &subLen, NULL, NULL, NULL, NULL)
+            != ERROR_SUCCESS)
+            break;
+        if (RegOpenKeyExA(hClass, sub, 0, KEY_READ, &hSub) != ERROR_SUCCESS)
+            continue;
+        desc[0] = 0;
+        sz = sizeof desc;
+        RegQueryValueExA(hSub, "DriverDesc", NULL, NULL, (BYTE *)desc, &sz);
+        if (desc[0] && (strstr(desc, "AMD") || strstr(desc, "Radeon") ||
+                        strstr(desc, "ATI"))) {
+            ver[0] = 0; date[0] = 0;
+            sz = sizeof ver;
+            RegQueryValueExA(hSub, "DriverVersion", NULL, NULL, (BYTE *)ver, &sz);
+            sz = sizeof date;
+            RegQueryValueExA(hSub, "DriverDate", NULL, NULL, (BYTE *)date, &sz);
+            fprintf(stderr,
+                    "BOINC: installed AMD display driver: \"%s\", version"
+                    " %s, dated %s\n", desc, ver[0] ? ver : "(unknown)",
+                    date[0] ? date : "(unknown)");
+            logged = 1;
+        }
+        RegCloseKey(hSub);
+    }
+    RegCloseKey(hClass);
+    if (!logged)
+        fprintf(stderr, "BOINC: no AMD/Radeon display adapter found in the"
+                " registry to report a driver version for\n");
+#endif
+}
+
 static int bench_main_impl(int argc, char **argv)
 {
     /* Identity of the card this process actually selected, captured where the
@@ -1650,10 +1723,12 @@ static int bench_main_impl(int argc, char **argv)
         if (err != hipSuccess) {
             fprintf(stderr, "bench: cannot enumerate HIP devices: %s\n",
                     hipGetErrorString(err));
+            bench_log_amd_driver_version();
             return 1;
         }
         if (ndev < 1) {
             fprintf(stderr, "bench: this process sees no HIP device\n");
+            bench_log_amd_driver_version();
             return 1;
         }
         if (selected_device >= ndev) {

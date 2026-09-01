@@ -74,7 +74,7 @@ rem the full target list and rationale). This is the knob a real BOINC
 rem deployment binary should use, since a volunteer pool spans many cards.
 if not defined GFX_ARCH set "GFX_ARCH=gfx1103"
 if /I "%GFX_ARCH%"=="all" (
-    set "HIP_ARCH=--offload-arch=gfx1010 --offload-arch=gfx1012 --offload-arch=gfx1030 --offload-arch=gfx1031 --offload-arch=gfx1032 --offload-arch=gfx1034 --offload-arch=gfx1100 --offload-arch=gfx1101 --offload-arch=gfx1102 --offload-arch=gfx1103 --offload-arch=gfx1150 --offload-arch=gfx1151 --offload-arch=gfx1200 --offload-arch=gfx1201"
+    set "HIP_ARCH=--offload-arch=gfx1010 --offload-arch=gfx1011 --offload-arch=gfx1012 --offload-arch=gfx1030 --offload-arch=gfx1031 --offload-arch=gfx1032 --offload-arch=gfx1033 --offload-arch=gfx1034 --offload-arch=gfx1035 --offload-arch=gfx1036 --offload-arch=gfx1100 --offload-arch=gfx1101 --offload-arch=gfx1102 --offload-arch=gfx1103 --offload-arch=gfx1150 --offload-arch=gfx1151 --offload-arch=gfx1152 --offload-arch=gfx1153 --offload-arch=gfx1200 --offload-arch=gfx1201"
 ) else (
     set "HIP_ARCH=--offload-arch=%GFX_ARCH%"
 )

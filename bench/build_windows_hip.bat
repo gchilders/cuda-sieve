@@ -68,9 +68,18 @@ where hipcc >nul 2>nul || (
 )
 
 rem ---- GFX_ARCH ------------------------------------------------------------
+rem GFX_ARCH=all: every RDNA1-4 target TheRock's own SUPPORTED_GPUS.md lists
+rem as Build-Passing-or-better, not just the ones this session first picked --
+rem a real field failure (BOINC app_version 173) traced to gfx1035 (Radeon
+rem 680M/660M, Rembrandt-generation Ryzen 6000 laptop iGPUs) and gfx1036 (the
+rem iGPU in Ryzen 9000-series desktop CPUs) being missing from the original
+rem 14-target list: HIP enumerated the device fine but hipMemcpyToSymbol
+rem failed with "invalid kernel file" -- no compiled code object existed for
+rem that device's exact architecture. gfx1011/gfx1033/gfx1152/gfx1153 were
+rem the same kind of gap, just not yet hit in the field.
 if not defined GFX_ARCH set "GFX_ARCH=gfx1103"
 if /I "%GFX_ARCH%"=="all" (
-    set "HIP_ARCH=--offload-arch=gfx1010 --offload-arch=gfx1012 --offload-arch=gfx1030 --offload-arch=gfx1031 --offload-arch=gfx1032 --offload-arch=gfx1034 --offload-arch=gfx1100 --offload-arch=gfx1101 --offload-arch=gfx1102 --offload-arch=gfx1103 --offload-arch=gfx1150 --offload-arch=gfx1151 --offload-arch=gfx1200 --offload-arch=gfx1201"
+    set "HIP_ARCH=--offload-arch=gfx1010 --offload-arch=gfx1011 --offload-arch=gfx1012 --offload-arch=gfx1030 --offload-arch=gfx1031 --offload-arch=gfx1032 --offload-arch=gfx1033 --offload-arch=gfx1034 --offload-arch=gfx1035 --offload-arch=gfx1036 --offload-arch=gfx1100 --offload-arch=gfx1101 --offload-arch=gfx1102 --offload-arch=gfx1103 --offload-arch=gfx1150 --offload-arch=gfx1151 --offload-arch=gfx1152 --offload-arch=gfx1153 --offload-arch=gfx1200 --offload-arch=gfx1201"
 ) else (
     set "HIP_ARCH=--offload-arch=%GFX_ARCH%"
 )

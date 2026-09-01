@@ -703,3 +703,51 @@ HIP_TUNING_PLAN.md's Item 7.
   <ROCM_PATH>\amdgcn\bitcode where clang looks by default. hipcc/clang
   invocations need --rocm-device-lib-path=C:\rocm\lib\llvm\amdgcn\bitcode
   explicitly (a CMake HIP build here will need the same flag threaded through).
+
+## Real field failures, first BOINC deployment (app_version_id 173)
+
+Two distinct failure classes came back from actual volunteer hosts, both
+confirming risks this project had already flagged as real but unverified.
+
+**Class 1 -- missing architectures in the fat binary (fixed).** A host
+enumerated its device fine, then `fbgen_gpu.hip` failed with
+`hipMemcpyToSymbol(...) failed: invalid kernel file` -- no compiled code
+object matched that device's exact architecture. The device's reported name,
+`"AMD Radeon(TM) Graphics"` (fully generic, no model number), was the
+giveaway: this is exactly how several common Ryzen APU iGPUs report
+themselves. Cross-checking the original 14-target `GFX_ARCH=all` list
+against TheRock's own SUPPORTED_GPUS.md turned up real gaps never actually
+verified against that table when the list was first written: **gfx1035**
+(Radeon 680M/660M -- Rembrandt-generation Ryzen 6000 laptop iGPUs, very
+common consumer hardware) and **gfx1036** (the iGPU built into Ryzen
+9000-series desktop CPUs -- meaning a volunteer with no discrete GPU at all
+could still be matched by BOINC's coprocessor detection and handed this
+task). Also missing, same gap, not yet hit in the field: gfx1011 (RDNA1,
+Radeon Pro 5600M/5600 XT), gfx1033 (RDNA2, Steam Deck), gfx1152/gfx1153
+(RDNA3.5, newer Ryzen AI variants). **Fixed**: `GFX_ARCH=all` in both
+build_windows_hip.bat and build_windows_hip_boinc.bat now lists all 20
+architectures TheRock's table marks Build-Passing-or-better, not a
+hand-picked subset. Lesson for next time: cross-check a "build for
+everything" arch list against the upstream support table directly, don't
+assemble it from memory/spot-checks.
+
+**Class 2 -- driver too old/incompatible (documented, not fixable from the
+app side).** A different host failed earlier, at `hipGetDeviceCount()`
+itself: `"cannot enumerate HIP devices: no ROCm-capable device is detected"`,
+even though BOINC's own (separate, OpenCL/ADL-based) GPU detection had
+already assigned the task, meaning a real AMD adapter is present. This is
+the driver-compatibility gap already flagged before deployment: AMD
+publishes no minimum-driver-version guarantee for TheRock's ROCm/HIP stack
+on Windows, so some slice of volunteers with older Adrenalin drivers were
+always going to fail here, and there is no code-side fix for it. Added a
+best-effort diagnostic instead (`bench_log_amd_driver_version()` in
+bench_main_hip.cpp, called from both "no device" paths in device
+enumeration): reads the installed AMD display driver's version/date
+straight from the registry (`SYSTEM\CurrentControlSet\Control\Class\
+{4d36e968-e325-11ce-bfc1-08002be10318}`), independent of HIP entirely, so
+BOINC's stderr.txt at least records which driver version failed. Verified
+by forcing `HIP_VISIBLE_DEVICES` to an invalid value on this machine and
+confirming the exact field error reproduces, followed by the new diagnostic
+line reporting this box's real driver version and date. The intent is to
+accumulate enough real failing-host data points over time to eventually
+learn where the actual compatibility floor sits, since AMD won't say.
