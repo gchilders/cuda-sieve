@@ -2067,10 +2067,10 @@ static void dump_one_kernel_attrs(const char *name, const void *func,
         return;
     }
     hipOccupancyMaxActiveBlocksPerMultiprocessor(&occBlocks, func, blockSize, dynSmem);
-    printf("%-28s regs=%-4d staticSmem=%-6zu maxThreads/blk=%-5d"
-           " @block=%-4d dynSmem=%-6zu -> %d blocks/CU\n",
-           name, attr.numRegs, attr.sharedSizeBytes, attr.maxThreadsPerBlock,
-           blockSize, dynSmem, occBlocks);
+    printf("%-28s regs=%-4d staticSmem=%-6zu localMem(spill)=%-5zu"
+           " maxThreads/blk=%-5d @block=%-4d dynSmem=%-6zu -> %d blocks/CU\n",
+           name, attr.numRegs, attr.sharedSizeBytes, attr.localSizeBytes,
+           attr.maxThreadsPerBlock, blockSize, dynSmem, occBlocks);
 }
 
 extern "C" void bench_dump_kernel_attrs(void)
@@ -3146,3 +3146,29 @@ after_apply:
 
 #include "cofac_hip.cuh"
 #include "pipeline_hip.cuh"
+
+/* HIP_TUNING_PLAN.md item 3: k_cofac<L,METHOD,STAGE2> is defined in
+ * cofac_hip.cuh, included above -- must live after that #include to see it,
+ * unlike the fill/apply kernels dump_one_kernel_attrs() above already
+ * covers. METHOD 0 = rho (no stage2 variant exists), METHOD 1 = ECM
+ * (STAGE2 0 or 1); L is 3 or 4 (CF_LMAX). Matches STATUS.md's CUDA-side
+ * register table (78/94/86/112/122/154 regs on sm_120) so the two can be
+ * compared directly -- those numbers are ptxas/NVIDIA-specific and do not
+ * transfer to AMD's compiler, hence measuring fresh here rather than
+ * assuming they carry over. Default cofactor launch config is 256
+ * threads/block (bench_main_hip.cpp: cfg.threads = 256), no dynamic smem. */
+extern "C" void dump_cofac_kernel_attrs(void)
+{
+    dump_one_kernel_attrs("k_cofac<3,rho,->",
+                           reinterpret_cast<const void *>(k_cofac<3, 0, 0>), 256, 0);
+    dump_one_kernel_attrs("k_cofac<4,rho,->",
+                           reinterpret_cast<const void *>(k_cofac<4, 0, 0>), 256, 0);
+    dump_one_kernel_attrs("k_cofac<3,ECM,no-s2>",
+                           reinterpret_cast<const void *>(k_cofac<3, 1, 0>), 256, 0);
+    dump_one_kernel_attrs("k_cofac<4,ECM,no-s2>",
+                           reinterpret_cast<const void *>(k_cofac<4, 1, 0>), 256, 0);
+    dump_one_kernel_attrs("k_cofac<3,ECM,s2>",
+                           reinterpret_cast<const void *>(k_cofac<3, 1, 1>), 256, 0);
+    dump_one_kernel_attrs("k_cofac<4,ECM,s2>",
+                           reinterpret_cast<const void *>(k_cofac<4, 1, 1>), 256, 0);
+}

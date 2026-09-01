@@ -20,9 +20,10 @@
 #include <limits.h>
 #include <ctype.h>
 
-/* HIP_TUNING_PLAN.md item 1 diagnostic -- defined in bench_kernels.hip,
- * where the kernel templates it inspects are visible. */
+/* HIP_TUNING_PLAN.md item 1/3 diagnostics -- defined in bench_kernels.hip,
+ * where the kernel templates they inspect are visible. */
 extern "C" void bench_dump_kernel_attrs(void);
+extern "C" void dump_cofac_kernel_attrs(void);
 
 static int parse_u64_arg(const char *flag, const char *arg, uint64_t *out)
 {
@@ -1740,6 +1741,7 @@ static int bench_main_impl(int argc, char **argv)
          * something meant to ship enabled. */
         if (getenv("BENCH_DUMP_KERNEL_ATTRS")) {
             bench_dump_kernel_attrs();
+            dump_cofac_kernel_attrs();
         }
         snprintf(dev_name, sizeof dev_name, "%s", prop.name);
         /* NVML's own spelling of a bus ID: eight-digit domain, then bus and

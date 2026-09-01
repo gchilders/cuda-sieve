@@ -341,3 +341,67 @@ re-derive the same occupancy number and re-try the same change. Not
 swept: region values above 14, since that requires also raising `--logI`
 (a full geometry change, conflating region size with sieve width/height --
 out of this item's scope; worth its own item if pursued later).
+
+## Item 3 results: cofactor kernel register pressure -- DONE, no change needed
+
+**Method**: extended `bench_dump_kernel_attrs()` with a second function,
+`dump_cofac_kernel_attrs()` (necessarily separate: `k_cofac` lives in
+`cofac_hip.cuh`, `#include`d at the very end of `bench_kernels.hip`, after
+where the first diagnostic function had to be placed). Covers all six
+`k_cofac<L, METHOD, STAGE2>` instantiations a `CF_LMAX=4` build carries
+(`L` in {3,4}, rho has no stage2 variant, ECM has both) -- the same six
+STATUS.md's CUDA-side `ptxas -v` table covers, at the same default launch
+config (256 threads/block, `bench_main_hip.cpp`'s `cfg.threads = 256`).
+
+**Registers and occupancy, gfx1103** (STATUS.md's NVIDIA sm_120 numbers in
+parens for comparison):
+
+| `k_cofac<L,method,stage2>` | regs (NVIDIA) | static smem | spill/thread (NVIDIA) | blocks/CU |
+|---|---:|---:|---:|---:|
+| `<3,rho,->` | 71 (78) | 61440 B | 0 (0) | 1 |
+| `<4,rho,->` | 85 (94) | 65536 B | **32 B (0)** | 1 |
+| `<3,ECM,no-s2>` | 88 (86) | 61440 B | 0 (0) | 1 |
+| `<4,ECM,no-s2>` | 109 (112) | 65536 B | **32 B (0)** | 1 |
+| `<3,ECM,s2>` | 125 (122) | 61440 B | **320 B (0)** | 1 |
+| `<4,ECM,s2>` | 128 (154) | **16384 B** | **608 B (0)** | **4** |
+
+**A real difference from CUDA, worth taking seriously**: STATUS.md's own
+table (measured 2026-08-18) states plainly *"Nothing spills at any width"*
+on NVIDIA's `ptxas`, across all six instantiations. On gfx1103, **four of
+the six spill** (32-608 bytes/thread of local/spill memory) -- HIP-clang's
+register allocator makes a genuinely different tradeoff than `ptxas` for
+this code. This is exactly the risk this plan's item 3 was written to
+check for before trusting a "cofactor width doesn't cost much" read taken
+only from NVIDIA hardware.
+
+**But it does not translate into a bigger real-world width penalty --
+measured, not assumed.** Ran the actual pipeline forcing each width/method
+combination (`--cof-rho`/`--cof-ecm`, `--ecm-b2 0` vs. nonzero for stage2,
+`--cof-limbs 3/4 --cof-limbs0 3/4`), 29 special-q, reading the
+cofactorisation queue's own device-time instrumentation:
+
+| method | 3-limb | 4-limb | 4/3 ratio |
+|---|---:|---:|---:|
+| rho | 44.66 ms | 64.97 ms | 1.46x |
+| ECM, no stage2 | 72.10 ms | 125.14 ms | 1.74x |
+| ECM, stage2 | 55.97 ms | 79.48 ms | **1.42x** |
+
+All three ratios land in the same rough band as STATUS.md's own NVIDIA
+measurement (~1.72x on a real unforced job -- not perfectly comparable
+methodology, but the same order of magnitude, not a multiple worse).
+**The most-spilling variant, `<4,ECM,s2>` (608 B/thread), has the SMALLEST
+width penalty of the three (1.42x) and the BEST occupancy of any of the six
+kernels (4 blocks/CU)** -- HIP-clang's choice to spill some state out of
+registers for this specific instantiation correlates with dramatically
+better occupancy, and empirically that trade pays for itself rather than
+costing extra. Spilling is not automatically bad; here it happened to unlock
+occupancy the non-spilling variants don't get.
+
+**Conclusion: no code change.** The spills are real and worth having found
+-- STATUS.md's "nothing spills, CUDA-side" claim does not carry over to HIP,
+and a future session should not assume it does -- but they are not causing
+an AMD-specific performance cliff. cofcheck.sh's full suite still passes
+(no kernel code was touched for this item, only the diagnostic). If this
+ever needs revisiting, `CF_ECM_NBABY` is the knob STATUS.md itself already
+names as the lever for ECM stage 2's live-state footprint, on either
+platform.

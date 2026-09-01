@@ -549,7 +549,7 @@ compiled from is the same source already validated end-to-end on gfx1103 --
 but "compiles clean for gfx1030" and "runs correctly on a real RX 6800" are
 different claims, and only the former is established here.
 
-## Performance tuning: plan written, items 1-2 done
+## Performance tuning: plan written, items 1-3 done
 See `bench/HIP_TUNING_PLAN.md` for the full plan and item 1's (`
 __launch_bounds__` sweep) results. Short version: added a real diagnostic
 tool (`bench_dump_kernel_attrs()`, env-var gated) since this ROCm/Windows
@@ -582,6 +582,21 @@ higher shared-memory ceiling meant it never hit the occupancy cliff region
 14 causes on AMD in the first place -- it just happens to land in the same
 place both builds want). Recorded so a future session doesn't re-derive
 the same occupancy number and re-try the same change.
+
+Item 3 (cofactor register pressure) extended the diagnostic to all six
+`k_cofac<L,method,stage2>` instantiations. Real finding: STATUS.md states
+plainly that nothing spills at any width on NVIDIA's ptxas; on gfx1103,
+**four of the six spill** (32-608 B/thread) -- HIP-clang's register
+allocator genuinely differs from ptxas here, and "cofactor width doesn't
+cost much" is not a claim that automatically carries over from the CUDA
+build. But measured (not assumed): the 3->4-limb width penalty (1.42x-1.74x
+across rho/ECM/ECM+stage2) lands in the same rough band as STATUS.md's own
+NVIDIA number, not a multiple worse. Curiously, the MOST-spilling variant
+(`<4,ECM,s2>`, 608 B/thread) has the BEST occupancy of any of the six (4
+blocks/CU, vs 1 for the other five) and the SMALLEST width penalty (1.42x)
+-- HIP-clang traded spill traffic for occupancy on this one instantiation,
+and it paid off rather than costing extra. No code change; cofcheck.sh
+still passes (no kernel code touched, only the diagnostic).
 
 ## Windows build notes
 - This ROCm build is AMD's "TheRock" Windows distribution
