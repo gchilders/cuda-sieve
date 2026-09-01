@@ -147,8 +147,30 @@ hipcc %HIP_ARCH% %HIP_DEVLIB% -o bench_hip_boinc.exe ^
     -lWs2_32 -lwininet -lpsapi -lPowrprof -lIphlpapi -lAdvapi32 -lUser32 -lCrypt32 -lShell32 -lVersion || exit /b 1
 
 echo Built %CD%\bench_hip_boinc.exe (GFX_ARCH=%GFX_ARCH% CF_LMAX=%CF_LMAX% build=%GIT_DESC%)
-echo NOTE: bench_hip_boinc.exe needs C:\rocm\bin on PATH (libamdhip64.dll etc.)
-echo       to run -- same as bench_hip.exe, no static HIP runtime exists.
+echo NOTE: AMD provides no static HIP runtime (unlike --cudart static), so
+echo       this exe is not fully self-contained the way bench.exe is. For
+echo       distribution, copy these 6 files from C:\rocm\bin and
+echo       C:\Windows\System32 into the SAME DIRECTORY as bench_hip_boinc.exe
+echo       (same-directory placement is enough -- no PATH/installer needed,
+echo       verified against a clean directory with PATH stripped to just the
+echo       Windows system dirs):
+echo         C:\rocm\bin\amdhip64_7.dll
+echo         C:\rocm\bin\amd_comgr.dll
+echo         C:\rocm\bin\rocm_kpack.dll
+echo         C:\Windows\System32\msvcp140.dll
+echo         C:\Windows\System32\vcruntime140.dll
+echo         C:\Windows\System32\vcruntime140_1.dll
+echo       Everything else bench_hip_boinc.exe or those three ROCm DLLs need
+echo       is either a base Windows component (KERNEL32/USER32/ADVAPI32/...)
+echo       or a virtual api-ms-win-crt-*.dll name satisfied by Windows
+echo       10/11's own API Set redirection, not a real file to bundle.
+echo       The DLL version suffix (amdhip64_7, not amdhip64) is TheRock's
+echo       own HIP-major-version-numbered name; a differently-built,
+echo       differently-versioned copy of the same filename may already be
+echo       installed by the volunteer's AMD driver, but it is not
+echo       guaranteed present or ABI-identical to what this was built and
+echo       tested against -- ship the tested copies above, do not rely on
+echo       whatever the driver happens to carry.
 exit /b 0
 
 :do_clean
