@@ -418,8 +418,19 @@ template <int CELLBITS, int ATOMIC, int NORMMODE, bool SLABBED = false>
  * validation). A caller that sets cfg.apply_threads > 512 through any path
  * that bypasses that CLI check would launch anyway, exercising this
  * kernel's warp-tier striding and shared-memory sizing outside its
- * validated envelope with no compiler-level backstop. */
-__global__  /* __launch_bounds__(512, 3) dropped for HIP: the 2nd arg means MIN_WARPS_PER_EXECUTION_UNIT under HIP, not minBlocksPerMultiprocessor -- CUDA's tuned value is meaningless here. Not re-tuned yet; see CLAUDE.md work item 3. Losing the 512-thread hard ceiling as a side effect is tracked in CLAUDE.md's code-review findings. */
+ * validated envelope with no compiler-level backstop.
+ *
+ * HIP_TUNING_PLAN.md item 1, first candidate: __launch_bounds__(512, 2).
+ * bench_dump_kernel_attrs() shows this kernel uses only 26 registers at
+ * block=512 -- nowhere near register-file-limited -- and is actually
+ * shared-memory-bound: 3 blocks/CU fit at --region 13 (17408 B dynamic
+ * smem) but only 1 fits at the default --region 14 (33792 B), against
+ * gfx1103's flat 64 KB/CU LDS ceiling. Since __launch_bounds__ only
+ * influences register allocation, not LDS usage, this is expected to have
+ * little to no effect on occupancy at region 14 -- testing it anyway
+ * rather than assuming, per HIP_TUNING_PLAN.md's own methodology. See that
+ * file for the measured before/after. */
+__global__ __launch_bounds__(512, 2)
 void k_apply(const uint32_t *__restrict buckets,
                         const uint32_t *__restrict cnt, uint32_t cap,
                         int logI, int log_region,
@@ -683,8 +694,17 @@ report spurious cell mismatches. Pricing builds only, never for relations."
  * of the volume, many in a row do. Collect a run and reserve it with ONE
  * shared atomic, which also cuts the number of block barriers by the same
  * factor. The barrier-per-record version this replaces spent 30% of its
- * issue slots stalled on barriers at 7.5% of DRAM peak. */
-__global__  /* __launch_bounds__(512, 3) dropped for HIP: the 2nd arg means MIN_WARPS_PER_EXECUTION_UNIT under HIP, not minBlocksPerMultiprocessor -- CUDA's tuned value is meaningless here. Not re-tuned yet; see CLAUDE.md work item 3. */
+ * issue slots stalled on barriers at 7.5% of DRAM peak.
+ *
+ * HIP_TUNING_PLAN.md item 1: bench_dump_kernel_attrs() shows only 37
+ * registers at block=512, but a fixed ~34 KB of STATIC shared memory
+ * (L1_NBUF*L1_CAP*4 plus the cnt/base arrays) already limits this kernel to
+ * 1 resident block/CU against gfx1103's flat 64 KB/CU ceiling -- two blocks
+ * would need ~68 KB. __launch_bounds__ only steers register allocation, and
+ * registers are not the constraint here, so no candidate value is expected
+ * to change occupancy; verified via bench_dump_kernel_attrs() rather than
+ * left as an assumption -- see HIP_TUNING_PLAN.md. */
+__global__ __launch_bounds__(512, 1)
 void k_fill_l1(const plat_t *__restrict plat,
                uint32_t n, uint32_t xmax, int logI, int log_super,
                uint32_t *__restrict cursor,
@@ -794,8 +814,12 @@ void k_fill_l1(const plat_t *__restrict plat,
 #define L2_NBUF 128
 #define L2_CAP   64
 
+/* HIP_TUNING_PLAN.md item 1: same story as k_fill_l1 -- 22 registers at
+ * block=512 (bench_dump_kernel_attrs()), ~34 KB static shared memory
+ * (L2_NBUF*L2_CAP*4 plus bookkeeping) already caps this at 1 block/CU on
+ * gfx1103's 64 KB/CU ceiling regardless of register tuning. */
 template <int RECBYTES>
-__global__  /* __launch_bounds__(512, 3) dropped for HIP: the 2nd arg means MIN_WARPS_PER_EXECUTION_UNIT under HIP, not minBlocksPerMultiprocessor -- CUDA's tuned value is meaningless here. Not re-tuned yet; see CLAUDE.md work item 3. */
+__global__ __launch_bounds__(512, 1)
 void k_fill_l2(const uint32_t *__restrict in, const uint32_t *__restrict incnt,
                uint32_t in_cap, int log_region, int log_super,
                uint32_t *__restrict cursor, uint8_t *__restrict out,
@@ -2020,6 +2044,67 @@ out:
     hipFree(d); hipFree(d_bad); free(h);
 #undef MODDEV_CK
     return rc;
+}
+
+/* HIP_TUNING_PLAN.md item 1 diagnostic: this ROCm/Windows distribution ships
+ * no rocprof/omniperf, so hipFuncGetAttributes()/hipOccupancyMax... are the
+ * available substitute for the register-pressure table STATUS.md keeps for
+ * the CUDA build's ptxas -v output (those numbers don't transfer to AMD's
+ * compiler at all). Prints register/shared-mem usage and achievable
+ * occupancy for the kernels __launch_bounds__ was dropped from
+ * (k_fill_l1/k_fill_l2/k_apply), plus k_fill_atomic for comparison since
+ * that's what --fill-mode atomic (the default) actually launches instead.
+ * Triggered by the BENCH_DUMP_KERNEL_ATTRS env var rather than a CLI flag,
+ * to avoid touching the CLI parser for a one-off tuning tool -- reusable
+ * for the rest of HIP_TUNING_PLAN.md's items, not meant to ship enabled. */
+static void dump_one_kernel_attrs(const char *name, const void *func,
+                                   int blockSize, size_t dynSmem)
+{
+    hipFuncAttributes attr;
+    int occBlocks = -1;
+    if (hipFuncGetAttributes(&attr, func) != hipSuccess) {
+        printf("%-28s hipFuncGetAttributes FAILED\n", name);
+        return;
+    }
+    hipOccupancyMaxActiveBlocksPerMultiprocessor(&occBlocks, func, blockSize, dynSmem);
+    printf("%-28s regs=%-4d staticSmem=%-6zu maxThreads/blk=%-5d"
+           " @block=%-4d dynSmem=%-6zu -> %d blocks/CU\n",
+           name, attr.numRegs, attr.sharedSizeBytes, attr.maxThreadsPerBlock,
+           blockSize, dynSmem, occBlocks);
+}
+
+extern "C" void bench_dump_kernel_attrs(void)
+{
+    hipDeviceProp_t prop;
+    hipGetDeviceProperties(&prop, 0);
+    printf("=== kernel attrs on %s (gcnArch %s, %d CUs, %zu B LDS/CU) ===\n",
+           prop.name, prop.gcnArchName, prop.multiProcessorCount,
+           (size_t)prop.sharedMemPerMultiprocessor);
+
+    dump_one_kernel_attrs("k_fill_atomic<4,false>",
+                           reinterpret_cast<const void *>(k_fill_atomic<4, false>),
+                           256, 0);
+    dump_one_kernel_attrs("k_fill_atomic<4,true>",
+                           reinterpret_cast<const void *>(k_fill_atomic<4, true>),
+                           256, 0);
+    dump_one_kernel_attrs("k_fill_l1",
+                           reinterpret_cast<const void *>(k_fill_l1), 512, 0);
+    dump_one_kernel_attrs("k_fill_l2<2>",
+                           reinterpret_cast<const void *>(k_fill_l2<2>), 512, 0);
+    dump_one_kernel_attrs("k_fill_l2<4>",
+                           reinterpret_cast<const void *>(k_fill_l2<4>), 512, 0);
+    /* smem sizes bracket the --region 13/14 range: (1<<13)*2+512*2=17408,
+     * (1<<14)*2+512*2=33792 -- the latter is the exact C194 number the
+     * k_apply comment above already cites for a 512-slice factor base. */
+    dump_one_kernel_attrs("k_apply<16,1,HORNER,false>",
+                           reinterpret_cast<const void *>(k_apply<16, 1, NORM_HORNER, false>),
+                           512, 17408);
+    dump_one_kernel_attrs("k_apply<16,1,HORNER,false>",
+                           reinterpret_cast<const void *>(k_apply<16, 1, NORM_HORNER, false>),
+                           512, 33792);
+    dump_one_kernel_attrs("k_apply<16,1,HORNER,true>",
+                           reinterpret_cast<const void *>(k_apply<16, 1, NORM_HORNER, true>),
+                           512, 33792);
 }
 
 extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,

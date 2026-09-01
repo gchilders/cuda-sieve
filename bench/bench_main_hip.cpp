@@ -20,6 +20,10 @@
 #include <limits.h>
 #include <ctype.h>
 
+/* HIP_TUNING_PLAN.md item 1 diagnostic -- defined in bench_kernels.hip,
+ * where the kernel templates it inspects are visible. */
+extern "C" void bench_dump_kernel_attrs(void);
+
 static int parse_u64_arg(const char *flag, const char *arg, uint64_t *out)
 {
     if (bench_parse_u64_decimal(arg, out)) {
@@ -1729,6 +1733,13 @@ static int bench_main_impl(int argc, char **argv)
             fprintf(stderr, "bench: cannot query the HIP device -- refusing to"
                     " fall back to a hardcoded grid width\n");
             return 1;
+        }
+        /* HIP_TUNING_PLAN.md item 1 diagnostic hook -- see
+         * bench_dump_kernel_attrs() in bench_kernels.hip. Env-var gated
+         * rather than a CLI flag since this is a one-off tuning tool, not
+         * something meant to ship enabled. */
+        if (getenv("BENCH_DUMP_KERNEL_ATTRS")) {
+            bench_dump_kernel_attrs();
         }
         snprintf(dev_name, sizeof dev_name, "%s", prop.name);
         /* NVML's own spelling of a bus ID: eight-digit domain, then bus and

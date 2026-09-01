@@ -549,6 +549,40 @@ compiled from is the same source already validated end-to-end on gfx1103 --
 but "compiles clean for gfx1030" and "runs correctly on a real RX 6800" are
 different claims, and only the former is established here.
 
+## Performance tuning: plan written, items 1-2 done
+See `bench/HIP_TUNING_PLAN.md` for the full plan and item 1's (`
+__launch_bounds__` sweep) results. Short version: added a real diagnostic
+tool (`bench_dump_kernel_attrs()`, env-var gated) since this ROCm/Windows
+distribution ships no rocprof/omniperf -- it showed none of k_fill_l1/
+k_fill_l2/k_apply are register-bound on gfx1103 (all have low register
+counts), so re-adding `__launch_bounds__` had zero measured performance
+effect (confirmed both via the occupancy calculator and by re-running the
+544-q baseline). It DID have one real, independent benefit: the first
+`__launch_bounds__` argument restored the compiler-enforced launch-size
+ceiling for k_apply that the earlier code-review finding (this same
+CLAUDE.md, "Stale 'hard ceiling' claim") flagged as lost -- both the
+compile-time backstop and the runtime check from that fix now exist
+together. cofcheck.sh's full suite still passes with these changes in
+place. Also corrected a premise in the plan itself: `--fill-mode twolevel`
+(what actually exercises k_fill_l1/l2) turns out to be a benchmark-harness-
+only flag, refused under `--pipeline` and already known 2.7x slower than
+the default -- it's dead code for production, not a live tuning decision.
+
+Item 2 (log_region re-sweep) directly tested whether region 13's 3x better
+occupancy (found in item 1) translates to real speed -- **it doesn't**.
+Measured region 9 through 14 on the real pipeline: both fill and apply get
+monotonically SLOWER as region shrinks, across the whole range, despite
+occupancy going the opposite direction. Region 13 at full (544-q) sample:
+2.24x slower fill, 1.34x slower apply than the region-14 default. More
+regions means more per-region fixed overhead, and that scales faster than
+the occupancy gain pays for. No code change -- the CUDA-tuned default
+(`--region 14`) is already right on this hardware too, for a completely
+different reason (CUDA never needed to know about this tradeoff, since its
+higher shared-memory ceiling meant it never hit the occupancy cliff region
+14 causes on AMD in the first place -- it just happens to land in the same
+place both builds want). Recorded so a future session doesn't re-derive
+the same occupancy number and re-try the same change.
+
 ## Windows build notes
 - This ROCm build is AMD's "TheRock" Windows distribution
   (therock-dist-windows-gfx110X-all-10.0.0.tar.gz), not a standard ROCm
