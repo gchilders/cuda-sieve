@@ -140,7 +140,15 @@ rem unconditionally (harmless when HAVE_BOINC is off) so it doesn't need to
 rem be threaded through as a separate knob.
 set "CFLAGS=/nologo /O2 /W3 /MT -D_CRT_SECURE_NO_WARNINGS -DBENCH_HIP_BUILD %CF_LMAX_DEF% %DEFS%"
 set "CXXFLAGS=/nologo /O2 /W3 /MT /EHsc -D_CRT_SECURE_NO_WARNINGS -DBENCH_HIP_BUILD %CF_LMAX_DEF% %DEFS%"
-set "HIPFLAGS=-O2 -std=c++17 %HIP_ARCH% %HIP_DEVLIB% -D_CRT_SECURE_NO_WARNINGS -DBENCH_HIP_BUILD %CF_LMAX_DEF% %DEFS%"
+rem Flat scratch for the device stack. A CORRECTNESS FIX for gfx10, not a
+rem tuning knob -- without it ECM stage 2 silently accomplishes nothing on
+rem every RDNA1/RDNA2 card. Full rationale and the field before/after numbers
+rem are in build_windows_hip_boinc.bat's note and CLAUDE.md. Kept identical
+rem here so the two builds never generate different device code for the same
+rem source.
+if not defined HIP_SCRATCH set "HIP_SCRATCH=-Xclang -target-feature -Xclang +enable-flat-scratch"
+
+set "HIPFLAGS=-O2 -std=c++17 %HIP_ARCH% %HIP_DEVLIB% %HIP_SCRATCH% -D_CRT_SECURE_NO_WARNINGS -DBENCH_HIP_BUILD %CF_LMAX_DEF% %DEFS%"
 
 echo Building host C objects with cl.exe... (GFX_ARCH=%GFX_ARCH% CF_LMAX=%CF_LMAX% build=%GIT_DESC%)
 for %%F in (fb_load.c verify_cpu.c poly.c primes.c rfb.c fb_cado.c platform.c) do (

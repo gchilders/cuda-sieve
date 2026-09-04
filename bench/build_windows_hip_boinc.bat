@@ -123,7 +123,35 @@ rem not accept -- clang wants -I, not /I -- so leaving it out of HIPFLAGS is
 rem both unnecessary and would be a syntax error there.
 set "CFLAGS=/nologo /O2 /W3 /MT -D_CRT_SECURE_NO_WARNINGS %BOINC_DEF% %CF_LMAX_DEF% %DEFS%"
 set "CXXFLAGS=/nologo /O2 /W3 /MT /EHsc -D_CRT_SECURE_NO_WARNINGS %BOINC_DEF% %BOINC_INC% %CF_LMAX_DEF% %DEFS%"
-set "HIPFLAGS=-O2 -std=c++17 %HIP_ARCH% %HIP_DEVLIB% -D_CRT_SECURE_NO_WARNINGS %BOINC_DEF% %CF_LMAX_DEF% %DEFS%"
+rem ---- HIP_SCRATCH: flat scratch for the device stack ----------------------
+rem THIS IS A CORRECTNESS FIX, not a tuning knob. The AMDGPU backend does not
+rem enable flat scratch by default on gfx10, so a gfx10 target lowers every
+rem stack/spill access as a one-dword MUBUF buffer_load_dword/
+rem buffer_store_dword, while gfx11+ uses wide flat scratch_*_b128. Measured
+rem on mz_ecm_stage2_pass<3>: 144 narrow MUBUF accesses for gfx1030 against 48
+rem wide flat ones for gfx1103, same data volume.
+rem
+rem On that MUBUF path, ECM stage 2 silently accomplished NOTHING on every
+rem gfx10 card -- RDNA1 (gfx1010/gfx1012) and RDNA2 (gfx103x) alike -- while
+rem rho and ECM stage 1 were unaffected. Stage 2 is the only part of the
+rem cofactor path that makes a real device call with a stack frame
+rem (mz_ecm_stage2_pass/x_mul_s2 are CF_NOINLINE), so it was the only code
+rem exposed to it; everything else is inlined and spills nothing.
+rem
+rem Field-confirmed on the same job, before -> after: round-1 ECM drop
+rem 10.2-10.65% -> 45.0-45.3%, matching RDNA3/RDNA4 controls exactly; side
+rem stuck rate 69.7% -> 27.8%, identical to the healthy cards to four
+rem significant figures; and the ECM-side split rate 2.43% -> 3.23% against
+rem controls at 3.19-3.20%, i.e. about a third more relations recovered.
+rem
+rem Every GFX_ARCH=all target is gfx10/11/12 and gfx11/12 already default to
+rem flat scratch, so this only changes gfx10. The x86 host pass ignores the
+rem unknown feature (verified: the object builds). Clear HIP_SCRATCH to fall
+rem back to stock lowering -- which reintroduces the bug on gfx10. See
+rem CLAUDE.md.
+if not defined HIP_SCRATCH set "HIP_SCRATCH=-Xclang -target-feature -Xclang +enable-flat-scratch"
+
+set "HIPFLAGS=-O2 -std=c++17 %HIP_ARCH% %HIP_DEVLIB% %HIP_SCRATCH% -D_CRT_SECURE_NO_WARNINGS %BOINC_DEF% %CF_LMAX_DEF% %DEFS%"
 
 echo Building host C objects with cl.exe... (GFX_ARCH=%GFX_ARCH% CF_LMAX=%CF_LMAX% HAVE_BOINC=1 build=%GIT_DESC%)
 for %%F in (fb_load.c verify_cpu.c poly.c primes.c rfb.c fb_cado.c platform.c) do (

@@ -720,16 +720,66 @@ CF_NOINLINE int mz_ecm_stage2_pass(mz<L> *fac, const mpt<L> *Q,
                                     uint32_t vmin, uint32_t nv,
                                     uint64_t *work)
 {
-    mpt<L> baby[CF_ECM_NBABY], step, prev, cur, next;
+    /* The baby steps are held on a SHARED DENOMINATOR: bx[k] = X_k *
+     * prod_{j!=k} Z_j against one bz = prod_j Z_j, so (bx[k] : bz) is the
+     * same projective point (X_k : Z_k) was. Every cross product below is
+     * then the old one scaled by prod_{j!=k} Z_j, and scaling by a nonzero
+     * value cannot change gcd(d, n) -- the factors found are identical, which
+     * cofcheck.sh's pinned relation counts confirm.
+     *
+     * The point is the inner loop: with one denominator for every baby step,
+     * the X_G * Z term is common to all k and hoists out, so a selected pair
+     * costs ONE multiply instead of two. At B1=200/B2=6000 that is ~540 fewer
+     * mz_mul per curve against ~3*NBABY to build the rescale once. Measured
+     * A/B on gfx1103 (oracle/c183, 148 q, only this function differing):
+     * algebraic queue 52.62/52.18 -> 50.19/49.75 ms, ~4.6%, with the rational
+     * (rho) queue unchanged as the control and 596 relations either way.
+     *
+     * Chosen over per-point affine normalisation deliberately: affine needs a
+     * modular inverse, there is no mz_inv in this file, and a binary extended
+     * GCD in device code is new delicate arithmetic for no extra gain here.
+     * The shared denominator needs no inversion at all.
+     *
+     * NOT a register-pressure fix, and not why RDNA1/2 lost stage 2 -- every
+     * stage-2 kernel is already at vgpr=128, so trimming live values relocates
+     * spill rather than freeing registers (measured: scratch 336 -> 384 on
+     * gfx1030 L=3). That was the gfx10 MUBUF stack lowering; see CLAUDE.md. */
+    mz<L> bx[CF_ECM_NBABY], bz;
+    mpt<L> step, prev, cur, next;
     mz<L> prod, g;
 
     for (int replay = 0; replay < 2; replay++) {
         prod = *one;
-        for (uint32_t k = 0; k < CF_ECM_NBABY; k++) {
-            const uint32_t scalar = cf_ecm_baby(k);
-            baby[k] = *Q;
-            if (scalar != 1)
-                x_mul_s2<L>(&baby[k], scalar, an, ad, n, n0inv, work);
+        {
+            /* Never hold the full (X:Z) points as an array: each baby step is
+             * built in ONE scratch point, then split into bx[k] and bzs[k], so
+             * the peak here is bx[] + bzs[] rather than bx[] + a full mpt<L>
+             * array. bx[] doubles as the running accumulator, so no separate
+             * prefix array is needed either. Deliberately NOT unrolled --
+             * x_mul_s2 is __noinline__, and unrolling its call sites widens
+             * the live range of every argument across all NBABY calls. */
+            mz<L> bzs[CF_ECM_NBABY], acc, t;
+            for (uint32_t k = 0; k < CF_ECM_NBABY; k++) {
+                const uint32_t scalar = cf_ecm_baby(k);
+                mpt<L> p = *Q;
+                if (scalar != 1)
+                    x_mul_s2<L>(&p, scalar, an, ad, n, n0inv, work);
+                bx[k] = p.X; bzs[k] = p.Z;
+            }
+            /* Forward: bx[k] = X_k * prod_{j<k} Z_j, acc ends at prod_j Z_j. */
+            acc = *one;
+            for (uint32_t k = 0; k < CF_ECM_NBABY; k++) {
+                mz_mul<L>(&t, &bx[k], &acc, n, n0inv); bx[k] = t;
+                mz_mul<L>(&t, &acc, &bzs[k], n, n0inv); acc = t;
+            }
+            bz = acc;
+            /* Backward: acc holds prod_{j>k} Z_j, so this completes each
+             * bx[k] to X_k * prod_{j!=k} Z_j. */
+            acc = *one;
+            for (int k = (int)CF_ECM_NBABY - 1; k >= 0; k--) {
+                mz_mul<L>(&t, &bx[k], &acc, n, n0inv); bx[k] = t;
+                mz_mul<L>(&t, &acc, &bzs[k], n, n0inv); acc = t;
+            }
         }
         step = *Q; x_mul_s2<L>(&step, CF_ECM_D, an, ad, n, n0inv, work);
         prev = step; x_mul_s2<L>(&prev, vmin, an, ad, n, n0inv, work);
@@ -741,23 +791,29 @@ CF_NOINLINE int mz_ecm_stage2_pass(mz<L> *fac, const mpt<L> *Q,
         for (uint32_t vi = 0; vi < nv; vi++) {
             const mpt<L> *G = vi ? &cur : &prev;
             const uint32_t mask = masks[vi];
-            #pragma unroll
-            for (uint32_t k = 0; k < CF_ECM_NBABY; k++)
-                if (mask & (1u << k)) {
-                    mz<L> a, b, d;
-                    mz_mul<L>(&a, &G->X, &baby[k].Z, n, n0inv);
-                    mz_mul<L>(&b, &baby[k].X, &G->Z, n, n0inv);
-                    d = a; mz_sub_mod<L>(&d, &b, n);
-                    (*work)++;                  /* one selected stage-2 pair */
-                    if (replay) {
-                        mz_gcd<L>(&g, d, *n);
-                        if (!mz_is_one<L>(&g) && mz_cmp<L>(&g, n) != 0) {
-                            *fac = g; return 1;
+            if (mask) {
+                /* One denominator for every baby step, so this term is the
+                 * same for all k -- hoisted out of the loop below, and not
+                 * computed at all on a giant step that selects nothing. */
+                mz<L> gx;
+                mz_mul<L>(&gx, &G->X, &bz, n, n0inv);
+                #pragma unroll
+                for (uint32_t k = 0; k < CF_ECM_NBABY; k++)
+                    if (mask & (1u << k)) {
+                        mz<L> b, d;
+                        mz_mul<L>(&b, &bx[k], &G->Z, n, n0inv);
+                        d = gx; mz_sub_mod<L>(&d, &b, n);
+                        (*work)++;              /* one selected stage-2 pair */
+                        if (replay) {
+                            mz_gcd<L>(&g, d, *n);
+                            if (!mz_is_one<L>(&g) && mz_cmp<L>(&g, n) != 0) {
+                                *fac = g; return 1;
+                            }
+                        } else {
+                            mz_mul<L>(&b, &prod, &d, n, n0inv); prod = b;
                         }
-                    } else {
-                        mz_mul<L>(&a, &prod, &d, n, n0inv); prod = a;
                     }
-                }
+            }
             if (vi + 1 < nv && vi) {
                 x_add<L>(&next, &cur, &step, &prev, n, n0inv);
                 (*work)++;                       /* one stage-2 giant step */

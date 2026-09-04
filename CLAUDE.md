@@ -751,3 +751,86 @@ confirming the exact field error reproduces, followed by the new diagnostic
 line reporting this box's real driver version and date. The intent is to
 accumulate enough real failing-host data points over time to eventually
 learn where the actual compatibility floor sits, since AMD won't say.
+
+## ECM stage 2 was silently dead on every gfx10 card: the MUBUF stack lowering
+
+**The bug.** On RDNA1 (gfx1010/gfx1012) and RDNA2 (gfx103x), ECM stage 2
+accomplished nothing measurable. rho and ECM stage 1 were completely
+unaffected on the same hardware. Field symptom on a 3LP band: 64-70% of
+cofactors "left unresolved by the splitting budget" against ~28% on RDNA3/4,
+which is real yield loss -- those records are of UNKNOWN status and some of
+them are relations.
+
+**The cause.** The AMDGPU backend does not enable flat scratch by default on
+gfx10, so a gfx10 target lowers every stack/spill access as a one-dword MUBUF
+`buffer_load_dword`/`buffer_store_dword` where gfx11+ uses wide flat
+`scratch_*_b128`. Measured on `mz_ecm_stage2_pass<3>`: 144 narrow MUBUF
+accesses for gfx1030 against 48 wide flat ones for gfx1103, same data volume.
+Stage 2 is the ONLY part of the cofactor path that makes a real device call
+with a stack frame -- `mz_ecm_stage2_pass` and `x_mul_s2` are `CF_NOINLINE`
+-- so it was the only code exposed. rho and ECM stage 1 are fully inlined and
+spill nothing (`vgpr_spill_count=0` on every non-stage-2 kernel variant, both
+architectures), which is exactly why they never showed it.
+
+**The fix** is one build variable, `HIP_SCRATCH` in both HIP build scripts:
+`-Xclang -target-feature -Xclang +enable-flat-scratch`. It makes gfx1030's
+stage-2 codegen numerically identical to gfx1103's (scratch/spill 352/9 at
+L=3, 624/57 at L=4, matching exactly). Every GFX_ARCH=all target is
+gfx10/11/12 and gfx11/12 already default to flat scratch, so only gfx10
+changes; the x86 host pass ignores the unknown feature. Clearing HIP_SCRATCH
+reverts to stock lowering, which REINTRODUCES the bug on gfx10.
+
+**Field-confirmed on all three generations, same job, before -> after:**
+
+  round-1 ECM drop   RDNA1/2 10.2-10.65%  ->  45.0-45.3%
+  side stuck rate    RDNA1/2 69.7%        ->  27.8%
+  ECM-side split     2.43%                ->  3.23%
+
+RDNA3/RDNA4 controls on that job sit at 44.9-45.2% / 27.85-27.86% / 3.19-3.20%
+-- so the fixed cards land exactly on the healthy baseline, and the stuck rate
+now matches to four significant figures across generations, i.e. it is a
+property of the job rather than the hardware. Roughly a third more relations
+recovered from the ECM side. Confirmed on RX 5700 XT (gfx1010), RX 6700 XT and
+RX 6950 XT (gfx103x).
+
+**How it was actually found**, since the obvious route did not work: (1)
+isolating stage 1 from stage 2 using `--ecm-b2 0`, a flag already in the
+binary, gave a healthy-hardware baseline of 10.66% that matched the affected
+cards' FULL-ECM rate to within 0.01 points -- that said "stage 2 is doing
+nothing" before any kernel was read; (2) diffing generated device assembly
+between the working and broken targets (`hipcc --cuda-device-only -S
+--offload-arch=...`) turned "somewhere in ECM" into one instruction-selection
+difference with a build flag attached. Two plausible-sounding hypotheses died
+on measurement first: divergent-control-flow EXEC-mask corruption (refuted --
+rho has data-dependent trip counts too and is fine), and RDNA1/2 being more
+register-starved (refuted by its own data -- gfx1103 spills MORE, 57 vs 40
+VGPRs on `k_cofac<4,ECM,stage2>`, and works). Lesson: compare generated code
+between a working and a broken target before theorising about the compiler.
+
+## ECM stage 2 on a shared denominator (speed, independent of the above)
+
+`mz_ecm_stage2_pass` holds its baby steps on one common denominator:
+`bx[k] = X_k * prod_{j!=k} Z_j` against a single `bz = prod_j Z_j`, so
+`(bx[k] : bz)` is the same projective point `(X_k : Z_k)` was. Every cross
+product is the old one scaled by a nonzero factor, which cannot change
+`gcd(d, n)` -- the factors found are provably identical, and cofcheck.sh's
+pinned relation counts confirm it.
+
+The gain is in the inner loop: with one denominator for every baby step the
+`X_G * Z` term is common to all k and hoists out, so a selected pair costs ONE
+multiply instead of two -- ~540 fewer `mz_mul` per curve at B1=200/B2=6000,
+against ~3*NBABY to build the rescale once per curve. Measured A/B on gfx1103
+(oracle/c183, 148 q, only this function differing): algebraic queue
+52.62/52.18 -> 50.19/49.75 ms (~4.6%), total cofactor device time ~3.4%, the
+rational (rho) queue unchanged as the control, and 596 relations either way.
+
+Chosen over per-point affine normalisation deliberately: affine needs a
+modular inverse, there is no `mz_inv` in this file, and writing a binary
+extended GCD in device code is new delicate arithmetic for no extra gain. The
+shared denominator needs no inversion at all.
+
+**This is NOT a register-pressure fix and was never the RDNA1/2 cause.** Every
+stage-2 kernel is already pinned at `vgpr=128`, so trimming live values
+relocates spill rather than freeing registers -- measured, scratch went 336 ->
+384 on gfx1030 at L=3, i.e. slightly WORSE. It is kept purely on the speed
+number above.
