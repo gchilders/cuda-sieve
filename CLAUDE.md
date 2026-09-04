@@ -531,14 +531,22 @@ machine's own 780M (confirmed running at 14.41 GB total addressable in
 Phase 5/6's own testing) -- excluding them would exclude the very box this
 port was developed and validated on.
 
-**Real, load-bearing difference from CUDA's fat binary, not just a footnote**:
-CUDA's `compute_80,code=compute_80` PTX entry lets a newer-than-listed GPU
-still load via JIT recompilation. HIP has no equivalent here -- each
-`--offload-arch` embeds real finished machine code for that exact target,
-and the runtime picks an exact match or fails. A future RDNA5 card (or any
-gfx ID not in the 14 above) will not run this binary at all, however similar
-its ISA -- there is no forward-compatible fallback path to fall back on.
-Re-running with the new gfx ID added is the only fix when that happens.
+**THIS PARAGRAPH WAS WRONG AND IS CORRECTED BELOW** (kept, rather than
+quietly deleted, because it was load-bearing: it is the stated reason the
+arch list had to be exhaustive, and believing it cost a real field failure).
+It read: CUDA's `compute_80,code=compute_80` PTX entry lets a
+newer-than-listed GPU still load via JIT recompilation; HIP has no
+equivalent, each `--offload-arch` embeds finished machine code for that exact
+target, the runtime picks an exact match or fails, and any gfx ID not listed
+"will not run this binary at all, however similar its ISA".
+
+HIP *does* have a forward-compatible fallback: LLVM's family **generic
+targets** (`gfx10-1-generic`, `gfx10-3-generic`, `gfx11-generic`,
+`gfx12-generic` -- clang also accepts `gfx12-5-generic`, but this ROCm ships
+no device library for it, so it is excluded; see below), all of which
+this toolchain builds and
+all of which report `.wavefront_size: 32`. See the "all supported
+architectures" section below for the measurements.
 
 **Verification**: sanity-checked all 14 `--offload-arch` strings against
 this ROCm 10.0.0 install with a throwaway probe.hip compile (zero errors)
@@ -834,3 +842,71 @@ stage-2 kernel is already pinned at `vgpr=128`, so trimming live values
 relocates spill rather than freeing registers -- measured, scratch went 336 ->
 384 on gfx1030 at L=3, i.e. slightly WORSE. It is kept purely on the speed
 number above.
+
+## GFX_ARCH=all now covers every wavefront32 target, plus generic fallbacks
+
+Asked whether the arch list was complete. It was not. Queried the toolchain
+instead of trusting the earlier list: `clang --print-supported-cpus -target
+amdgcn-amd-amdhsa` reports these gfx10/11/12 targets, and the previous
+20-entry list was missing **six specifics** -- gfx1013, gfx1170, gfx1171,
+gfx1172, gfx1250, gfx1251 -- plus the **generics**. All report
+`.wavefront_size: 32`, so none violates the warp-32 ground rule.
+GFX_ARCH=all went 20 -> 30 entries (26 specific + 4 generic).
+
+**`gfx12-5-generic` is deliberately NOT in the list, and must not be added
+back without checking**: clang accepts it as a target, but this ROCm ships no
+device library for it, so a real build dies with `clang: error: cannot find
+ROCm device library for gfx12-5-generic`. `C:\rocm\lib\llvm\amdgcn\bitcode`
+has `oclc_isa_version_{10-1,10-3,11,12}-generic.bc` and every specific in the
+list above, but no 12-5. If a later ROCm ships it, it can be added.
+
+**Methodology note worth keeping**: the first screen of these targets
+compiled a trivial kernel with `--cuda-device-only -S`, and gfx12-5-generic
+PASSED that. It only failed once the real kernels were built, because
+compiling a small kernel to assembly does not pull in the device bitcode that
+`ocml`/`ockl` math calls require. Checking a target accepts a flag is not the
+same as checking it builds -- validate against the actual translation units.
+
+CDNA remains excluded on purpose, unchanged: wavefront64, and the ground rule
+at the top of this file assumes 32 throughout.
+
+**The generic targets are a real forward-compatible fallback, which this file
+previously denied** (see the corrected paragraph in the fat-binary section
+above). Two measurements, neither assumed:
+
+1. A binary built with ONLY `gfx11-generic` runs correctly on this box's
+   gfx1103 -- full `--pipeline --cofactor` job, self-check 100% both sides,
+   37 relations, exit 0. So a generic code object really does execute on a
+   specific device in its family.
+2. The runtime PREFERS an exact match when one exists, and listing order does
+   not matter. Verified with a probe whose kernel reports which code object
+   actually ran, keyed on the predefined macros (`__gfx1103__` vs
+   `__gfx11_generic__` -- the generic target also defines
+   `__amdgcn_target_id__ "gfx11-generic"`):
+
+     specific listed first  -> executed gfx1103
+     generic listed first   -> executed gfx1103
+     generic only (control) -> executed gfx11-generic
+
+   The control matters: it proves the probe discriminates, so the first two
+   are not false positives.
+
+Together those mean the generics cost nothing on any card that has a specific
+code object -- they only catch cards that would otherwise refuse to run. This
+is exactly the app_version 173 failure mode: it died on gfx1035/gfx1036 with
+`hipMemcpyToSymbol ... invalid kernel file` purely because those IDs were
+absent from the list, and `gfx10-3-generic` would have caught it.
+
+**Not measured, and worth knowing before this is leaned on:**
+- Binary size. Eleven more code objects on top of a 35 MB fat binary;
+  volunteers download it.
+- Generic-path performance. Generic code cannot assume family-specific
+  features, so it may be slower than a specific object. It only ever affects
+  cards that have NO specific object, which today cannot run at all, so
+  "possibly slower" strictly beats "invalid kernel file" -- but it is not a
+  reason to drop specific targets in favour of generics.
+- Coverage boundaries. `gfx11-generic` covering `gfx1103` is proven; do NOT
+  generalise that to "a generic covers every future member of its family".
+  The existence of a separate `gfx12-5-generic` alongside `gfx12-generic`
+  shows the families have sub-boundaries, so keep adding specifics as new
+  hardware appears rather than relying on the generics to absorb it.

@@ -30,14 +30,31 @@ rem   gfx1030/1031/1032/1034  RDNA2: RX 6800-6900 series, 6700(XT), 6600
 rem                        series, 6500XT/6400
 rem   gfx1100/1101/1102/1103  RDNA3: RX 7900 series, 7800XT/7700XT, 7600
 rem                        series, and the 780M/880M iGPU family (this box)
-rem   gfx1150/1151         RDNA3.5: Strix Point/Strix Halo iGPUs
+rem   gfx1150-1153         RDNA3.5: Strix Point/Strix Halo iGPUs
+rem   gfx1170/1171/1172    newer wavefront32 targets this toolchain accepts
 rem   gfx1200/1201         RDNA4: RX 9060 series, RX 9070(XT)
-rem UNLIKE the CUDA build's fat binary, there is no PTX-style forward-
-rem compatible fallback here: HIP embeds real machine code per listed arch,
-rem and only an EXACT match runs. A GPU whose gfx ID isn't in this list
-rem (a future RDNA5 card, for instance) will not run this binary at all,
-rem no matter how similar its ISA. Re-run with the new gfx ID added when
-rem that happens. See CLAUDE.md for how this list was chosen and verified.
+rem   gfx1250/1251         newest wavefront32 targets this toolchain accepts
+rem
+rem The list is every gfx10/11/12 target `clang --print-supported-cpus
+rem -target amdgcn-amd-amdhsa` accepts, each checked to report
+rem .wavefront_size: 32 -- so nothing here violates the warp-32 ground rule,
+rem and nothing wavefront32 that this toolchain can build is left out.
+rem
+rem FORWARD COMPATIBILITY: it exists, via the *-generic targets at the end of
+rem the list. An earlier version of this comment said the opposite -- that HIP
+rem "embeds real machine code per listed arch, and only an EXACT match runs",
+rem so an unlisted GPU could not run the binary at all. That was WRONG, and it
+rem cost a real field failure: app_version 173 died on gfx1035/gfx1036 with
+rem "invalid kernel file" purely because those IDs were absent, which
+rem gfx10-3-generic would have caught.
+rem
+rem Measured, not assumed: a binary built with ONLY gfx11-generic runs
+rem correctly on this box's gfx1103. And the runtime prefers an exact match
+rem when one exists -- verified with a probe whose kernel reports which code
+rem object executed (__gfx1103__ vs __gfx11_generic__): with both listed it
+rem picks gfx1103 REGARDLESS of listing order, and generic-only picks generic.
+rem So the generics cost nothing on any card that has a specific object; they
+rem only catch the ones that would otherwise refuse to run. See CLAUDE.md.
 rem ---------------------------------------------------------------------------
 
 if /I "%~1"=="clean" goto :do_clean
@@ -68,18 +85,37 @@ where hipcc >nul 2>nul || (
 )
 
 rem ---- GFX_ARCH ------------------------------------------------------------
-rem GFX_ARCH=all: every RDNA1-4 target TheRock's own SUPPORTED_GPUS.md lists
-rem as Build-Passing-or-better, not just the ones this session first picked --
+rem GFX_ARCH=all: every wavefront32 gfx10/11/12 target THIS TOOLCHAIN accepts
+rem (`clang --print-supported-cpus -target amdgcn-amd-amdhsa`), plus the
+rem family *-generic fallbacks -- not a hand-picked subset, and not a subset of
+rem TheRock's SUPPORTED_GPUS.md either, which is what the two earlier versions
+rem of this list were. Each entry was checked to report .wavefront_size: 32.
+rem
+rem Two rounds of this list being too short have already cost something --
 rem a real field failure (BOINC app_version 173) traced to gfx1035 (Radeon
 rem 680M/660M, Rembrandt-generation Ryzen 6000 laptop iGPUs) and gfx1036 (the
 rem iGPU in Ryzen 9000-series desktop CPUs) being missing from the original
 rem 14-target list: HIP enumerated the device fine but hipMemcpyToSymbol
 rem failed with "invalid kernel file" -- no compiled code object existed for
 rem that device's exact architecture. gfx1011/gfx1033/gfx1152/gfx1153 were
-rem the same kind of gap, just not yet hit in the field.
+rem the same kind of gap, just not yet hit in the field; gfx1013/gfx1170-1172/
+rem gfx1250-1251 were a third round of the same gap, found by asking the
+rem toolchain instead of curating a list. The generics are the structural fix
+rem for that recurring mistake -- an unlisted card in a covered family now
+rem degrades to "runs, possibly slower" instead of "cannot run at all".
+rem
+rem One accepted target is deliberately EXCLUDED: gfx12-5-generic. clang
+rem accepts it as a target name, but this ROCm ships no device library for
+rem it, so a real build dies with "cannot find ROCm device library for
+rem gfx12-5-generic". The bitcode dir (C:/rocm/lib/llvm/amdgcn/bitcode) has
+rem oclc_isa_version_{10-1,10-3,11,12}-generic.bc and every specific listed
+rem above, but no 12-5. Do not add it back without first confirming that
+rem bitcode file exists. Note the trap it fell into here: it PASSED a screen
+rem that compiled a trivial kernel with --cuda-device-only -S, because that
+rem never links the device bitcode the real kernels actually need.
 if not defined GFX_ARCH set "GFX_ARCH=gfx1103"
 if /I "%GFX_ARCH%"=="all" (
-    set "HIP_ARCH=--offload-arch=gfx1010 --offload-arch=gfx1011 --offload-arch=gfx1012 --offload-arch=gfx1030 --offload-arch=gfx1031 --offload-arch=gfx1032 --offload-arch=gfx1033 --offload-arch=gfx1034 --offload-arch=gfx1035 --offload-arch=gfx1036 --offload-arch=gfx1100 --offload-arch=gfx1101 --offload-arch=gfx1102 --offload-arch=gfx1103 --offload-arch=gfx1150 --offload-arch=gfx1151 --offload-arch=gfx1152 --offload-arch=gfx1153 --offload-arch=gfx1200 --offload-arch=gfx1201"
+    set "HIP_ARCH=--offload-arch=gfx1010 --offload-arch=gfx1011 --offload-arch=gfx1012 --offload-arch=gfx1013 --offload-arch=gfx1030 --offload-arch=gfx1031 --offload-arch=gfx1032 --offload-arch=gfx1033 --offload-arch=gfx1034 --offload-arch=gfx1035 --offload-arch=gfx1036 --offload-arch=gfx1100 --offload-arch=gfx1101 --offload-arch=gfx1102 --offload-arch=gfx1103 --offload-arch=gfx1150 --offload-arch=gfx1151 --offload-arch=gfx1152 --offload-arch=gfx1153 --offload-arch=gfx1170 --offload-arch=gfx1171 --offload-arch=gfx1172 --offload-arch=gfx1200 --offload-arch=gfx1201 --offload-arch=gfx1250 --offload-arch=gfx1251 --offload-arch=gfx10-1-generic --offload-arch=gfx10-3-generic --offload-arch=gfx11-generic --offload-arch=gfx12-generic"
 ) else (
     set "HIP_ARCH=--offload-arch=%GFX_ARCH%"
 )
