@@ -395,6 +395,9 @@ int  bench_boinc_is_managed(void);
 /* The CUDA device the client assigned to this task, from init_data.xml, or -1
  * when there is no BOINC assignment (including every non-BOINC build). */
 int  bench_boinc_gpu_device(void);
+/* Log the client's raw GPU assignment to stderr. For the path where this
+ * process cannot honour the assigned ordinal; a no-op in non-BOINC builds. */
+void bench_boinc_log_gpu_assignment(void);
 int  bench_boinc_resolve_path(const char *option, const char *logical_name,
                               const char **resolved_name);
 void bench_boinc_fraction_done(double fraction_done);

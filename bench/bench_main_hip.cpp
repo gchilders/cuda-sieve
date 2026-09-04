@@ -1670,6 +1670,12 @@ static int bench_main_impl(int argc, char **argv)
      * Whether an assignment arrived at all is the first thing to check when a
      * host reports every task on one card, so it goes to stderr, which BOINC
      * uploads with the result -- stdout is discarded with the slot. */
+    /* Whether the ordinal below came from the CLIENT or from --device. The two
+     * get different treatment when it turns out to be out of range: an
+     * operator's --device typo should fail loudly, but a client assignment
+     * this process cannot honour must NOT kill the task -- see the remap in
+     * the device-count check further down. */
+    int device_from_boinc = 0;
     {
         const int boinc_device = bench_boinc_gpu_device();
         if (boinc_device >= 0) {
@@ -1678,6 +1684,7 @@ static int bench_main_impl(int argc, char **argv)
                         "BOINC: ignoring --device %d; the client assigned this"
                         " task HIP device %d\n", cuda_device, boinc_device);
             cuda_device = boinc_device;
+            device_from_boinc = 1;
             fprintf(stderr, "BOINC: client assigned HIP device %d\n",
                     cuda_device);
         }
@@ -1708,7 +1715,7 @@ static int bench_main_impl(int argc, char **argv)
      * targets device 0; HIP always selects first, so the gate doesn't apply). */
     int ndev = 0;               /* HIP devices visible to THIS process */
     {
-        const int selected_device = cuda_device >= 0 ? cuda_device : 0;
+        int selected_device = cuda_device >= 0 ? cuda_device : 0;
         hipError_t err;
 
         /* The client and this process can disagree about how many GPUs exist
@@ -1732,15 +1739,63 @@ static int bench_main_impl(int argc, char **argv)
             return 1;
         }
         if (selected_device >= ndev) {
+            const char *const hvd = getenv("HIP_VISIBLE_DEVICES")
+                ? " HIP_VISIBLE_DEVICES is set, which renumbers devices"
+                  " from 0."
+                : "";
+            if (!device_from_boinc) {
+                /* An operator typed this. Fail fast and loudly. */
+                fprintf(stderr,
+                        "bench: HIP device %d requested, but this process sees"
+                        " only %d device%s (valid ordinals 0..%d).%s\n",
+                        selected_device, ndev, ndev == 1 ? "" : "s", ndev - 1,
+                        hvd);
+                return 1;
+            }
+            /* A CLIENT assignment this process cannot honour. Failing the task
+             * was wrong: the ordinal comes from BOINC's own coprocessor list,
+             * which it builds from OpenCL/ADL, and that enumeration is NOT
+             * this runtime's. ROCm enumerates only ROCm-capable devices, so a
+             * host with an unsupported iGPU alongside usable cards reports
+             * more GPUs to the client than exist here -- and every task on
+             * such a host then errored out instead of computing anything.
+             *
+             * MODULO, not a clamp to 0, and the difference matters: with four
+             * concurrent tasks assigned 0..3 against two visible devices,
+             * n % ndev gives 0,1,0,1 -- still spread two per card -- where
+             * clamping would pile all four onto device 0, which is the
+             * all-tasks-on-one-card bug this whole code path exists to
+             * prevent. It is a fallback, not a mapping: the client's ordinal
+             * and this runtime's can also DISAGREE ON ORDER at equal counts,
+             * which no arithmetic here can detect. Doing it properly needs a
+             * stable identity (PCI bus) on both sides, and BOINC's
+             * APP_INIT_DATA carries no PCI info -- see CLAUDE.md. */
+            const int remapped = selected_device % ndev;
             fprintf(stderr,
-                    "bench: HIP device %d requested, but this process sees"
-                    " only %d device%s (valid ordinals 0..%d).%s\n",
-                    selected_device, ndev, ndev == 1 ? "" : "s", ndev - 1,
-                    getenv("HIP_VISIBLE_DEVICES")
-                        ? " HIP_VISIBLE_DEVICES is set, which renumbers"
-                          " devices from 0."
-                        : "");
-            return 1;
+                    "bench: the client assigned HIP device %d but this process"
+                    " sees only %d device%s (valid ordinals 0..%d).%s Running"
+                    " on device %d instead rather than failing the task; this"
+                    " host may run more than one task per GPU.\n",
+                    selected_device, ndev, ndev == 1 ? "" : "s", ndev - 1, hvd,
+                    remapped);
+            /* Everything needed to tell the two causes apart from a host's
+             * uploaded stderr alone: a device the client counts but ROCm will
+             * not enumerate (counts differ by the unsupported ones), versus
+             * the same cards enumerated twice through two OpenCL platforms
+             * (counts differ by a factor). Only on this path -- never on a
+             * healthy task. */
+            bench_boinc_log_gpu_assignment();
+            for (int d = 0; d < ndev; d++) {
+                hipDeviceProp_t p;
+                if (hipGetDeviceProperties(&p, d) != hipSuccess) continue;
+                fprintf(stderr,
+                        "bench: HIP device %d: %s (%s) pci %04x:%02x:%02x\n",
+                        d, p.name, p.gcnArchName, p.pciDomainID, p.pciBusID,
+                        p.pciDeviceID);
+            }
+            bench_log_amd_driver_version();
+            selected_device = remapped;
+            cuda_device = remapped;
         }
 
         if (cuda_device >= 0 || blocking_sync) {

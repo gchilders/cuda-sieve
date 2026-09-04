@@ -220,6 +220,32 @@ extern "C" int bench_boinc_gpu_device(void)
 #endif
 }
 
+/* Dump the client's raw GPU assignment. Called ONLY when this process cannot
+ * honour the assigned ordinal, to make the cause diagnosable from a host's
+ * uploaded stderr -- never on a healthy task.
+ *
+ * gpu_opencl_dev_index is reported alongside gpu_device_num because they are
+ * different numbers from different lists, and which one the client picked
+ * says where the mismatch comes from. It is NOT a usable mapping into HIP's
+ * ordinals either: the client sets it from opencl_prop.opencl_device_index
+ * (client/gpu_opencl.cpp), its own index into a list flattened across every
+ * OpenCL platform, so consuming it would mean reproducing BOINC's exact
+ * enumeration order and filtering. Logged as evidence, not acted on. */
+extern "C" void bench_boinc_log_gpu_assignment(void)
+{
+#ifdef HAVE_BOINC
+    APP_INIT_DATA aid;
+
+    if (boinc_state != BOINC_READY) return;
+    if (boinc_get_init_data(aid)) return;
+    fprintf(stderr,
+            "BOINC: assignment was gpu_type='%s' device_num=%d"
+            " opencl_dev_index=%d gpu_usage=%.3f\n",
+            aid.gpu_type, aid.gpu_device_num, aid.gpu_opencl_dev_index,
+            aid.gpu_usage);
+#endif
+}
+
 extern "C" int bench_boinc_is_managed(void)
 {
 #ifdef HAVE_BOINC
