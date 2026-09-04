@@ -39,6 +39,11 @@ enum boinc_runtime_state {
 };
 static enum boinc_runtime_state boinc_state;
 static double last_fraction_done;
+/* Non-zero while a throwaway pass is running; see bench_boinc_progress_suspend.
+ * Not reset by bench_boinc_init: it is only ever set around a bracketed call
+ * that clears it again, and a stale 1 would silence progress for the whole
+ * run. */
+static int progress_suspended;
 static int fraction_warning_printed;
 
 static void free_resolved_paths(void)
@@ -316,12 +321,25 @@ extern "C" int bench_boinc_resolve_path(const char *option,
     return 0;
 }
 
+extern "C" void bench_boinc_progress_suspend(int on)
+{
+#ifdef HAVE_BOINC
+    progress_suspended = on ? 1 : 0;
+#else
+    (void)on;
+#endif
+}
+
 extern "C" void bench_boinc_fraction_done(double fraction_done)
 {
 #ifdef HAVE_BOINC
     int rc;
 
     if (boinc_state != BOINC_READY || !std::isfinite(fraction_done)) return;
+    /* Dropped before the monotonic high-water mark below, deliberately: a
+     * throwaway calibration band must not leave 0.99 behind for the real band
+     * to be clamped up to. See bench_boinc_progress_suspend(). */
+    if (progress_suspended) return;
     if (fraction_done < 0.0) fraction_done = 0.0;
     if (fraction_done > 1.0) fraction_done = 1.0;
     /* BOINC requires successive values to be nondecreasing. Keep that

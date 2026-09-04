@@ -910,3 +910,51 @@ absent from the list, and `gfx10-3-generic` would have caught it.
   The existence of a separate `gfx12-5-generic` alongside `gfx12-generic`
   shows the families have sub-boundaries, so keep adding specifics as new
   hardware appears rather than relying on the generics to absorb it.
+
+## BOINC tasks jumped to 99% seconds after starting: the calibration pass
+
+**Symptom.** Volunteers saw a workunit go from 0% to 99% within seconds of
+starting, then sit at 99% for hours while it did the real work. Cosmetic --
+relations, validation and exit status were all correct -- but it made every
+task's progress bar useless.
+
+**Cause.** `calibrate_slab_rows()` (pipeline_hip.cuh) times up to three
+throwaway single-q bands to pick a slab geometry. It runs them through the
+*same* `run_pipeline_impl` that reports BOINC progress, passing `qgen = NULL`
+and `nq = 1`. In `pipe_progress_fraction()` that combination falls past the
+target-rels branch (no `--target-rels`), past both generated-band branches
+(they require `streaming`, i.e. `qgen != NULL`) and lands on `nqdone / nq` --
+which is `1/1 = 1.0` the instant the single calibration q retires. Clamped to
+0.99 and reported.
+
+The 99% then *stuck* because `bench_boinc_fraction_done()` enforces BOINC's
+nondecreasing requirement: every genuine report from the real band afterwards
+was silently raised back to the 0.99 high-water mark.
+
+**Fix.** `bench_boinc_progress_suspend(int)` -- a flag checked in
+`bench_boinc_fraction_done()` *before* the monotonic clamp, so suspended
+reports are dropped without advancing the high-water mark. The calibration
+call is bracketed with it, next to the existing `g_runlog_quiet` bracket that
+suppresses that pass's warnings for the same reason.
+
+**Measured, not reasoned.** Temporary instrumentation printing every reported
+fraction, one build, run both ways against the deployed geometry
+(`--logI 15`, `--qrange`, no `--slab-j`):
+
+    before:  0.990000 susp=0 last=0.000000   <- first report of the task
+             ... real band: 0.000513, 0.026181, ... all with last=0.990000
+    after:   0.990000 susp=1 last=0.000000   <- dropped, mark not advanced
+             ... real band: 0.000513, 0.026181, ... 0.968686, 0.99, 1.0
+
+Relation counts identical both ways (7/7/7/931/5200), confirming this only
+ever touched reporting.
+
+**The trigger is the deployed command line, not an exotic case.** Calibration
+runs whenever `--slab-j` is absent and the geometry is large enough to slab,
+which `--logI 15` is. Any task using it hit this.
+
+**pipeline.cuh (CUDA) has the identical bug and is deliberately NOT fixed** --
+the ground rule at the top of this file keeps the CUDA build byte-identical.
+`bench_boinc_progress_suspend()` is additive and harmless there; if the CUDA
+build is ever revived for BOINC, bracket its `calibrate_slab_rows()` the same
+way.

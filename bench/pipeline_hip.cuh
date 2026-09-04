@@ -2731,13 +2731,28 @@ static uint32_t calibrate_slab_rows(const fb_t *fb1, const fb_t *fbs1,
          * discarded either way -- reset unconditionally right after so the
          * real run below is never silenced by a candidate that happened to
          * warn. */
+        /* Progress reporting is suspended for the same reason as the warnings,
+         * and it is not merely cosmetic bookkeeping: run_pipeline_impl reports
+         * fraction-done from its own arguments, and with qgen NULL and nq 1
+         * pipe_progress_fraction's generated-band and target-rels branches all
+         * fall through to nqdone/nq -- which is 1/1 the moment the single
+         * calibration q retires. That is clamped to 0.99 and, because BOINC
+         * reports must be nondecreasing (see bench_boinc_fraction_done), it
+         * became the floor for the REST OF THE WORKUNIT: every genuine 0.4%,
+         * 0.8%, ... from the real band was silently raised back to 99%. Field
+         * symptom was a task pinned at 99% within seconds of starting and
+         * staying there for hours. Suspending drops the throwaway reports
+         * without advancing the high-water mark, so the real band still starts
+         * from zero. */
         t0 = host_ms();
         g_runlog_quiet = 1;
+        bench_boinc_progress_suspend(1);
         rc_cal = cplan.enabled
             ? run_pipeline_impl<true>(fb1, fbs1, fb0, fbs0, qlist, 1, NULL,
                                       POLY, &ccfg, &cplan)
             : run_pipeline_impl<false>(fb1, fbs1, fb0, fbs0, qlist, 1, NULL,
                                        POLY, &ccfg, &cplan);
+        bench_boinc_progress_suspend(0);
         g_runlog_quiet = 0;
         if (rc_cal)
             continue;
