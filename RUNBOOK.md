@@ -698,6 +698,30 @@ allowance, and a job fingerprint.
   Unreadable files, active locks, other filesystem errors, bad inputs,
   band/command mismatches and compute failures remain fatal because deleting
   output cannot repair them.
+- **Some per-slab failures now cost yield rather than the task.** A bucket
+  array overflow, a norm overflow, or a factor list truncated past the
+  per-survivor cap used to fail the whole band -- one field report threw away
+  3373 special-q of completed work over a shortfall of a single record, and
+  ended in `boinc_finish(-1)` that the volunteer could neither see nor act on.
+  Each of these now warns, skips that one slab, and continues. A special-q
+  that loses every one of its slabs is counted and skipped rather than
+  tripping the "no survivors at this q" check, which is otherwise still fatal
+  when the sieve actually ran.
+
+  **No relation is at risk.** All three are tested before the intersect/trial
+  division/emit stage, so a skipped slab contributes nothing to the output
+  file, and dropped bucket records can only lower a position's log sum -- an
+  overflow costs survivors it never invents.
+
+  Warnings are rate-limited; the true totals appear in an end-of-band summary
+  naming how many slabs were skipped, how many of those were for untrustworthy
+  trial division, and how many special-q were lost entirely. Two consequences
+  worth knowing: a host that skips a slab returns fewer relations than one that
+  does not, so a validator comparing results *between* hosts may now reject
+  these rather than seeing an error; and norm overflow or truncated lists
+  usually mean a misconfigured job (mfb too generous, `PIPE_K` too small)
+  rather than a transient, so such a job now yields very little while still
+  exiting 0. The summary line naming mfb/`PIPE_K` is what makes that visible.
   Checkpoints that include candidate output also record the candidate staging
   pathname and file identity. This lets a relaunch that omitted `--candidates`
   remove the matching private staging file without trusting checkpoint text as
