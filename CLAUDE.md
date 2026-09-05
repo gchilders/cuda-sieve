@@ -958,3 +958,83 @@ the ground rule at the top of this file keeps the CUDA build byte-identical.
 `bench_boinc_progress_suspend()` is additive and harmless there; if the CUDA
 build is ever revived for BOINC, bracket its `calibrate_slab_rows()` the same
 way.
+
+## Drift ledger: what the HIP fork has that the CUDA build does not
+
+The CUDA build is deliberately frozen (ground rule at the top of this file),
+so every HIP-side fix and speedup since the port is a divergence. This is the
+list, kept here because otherwise it lives only in commit messages. It is what
+someone with NVIDIA hardware would need in order to port them back.
+
+**Why the forks are not simply merged.** The duplication is real -- the five
+forked pairs are 87-95% identical, ~14,000 lines, and most of the difference
+is mechanical cuda*/hip* renaming. Merging them behind #ifdef is still the
+wrong trade, for a reason bigger than complexity: this file's own acceptance
+test is "HIP build output must be byte-identical to the CUDA build". That is a
+differential test between two independently-derived implementations, and it is
+what every ss_first commit below was actually validated with. Share the
+arithmetic and a bug in it produces identical wrong answers on both sides,
+and the cross-check passes clean. The independence IS the test.
+
+Three supporting reasons, none of them decisive alone: in-place
+`|| defined(__HIPCC__)` guards were tried first and failed on the API-heavy
+files (see bench_kernels.hip's header -- "undeclared identifier 'cudaFree'
+deep in cofac.cuh"); some differences are semantic rather than spelling
+(`__launch_bounds__`'s second argument means MIN_WARPS_PER_EXECUTION_UNIT on
+HIP and minBlocksPerMultiprocessor on CUDA); and there is no NVIDIA GPU on
+this box, so a merge is the highest-blast-radius change available and the
+least verifiable here.
+
+**Going-forward rule, which is where the real fix is.** The shared-header
+pattern already works: bigint.cuh, td.cuh, plattice.cuh and prp.cuh are shared
+by both builds with no friction, and ss_first's reciprocal reuses td.cuh's
+td_magic_build/td_mod_magic across the boundary unchanged. So: if a change is
+pure arithmetic with no platform API in it, put it in a shared header from the
+start rather than forking it. pipe_progress_fraction is the counter-example --
+host-side arithmetic, zero API, duplicated for no reason.
+
+### The divergences
+
+| # | CUDA file | What it is missing | HIP commit |
+|---|---|---|---|
+| 1 | `pipeline.cuh` | BOINC progress pinned at 99% | `eb72ede` |
+| 2 | `cofac.cuh` | ECM stage 2 on a shared denominator | `43ea104` |
+| 3 | `bench_kernels.cu` | `ss_first` reduction work (3 commits) | `1b779b0`, `3a8049d`, `711cdaf` |
+| 4 | `bench_main.cu` | GPU-ordinal fallback + BOINC diagnostics | `e769470` |
+
+**1. `pipeline.cuh` still pins BOINC progress at 99%.** Verified: it has zero
+occurrences of `bench_boinc_progress_suspend`. `calibrate_slab_rows()` runs a
+throwaway single-q band through the same run_pipeline_impl that reports
+progress; with qgen NULL and nq 1 the fraction is nqdone/nq == 1.0, clamped to
+0.99, and BOINC's nondecreasing rule makes that the floor for the whole task.
+This is a live bug, not a missing optimisation -- it only does not bite because
+nothing currently ships a BOINC-linked CUDA build. Fix is the
+suspend/resume bracket around the calibration call.
+
+**2. `cofac.cuh` still runs ECM stage 2 with per-point denominators.** It
+declares `mpt<L> baby[CF_ECM_NBABY], ...`; the HIP fork declares
+`mz<L> bx[CF_ECM_NBABY], bz` plus `bzs[]` and carries one shared denominator.
+98 differing lines in that function alone. Worth ~4.6% off the ECM queue, and
+provably identical output.
+
+**3. `bench_kernels.cu` still has the original two-modulo `ss_first`.**
+Verified: it is still `base = rt*j % p` followed by `(base - ilo) % p`. The
+HIP side is now one reduction, then a multiply-shift reciprocal, then that
+reciprocal's shift and bias derived on device. apply 128.6 -> 107.8 ms on
+gfx1103, -16.2%, byte-identical relations across logI 14/15/16, both sq-sides,
+cofactor on/off, and bkthresh/J values that push 53% of entries onto the
+fallback path. NOTE this one is the least portable of the four: the win is
+AMD-shaped, because AMD has no integer-divide instruction. On NVIDIA the same
+change is still a win in principle but the size is unknown and unmeasured --
+measure before porting, do not assume -16%.
+
+**4. `bench_main.cu` has no GPU-ordinal fallback and no BOINC GPU
+diagnostics.** Verified: zero occurrences of `device_from_boinc` or
+`bench_boinc_log_gpu_assignment`. Both builds link BOINC, so this one is a
+genuine gap rather than dead weight: a client assigning an ordinal the process
+cannot see fails the task outright instead of remapping modulo the visible
+count.
+
+Not in the table, because they are toolchain rather than source: the HIP build
+scripts carry `+enable-flat-scratch` (the gfx10 stage-2 correctness fix) and
+the 30-target GFX_ARCH=all list. Neither has a CUDA analogue.
