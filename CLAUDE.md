@@ -24,6 +24,14 @@ distribution to BOINC volunteers on Windows and Linux.
 
 ## Ground rules
 - Do not modify the CUDA build. The HIP port lives alongside it.
+  **ONE authorised exception so far, 2026-09-05**: `pipeline.cuh` carries the
+  soft-failure change (bucket overflow / untrustworthy trial division skip the
+  slab instead of failing the band). It was ported deliberately, on the
+  instruction that this behaviour "should be the same on all platforms",
+  because it is task-survival behaviour rather than a tuning change. It is
+  **UNTESTED ON NVIDIA** -- there is no CUDA toolkit on this box, so it was
+  not even compiled, only diffed line-for-line against the HIP version. Build
+  it before trusting it. Nothing else in the CUDA build has been touched.
 - Acceptance test: HIP build output must be byte-identical to the CUDA
   build's relations on the oracle jobs, with `make -C bench check` green.
 - Warp width 32 is assumed throughout (`>> 5`, `& 31`, lane 31 broadcasts).
@@ -1038,3 +1046,67 @@ count.
 Not in the table, because they are toolchain rather than source: the HIP build
 scripts carry `+enable-flat-scratch` (the gfx10 stage-2 correctness fix) and
 the 30-target GFX_ARCH=all list. Neither has a CUDA analogue.
+
+## Soft failures: a degraded task beats a dead one
+
+A field report showed BOINC tasks dying like this:
+
+    side 0: bucket array OVERFLOWED by 1 records
+    band FAILED after 3373 generated q; the .part is kept
+    called boinc_finish(-1)
+
+3373 special-q of work thrown away over a one-record shortfall, and a
+volunteer left with an error they can neither see nor act on. Three per-slab
+conditions are now SOFT -- warn, skip that slab, keep the band alive:
+
+| condition | was | now |
+|---|---|---|
+| bucket array overflow | band FAILED | skip slab, continue |
+| norm overflow | band FAILED | skip slab, continue |
+| truncated factor list | band FAILED | skip slab, continue |
+| every slab of a q skipped | "no survivors" -> FAILED | count a lost q, continue |
+
+**Why this cannot emit a bad relation, structurally.** All three are tested
+BEFORE intersect/TD/emit, so a skipped slab contributes nothing to the
+relation file. Dropped bucket records can only LOWER a position's log sum, so
+an overflow costs survivors it never invents. The cost is yield, never
+correctness.
+
+The fourth row is the trap worth remembering: "an entire q with no two-sided
+survivors is suspicious and remains fatal" is a real invariant, and leaving it
+alone would have converted every bucket overflow back into a dead task by the
+back door. It is still fatal when the sieve actually RAN -- only
+explained-zero is tolerated.
+
+**Measured, not argued.** Overflow is hard to provoke by shrinking `cap`,
+because `cap` is a global per-region capacity: scale it down and EVERY region
+overflows at once, which is not the field failure. Real overflows come from
+per-q distribution variance. So the mixed case was forced synthetically
+(overflow every third slab):
+
+    31 slabs skipped, exit 0, 956 relations against 1459 for the clean run,
+    and every relation still verified: 11751/11751 and 5230/5230 PASS
+
+The worst case (cap/8, every slab of every q lost) also exits 0 with correct
+counters, where before it was a guaranteed boinc_finish(-1). With no overflow
+at all, relation output is byte-identical to the previous build at logI
+14/15/16 -- the change is a no-op on the normal path.
+
+**Two things this deliberately trades away.**
+
+1. A host that skips a slab returns fewer relations than one that does not. If
+   the project validator compares results BETWEEN hosts rather than checking
+   validity, these partial results may now fail validation instead of
+   erroring. Same credit outcome, different failure mode.
+2. Norm overflow and truncated factor lists usually mean a MISCONFIGURED job
+   (mfb too generous, PIPE_K too small), not a transient. A job that trips
+   them everywhere now yields almost nothing while exiting 0. The end-of-band
+   counter names those two specifically and says mfb/PIPE_K needs attention --
+   that line is what keeps the failure visible. Do not remove it.
+
+Warnings are rate-limited (8 for overflow, 4 for each TD condition) with true
+totals in the end-of-band summary: stderr is uploaded under BOINC, and
+unbounded per-event logging has already produced hundreds of duplicate lines
+once in this project's history.
+
+Both builds carry this -- see the authorised exception in the ground rules.
