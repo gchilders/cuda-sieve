@@ -149,6 +149,7 @@ typedef struct {
     uint32_t *survbits;
     uint16_t *slice, *slice_logp;
     uint32_t *sp, *srt, *sg;
+    uint32_t *smag, *sshb;      /* ss_first reciprocals; see ss_magic_build */
     uint16_t *slp;
     uint32_t  nslice_pow2, nsmall, nblk, nwrp, nfb;
     size_t    apply_smem;
@@ -156,6 +157,7 @@ typedef struct {
     uint32_t  CINIT, BOUND, tconst, nsurv;
     /* persistent across special-q */
     uint32_t *hsp, *hsrt, *hsg; uint16_t *hslp;
+    uint32_t *hsmag, *hsshb;
     uint32_t *d_nsurv, *d_nproj;
     unsigned long long *d_nlost;
     hipEvent_t ev[4];
@@ -167,12 +169,15 @@ static void pside_free(pside_t *S)
     hipFree(S->walk_cur); hipFree(S->walk_next);
     hipFree(S->survbits); hipFree(S->slice); hipFree(S->slice_logp);
     hipFree(S->sp); hipFree(S->srt); hipFree(S->sg); hipFree(S->slp);
+    hipFree(S->smag); hipFree(S->sshb);
     hipFree(S->d_nsurv);
     hipFree(S->d_nproj); hipFree(S->d_nlost);
     if (S->hsp)  hipHostFree(S->hsp);
     if (S->hsrt) hipHostFree(S->hsrt);
     if (S->hsg)  hipHostFree(S->hsg);
     if (S->hslp) hipHostFree(S->hslp);
+    if (S->hsmag) hipHostFree(S->hsmag);
+    if (S->hsshb) hipHostFree(S->hsshb);
     for (int k = 0; k < 4; k++) if (S->ev[k]) hipEventDestroy(S->ev[k]);
     memset(S, 0, sizeof(*S));
 }
@@ -296,10 +301,16 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
                                    hipHostMallocDefault));
         SIDE_INIT_CK(hipHostAlloc((void **)&S->hsg, (size_t)fbs->n * 4,
                                    hipHostMallocDefault));
+        SIDE_INIT_CK(hipHostAlloc((void **)&S->hsmag, (size_t)fbs->n * 4,
+                                   hipHostMallocDefault));
+        SIDE_INIT_CK(hipHostAlloc((void **)&S->hsshb, (size_t)fbs->n * 4,
+                                   hipHostMallocDefault));
         SIDE_INIT_CK(hipMalloc(&S->sp,  (size_t)fbs->n * 4));
         SIDE_INIT_CK(hipMalloc(&S->srt, (size_t)fbs->n * 4));
         SIDE_INIT_CK(hipMalloc(&S->sg,  (size_t)fbs->n * 4));
         SIDE_INIT_CK(hipMalloc(&S->slp, (size_t)fbs->n * 2));
+        SIDE_INIT_CK(hipMalloc(&S->smag, (size_t)fbs->n * 4));
+        SIDE_INIT_CK(hipMalloc(&S->sshb, (size_t)fbs->n * 4));
     }
     SIDE_INIT_CK(hipMalloc(&S->d_nsurv, 4));
     SIDE_INIT_CK(hipMalloc(&S->d_nproj, 4));
@@ -405,6 +416,15 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
             free(tg); tg = NULL;
             free(tlp); tlp = NULL;
         }
+        /* Reciprocals AFTER the sort, same as the standalone path: the sort
+         * key is the modulus, so building them earlier would only mean
+         * permuting them too. */
+        {
+            const uint32_t ihalf = 1u << (cfg->logI - 1);
+            for (uint32_t i = 0; i < k; i++)
+                ss_magic_build(hsp[i], cfg->J, ihalf,
+                               &S->hsmag[i], &S->hsshb[i]);
+        }
         S->nblk = S->nwrp = 0;
         for (uint32_t i = 0; i < k && hsp[i] < SS_BLOCK_CUT; i++) S->nblk = i + 1;
         for (uint32_t i = 0; i < k && hsp[i] < SS_WARP_CUT; i++) S->nwrp = i + 1;
@@ -415,6 +435,10 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
         PERQ_CK(hipMemcpy(S->sg, hsg, (size_t)k * sizeof(*hsg),
                            hipMemcpyHostToDevice));
         PERQ_CK(hipMemcpy(S->slp, hslp, (size_t)k * sizeof(*hslp),
+                           hipMemcpyHostToDevice));
+        PERQ_CK(hipMemcpy(S->smag, S->hsmag, (size_t)k * sizeof(*S->hsmag),
+                           hipMemcpyHostToDevice));
+        PERQ_CK(hipMemcpy(S->sshb, S->hsshb, (size_t)k * sizeof(*S->hsshb),
                            hipMemcpyHostToDevice));
     }
 
@@ -575,7 +599,8 @@ static int pipe_side_sieve_slab(const fb_t *fb, const bench_cfg_t *cfg,
         (const uint32_t *)d_bucket, d_cursor, cap, cfg->logI, log_region,
         S->slice_logp, S->nslice_pow2, S->N, S->CINIT, S->CINIT - S->BOUND,
         S->tconst, NULL, S->d_nsurv, NULL, 0xFFFFFFFFu,
-        S->sp, S->srt, S->sg, S->slp, S->nsmall, S->nblk, S->nwrp,
+        S->sp, S->srt, S->sg, S->slp, S->smag, S->sshb,
+        S->nsmall, S->nblk, S->nwrp,
         0xFFFFFFFFu, NULL, S->survbits, cfg->not_both_even, j_base);
     SLAB_CK(hipEventRecord(S->ev[3]));
     SLAB_CK(hipEventSynchronize(S->ev[3]));

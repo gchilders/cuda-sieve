@@ -260,8 +260,24 @@ __device__ __forceinline__ void ss_add(uint32_t *S, uint32_t c, uint32_t lp)
 
 /* First offset within [0,width) whose i is congruent to rt*j (mod p). */
 __device__ __forceinline__ uint32_t ss_first(uint32_t p, uint32_t rt,
-                                             uint32_t j, int32_t ilo)
+                                             uint32_t j, int32_t ilo,
+                                             uint32_t magic, uint32_t shbias)
 {
+    /* Magic path: no integer division at all, just __umulhi + shift + mad.
+     * `bias` is the smallest multiple of p that is >= Ihalf, precomputed on
+     * the host (ss_magic_build), so bias - ilo >= 0 for every ilo in
+     * [-Ihalf, Ihalf) and the numerator is unsigned with the residue
+     * unchanged. The uint32 arithmetic below is exact because the true value
+     * is non-negative and < 2^31 -- the host refuses the magic (magic == 0)
+     * for any entry where it could not prove that, which is also how m == 1
+     * arrives here, matching tdsmall_t's existing convention in td.cuh.
+     *
+     * td_mod_magic is exact only for dividends < 2^31; that is precisely the
+     * bound the host checks. */
+    if (magic) {
+        const uint32_t w = rt * j + (shbias & 0x03ffffffu) - (uint32_t)ilo;
+        return td_mod_magic(w, p, magic, shbias >> 26);
+    }
     /* ONE reduction, not two. base == rt*j (mod p), so (base - ilo) mod p is
      * just (rt*j - ilo) mod p -- the intermediate reduction to `base` buys
      * nothing. The bias makes the numerator unsigned so the sign fixup goes
@@ -277,12 +293,45 @@ __device__ __forceinline__ uint32_t ss_first(uint32_t p, uint32_t rt,
     return (uint32_t)(t % p);
 }
 
+/* Host side of the above: the (magic, sh, bias) triple for one entry, packed
+ * as ss_first wants it. Returns 0 into *magic to mean "no magic, use the
+ * 64-bit fallback" -- for m == 1 (td_magic_build's own signal) and, more
+ * importantly, whenever the numerator cannot be PROVEN below 2^31, which is
+ * the exactness bound on td_mod_magic. jmax is the largest row index the
+ * kernel can pass and ihalf is 1 << (logI-1).
+ *
+ * Refusing rather than assuming matters: --bkthresh and --J are both operator
+ * knobs, so m*jmax is not bounded by anything this file controls. A silent
+ * wrong residue here would corrupt relations, not crash. */
+static inline void ss_magic_build(uint32_t m, uint32_t jmax, uint32_t ihalf,
+                                  uint32_t *magic, uint32_t *shbias)
+{
+    uint32_t mg, sh, bias;
+    uint64_t wmax;
+
+    *magic = 0; *shbias = 0;
+    td_magic_build(m, &mg, &sh);
+    if (!mg) return;                       /* m == 1: every position hits */
+
+    bias = ((ihalf + m - 1) / m) * m;      /* least multiple of m >= ihalf */
+    /* Largest numerator the kernel can form: rt <= m-1, j <= jmax, and the
+     * -ilo term is at most +ihalf. */
+    wmax = (uint64_t)(m - 1) * jmax + bias + ihalf;
+    if (wmax >= (1ull << 31)) return;      /* cannot prove exactness */
+    if (bias >= (1u << 26) || sh >= 32) return;   /* will not pack */
+
+    *magic  = mg;
+    *shbias = (sh << 26) | bias;
+}
+
 template <int CELLBITS, int ATOMIC, bool SLABBED = false>
 __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_region,
                             const uint32_t *__restrict sp,
                             const uint32_t *__restrict srt,
                             const uint32_t *__restrict sg,
                             const uint16_t *__restrict slp,
+                            const uint32_t *__restrict smag,
+                            const uint32_t *__restrict sshb,
                             uint32_t nsmall, uint32_t nblk, uint32_t nwrp,
                             uint32_t tid, uint32_t nth, uint32_t j_base)
 {
@@ -302,7 +351,9 @@ __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_regi
             const uint32_t m = sp[e], g = sg[e], lp = slp[e];                 \
             if (g > 1 && (j % g)) break;                                      \
             {                                                                 \
-                const uint32_t c0 = ss_first(m, srt[e], g > 1 ? j / g : j, ilo); \
+                const uint32_t c0 = ss_first(m, srt[e], g > 1 ? j / g : j, ilo, \
+                                             smag ? smag[e] : 0u,              \
+                                             smag ? sshb[e] : 0u);             \
                 for (uint32_t c = c0 + (first) * m; c < width; c += (step) * m)\
                     ss_add<CELLBITS,ATOMIC>(S, c, lp);                        \
             }                                                                 \
@@ -452,6 +503,7 @@ void k_apply(const uint32_t *__restrict buckets,
                         uint32_t dbg_region,
                         const uint32_t *__restrict sp, const uint32_t *__restrict srt,
                         const uint32_t *__restrict sg, const uint16_t *__restrict slp,
+                        const uint32_t *__restrict smag, const uint32_t *__restrict sshb,
                         uint32_t nsmall, uint32_t nblk, uint32_t nwrp,
                         uint32_t probe_x, uint32_t *__restrict probe_out,
                         uint32_t *__restrict survbits, int not_both_even,
@@ -570,6 +622,7 @@ report spurious cell mismatches. Pricing builds only, never for relations."
     /* ---- small primes: line-sieved straight into the same shared region ---- */
     if (nsmall)
         sieve_small<CELLBITS, ATOMIC, SLABBED>(S, b, logI, log_region, sp, srt, sg, slp,
+                                               smag, sshb,
                                                nsmall, nblk, nwrp, tid, nth, j_base);
 
     /* ---- apply ---- */
@@ -921,6 +974,7 @@ struct dev_bufs {
     uint32_t *nsurv, *probe;
     uint16_t *dbg;
     uint32_t *sp, *srt, *sg;
+    uint32_t *smag, *sshb;
     uint16_t *slp;
     uint8_t  *dumpbuf;
     uint32_t *survbits;
@@ -2214,6 +2268,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
      * the tier boundaries are just two indices. ---- */
     uint32_t nsmall = 0, nblk = 0, nwrp = 0;
     uint32_t *hsp = NULL, *hsrt = NULL, *hsg = NULL; uint16_t *hslp = NULL;
+    uint32_t *hsmag = NULL, *hsshb = NULL;
     /* per-q HOST work, billed separately: it is invisible to cudaEvent timing
      * and Goal 1 is a claim about host demand. */
     double h_ms_transform = 0, h_ms_sort = 0, h_ms_xfer = 0;
@@ -2229,6 +2284,8 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
         CK(hipHostAlloc((void **)&hsrt, (size_t)fbs->n * 4, hipHostMallocDefault));
         CK(hipHostAlloc((void **)&hslp, (size_t)fbs->n * 2, hipHostMallocDefault));
         CK(hipHostAlloc((void **)&hsg,  (size_t)fbs->n * 4, hipHostMallocDefault));
+        CK(hipHostAlloc((void **)&hsmag, (size_t)fbs->n * 4, hipHostMallocDefault));
+        CK(hipHostAlloc((void **)&hsshb, (size_t)fbs->n * 4, hipHostMallocDefault));
         h_ms_transform = host_ms();
         for (i = 0; i < fbs->n; i++) {
             uint32_t q = fbs->primes[i], r = fbs->roots[i], rt, g, m;
@@ -2280,8 +2337,18 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
         }
         h_ms_sort = host_ms() - h_ms_sort;
 
+        /* Reciprocals AFTER the sort: the key is the modulus itself, so
+         * building them earlier would mean permuting them too, for no gain. */
+        {
+            const uint32_t ihalf = 1u << (cfg->logI - 1);
+            for (i = 0; i < nsmall; i++)
+                ss_magic_build(hsp[i], cfg->J, ihalf, &hsmag[i], &hsshb[i]);
+        }
+
         for (i = 0; i < nsmall && hsp[i] < SS_BLOCK_CUT; i++) nblk = i + 1;
         for (i = 0; i < nsmall && hsp[i] < SS_WARP_CUT;  i++) nwrp = i + 1;
+        CK(hipMalloc(&D.smag, (size_t)nsmall * 4));
+        CK(hipMalloc(&D.sshb, (size_t)nsmall * 4));
         CK(hipMalloc(&D.sp,  (size_t)nsmall * 4));
         CK(hipMalloc(&D.srt, (size_t)nsmall * 4));
         CK(hipMalloc(&D.sg,  (size_t)nsmall * 4));
@@ -2296,6 +2363,8 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
         CK(hipMemcpy(D.srt, hsrt, (size_t)nsmall * 4, hipMemcpyHostToDevice));
         CK(hipMemcpy(D.sg,  hsg,  (size_t)nsmall * 4, hipMemcpyHostToDevice));
         CK(hipMemcpy(D.slp, hslp, (size_t)nsmall * 2, hipMemcpyHostToDevice));
+        CK(hipMemcpy(D.smag, hsmag, (size_t)nsmall * 4, hipMemcpyHostToDevice));
+        CK(hipMemcpy(D.sshb, hsshb, (size_t)nsmall * 4, hipMemcpyHostToDevice));
         CK(hipDeviceSynchronize());
         h_ms_xfer = host_ms() - h_ms_xfer;
         {   double upd = 0; uint32_t xm = (1u << cfg->logI) * cfg->J;
@@ -2612,6 +2681,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                         N, CINIT, CINIT - BOUND, tconst, D.dumpbuf,            \
                         D.nsurv,                                               \
                         D.dbg, dbgreg, D.sp, D.srt, D.sg, D.slp,             \
+                        D.smag, D.sshb,                                       \
                         nsmall, nblk, nwrp, probe_x, D.probe,                  \
                         D.survbits, cfg->not_both_even, 0u);                   \
                 }                                                              \
@@ -3144,12 +3214,15 @@ after_apply:
     free(hslice); free(hlogp);
     if (hsp)  hipHostFree(hsp);
     if (hsrt) hipHostFree(hsrt);
+    if (hsmag) hipHostFree(hsmag);
+    if (hsshb) hipHostFree(hsshb);
     if (hsg)  hipHostFree(hsg);
     if (hslp) hipHostFree(hslp);
     hipFree(D.primes); hipFree(D.roots); hipFree(D.plat); hipFree(D.cursor);
     hipFree(D.out); hipFree(D.overflow); hipFree(D.nproj); hipFree(D.nlost);
     hipFree(D.l1); hipFree(D.l1cnt); hipFree(D.slice); hipFree(D.slice_logp);
     hipFree(D.nsurv); hipFree(D.dbg); hipFree(D.probe);
+    hipFree(D.smag); hipFree(D.sshb);
     hipFree(D.sp); hipFree(D.srt); hipFree(D.sg); hipFree(D.slp); hipFree(D.dumpbuf); hipFree(D.survbits);
     return td_failed ? -1 : 0;
 }
