@@ -278,10 +278,19 @@ else
     tail -15 "$TMP/out" | sed 's/^/  | /'
 fi
 
-# ---- case C: PIPE_SKIP_MAX ends the run cleanly ----------------------------
-# A stop, not a crash: rc stays 0, the cofactor queue is flushed and a
-# checkpoint is written, exactly like the stop-file path. Regressing this to
-# `rc = -1` would throw away every queued relation and report the band FAILED.
+# ---- case C: PIPE_SKIP_MAX ends the run as UNSUPPORTED ---------------------
+# A DELIBERATE STOP THAT IS NOT A SUCCESS, and the two halves are asserted
+# separately because they used to be conflated.
+#
+#   Drain and checkpoint, exactly like the stop-file path: regressing this to
+#   `rc = -1` would throw away every queued relation and report the band FAILED.
+#
+#   Exit BENCH_EXIT_UNSUPPORTED, not 0. This changed 2026-09-05. The old gate
+#   asserted "bench exited 0", which is what let a BOINC work unit be credited
+#   as a completed band after a hundred skips -- and per case D below, every
+#   resume of the same binary emits nothing. The stop is right; the success
+#   status was not. The run must also NAME the width to rebuild at, because
+#   stderr.txt is all a project gets back from a failed result.
 # Long enough to reach PIPE_SKIP_MAX TWICE: case D measures the step a resume
 # makes, and it cannot if the first cap already leaves the range nearly spent.
 QHI=$((QMIN + 6000))
@@ -297,10 +306,15 @@ if [ "$cap_n" -gt 0 ]; then
 else
     echo "  cap job: Y0 = -2^$((LIMIT - 25)), logI 14 -- normscan returned no sample"
 fi
-if run_band "$TMP/all.job" 14 --cofactor; then
-    pass "C cap stop is not a failure" "bench exited 0"
+run_band "$TMP/all.job" 14 --cofactor && cst=0 || cst=$?
+if [ "$cst" -eq 3 ]; then
+    pass "C cap stop exits UNSUPPORTED" "bench exited 3"
 else
-    bad "C cap stop is not a failure" "bench exited $?"
+    bad "C cap stop exits UNSUPPORTED" "bench exited $cst, expected 3"
+    # Same excerpt cases A and B print. This gate needs a card and is not in
+    # `make check`, so a failure here is usually costing someone rented time --
+    # it must not require a second run just to see what happened.
+    tail -15 "$TMP/out" | sed 's/^/  | /'
 fi
 grep -qE '\*\* [0-9]+ special-q skipped for norm width' "$TMP/out" \
     && pass "C cap warning printed" "$(grep -oE '\*\* [0-9]+ special-q skipped' "$TMP/out" | head -1)" \
@@ -308,9 +322,25 @@ grep -qE '\*\* [0-9]+ special-q skipped for norm width' "$TMP/out" \
 grep -q 'FAILED' "$TMP/out" \
     && bad  "C band not reported FAILED" "$(grep -m1 FAILED "$TMP/out")" \
     || pass "C band not reported FAILED" ""
-grep -qE 'Rerun the same command to resume at q=' "$TMP/out" \
+# "resume at q=" only -- the capped stop deliberately does NOT say "rerun the
+# same command", since rerunning this binary caps again ~PIPE_SKIP_MAX q later.
+grep -qE 'resume at q=[0-9]+' "$TMP/out" \
     && pass "C checkpoint written at the cap" "$(grep -oE 'resume at q=[0-9]+' "$TMP/out" | head -1)" \
     || bad  "C checkpoint written at the cap" "no checkpoint line"
+grep -qE 'REBUILD BEFORE RESUMING' "$TMP/out" \
+    && pass "C cap stop says a rebuild is needed" "" \
+    || bad  "C cap stop says a rebuild is needed" "no rebuild advice"
+# ASSERT THE NEGATIVE TOO. Both stop messages contain "resume at q=", so the
+# assertion above cannot tell a capped stop from an ordinary one; if `capped`
+# stopped being set the band would fall into the ordinary branch and still
+# pass. The ordinary branch's phrase is the discriminator.
+grep -q 'Rerun the same command to resume' "$TMP/out" \
+    && bad  "C cap stop is not the ordinary stop" "took the plain stop message" \
+    || pass "C cap stop is not the ordinary stop" ""
+grep -qE 'make BN_LIMBS=[0-9]+`? \(this build carries|no supported BN_LIMBS is wide enough for' "$TMP/out" \
+    && pass "C cap stop names the width to rebuild at" \
+            "$(grep -oE 'make BN_LIMBS=[0-9]+' "$TMP/out" | tail -1)" \
+    || bad  "C cap stop names the width to rebuild at" "no width named"
 
 # ---- D: what a resume actually does after a cap stop -----------------------
 # REPORTED, NOT ASSERTED. nqskip is not checkpointed, so a resumed band starts

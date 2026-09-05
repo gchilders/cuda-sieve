@@ -47,6 +47,19 @@ static void pipe_request_stop(void)
     if (++g_pipe_stop >= 2) bench_fast_exit(130);
 }
 
+/* The widest BN_LIMBS any skipped (q,rho) asked for this session; -1 once some
+ * skip needed more than the 16 limbs the build supports, 0 when nothing was
+ * skipped. It exists so the PIPE_SKIP_MAX stop can put ONE number on stderr --
+ * stderr.txt is what a BOINC project gets back from a failed result, and
+ * "rebuild at N limbs" is the whole content of that failure. Leaving it to be
+ * reconstructed from a hundred per-skip warnings is not a dispatch rule.
+ *
+ * A file static because the skip is raised three call levels down inside
+ * pipe_side_prepare_q, whose return value is already a three-way code; the
+ * alternative was an out-parameter threaded through the per-q path for a value
+ * only the cap ever reads. Reset at the top of every band. */
+static int g_pipe_need_limbs = 0;
+
 /* Record a resume point.
  *
  * THE PRECONDITION IS THE WHOLE DESIGN: the caller must guarantee that the
@@ -330,7 +343,14 @@ enum { PIPE_Q_SKIP = 1 };
  * holes -- nqskip is not checkpointed, so a resumed band starts counting again,
  * and a work unit of a few hundred q can never reach the cap. Both are
  * acceptable only because normscan is supposed to make the whole situation
- * unreachable; neither should be relied on as the primary defence. */
+ * unreachable; neither should be relied on as the primary defence.
+ *
+ * REACHING IT IS NOT A CLEAN STOP. The band still drains and checkpoints --
+ * throwing away the queued relations would be strictly worse -- but it returns
+ * PIPE_RC_UNSUPPORTED, exits nonzero, and reports BENCH_OUTCOME_UNSUPPORTED to
+ * BOINC. It used to exit 0, which credited a work unit for a band that emitted
+ * a hundred skips and, per finding 93 case D, would emit nothing again on every
+ * resume of the same binary. The stop is deliberate; the SUCCESS was not. */
 #ifndef PIPE_SKIP_MAX
 #define PIPE_SKIP_MAX 100
 #endif
@@ -496,6 +516,12 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
                 else
                     runlog_warn("     no supported BN_LIMBS is wide enough"
                                 " (the maximum is 16, i.e. 512 bits)");
+                /* MAX over the band, and -1 wins outright: a single (q,rho)
+                 * that no supported width covers makes "rebuild at N" wrong
+                 * advice however many others would have fitted at N. */
+                if (!need) g_pipe_need_limbs = -1;
+                else if (g_pipe_need_limbs >= 0 && need > g_pipe_need_limbs)
+                    g_pipe_need_limbs = need;
                 /* DRAIN BEFORE SKIPPING. This path does NOT reach the slab
                  * loop -- run_pipeline_impl `continue`s on PIPE_Q_SKIP -- so
                  * nothing downstream will synchronise. Two things are left in
@@ -1372,8 +1398,16 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
      * which is the ONLY thing that makes the .part resumable. Conflating the
      * two keeps a .part that no rerun can consume and that the startup check
      * then refuses, wedging an unattended queue. */
-    int stopped = 0, ckpt_armed = 0, ckpt_written = 0, ckpt_warned = 0;
+    /* stopped: a clean stop of either kind, which is what suppresses the
+     * commit. capped: that stop was PIPE_SKIP_MAX, which is a different thing
+     * to tell a job queue -- rerunning the same binary cannot help. */
+    int stopped = 0, capped = 0, ckpt_armed = 0, ckpt_written = 0, ckpt_warned = 0;
     int stop_hooked = 0;
+
+    /* A file static, so a second band in one process would inherit the first
+     * one's answer. Nothing does that today; the reset costs nothing and the
+     * bug it prevents is a wrong width in a failure report. */
+    g_pipe_need_limbs = 0;
 
     /* This must precede pipe_est_records(): that helper divides by every
      * modulus, so a zero modulus in an unvalidated object is already too late
@@ -1788,10 +1822,25 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                      * and threw away every relation queued since the last one,
                      * then reported the band as FAILED with no checkpoint. This
                      * is a deliberate stop on a known condition, so it drains
-                     * and checkpoints exactly like the stop-file path. */
-                    runlog_warn("  ** %llu special-q skipped for norm width;"
-                                " this build is too narrow for the job."
-                                " Run ./normscan and rebuild.", nqskip);
+                     * and checkpoints exactly like the stop-file path.
+                     *
+                     * IT DOES NOT EXIT LIKE ONE. `capped` carries the reason
+                     * out to the return mapping, which reports it as
+                     * PIPE_RC_UNSUPPORTED: draining is what the two stops share,
+                     * "this work unit succeeded" is not. */
+                    if (g_pipe_need_limbs > 0)
+                        runlog_warn("  ** %llu special-q skipped for norm width;"
+                                    " this build is too narrow for the job."
+                                    " Rebuild with `make BN_LIMBS=%d` (this"
+                                    " build carries %d) and run ./normscan over"
+                                    " the band first.",
+                                    nqskip, g_pipe_need_limbs, BN_LIMBS);
+                    else
+                        runlog_warn("  ** %llu special-q skipped for norm width;"
+                                    " this build is too narrow for the job and"
+                                    " no supported BN_LIMBS is wide enough for"
+                                    " every skipped (q,rho). Run ./normscan"
+                                    " over the band.", nqskip);
                     if (cfg->cofactor && Q.n &&
                         cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim,
                                    cfg->lpb, cfg->cof_rounds, cfg->cof_budget,
@@ -1802,6 +1851,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                                         base_nq + nqdone, &ckpt_written,
                                         &ckpt_warned);
                     stopped = 1;
+                    capped = 1;
                     break;
                 }
                 continue;              /* next q; nqdone is not incremented */
@@ -2413,7 +2463,14 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         }
     }
 #ifdef HAVE_BOINC
-    if (rc == 0) bench_boinc_fraction_done(0.99);
+    /* !stopped, NOT just rc == 0. rc is still 0 here for a stopped or capped
+     * band -- the PIPE_RC_ mapping runs at `done:` -- so this reported 0.99 for
+     * a band that took a signal after 30 of 1000 q. The client would show 99%,
+     * then the restarted session reports 3% and the progress bar and the
+     * remaining-time estimate both jump backwards. The 0.99 means "the band is
+     * finished and only the flush, rename and cleanup remain"; a stop has the
+     * whole band left. */
+    if (rc == 0 && !stopped) bench_boinc_fraction_done(0.99);
 #endif
     if (rc == 0) {
         /* Query only after the scientific output is committed. Per-q buffers
@@ -2444,12 +2501,37 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             runlog_warn("  band FAILED after %u of %u q; %s",
                         nqdone, nq, fate);
     }
-    if (stopped && ckpt_written)
+    if (stopped && ckpt_written && capped)
+        /* runlog_warn, NOT printf: this is the operator-facing half of an
+         * exit-3 result, and under BOINC stdout is not uploaded -- stderr.txt
+         * is all a project gets back. The width already went to stderr at the
+         * cap; the resume point and the "do not just rerun it" warning were
+         * going to stdout, where a project triaging the failure cannot see
+         * them.
+         *
+         * Same checkpoint, opposite advice. "Rerun the same command" is what
+         * the ordinary stop wants and it is exactly wrong here: finding 93's
+         * case D measured a resumed capped band advancing ~PIPE_SKIP_MAX q and
+         * emitting nothing, because nqskip is not checkpointed. The resume
+         * point is still printed -- it is real, and a WIDER build should start
+         * from it. The phrase "resume at q=" is load-bearing for skipcheck.sh,
+         * which reads the point back out of this line. */
+        runlog_warn("\n  stopped after %u q this session (%llu total, %llu"
+                    " relations); checkpoint written, resume at q=%llu."
+                    " REBUILD BEFORE RESUMING: this binary hits the same cap"
+                    " about %d skips into any rerun and emits nothing.",
+                    nqdone, base_nq + nqdone, ck.nrel,
+                    (unsigned long long)ck.next_q, PIPE_SKIP_MAX);
+    else if (stopped && ckpt_written)
         printf("\n  stopped after %u q this session (%llu total, %llu"
                " relations). Rerun the same command to resume at q=%llu.\n",
                nqdone, base_nq + nqdone, ck.nrel,
                (unsigned long long)ck.next_q);
     else if (stopped)
+        /* Now an ERROR, not a zero exit. A stop with no resume point is not
+         * resumable work, and reporting it as a clean stop is what would turn
+         * a BOINC temporary exit into a restart loop over a band that always
+         * begins again from nothing. See the PIPE_RC_ mapping at the end. */
         fprintf(stderr,
                 "\n  stopped after %u q, but NO checkpoint could be written."
                 " %s cannot be\n  resumed automatically; move it aside or pass"
@@ -2460,10 +2542,21 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
      * produced nothing but skips would have reported nothing at all. A band
      * runs for days and scrolls, so this has to survive in the summary and not
      * only in the per-q warnings. Silent is the one thing this must not be. */
-    if (nqskip)
-        printf("\n  ** %llu special-q SKIPPED: exact norm wider than %d bits."
-               " Run ./normscan over the band and rebuild wider. **\n",
-               nqskip, BN_LIMBS * 32);
+    /* runlog_warn for the same reason the capped stop uses it: a band that
+     * skipped 99 q never reaches the cap, exits 0, and reports a completed work
+     * unit -- so this line is the ONLY signal that its output is deficient, and
+     * on stdout a project never sees it. It also names the width now; that
+     * number was computed at every skip and thrown away here. */
+    if (nqskip && g_pipe_need_limbs > 0)
+        runlog_warn("\n  ** %llu special-q SKIPPED: exact norm wider than the"
+                    " %d bits this build carries. Run ./normscan over the band"
+                    " and rebuild with `make BN_LIMBS=%d`. **",
+                    nqskip, BN_LIMBS * 32, g_pipe_need_limbs);
+    else if (nqskip)
+        runlog_warn("\n  ** %llu special-q SKIPPED: exact norm wider than the"
+                    " %d bits this build carries, and no supported BN_LIMBS is"
+                    " wide enough for every one of them. Run ./normscan over the"
+                    " band. **", nqskip, BN_LIMBS * 32);
     if (nqdone) {
         const double N = nqdone;
         const double dev = (tm.rank + tm.emit + tm.summary + tm.resieve + tm.td
@@ -2609,7 +2702,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                        * two would read as a contradiction. */
                       (double)(cfg->cofactor ? Q.nrel
                                              : (unsigned long long)acc_rel) / N,
-                      stopped ? "  [stopped cleanly]" : (rc ? "  [FAILED]" : ""));
+                      capped  ? "  [stopped: build too narrow]"
+                      : stopped ? "  [stopped cleanly]"
+                      : (rc ? "  [FAILED]" : ""));
         if (cfg->cofactor) {
             printf("\n  --- cofactorisation, cross-q queue ---\n");
             printf("  %-34s %8.2f ms\n", "rational queue", Q.ms_rat / N);
@@ -2735,6 +2830,18 @@ done:
     if (eb) cudaEventDestroy(eb);
     if (qspan0) cudaEventDestroy(qspan0);
     if (qspan1) cudaEventDestroy(qspan1);
+    /* ONE place maps the band's four outcomes onto the return code, and it is
+     * after every cleanup path that can still turn a success into a failure.
+     * Everything above works in the internal 0/-1 convention, so no `rc < 0`
+     * test anywhere in this function had to learn about the new values.
+     *
+     * A stop with no checkpoint is a FAILURE, not a stop: there is nothing to
+     * resume, so calling it resumable is what would make a client restart it
+     * forever. See `enum bench_outcome` in bench.h. */
+    if (rc == 0) {
+        if (capped)       rc = PIPE_RC_UNSUPPORTED;
+        else if (stopped) rc = ckpt_written ? PIPE_RC_STOPPED : PIPE_RC_FAIL;
+    }
     return rc;
 }
 

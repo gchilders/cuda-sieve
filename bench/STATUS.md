@@ -386,7 +386,10 @@ with a stamp file so changing it forces the rebuild.
 At runtime `pipe_side_prepare_q` checks each q against the built width and
 **skips** the ones that do not fit, warning each time and ending the band at
 `PIPE_SKIP_MAX`. That keeps a band alive across a rare bad lattice; it is damage
-control, not an answer, because every skip is a lost special-q.
+control, not an answer, because every skip is a lost special-q. The band still
+drains and checkpoints when it ends that way, but since 2026-09-05 it exits
+`BENCH_EXIT_UNSUPPORTED` (3) and names the width to rebuild at, rather than
+reporting a completed work unit (item 3c).
 
 #### `normscan` — decide the width before distributing work
 
@@ -1161,8 +1164,9 @@ not by size.
 |---|---|---|---|
 | 1 | Add and run a `PIPE_Q_SKIP` gate | local GPU, minutes | **DONE 2026-09-04** — `skipcheck.sh` + `make skipcheck`, 4 cases, all pass at `BN_LIMBS=4`. Finding 93. The planned recipe (`BN_LIMBS=6` + a c183/c194 band) could **not** have worked: it skips 100% of q, so the band never sieves and "does the band survive a skip" is untestable |
 | 2 | Three doc fixes: RUNBOOK fill grid, README BOINC checkpoint, STATUS rho/ECM | nothing | **DONE 2026-09-03** |
-| 3 | Extend `walk_cases[]` to `{15,32768}` and `{16,32768}`; comment the `uint32_t xmax` ceiling | nothing | **not started** — finding 92: a table edit, no sort work |
-| 3b | Decide whether a capped band should advance faster than ~`PIPE_SKIP_MAX` q per invocation | policy | **new, open** — finding 93 case D: a resume *does* advance (q=15001793 → 15003097) but produces zero relations per run. Not a deadlock; possibly still wrong under BOINC |
+| 3 | Extend `walk_cases[]` to `{15,32768}` and `{16,32768}`; comment the `uint32_t xmax` ceiling | nothing | **DONE 2026-09-05** — four production geometries added (`{14,16384}`, `{15,16384}`, `{15,32768}`, `{16,32768}`); all 12 cases pass in 0.043 s CPU. The ceiling is `I*J <= 2^31`, commented in place: `check_one()` holds `xmax` in a `uint32_t`, so `{16,65536}` would wrap it to 0 and pass vacuously |
+| 3b | Decide whether a capped band should advance faster than ~`PIPE_SKIP_MAX` q per invocation | policy | **DECIDED 2026-09-05: it should not advance at all** — case D's ~100-q-per-run crawl is only pathological while the cap reports SUCCESS. A capped band now exits `BENCH_EXIT_UNSUPPORTED` (3) and reports `BENCH_OUTCOME_UNSUPPORTED`, so a client stops reissuing it to the same app version instead of burning slots on it. Checkpointing `nqskip` would make it fail on the first q rather than the hundredth — cosmetic once the outcome is right, and not done |
+| 3c | Exit outcomes: a finished band, a checkpointed stop and a too-narrow build must not all be `boinc_finish(0)` | nothing | **DONE 2026-09-05, UNTESTED UNDER A CLIENT** — `enum bench_outcome` in `bench.h`, `PIPE_RC_*` out of `run_pipeline`; stop → `boinc_temporary_exit`, cap → `boinc_finish(3)`, and only a completed band reports fraction 1.0. `--stop-file` stays available under a client and now DEFERS (temporary exit) when the file is present at startup instead of erroring — an xhigh review caught that refusing it removed the only clean stop a Windows task has, since the client stops those with `TerminateProcess` (README "use `--stop-file` for a clean stop there"). `skipcheck.sh` case C asserts exit 3 and the named rebuild width. `skipcheck` passes at `BN_LIMBS=4` (cap exits 3, names `make BN_LIMBS=6`); `make check` passes at the default 12. **The `HAVE_BOINC` branch is type-checked only against a stub `boinc_api.h`, never against real BOINC** — no install on this box. Two things need Greg: that `boinc_temporary_exit(int delay, const char *reason, bool is_notice)` still matches upstream, and whether the project wants a specific error convention for "build too narrow" so the scheduler reassigns to a wider app version instead of retrying |
 | 4 | Three-position `--qspan` delay calibration (before first launch, between, after last) | local GPU, idle box | **optional** — settles the unreconciled `wall - span`; frame it as testing event-endpoint/submission semantics, not as perf work |
 | 5 | Next rental: **concurrent fill primary, concurrent resieve as a second arm**, interleaved, fresh baseline | rented card (3090/L40S/4090) | **not started** — item 1 below, the largest open item |
 | 6 | Leave `pipeline.cuh:1924`'s `cudaDeviceSynchronize` alone | — | **decided, no action** |

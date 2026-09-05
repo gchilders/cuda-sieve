@@ -217,7 +217,7 @@ static void usage(void)
 "\n"
 "COFACTORISATION\n"
 "  --cof-rounds N   rho requeue rounds, budget doubling each time\n"
-"                   [6 for --cofac; 2 for --pipeline --cofactor]\n"
+"                   [6 for --cofac; 4 for --pipeline --cofactor]\n"
 "  --cof-budget N   rho iterations in the first round\n"
 "                   [4096 for --cofac; 65536 for --pipeline --cofactor]\n"
 "  --cof-ecm        ECM instead of Pollard-Brent rho; stage 1 alone loses,\n"
@@ -547,6 +547,21 @@ static int verify_walk_cases(void)
         { 8,   64, "4:1" }, { 8,  128, "2:1" }, { 8,  256, "1:1" },
         { 8,  512, "1:2" }, { 9,  256, "2:1" }, { 9,  512, "1:1" },
         { 10, 512, "2:1" }, { 10,1024, "1:1" },
+        /* THE SIZES ACTUALLY SHIPPED. Everything above is a toy: logI 10 is
+         * 16x narrower than the I15 the c183 and c194 bands run at, and a walk
+         * defect that only appears once I exceeds a 16-bit intermediate would
+         * have passed every case in this table. Free -- the whole gate is
+         * 0.03 s of CPU -- so the only reason it was not here is that nobody
+         * added it (STATUS item 3, finding 92).
+         *
+         * THE CEILING IS I*J <= 2^31. check_one() holds xmax = I*J in a
+         * uint32_t, and the option checker already refuses I*J past 31 bits
+         * outside --pipeline (see the "must fit in 31 bits" error below), so
+         * { 16, 32768 } sits exactly on the limit and { 16, 65536 } would
+         * wrap xmax to 0 and pass vacuously. Do not add a case past it
+         * without widening that variable first. */
+        { 14,16384, "1:1" }, { 15,16384, "2:1" },
+        { 15,32768, "1:1" }, { 16,32768, "2:1" },
     };
     const unsigned nwalk = sizeof walk_cases / sizeof walk_cases[0];
     printf("[verify] Franke-Kleinjung walk vs brute force, %u cases"
@@ -849,7 +864,12 @@ static int boinc_discard_bad_resume(const resume_recovery_t *r,
     return 1;
 }
 
-static int bench_main_impl(int argc, char **argv)
+/* `outcome` is an OUT-PARAMETER and not the return value, because the return
+ * value is the process exit status and 1 and 2 are already spoken for there by
+ * the argument checks. main() supplies the default -- OK on a zero status,
+ * FAILED otherwise -- so only the pipeline branch, the one caller that can
+ * tell a checkpointed stop from a finished band, writes to it. */
+static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
 {
     /* Identity of the card this process actually selected, captured where the
      * device is queried and read much later by the run-log header. Captured
@@ -1834,7 +1854,10 @@ static int bench_main_impl(int argc, char **argv)
          * live -- the --fill-blocks lesson (bench_kernels.cu, twolevel note).
          * --fill-streams reaches k_fill_atomic only, so say so HERE rather
          * than letting --mode twolevel swallow it silently. */
-        if (cfg.fill_streams > 1)
+        /* NOT under --pipeline: the harness_only check below refuses the flag
+         * there, and printing the banner first put the very line that check
+         * exists to prevent into the log ahead of the refusal. */
+        if (cfg.fill_streams > 1 && !cfg.pipeline)
             printf("fill concurrency: %d workspaces on %d streams"
                    "  [--fill-streams]%s\n", cfg.fill_streams, cfg.fill_streams,
                    cfg.fill_mode == FILL_ATOMIC
@@ -1890,6 +1913,12 @@ static int bench_main_impl(int argc, char **argv)
          * quoted as something it was not, so it is an error rather than a
          * silent no-op. */
         static const char *harness_only[] = {
+            /* --fill-streams reaches k_fill_atomic in run_bench ONLY. The
+             * pipeline never reads it, so `--pipeline --fill-streams 4` used
+             * to print the concurrency banner above and then sieve with one
+             * stream -- a log that proves a configuration the run did not
+             * have, which is the exact defect this list exists to prevent. */
+            "--fill-streams",
             "--record-bytes", "--mode", "--cells", "--norm", "--apply-mode",
             "--stage", "--reps", "--verify", "--verify-only", "--side", "--dump", "--probe",
             "--survbits", "--other-bits", "--emit", "--emit-cof", "--td",
@@ -1945,20 +1974,47 @@ static int bench_main_impl(int argc, char **argv)
         if (!cfg.lpb)  cfg.lpb  = 32;
         if (!cfg.mfb)  cfg.mfb  = 92;
 
-        /* A stop file that is still present would be honoured at the very
-         * first q, so the run would drain nothing, rewrite the same
-         * checkpoint and exit 0 -- telling a job queue the work succeeded
-         * while making no progress, forever. Refuse to start instead, rather
-         * than deleting a path the operator created. */
-        if (cfg.stopfile && bench_path_exists(cfg.stopfile)) {
-            fprintf(stderr, "bench: --stop-file %s already exists; remove it"
-                    " before starting.\n", cfg.stopfile);
-            return 1;
-        }
+        /* BEFORE the existence check, which ACTS on the file: a --stop-file
+         * with no --relations is a misconfiguration, and under a client the
+         * check below would defer on it forever instead of saying so once. */
         if (cfg.stopfile && !cfg.relations) {
             fprintf(stderr, "bench: --stop-file needs --relations: there is no"
                     " checkpoint to stop against.\n");
             return 2;
+        }
+        /* A stop file that is still present would be honoured at the very
+         * first q, so the run would drain nothing, rewrite the same
+         * checkpoint and exit 0 -- telling a job queue the work succeeded
+         * while making no progress, forever. Refuse to start instead, rather
+         * than deleting a path the operator created.
+         *
+         * UNDER A CLIENT IT DEFERS INSTEAD OF FAILING, and --stop-file is
+         * emphatically NOT refused there. An earlier version of this change
+         * refused the combination outright on the theory that a client cannot
+         * create the file, so the path was not a client path. That was wrong
+         * twice over: the file is created by an OPERATOR to stop a task that
+         * happens to be running under a client, and on Windows it is the only
+         * mechanism that works at all -- the client stops tasks with
+         * TerminateProcess, which runs no handler and cannot checkpoint on the
+         * way out (pipeline.cuh's stop-hook note, and README's "use
+         * --stop-file for a clean stop there"). Refusing it removed the only
+         * clean stop a Windows volunteer task had.
+         *
+         * So the file means "do not run now", and a temporary exit is exactly
+         * that: the client backs off and asks again, the .part and sidecar are
+         * untouched, and removing the file resumes the work. A hard error here
+         * would burn the work unit for an operator's pause. */
+        if (cfg.stopfile && bench_path_exists(cfg.stopfile)) {
+            if (bench_boinc_is_managed()) {
+                fprintf(stderr, "bench: --stop-file %s exists; deferring to the"
+                        " client rather than starting the band. Remove it to"
+                        " resume.\n", cfg.stopfile);
+                *outcome = BENCH_OUTCOME_STOPPED;
+                return 0;
+            }
+            fprintf(stderr, "bench: --stop-file %s already exists; remove it"
+                    " before starting.\n", cfg.stopfile);
+            return 1;
         }
 
         /* ---- resume, before anything reads qmin (STATUS.md item 12a) ----
@@ -2872,6 +2928,29 @@ resume_artifacts_ready:
         }
         runlog_close();
         fb_free(&fb1); fb_free(&fbs1); fb_free(&fb0); fb_free(&fbs0);
+        /* The band's outcome, separated from its exit status:
+         *
+         *   STOPPED exits 0. Unattended scripts have always read a clean stop
+         *   as success and there is no reason to break them -- the stop did
+         *   what it was asked to do. BOINC is the only consumer that needs the
+         *   distinction, and it gets it from `outcome`.
+         *
+         *   UNSUPPORTED exits nonzero. This is the deliberate behaviour change:
+         *   a band that ended because the build cannot sieve the job is not a
+         *   success, locally or under a client, and skipcheck.sh case C is
+         *   updated to match. */
+        switch (prc) {
+        case PIPE_RC_STOPPED:
+            *outcome = BENCH_OUTCOME_STOPPED;
+            prc = 0;
+            break;
+        case PIPE_RC_UNSUPPORTED:
+            *outcome = BENCH_OUTCOME_UNSUPPORTED;
+            prc = BENCH_EXIT_UNSUPPORTED;
+            break;
+        default:                    /* 0 = finished, negative = failed */
+            break;
+        }
         return prc;
     }
 
@@ -2976,8 +3055,12 @@ resume_artifacts_ready:
 int main(int argc, char **argv)
 {
     int rc;
+    /* Defaulted here, narrowed only by the pipeline: every other path in this
+     * program either finished its work or failed, and has nothing else to say
+     * to a job queue. */
+    enum bench_outcome outcome = BENCH_OUTCOME_OK;
     rc = bench_boinc_init();
-    if (rc) return bench_boinc_finish(rc);
+    if (rc) return bench_boinc_finish(BENCH_OUTCOME_FAILED, rc);
     /* A pricing build alters the norm, so its relations are not production
      * output. The run log records that (BUILD-DEFS), but ONLY when --log was
      * passed and only for --pipeline, so a pricing binary run without it left
@@ -2992,6 +3075,7 @@ int main(int argc, char **argv)
     if (*runlog_build_defs())
         fprintf(stderr, "*** PRICING BUILD: %s -- relations from this binary"
                 " are NOT production output ***\n", runlog_build_defs());
-    rc = bench_main_impl(argc, argv);
-    return bench_boinc_finish(rc);
+    rc = bench_main_impl(argc, argv, &outcome);
+    if (rc != 0 && outcome == BENCH_OUTCOME_OK) outcome = BENCH_OUTCOME_FAILED;
+    return bench_boinc_finish(outcome, rc);
 }

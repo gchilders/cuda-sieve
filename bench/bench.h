@@ -381,6 +381,32 @@ uint64_t verify_count_updates(const fb_t *fb, const qlat_t *L,
                               int logI, uint32_t J,
                               int log_region, uint32_t *per_region);
 
+/* ---- how a run ENDED, which is not the same as its exit status --------- *
+ *
+ * Three of these leave a usable .part behind and only one is an error, but a
+ * job queue has to tell them apart. A finished band is a result; a drained and
+ * checkpointed stop is work the SAME host should be handed back; a band whose
+ * norms are wider than this build carries is a permanent mismatch that no
+ * amount of reissuing the same app version fixes.
+ *
+ * This program used to report all four as boinc_finish(0), because rc == 0 was
+ * the only thing main() knew -- so a work unit that stopped after 100 skipped
+ * special-q was credited as a completed band. The --stop-file startup refusal
+ * in bench_main.cu already rejected the one case of this it could see locally
+ * ("telling a job queue the work succeeded while making no progress,
+ * forever"); this is that rule applied to the two paths that escaped it. */
+enum bench_outcome {
+    BENCH_OUTCOME_OK = 0,       /* band finished; output committed          */
+    BENCH_OUTCOME_FAILED,       /* error, usage rejection, or unresumable   */
+    BENCH_OUTCOME_STOPPED,      /* signal stop: drained AND checkpointed    */
+    BENCH_OUTCOME_UNSUPPORTED   /* norm wider than this BN_LIMBS carries    */
+};
+
+/* Process exit status for BENCH_OUTCOME_UNSUPPORTED. Distinct from 1 and 2,
+ * which the argument checks use, so an unattended wrapper can tell "this build
+ * cannot sieve this job -- get a wider one" from "you typed the wrong flag". */
+#define BENCH_EXIT_UNSUPPORTED 3
+
 /* ---- optional BOINC integration -------------------------------------- */
 
 /* These wrappers are no-ops in the normal build.  When HAVE_BOINC is set,
@@ -398,7 +424,11 @@ int  bench_boinc_gpu_device(void);
 int  bench_boinc_resolve_path(const char *option, const char *logical_name,
                               const char **resolved_name);
 void bench_boinc_fraction_done(double fraction_done);
-int  bench_boinc_finish(int status);
+/* `status` is the process exit status; `outcome` is what the run actually did,
+ * and it is the one that decides how BOINC is told. They are separate because
+ * a clean stop exits 0 for the shell -- unattended scripts have always read it
+ * that way -- while BOINC must NOT be told the work unit finished. */
+int  bench_boinc_finish(enum bench_outcome outcome, int status);
 
 /* ---- cofactor WIDTH, in 32-bit limbs ------------------------------------ *
  *
@@ -868,6 +898,19 @@ void sqgen_free(sqgen_t *G);
  * trial-divide and classify each side against the shared two-sided bitmap,
  * then join. This is the path that becomes the siever; run_bench stays the
  * measurement harness. */
+/* run_pipeline's return values, which map onto `enum bench_outcome` above.
+ * NOT to be confused with PIPE_Q_SKIP in pipeline.cuh: that is one special-q's
+ * third outcome, these describe the whole band. Negative still means failure,
+ * so every `< 0` test in the pipeline stays correct. */
+enum {
+    PIPE_RC_OK          =  0,  /* band finished; output committed          */
+    PIPE_RC_FAIL        = -1,  /* error, or a stop with nothing resumable  */
+    PIPE_RC_STOPPED     =  2,  /* signal/stop file: drained + checkpointed */
+    /* NOT an independent 3: bench_main.cu maps this straight onto the exit
+     * status, and two constants that must stay equal will not. */
+    PIPE_RC_UNSUPPORTED = BENCH_EXIT_UNSUPPORTED
+};
+
 int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                  const fb_t *fb0, const fb_t *fbs0,
                  const qsel_t *qlist, uint32_t nq, sqgen_t *qgen,

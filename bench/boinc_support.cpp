@@ -304,12 +304,25 @@ extern "C" void bench_boinc_fraction_done(double fraction_done)
 #endif
 }
 
-extern "C" int bench_boinc_finish(int status)
+/* Seconds the client is asked to wait before restarting a cleanly stopped task.
+ * Short on purpose: the stop was ours (a signal at a special-q boundary), the
+ * checkpoint is current, and nothing external is being waited on -- this is not
+ * a "come back when the GPU is free" deferral. */
+#ifdef HAVE_BOINC
+#define BENCH_BOINC_RESUME_DELAY 60
+#endif
+
+extern "C" int bench_boinc_finish(enum bench_outcome outcome, int status)
 {
 #ifdef HAVE_BOINC
     int rc;
 
-    if (boinc_state == BOINC_READY && status == 0)
+    /* ONLY a completed band reports 1.0. The in-band reporter caps itself at
+     * 0.99 (pipeline.cuh) precisely so this call is the single place a work
+     * unit is ever declared finished; a stop or a width mismatch must not
+     * reach it. Keyed on the OUTCOME, not on `status`, because a clean stop
+     * still exits 0 for the shell. */
+    if (boinc_state == BOINC_READY && outcome == BENCH_OUTCOME_OK)
         bench_boinc_fraction_done(1.0);
     free_resolved_paths();
 
@@ -325,11 +338,62 @@ extern "C" int bench_boinc_finish(int status)
         return status;
     }
     boinc_state = BOINC_NOT_STARTED;
+
+    /* A checkpointed stop is not a result and not an error: it is the same work
+     * unit, unfinished, on a host that already holds its .part and sidecar.
+     * boinc_temporary_exit() is the API's mechanism for exactly that -- it
+     * writes the temporary-exit file with a delay and leaves the slot intact,
+     * so the client reschedules THIS task instead of recording a completion.
+     *
+     * BENCH_OUTCOME_STOPPED always leaves a resumable state behind: the band
+     * raises it only with a checkpoint written (pipeline.cuh maps a stop with
+     * no resume point to PIPE_RC_FAIL instead), and the startup stop-file
+     * deferral raises it before anything is opened at all. That is what keeps
+     * this from becoming a restart loop over work that cannot resume.
+     *
+     * GUARDED ON bench_boinc_is_managed(), NOT on BOINC_READY. A HAVE_BOINC
+     * binary launched from a shell also reaches BOINC_READY -- boinc_init_options()
+     * succeeds standalone -- and boinc_temporary_exit() has no standalone guard
+     * of its own: it would write a `temporary_exit` file into the working
+     * directory and leave through boinc_exit() for an operator who just pressed
+     * ^C at a terminal. */
+    if (outcome == BENCH_OUTCOME_STOPPED && bench_boinc_is_managed()) {
+        rc = boinc_temporary_exit(BENCH_BOINC_RESUME_DELAY,
+                                  "stopped at a special-q boundary;"
+                                  " the checkpoint is current", false);
+        /* Normally does not return -- it exits the process. If it did fail
+         * (it can only fail to write the file), falling through to
+         * boinc_finish(0) would claim the band as complete, which is the
+         * defect this whole path exists to remove. Report an error instead:
+         * a reissued work unit costs one band, a false completion costs the
+         * project a deficient result it cannot tell from a good one. */
+        fprintf(stderr, "BOINC: boinc_temporary_exit failed with status %d;"
+                " reporting the stop as an error rather than a completion\n",
+                rc);
+        /* The stop just became an error, so it needs a status that says so.
+         * This coercion is NARROW on purpose -- see the one below. */
+        status = status ? status : 1;
+    }
+
+    /* boinc_finish(nonzero) is what reports an application error, so an outcome
+     * that must be reported as one cannot arrive carrying a zero status.
+     *
+     * BENCH_OUTCOME_STOPPED IS DELIBERATELY NOT IN THAT SET. Its zero is the
+     * whole point once the branch above declines to handle it: a HAVE_BOINC
+     * binary launched from a shell takes an ordinary clean stop and must exit 0
+     * like every other build. Writing this as `outcome != BENCH_OUTCOME_OK`
+     * turned exactly that case into exit 1 -- the two guards have to agree
+     * about which outcomes are errors, and STOPPED is not one of them. */
+    if ((outcome == BENCH_OUTCOME_FAILED ||
+         outcome == BENCH_OUTCOME_UNSUPPORTED) && status == 0)
+        status = 1;
+
     rc = boinc_finish(status);
     /* BOINC normally terminates the application here. Preserve a useful
      * process status if a test double or an unusual runtime returns anyway. */
     return rc ? rc : status;
 #else
+    (void)outcome;
     return status;
 #endif
 }
