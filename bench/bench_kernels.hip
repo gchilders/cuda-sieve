@@ -262,9 +262,19 @@ __device__ __forceinline__ void ss_add(uint32_t *S, uint32_t c, uint32_t lp)
 __device__ __forceinline__ uint32_t ss_first(uint32_t p, uint32_t rt,
                                              uint32_t j, int32_t ilo)
 {
-    const int32_t base = (int32_t)(((uint64_t)rt * j) % p);   /* i mod p */
-    int32_t c = (base - ilo) % (int32_t)p;
-    return (uint32_t)(c < 0 ? c + (int32_t)p : c);
+    /* ONE reduction, not two. base == rt*j (mod p), so (base - ilo) mod p is
+     * just (rt*j - ilo) mod p -- the intermediate reduction to `base` buys
+     * nothing. The bias makes the numerator unsigned so the sign fixup goes
+     * too: p<<20 is a multiple of p (leaves the residue alone) and is >= 2^21
+     * for any p >= 2, while |ilo| <= 2^(logI-1) <= 2^19 because main() pins
+     * logI to [2,20]. No overflow: the uint32 product is < 2^64 and the bias
+     * is < 2^52 for any bkthresh a real job sets.
+     *
+     * Motivation is AMD-specific: there is no integer-divide instruction, so
+     * every % here is a software sequence. Removing one is removing real ALU
+     * work, not one op. */
+    const uint64_t t = (uint64_t)rt * j + ((uint64_t)p << 20) - (uint64_t)(int64_t)ilo;
+    return (uint32_t)(t % p);
 }
 
 template <int CELLBITS, int ATOMIC, bool SLABBED = false>
