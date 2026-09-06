@@ -32,6 +32,22 @@ one. The separate representation, memory,
 cofactor-performance, and filtering implications of lifting them are laid out
 in [Current size limits, and what lifting them entails](bench/STATUS.md#current-size-limits-and-what-lifting-them-entails).
 
+ECM stage 2 (`mz_ecm_stage2_pass`) holds its baby steps on a **shared
+denominator** rather than one per point: `bx[k] = X_k * prod_{j!=k} Z_j`
+against a single `bz = prod_j Z_j`, so `(bx[k] : bz)` is still the same
+projective point `(X_k : Z_k)` was, just rescaled by a common nonzero factor
+-- which cannot change `gcd(d, n)`, so the factors found are provably
+identical. The payoff is in the inner loop: with one denominator, the
+`X_G * Z` term is common to every selected `k` and hoists out, turning two
+multiplies per pair into one (roughly 540 fewer `mz_mul` per curve at
+`B1=200`/`B2=6000`). This started as an AMD-side discovery (RDNA has no
+integer-divide instruction, so removing arithmetic there matters more), but
+the change is architecture-neutral algebra, not an AMD trick, and it measures
+as a real win on NVIDIA too: **-4.46%** on the algebraic (ECM) queue on an
+RTX 4090 (n=5 interleaved runs, `oracle/c183`, non-overlapping ranges), with
+the rational (rho-only) queue flat as a same-job control. Relations are
+byte-identical with or without it.
+
 ## Build and test
 
 You need a Linux build environment, GNU Make, a C11 compiler, a C++17
