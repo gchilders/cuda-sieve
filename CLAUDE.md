@@ -1006,8 +1006,7 @@ host-side arithmetic, zero API, duplicated for no reason.
 | # | CUDA file | What it is missing | HIP commit |
 |---|---|---|---|
 | 1 | `pipeline.cuh` | BOINC progress pinned at 99% | `eb72ede` |
-| 2 | `bench_kernels.cu` | `ss_first` reduction work (3 commits) | `1b779b0`, `3a8049d`, `711cdaf` |
-| 3 | `bench_main.cu` | GPU-ordinal fallback + BOINC diagnostics | `e769470` |
+| 2 | `bench_main.cu` | GPU-ordinal fallback + BOINC diagnostics | `e769470` |
 
 **Resolved, 2026-09-06: `cofac.cuh`'s ECM stage 2 shared denominator.** This
 was divergence #2 (`43ea104`, HIP-only) until a k8s pod with a real RTX 4090
@@ -1029,6 +1028,30 @@ README.md, next to the existing rho/ECM method-selection paragraph; the full
 derivation stays here, in the section below, since that is where it was
 discovered.
 
+**Resolved, 2026-09-06: `bench_kernels.cu`'s `ss_first` reduction work.** This
+was divergence #2 (`1b779b0`, `3a8049d`, `711cdaf`, HIP-only), and it was the
+one the original note above was most cautious about: "the win is AMD-shaped
+... on NVIDIA the same change is still a win in principle but the size is
+unknown and unmeasured -- measure before porting, do not assume -16%." Measured
+now, on the same RTX 4090 pod as the cofac.cuh port above. Extracted the
+cumulative diff across all three commits against bench_kernels.hip/
+pipeline_hip.cuh, retargeted every hip*->cuda* API call (including the one
+non-mechanical rename in this diff, `hipHostFree` -> `cudaFreeHost`, which is
+a word-order change, not a prefix swap) and both file paths, then applied to
+**both** `main`'s and this branch's `bench_kernels.cu`/`pipeline.cuh`.
+Verified the retargeting introduced no logic drift by reverse-substituting the
+patched CUDA lines back to HIP names and diffing against the original three
+commits' added lines -- byte-for-byte identical. `make -C bench bench` exit 0
+on the first try, cofcheck.sh 51 PASS / 0 FAIL, relations byte-identical with
+or without it (86845 bytes, `cmp` clean). Timing, n=5 interleaved,
+`--stage apply --reps 100`, oracle/c183: apply 12.367 -> 10.700 ms, **-13.5%**,
+arms non-overlapping. The caution was warranted -- do not assume the AMD
+percentage carries over -- but this one really is a substantial win on NVIDIA
+too, for a different reason than on AMD: RTX 4090 has hardware integer
+division, so the gain here is fewer arithmetic instructions and fewer table
+loads per small-prime hit, not the elimination of a slow software-emulated
+divide the way it is on RDNA.
+
 **1. `pipeline.cuh` still pins BOINC progress at 99%.** Verified: it has zero
 occurrences of `bench_boinc_progress_suspend`. `calibrate_slab_rows()` runs a
 throwaway single-q band through the same run_pipeline_impl that reports
@@ -1038,18 +1061,7 @@ This is a live bug, not a missing optimisation -- it only does not bite because
 nothing currently ships a BOINC-linked CUDA build. Fix is the
 suspend/resume bracket around the calibration call.
 
-**2. `bench_kernels.cu` still has the original two-modulo `ss_first`.**
-Verified: it is still `base = rt*j % p` followed by `(base - ilo) % p`. The
-HIP side is now one reduction, then a multiply-shift reciprocal, then that
-reciprocal's shift and bias derived on device. apply 128.6 -> 107.8 ms on
-gfx1103, -16.2%, byte-identical relations across logI 14/15/16, both sq-sides,
-cofactor on/off, and bkthresh/J values that push 53% of entries onto the
-fallback path. NOTE this one is the least portable of the four: the win is
-AMD-shaped, because AMD has no integer-divide instruction. On NVIDIA the same
-change is still a win in principle but the size is unknown and unmeasured --
-measure before porting, do not assume -16%.
-
-**3. `bench_main.cu` has no GPU-ordinal fallback and no BOINC GPU
+**2. `bench_main.cu` has no GPU-ordinal fallback and no BOINC GPU
 diagnostics.** Verified: zero occurrences of `device_from_boinc` or
 `bench_boinc_log_gpu_assignment`. Both builds link BOINC, so this one is a
 genuine gap rather than dead weight: a client assigning an ordinal the process
