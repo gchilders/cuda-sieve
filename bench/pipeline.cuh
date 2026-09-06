@@ -145,6 +145,7 @@ typedef struct {
     uint32_t *survbits;
     uint16_t *slice, *slice_logp;
     uint32_t *sp, *srt, *sg;
+    uint32_t *smag;             /* ss_first reciprocals; see ss_magic_build */
     uint16_t *slp;
     uint32_t  nslice_pow2, nsmall, nblk, nwrp, nfb;
     size_t    apply_smem;
@@ -152,6 +153,7 @@ typedef struct {
     uint32_t  CINIT, BOUND, tconst, nsurv;
     /* persistent across special-q */
     uint32_t *hsp, *hsrt, *hsg; uint16_t *hslp;
+    uint32_t *hsmag;
     uint32_t *d_nsurv, *d_nproj;
     unsigned long long *d_nlost;
     cudaEvent_t ev[4];
@@ -163,12 +165,14 @@ static void pside_free(pside_t *S)
     cudaFree(S->walk_cur); cudaFree(S->walk_next);
     cudaFree(S->survbits); cudaFree(S->slice); cudaFree(S->slice_logp);
     cudaFree(S->sp); cudaFree(S->srt); cudaFree(S->sg); cudaFree(S->slp);
+    cudaFree(S->smag);
     cudaFree(S->d_nsurv);
     cudaFree(S->d_nproj); cudaFree(S->d_nlost);
     if (S->hsp)  cudaFreeHost(S->hsp);
     if (S->hsrt) cudaFreeHost(S->hsrt);
     if (S->hsg)  cudaFreeHost(S->hsg);
     if (S->hslp) cudaFreeHost(S->hslp);
+    if (S->hsmag) cudaFreeHost(S->hsmag);
     for (int k = 0; k < 4; k++) if (S->ev[k]) cudaEventDestroy(S->ev[k]);
     memset(S, 0, sizeof(*S));
 }
@@ -292,10 +296,13 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
                                    cudaHostAllocDefault));
         SIDE_INIT_CK(cudaHostAlloc((void **)&S->hsg, (size_t)fbs->n * 4,
                                    cudaHostAllocDefault));
+        SIDE_INIT_CK(cudaHostAlloc((void **)&S->hsmag, (size_t)fbs->n * 4,
+                                   cudaHostAllocDefault));
         SIDE_INIT_CK(cudaMalloc(&S->sp,  (size_t)fbs->n * 4));
         SIDE_INIT_CK(cudaMalloc(&S->srt, (size_t)fbs->n * 4));
         SIDE_INIT_CK(cudaMalloc(&S->sg,  (size_t)fbs->n * 4));
         SIDE_INIT_CK(cudaMalloc(&S->slp, (size_t)fbs->n * 2));
+        SIDE_INIT_CK(cudaMalloc(&S->smag, (size_t)fbs->n * 4));
     }
     SIDE_INIT_CK(cudaMalloc(&S->d_nsurv, 4));
     SIDE_INIT_CK(cudaMalloc(&S->d_nproj, 4));
@@ -401,6 +408,15 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
             free(tg); tg = NULL;
             free(tlp); tlp = NULL;
         }
+        /* Reciprocals AFTER the sort, same as the standalone path: the sort
+         * key is the modulus, so building them earlier would only mean
+         * permuting them too. */
+        {
+            const uint32_t ihalf = 1u << (cfg->logI - 1);
+            for (uint32_t i = 0; i < k; i++)
+                ss_magic_build(hsp[i], cfg->J, (uint32_t)(cfg->logI - 2),
+                               ihalf, &S->hsmag[i]);
+        }
         S->nblk = S->nwrp = 0;
         for (uint32_t i = 0; i < k && hsp[i] < SS_BLOCK_CUT; i++) S->nblk = i + 1;
         for (uint32_t i = 0; i < k && hsp[i] < SS_WARP_CUT; i++) S->nwrp = i + 1;
@@ -411,6 +427,8 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
         PERQ_CK(cudaMemcpy(S->sg, hsg, (size_t)k * sizeof(*hsg),
                            cudaMemcpyHostToDevice));
         PERQ_CK(cudaMemcpy(S->slp, hslp, (size_t)k * sizeof(*hslp),
+                           cudaMemcpyHostToDevice));
+        PERQ_CK(cudaMemcpy(S->smag, S->hsmag, (size_t)k * sizeof(*S->hsmag),
                            cudaMemcpyHostToDevice));
     }
 
@@ -558,7 +576,8 @@ static int pipe_side_sieve_slab(const fb_t *fb, const bench_cfg_t *cfg,
         (const uint32_t *)d_bucket, d_cursor, cap, cfg->logI, log_region,
         S->slice_logp, S->nslice_pow2, S->N, S->CINIT, S->CINIT - S->BOUND,
         S->tconst, NULL, S->d_nsurv, NULL, 0xFFFFFFFFu,
-        S->sp, S->srt, S->sg, S->slp, S->nsmall, S->nblk, S->nwrp,
+        S->sp, S->srt, S->sg, S->slp, S->smag, (uint32_t)(cfg->logI - 2),
+        S->nsmall, S->nblk, S->nwrp,
         0xFFFFFFFFu, NULL, S->survbits, cfg->not_both_even, j_base);
     SLAB_CK(cudaEventRecord(S->ev[3]));
     SLAB_CK(cudaEventSynchronize(S->ev[3]));
