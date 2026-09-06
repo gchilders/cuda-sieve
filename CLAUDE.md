@@ -1006,9 +1006,28 @@ host-side arithmetic, zero API, duplicated for no reason.
 | # | CUDA file | What it is missing | HIP commit |
 |---|---|---|---|
 | 1 | `pipeline.cuh` | BOINC progress pinned at 99% | `eb72ede` |
-| 2 | `cofac.cuh` | ECM stage 2 on a shared denominator | `43ea104` |
-| 3 | `bench_kernels.cu` | `ss_first` reduction work (3 commits) | `1b779b0`, `3a8049d`, `711cdaf` |
-| 4 | `bench_main.cu` | GPU-ordinal fallback + BOINC diagnostics | `e769470` |
+| 2 | `bench_kernels.cu` | `ss_first` reduction work (3 commits) | `1b779b0`, `3a8049d`, `711cdaf` |
+| 3 | `bench_main.cu` | GPU-ordinal fallback + BOINC diagnostics | `e769470` |
+
+**Resolved, 2026-09-06: `cofac.cuh`'s ECM stage 2 shared denominator.** This
+was divergence #2 (`43ea104`, HIP-only) until a k8s pod with a real RTX 4090
+(`nvidia/cuda:13.0.3-devel-ubuntu22.04`, CUDA 13.0.88) made it possible to
+actually test the port on NVIDIA hardware instead of guessing. Applied via
+`git apply` from `43ea1042`'s isolated cofac_hip.cuh diff (the same commit's
+gfx10 flat-scratch fix is HIP-build-only and not part of this) to **both**
+`main`'s `bench/cofac.cuh` and this branch's frozen copy, so the two stay in
+sync rather than main drifting ahead of hip-port's own CUDA file. Confirmed
+byte-identical between the two after patching (mod line endings). Measured on
+that RTX 4090, n=5 interleaved runs, same job as the AMD measurement below:
+algebraic (ECM) queue 11.402 -> 10.894 ms, **-4.46%**, arms non-overlapping;
+rational (rho) queue flat (7.054 -> 7.052 ms) as the same-job control. Almost
+exactly the AMD number (~4.6%) -- expected, since the change is architecture-
+neutral algebra, not an AMD-specific trick. `make -C bench bench` exit 0,
+cofcheck.sh 51 PASS / 0 FAIL, relations byte-identical with or without it
+(86845 bytes, `cmp` clean). Documented for CUDA readers in `main`'s
+README.md, next to the existing rho/ECM method-selection paragraph; the full
+derivation stays here, in the section below, since that is where it was
+discovered.
 
 **1. `pipeline.cuh` still pins BOINC progress at 99%.** Verified: it has zero
 occurrences of `bench_boinc_progress_suspend`. `calibrate_slab_rows()` runs a
@@ -1019,13 +1038,7 @@ This is a live bug, not a missing optimisation -- it only does not bite because
 nothing currently ships a BOINC-linked CUDA build. Fix is the
 suspend/resume bracket around the calibration call.
 
-**2. `cofac.cuh` still runs ECM stage 2 with per-point denominators.** It
-declares `mpt<L> baby[CF_ECM_NBABY], ...`; the HIP fork declares
-`mz<L> bx[CF_ECM_NBABY], bz` plus `bzs[]` and carries one shared denominator.
-98 differing lines in that function alone. Worth ~4.6% off the ECM queue, and
-provably identical output.
-
-**3. `bench_kernels.cu` still has the original two-modulo `ss_first`.**
+**2. `bench_kernels.cu` still has the original two-modulo `ss_first`.**
 Verified: it is still `base = rt*j % p` followed by `(base - ilo) % p`. The
 HIP side is now one reduction, then a multiply-shift reciprocal, then that
 reciprocal's shift and bias derived on device. apply 128.6 -> 107.8 ms on
@@ -1036,7 +1049,7 @@ AMD-shaped, because AMD has no integer-divide instruction. On NVIDIA the same
 change is still a win in principle but the size is unknown and unmeasured --
 measure before porting, do not assume -16%.
 
-**4. `bench_main.cu` has no GPU-ordinal fallback and no BOINC GPU
+**3. `bench_main.cu` has no GPU-ordinal fallback and no BOINC GPU
 diagnostics.** Verified: zero occurrences of `device_from_boinc` or
 `bench_boinc_log_gpu_assignment`. Both builds link BOINC, so this one is a
 genuine gap rather than dead weight: a client assigning an ordinal the process
