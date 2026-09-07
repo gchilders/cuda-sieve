@@ -112,6 +112,56 @@ TD_MOD_HD uint32_t td_mod_magic(uint32_t w, uint32_t m,
 }
 #undef TD_MOD_HD
 
+/* ---- ss_first's reciprocals (small-prime line sieve) -------------------- *
+ *
+ * Shared rather than forked: this is pure host arithmetic with no platform
+ * API in it, and it calls td_magic_build directly above. It lives here so
+ * bench_kernels.cu and bench_kernels.hip use ONE copy, and so pipeline.cuh /
+ * pipeline_hip.cuh can call it without depending on their includer having
+ * defined it first.
+ *
+ * SS_KSHIFT is the single source of truth for the bias shift. ss_first forms
+ * `rt*j + (p << SS_KSHIFT(logI)) - ilo` on the device and ss_magic_build
+ * proves that expression stays below 2^31 on the host; if the two ever
+ * disagree the residues are silently wrong, so both sides derive it here
+ * rather than open-coding `logI - 2`. */
+#define SS_KSHIFT(logI)  ((uint32_t)((logI) - 2))
+
+/* Returns 0 into *magic to mean "no magic, use ss_first's 64-bit fallback" --
+ * for m == 1, and, more importantly, whenever the numerator cannot be PROVEN
+ * below 2^31, which is the exactness bound on td_mod_magic above. kshift is
+ * SS_KSHIFT(logI) and ihalf is 1 << (logI-1).
+ *
+ * Refusing rather than assuming matters: --bkthresh and --J are both operator
+ * knobs, so m*jmax is not bounded by anything this header controls, and
+ * neither is m<<kshift. A silent wrong residue here would corrupt relations,
+ * not crash. The bound below is computed in 64-bit against the exact
+ * expression ss_first evaluates, so it stays honest if either knob is pushed.
+ *
+ * Powers of two keep a non-zero magic even though ss_first ignores it for
+ * them and uses an AND instead: it is the "bounds proved, take the fast path"
+ * flag. m == 1 is refused here and answered by the fallback (t % 1 == 0). */
+static inline void ss_magic_build(uint32_t m, uint32_t jmax, uint32_t kshift,
+                                  uint32_t ihalf, uint32_t *magic)
+{
+    uint32_t mg, sh;
+    uint64_t bias, wmax;
+
+    *magic = 0;
+    if (m < 2) return;                     /* every position hits; fallback */
+    td_magic_build(m, &mg, &sh);
+    if (!mg) return;
+
+    bias = (uint64_t)m << kshift;          /* a multiple of m, and >= ihalf */
+    if (bias < ihalf) return;              /* the p >= 2 argument, checked */
+    /* Largest numerator the kernel can form: rt <= m-1, j <= jmax, and the
+     * -ilo term contributes at most +ihalf. */
+    wmax = (uint64_t)(m - 1) * jmax + bias + ihalf;
+    if (wmax >= (1ull << 31)) return;      /* cannot prove exactness */
+
+    *magic = mg;
+}
+
 #if defined(__CUDACC__)
 
 /* Move the direct-test congruence origin forward by delta_j global rows. This

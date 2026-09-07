@@ -45,8 +45,15 @@ integer-divide instruction, so removing arithmetic there matters more), but
 the change is architecture-neutral algebra, not an AMD trick, and it measures
 as a real win on NVIDIA too: **-4.46%** on the algebraic (ECM) queue on an
 RTX 4090 (n=5 interleaved runs, `oracle/c183`, non-overlapping ranges), with
-the rational (rho-only) queue flat as a same-job control. Relations are
-byte-identical with or without it.
+the rational (rho-only) queue flat as a same-job control. Relations came out
+byte-identical with and without it on every job tested (logI 15 and 16 on
+`oracle/c183`). Note that is a measurement, not a guarantee: the rescale is
+by `prod_{j!=k} Z_j`, which preserves `gcd(d, n)` exactly when that product
+is a unit mod `n`. When it is not -- a baby-step `Z` sharing a factor with
+`n`, the lucky-hit case stage 1 normally catches -- the returned factor can
+differ. It can never be a WRONG factor (any `gcd` with `n` divides `n`, and
+`g == n` is rejected), so the change is safe; it simply is not the identity
+that phrasing would imply.
 
 ## Build and test
 
