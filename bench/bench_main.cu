@@ -3,6 +3,7 @@
 #include "platform.h"
 #include "ckpt.h"
 #include "runlog.h"
+#include "watchdog.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -176,6 +177,20 @@ static void usage(void)
 "  falls back to the previous checkpoint.\n"
 "  --restart        discard an existing .part and its checkpoint, start over\n"
 "  --stop-file P    stop cleanly once path P exists (for unattended runs)\n"
+"  --watchdog S     report to stderr when the sieve makes no progress for S\n"
+"                   seconds, with the phase, the (q,rho), the slab and the\n"
+"                   GPU's utilisation and watts -- the last of which says\n"
+"                   whether a kernel is not terminating or the host is stuck.\n"
+"                   Off by default: the give-up threshold below has only\n"
+"                   been measured on one card and one job, so it is opt-in.\n"
+"                   0 disables it.                                    [0]\n"
+"  --watchdog-kill S  after S seconds of no progress inside the band, exit 4\n"
+"                   rather than stay frozen: a wedged card must not hold the\n"
+"                   card, the lease and the output file indefinitely. The\n"
+"                   last checkpoint stays valid, so a resume loses at most\n"
+"                   the special-q in flight. 0 = report only.       [600]\n"
+"  --watchdog-log P  also append those reports to P, for a run whose stderr\n"
+"                   is collected somewhere inconvenient\n"
 "  --log PATH       append a run log: a header naming the commit, argv, job\n"
 "                   fingerprint, card, geometry and FB convention, then a\n"
 "                   timestamped record carrying progress alongside\n"
@@ -880,6 +895,33 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     char dev_name[256] = "";
     char dev_pci[32] = "";          /* NVML's domain:bus:device.function */
     int  dev_ordinal = -1, dev_count = 0;
+    /* Bound ONCE, from one place, before any second thread exists. The
+     * watchdog wants NVML whether or not --log does, so the bind cannot live
+     * inside the --log block; and it must not be retried afterwards, because
+     * by then the watchdog thread is reading what a retry would rewrite. The
+     * run-log header reports this flag instead of calling bind itself. */
+    int  nvml_bound = 0;
+    /* DEFAULT OFF, and the reasoning is about other people's hosts rather than
+     * this one. The give-up threshold below is a claim about how long a phase
+     * can legitimately take, and that claim has been measured on exactly one
+     * card, on one job, at one geometry. On an older or slower host, or a job
+     * whose per-q work is much larger, a phase that is merely slow would be
+     * killed by a default nobody chose -- the watchdog causing the failure it
+     * exists to report, on a machine whose owner never asked for it.
+     *
+     * Off, the whole mechanism is two predictable branches per slab (see the
+     * `armed` guards in watchdog.c) and no thread at all, so nothing in the
+     * band pays for its existence. Turn it on with --watchdog when a host is
+     * suspected of freezing; that is the case it was built for and the case
+     * where its thresholds have been checked. */
+    double watchdog_s = 0.0;
+    /* The give-up threshold, five times the report one. A frozen process is
+     * the worst outcome available -- it holds the card, the lease and the
+     * output file indefinitely -- and the slowest legitimate band phase
+     * measured is under two seconds, so 600 s is not a close call in either
+     * direction. It applies only inside the band loop; see wd_arm_kill. */
+    double watchdog_kill_s = 600.0;
+    const char *watchdog_log = NULL;
     const char *fbpath = "../oracle/input.job.afb.0";
     int fbpath_set = 0;
     const char *polypath = "../oracle/c183.poly";
@@ -1261,6 +1303,38 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
          * whatever filesystem the queue runs in. Under BOINC it is moot anyway,
          * since direct_process_action leaves suspend and quit to the runtime. */
         else if (!strcmp(argv[i], "--stop-file") && i + 1 < argc) cfg.stopfile = argv[++i];
+        /* Validated like --log-every below, not atof()'d. A safety feature that
+         * disarms itself on a typo is worse than one that is simply absent:
+         * `--watchdog 60s` gives atof 0, which reads as "off", and the operator
+         * who deliberately turned it on for a host suspected of freezing gets
+         * no watchdog and no message saying so. */
+        else if (!strcmp(argv[i], "--watchdog") && i + 1 < argc) {
+            char *end = NULL;
+            const double v = strtod(argv[++i], &end);
+            if (!end || *end || !(v == 0.0 || (v >= 1.0 && v <= 86400.0))) {
+                fprintf(stderr, "--watchdog %s: want 0 (off) or seconds in"
+                        " [1, 86400]\n", argv[i]);
+                return 1;
+            }
+            watchdog_s = v;
+        }
+        else if (!strcmp(argv[i], "--watchdog-kill") && i + 1 < argc) {
+            char *end = NULL;
+            const double v = strtod(argv[++i], &end);
+            if (!end || *end || !(v == 0.0 || (v >= 1.0 && v <= 86400.0))) {
+                fprintf(stderr, "--watchdog-kill %s: want 0 (report only) or"
+                        " seconds in [1, 86400]\n", argv[i]);
+                return 1;
+            }
+            watchdog_kill_s = v;
+        }
+        /* Resolved, for the reason the --log case below states: this flag
+         * exists for runs whose stderr goes somewhere inconvenient, which is
+         * exactly the BOINC case where a literal path lands outside the slot. */
+        else if (!strcmp(argv[i], "--watchdog-log") && i + 1 < argc) {
+            if (bench_boinc_resolve_path("--watchdog-log", argv[++i],
+                                         &watchdog_log)) return 1;
+        }
         /* Resolved like every other named output: under BOINC the log is a
          * workunit output file with a logical name, and writing it to the
          * literal string would put it outside the slot directory. */
@@ -1783,6 +1857,32 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
                  prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
         dev_ordinal = dev;
         dev_count = ndev;
+
+        /* Armed HERE, not later: everything above this point is argument
+         * checking that cannot stall for two minutes, and everything below it
+         * -- factor-base generation, the GPU root finder, resume, and the band
+         * itself -- can. NVML is bound first so the very first report already
+         * carries the one number that says which half of the machine is
+         * stuck. */
+        /* THE ONLY runlog_gpu_bind CALL. It used to be attempted here and
+         * again at the run-log header, which put an unsynchronised second bind
+         * -- one that assigns L.nvml_util/L.dev and then NULLs them and
+         * dlcloses the library on failure -- alongside a watchdog thread
+         * already reading and CALLING those pointers. The header below now
+         * reports `nvml_bound` rather than re-binding, so the bind stays
+         * single-threaded as it has always assumed it is. */
+        if (watchdog_s > 0 || cfg.logpath)
+            nvml_bound = runlog_gpu_bind(dev_pci) == 0;
+        if (watchdog_s > 0 &&
+            wd_start(watchdog_s, watchdog_kill_s, watchdog_log) == 0) {
+            /* On EVERY exit, not just the one at the end of the band. There
+             * are some seventy error returns below this point, plus
+             * `return run_cofac(...)`, and each of them reaches main() and
+             * exit() -- which tears down stdio and runs atexit handlers while
+             * a live watchdog thread may be mid-report. */
+            atexit(wd_stop);
+            wd_phase("setup");
+        }
 #ifdef HAVE_BOINC
         /* The one line that answers "did this task actually run on the card the
          * client gave it?". The grid: line below carries the same ordinal, but
@@ -1885,6 +1985,12 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         static const char *pipeline_only[] = {
             "--target-rels", "--lambda0", "--lambda1", "--sq-side",
             "--restart", "--stop-file", "--log", "--log-every",
+            /* The kill is armed by run_pipeline_impl and nowhere else, so
+             * outside --pipeline it is a silent no-op: the operator would be
+             * told a give-up threshold was configured while the process could
+             * still freeze forever. --watchdog itself is NOT here; its
+             * reporting works in any mode. */
+            "--watchdog-kill",
             "--slab-j", "--qspan", NULL
         };
         int nbad = 0;
@@ -2017,6 +2123,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
             return 1;
         }
 
+        wd_phase("setup.resume");
         /* ---- resume, before anything reads qmin (STATUS.md item 12a) ----
          *
          * Everything the fingerprint covers is settled by this point, which is
@@ -2697,6 +2804,11 @@ resume_artifacts_ready:
                         cfg.allowance0, cfg.allowance0 - d0, d0, cfg.mfb0);
                 (void)sl1; (void)sl0;
             }
+            /* Setup's own label. Without one the phase read whatever the last
+             * resume gate had set, so a stall in the GPU root finder was
+             * reported under the name of a scan that finished minutes before
+             * -- sending the operator to the wrong code. */
+            wd_phase("setup.factor_base");
             if (cfg.cadofb) {
                 if (fb_load_cado(cfg.cadofb, cfg.scale, &fb1) != 0) return 1;
             } else if (fbpath_set) {
@@ -2814,7 +2926,7 @@ resume_artifacts_ready:
              * exists to carry come from NVML, and without this line three days
              * of `gpu=n/a board=n/a` give no way to tell a missing driver
              * library from a PCI lookup that found the wrong card. */
-            if (runlog_gpu_bind(dev_pci) == 0)
+            if (nvml_bound)
                 runlog_note("telemetry", "NVML bound to %s", dev_pci);
             else
                 runlog_note("telemetry", "NVML unavailable; the gpu= and"
@@ -2926,6 +3038,8 @@ resume_artifacts_ready:
             free(ql);
             sqgen_free(qgen);
         }
+        /* Before runlog_close(), which unloads NVML out from under a report. */
+        wd_stop();
         runlog_close();
         fb_free(&fb1); fb_free(&fbs1); fb_free(&fb0); fb_free(&fbs0);
         /* The band's outcome, separated from its exit status:

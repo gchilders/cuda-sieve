@@ -57,6 +57,9 @@ bench/.bnlimbs.stamp
 # new job directory cannot be committed by being named something unexpected.
 /work/
 
+# Local aliquot-tracker sieve helper (experimental, not committed yet).
+/sievelocal.sh
+
 # Root-finder scratch. Named NAME.tmp.PID and renamed on success, so a stray
 # one is the residue of an interrupted makefb-side run, never an input.
 *.tmp.[0-9]*

@@ -78,6 +78,7 @@
 #ifndef CUDA_SIEVE_COFAC_CUH
 #define CUDA_SIEVE_COFAC_CUH
 
+#include "watchdog.h"
 #include <stdint.h>
 #include <errno.h>          /* strtoull ERANGE in the relation gate */
 /* Directly, not by luck of translation-unit ordering: this header calls
@@ -2225,6 +2226,10 @@ static int cf_check_relations(const char *path, const poly_t *poly,
         fclose(f); return -1;
     }
     while (bench_getline(&line, &cap, f) > 0) {
+        /* A full gate over a multi-gigabyte .part runs for minutes. Without a
+         * heartbeat the watchdog reports it as a stall, which trains the
+         * operator to ignore the one message that matters. */
+        wd_phase("resume.check_relations");
         const int r = cf_check_one(line, tp, lpb0, lpb1, &nprime, &ncomp, &nonprim);
         /* r == 1 only: r == 2 is "reconstructs but is not primitive", which
          * this gate must fail. */

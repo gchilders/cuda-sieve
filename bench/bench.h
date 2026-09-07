@@ -407,6 +407,18 @@ enum bench_outcome {
  * cannot sieve this job -- get a wider one" from "you typed the wrong flag". */
 #define BENCH_EXIT_UNSUPPORTED 3
 
+/* Process exit status when the watchdog gives up on a stalled run and kills
+ * it. Distinct from 1 so a work client can tell "this host wedged, reissue
+ * elsewhere" from "the band failed"; distinct from 3 so it is not mistaken for
+ * a permanent build/job mismatch that reissuing cannot fix.
+ *
+ * A run that exits this way left its LAST CHECKPOINT INTACT -- the exit is a
+ * bare _exit() from the watchdog thread, which cannot corrupt a file it never
+ * writes, and resume truncates the .part back to the last whole-q boundary in
+ * the normal way. Losing the q in flight is the price of not holding a lease
+ * on a card that has stopped answering. */
+#define BENCH_EXIT_STALLED 4
+
 /* ---- optional BOINC integration -------------------------------------- */
 
 /* These wrappers are no-ops in the normal build.  When HAVE_BOINC is set,

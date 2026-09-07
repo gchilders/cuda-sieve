@@ -801,6 +801,61 @@ allowance, and a job fingerprint.
   for a run with no terminal to press `^C` in.
 - **`--restart`** discards an existing `.part` and its checkpoint, and clears
   the BOINC automatic-recovery counter.
+- **`--watchdog S`** (**off by default**; `S` is the threshold in seconds)
+  prints a report to stderr when the sieve makes no progress for `S` seconds,
+  naming the phase it was last in, the `(q, rho)`, the slab, and the GPU's
+  utilisation and board watts. It repeats every `S` seconds and says how long
+  the stall lasted once progress resumes.
+
+  **Turning it on also arms a kill**: `--watchdog-kill` defaults to 600 s, so
+  a run that stalls inside the band for ten minutes is terminated with exit 4.
+  Pass **`--watchdog-kill 0`** for report-only observation. **`--watchdog-log
+  PATH`** also appends the reports to a file, for a run whose stderr goes
+  somewhere inconvenient (a work client, a BOINC slot).
+
+  The GPU columns are the reason it exists. A stall with **utilisation near
+  100%** means a *kernel* is not terminating: the host is parked in
+  `cudaEventSynchronize` doing what it was told, and the phase names the
+  kernel. **Near 0%** means the *host* is stuck. Nothing written after the fact
+  distinguishes those two, because every other instrument in the build lives on
+  the thread that stopped. From the second report onward it also sends itself
+  `SIGUSR2` once to print the stalled thread's backtrace (glibc builds); frames
+  in `libcuda` confirm a device-side hang, and `addr2line -e bench -f -C -i
+  <addr>` resolves our own.
+- **`--watchdog-kill S`** (default **600** *once `--watchdog` is on*; `0` =
+  report only) exits **4**
+  (`BENCH_EXIT_STALLED`) rather than staying frozen once a stall inside the
+  band reaches `S` seconds. A frozen process is the worst outcome available: it
+  holds the card, the work-unit lease and the output file for as long as nobody
+  is watching, and failing hardware does not always return an error
+  `CUDA_CHECKED` can see — it can simply stop answering. Exit 4 is distinct
+  from 1 (band failed) and 3 (build cannot sieve this job), so a client can
+  read it as "this host wedged, reissue elsewhere".
+
+  **Nothing committed is lost.** The exit is a bare `_exit` from the watchdog
+  thread, which writes no output file; the last checkpoint is intact and a
+  resume replays from the last whole special-q, so the cost is the q in flight.
+  The kill is armed only once the band loop starts — factor-base generation and
+  a multi-gigabyte resume scan are legitimately slow under one coarse phase
+  label, and killing a healthy run there would be the watchdog causing the
+  failure it exists to report. A stall during startup still reports.
+
+  If exit 4 repeats on one host, suspect the card before the code: `dmesg |
+  grep -i xid` and `nvidia-smi -q -d PAGE_RETIREMENT,ECC` for retired pages and
+  ECC counts. **Under WSL2 neither of those sees anything** — the driver lives
+  on the Windows side, and its faults are logged there:
+
+  ```sh
+  powershell.exe -NoProfile -Command \
+    "Get-WinEvent -FilterHashtable @{LogName='System';Id=153;ProviderName='nvlddmkm'} | Select -First 10"
+  ```
+
+  **Why it is off by default.** The give-up threshold is a claim about how long
+  a phase can legitimately take, and that claim has been measured on one card,
+  one job and one geometry. On a slower host or a much larger per-q workload, a
+  phase that is merely slow would be killed by a default its owner never chose.
+  Turn it on for a host suspected of freezing — that is the case its thresholds
+  were checked against.
 - `NAME.lock` refuses a second writer and clears itself if the recorded pid is
   gone.
 - In standalone mode, a `.part` whose fingerprint disagrees with the current

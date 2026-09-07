@@ -2718,6 +2718,106 @@ finding 92.
     overnight. Depends on 12a; unscoped beyond that. **Item 9 stops being
     cosmetic here**: its ~15–20 s of redundant startup is noise in a multi-day
     run and real overhead in anything that restarts the process per job.
+
+    **12d. Stall detection — BUILT 2026-09-05**, in `bench/watchdog.{c,h}`
+    plus heartbeat calls in `pipeline.cuh` and `cofac.cuh`. *(Prompted by
+    intermittent freezes on this box over the preceding few days: the process
+    stays alive and responsive to signals, and simply stops making progress.
+    Seen both under `ggnfs-distributed` and running `bench` directly, with no
+    identified trigger.)*
+
+    **The problem it solves is that a stall silences every instrument at
+    once.** The `\r` progress line, the run-log record and the per-q timers are
+    all written by the loop that stopped, so after the fact there is no way to
+    tell the two possible bugs apart. A watchdog thread — the one thing not in
+    the stall — watches a heartbeat the sieve thread bumps (a pointer store
+    and a counter, no lock, nothing that can itself block) and reports the
+    phase, the `(q, rho)`, the slab, and **NVML utilisation and board watts**.
+    That last pair is the whole point: **near 100% means a kernel is not
+    terminating** and the phase names it; **near 0% means the host side is
+    stuck**. From the second report — and only once the kill is armed, i.e.
+    inside the band — it also signals the sieve thread once for a backtrace:
+    frames in `libcuda` say device-side, ours say ours.
+
+    **OFF BY DEFAULT, decided 2026-09-06.** The give-up threshold is a claim
+    about how long a phase can legitimately take, measured on one card, one job
+    and one geometry; on a slower host or a much larger per-q workload it would
+    kill a run that was merely slow, on a machine whose owner never asked for
+    it. Disarmed it is two predictable branches per slab and no thread, so
+    nothing in the band pays for its existence. `--watchdog S` turns it on for
+    a host suspected of freezing.
+
+    **`--watchdog-kill` (default 600 s, once armed) then makes a freeze fail
+    instead of hang.** A frozen process holds the card, the work-unit lease and the
+    output file for as long as nobody is watching, which is worse than any
+    exit; hardware that has begun to fail does not always return an error
+    `CUDA_CHECKED` can see. It exits `BENCH_EXIT_STALLED` (4), distinct from 1
+    and 3 so a client reads it as "this host wedged, reissue elsewhere". The
+    exit is a bare `_exit` from the watchdog thread — it writes no output
+    file, so the last checkpoint is intact and 12a's resume replays from the
+    last whole special-q, losing at most the q in flight.
+
+    Two design points that are easy to get wrong:
+
+    - **The kill is armed only on entering the band loop.** Factor-base
+      generation and a multi-gigabyte `--check-relations` resume scan are
+      legitimately slow under one coarse phase label, and killing a healthy
+      run there would be the watchdog causing the failure it exists to report.
+      Startup still *reports*. The three resume-scan loops in `cofac.cuh` carry
+      heartbeats so a long `.part` gate does not read as a stall.
+    - **Report and kill thresholds are an order of magnitude apart** because
+      they answer different questions. A false report costs eight lines of
+      stderr; a false kill costs a special-q. Verified 2026-09-05: a two-q
+      AS276 band at a deliberately absurd `--watchdog 3` reported only the ~5 s
+      factor-base load and nothing inside the band, and a harness driving the
+      real `watchdog.o` produced report → report-with-backtrace → exit 4 on
+      schedule.
+
+    **HARDENED after review, 2026-09-06.** Five fixes worth keeping as design
+    constraints rather than diff noise, because each is a way the watchdog
+    could have become the failure it exists to report:
+
+    - **Nothing on the report or kill path may touch stdio.** `fputs(stderr)`
+      takes the FILE lock, and "blocked in printf on a pipe nobody drains" is
+      an ordinary way to be host-stuck — the sieve thread would hold the lock
+      the watchdog needs, and the kill would never fire. Raw `write(2)` and
+      `open`/`write`/`close` throughout.
+    - **The kill is tested before the report and before NVML**, so no query and
+      no write can sit between a wedged run and the exit that frees the card.
+      It also makes a `--watchdog-kill` below `--watchdog` behave as asked
+      instead of being silently clamped up to the report threshold.
+    - **NVML at most once per stall, and never before the phase/q/slab have
+      been written.** Those calls are ioctls into the very driver a stall may
+      have wedged. They kept answering throughout the 2026-09-06 incident,
+      which is why they are still here at all.
+    - **The backtrace is gated on the kill being armed.** `backtrace()` is not
+      async-signal-safe — its first call goes through the loader and malloc —
+      so firing it during a merely-slow startup, while the sieve thread holds
+      either lock, would deadlock the run. `SA_RESTART` too: an interrupted
+      `fsync` or driver ioctl must not be the price of a diagnostic.
+    - **`runlog_gpu_bind` is called exactly once, before the thread exists.**
+      A second bind on the `--log` path raced the running watchdog over
+      `L.dev`/`L.nvml_util`, which the failure path NULLs and `dlclose`s.
+
+    **WHAT IT FOUND, 2026-09-06 — the freezes are the CARD, and this box's
+    freezes are not a `cuda-sieve` bug.** A GMP-ECM GPU run (a wholly unrelated
+    codebase) hung with the identical signature: last progress at 24.8% with a
+    steady ETA, then nothing. Live state showed the GPU at 0-1% util clocking
+    *down* (P1 to P5, 38 W to 19 W) while the main thread burned 100% user CPU
+    with **system time completely flat** — a userspace spin making no syscalls,
+    i.e. the CUDA runtime busy-waiting on a completion that never arrived.
+    Linux `dmesg` was clean, because under WSL2 the driver is on the Windows
+    side: `nvlddmkm` Event 153, "Error occurred on GPUID: 100", **11 times in
+    14 days and accelerating** (2 on 8/24, then near-daily, 5 on 9/6), one of
+    them 7 minutes after that last ECM progress line.
+
+    So the fault is real and in the card or its driver; WSL2's contribution is
+    only that it turns a driver error into a silent hang rather than a
+    `CUDA_ERROR` the caller could see. Two consequences worth keeping: **a
+    freeze here is not evidence of a bug in this program**, and the same fault
+    **cannot explain a wrong relation** — it wedges rather than corrupts, which
+    is consistent with a long history of msieve never rejecting a relation from
+    this card.
 13. **Validate the BOINC GPU assignment — CLOSED 2026-08-17.** Greg Childers,
     who reported the original failure (every task on a multi-GPU host landing
     on device 0), reviewed and signed off on the assignment change, and a BOINC

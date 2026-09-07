@@ -239,7 +239,9 @@ C_OBJS   = $(C_SRCS:.c=.o)
 CPP_OBJS = $(CPP_SRCS:.cpp=.o)
 # runlog.o is deliberately NOT in C_SRCS: fbtest links C_OBJS, and it is a
 # CPU-only gate that must keep building on a machine with no driver library.
-OBJS     = $(CU_OBJS) $(C_OBJS) $(CPP_OBJS) runlog.o fbgen_lib.o fbgen_gpu_lib.o
+# watchdog.o is out for the same reason once removed -- it is the only object
+# that needs a thread, and the CPU-only gates must not grow a pthread link.
+OBJS     = $(CU_OBJS) $(C_OBJS) $(CPP_OBJS) runlog.o watchdog.o fbgen_lib.o fbgen_gpu_lib.o
 TEST_OBJS = slabtest.o
 
 # Switching HAVE_BOINC on an existing tree must rebuild boinc_support.o; make
@@ -323,9 +325,13 @@ all: bench fbtest fbgen fbgen_gpu sqgentest normscan dumpcmp mkcofbatch
 # linking it: the heartbeat's GPU columns must not become a build dependency,
 # and a host with a driver but no toolkit still has the versioned soname. On
 # glibc 2.34 and later dlopen is in libc and this resolves to an empty stub.
+# -lpthread for watchdog.o. On glibc 2.34+ the symbols are in libc and this
+# resolves to an empty stub, exactly as -ldl does above; it is spelled out so
+# the link keeps working on an older host and on a build without BOINC, whose
+# BOINC_LIBS supplies it by accident today.
 bench: $(OBJS) $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP)
 	$(NVCC) $(NVCC_ARCH) --cudart $(CUDART_LINK) -Xlinker --gc-sections \
-		$(BENCH_LINKFLAGS) -o $@ $(OBJS) $(BENCH_LIBS) -lm -ldl
+		$(BENCH_LINKFLAGS) -o $@ $(OBJS) $(BENCH_LIBS) -lm -ldl -lpthread
 
 # Only the CUDA objects care about the arch; the C objects are host-only.
 $(CU_OBJS): $(ARCH_STAMP)

@@ -20,6 +20,7 @@
 
 #include "ckpt.h"
 #include "runlog.h"
+#include "watchdog.h"
 #include <signal.h>
 
 /* ---- clean stop -------------------------------------------------------- *
@@ -136,6 +137,10 @@ static void pipe_try_checkpoint(const poly_t *P, const bench_cfg_t *cfg,
                                 unsigned long long nqdone,
                                 int *written, int *warned)
 {
+    /* fsync of the relation file lives under here, which is the one host
+     * phase that can legitimately block for seconds on a busy disk -- name it
+     * so a stall report can say so. */
+    wd_phase("q.checkpoint");
     if (pipe_checkpoint(P, cfg, ck, fr, fc, next, nrel, nqdone) == 0) {
         *written = 1;
         return;
@@ -602,6 +607,7 @@ static int pipe_side_sieve_slab(const fb_t *fb, const bench_cfg_t *cfg,
 #define SLAB_CK(x) do { if (CUDA_CHECKED(x)) goto done; } while (0)
     /* Preserve the pre-slab timing boundary: fill includes clearing the bucket
      * cursors/overflow counter, just as pipe_side_perq did. */
+    wd_phase(side ? "slab.fill.side1" : "slab.fill.side0");
     SLAB_CK(cudaEventRecord(S->ev[1]));
     SLAB_CK(cudaMemset(d_cursor, 0, (size_t)nregion * 4));
     SLAB_CK(cudaMemset(d_overflow, 0, 4));
@@ -623,6 +629,7 @@ static int pipe_side_sieve_slab(const fb_t *fb, const bench_cfg_t *cfg,
      * of sync with the kernel's, and the payoff is 0.16%. Revisit if the clear
      * ever shows up in a profile. */
     SLAB_CK(cudaMemset(S->survbits, 0, (size_t)nbitword * 4));
+    wd_phase(side ? "slab.apply.side1" : "slab.apply.side0");
     k_apply<16, 1, NORM_HORNER, SLABBED><<<nregion, athr, S->apply_smem>>>(
         (const uint32_t *)d_bucket, d_cursor, cap, cfg->logI, log_region,
         S->slice_logp, S->nslice_pow2, S->N, S->CINIT, S->CINIT - S->BOUND,
@@ -630,6 +637,7 @@ static int pipe_side_sieve_slab(const fb_t *fb, const bench_cfg_t *cfg,
         S->sp, S->srt, S->sg, S->slp, S->nsmall, S->nblk, S->nwrp,
         0xFFFFFFFFu, NULL, S->survbits, cfg->not_both_even, j_base);
     SLAB_CK(cudaEventRecord(S->ev[3]));
+    wd_phase(side ? "slab.sync.side1" : "slab.sync.side0");
     SLAB_CK(cudaEventSynchronize(S->ev[3]));
     SLAB_CK(cudaGetLastError());
     *t_fill  = time_kernel(S->ev[1], S->ev[2]);
@@ -1662,6 +1670,12 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     /* The side-0 special-q polynomial that used to be built here is gone:
      * qsel_validate() derives G = Y1*x + Y0 itself when sq_side == 0, so the
      * per-q gate below covers what pipe_check_root() did and more. */
+    /* From here on a stall is a stall: every phase below is milliseconds, so
+     * the watchdog's give-up threshold can be trusted. It is deliberately NOT
+     * armed during setup, where factor-base generation and a multi-gigabyte
+     * resume scan sit under one coarse label and can legitimately run for
+     * minutes. */
+    wd_arm_kill();
     for (uint32_t qi = 0;; qi++) {
         qsel_t generated, checked;
         const qsel_t *cur;
@@ -1685,6 +1699,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
          * accumulate_stats being exact complements. */
         const int want_host = !cfg->cofactor || fc;
 
+        wd_phase("q.select");
         if (qi < nq) {
             cur = &qlist[qi];
         } else if (qgen) {
@@ -1737,6 +1752,14 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             }
         }
         cur = &checked;
+        /* The context every later report is read against, set HERE and not
+         * further down: the seed checkpoint and the 30 s periodic checkpoint
+         * below both already work on THIS q, and pipe_try_checkpoint's fsync is
+         * the one host phase that can legitimately block for seconds. Set after
+         * those, a stall in them was reported against the PREVIOUS special-q --
+         * exactly the confusion the placement is supposed to prevent. */
+        wd_q((unsigned long long)cur->q, (unsigned long long)cur->rho,
+             (unsigned long long)nqdone);
 
         /* A cofactor queue can first fill in slab 1, 2, ... of q0. Such a
          * flush contains a partial q and is not a resume point. Seed a safe
@@ -1768,6 +1791,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         if (fr && g_pipe_stop) {
             printf("\n  stopping cleanly at q=%llu; draining the cofactor"
                    " queue\n", (unsigned long long)cur->q);
+            wd_phase("stop.cofq_flush");
             if (cfg->cofactor && Q.n &&
                 cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
                            cfg->cof_rounds, cfg->cof_budget, blocks,
@@ -1791,6 +1815,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                                 base_nq + nqdone, &ckpt_written, &ckpt_warned);
         }
 
+        wd_phase("q.lattice");
         qlat_build(&Lq, cur->q, cur->rho, POLY->skew);
         if (cfg->verbose_q)
             printf("\n  q = %llu, rho = %llu\n",
@@ -1808,6 +1833,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 prologue_q = host_ms() - hspan0;
                 hreg = host_ms();
             }
+            wd_phase("q.prepare");
             const int p1 = pipe_side_prepare_q<SLABBED>(fb1, fbs1, &Lq, POLY, cfg, 1,
                                                         cfg->scale, blocks, &S1,
                                                         &th1);
@@ -1857,6 +1883,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 continue;              /* next q; nqdone is not incremented */
             }
             if (cfg->qspan) { acc_prep += host_ms() - hreg; hreg = host_ms(); }
+            wd_phase("q.td_prepare");
             if (p1 < 0 || p0 < 0 || pipe_td_prepare_q(&C, fbs1, fbs0, &Lq, cfg, &tm)) {
                 rc = -1; break;
             }
@@ -1871,6 +1898,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
          * removes every continuation-state operation from device code. */
         if (cfg->qspan) { acc_tdprep += host_ms() - hreg; hreg = host_ms(); }
         for (uint32_t slab = 0; slab < slab_plan->nslab; slab++) {
+            wd_slab(slab, slab_plan->nslab);
             const uint32_t j_base = slab_jbase_at(slab_plan, slab);
             const uint32_t J_here = slab_rows_at(slab_plan, cfg->J, slab);
             const uint32_t xmax = I * J_here;
@@ -1893,6 +1921,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             ts0[1] += sf0; ts0[2] += sa0;
             side_surv1 += S1.nsurv; side_surv0 += S0.nsurv;
 
+            wd_phase("slab.intersect");
             PIPE_CK(cudaMemset(d_n, 0, 4));
             PIPE_CK(cudaMemset(d_pre, 0, 8));
             PIPE_CK(cudaMemset(d_two, 0, (size_t)nbitword * 4));
@@ -1919,6 +1948,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                  * while still reporting a pass. */
                 const int do_verify = nqdone == 0 && cfg->td_verify && hn_s != 0 &&
                     (!td_verified || cfg->cofgate);
+                wd_phase("slab.trialdiv");
                 if (pipe_td_perq<SLABBED>(&C, &Lq, cfg, &S1, &S0, d_two, xmax,
                                           j_base, blocks, cfg->threads, do_verify,
                                           &n, &nacc_s, &tm, &tv, want_host,
@@ -1946,6 +1976,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
              * replays the q atomically. */
             if (cfg->cofactor && nacc_s) {
                 if (Q.n + nacc_s > Q.cap) {
+                    wd_phase("slab.cofq_flush");
                     if (cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0,
                                    cfg->lim, cfg->lpb, cfg->cof_rounds,
                                    cfg->cof_budget, blocks, cfg->threads, fr)) {
@@ -1963,6 +1994,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                                 (unsigned long long)cur->q, slab, nacc_s, Q.cap);
                     rc = -1; break;
                 }
+                wd_phase("slab.cof_enqueue");
                 if (cof_enqueue(blocks, cfg->threads,
                                 C.d_ccof[0], C.d_cbits[0],
                                 C.d_ccof[1], C.d_cbits[1], C.d_ca, C.d_cb,
@@ -1978,6 +2010,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             tm.cofac += host_ms() - cf_start;
 
             join_start = host_ms();
+            wd_phase("slab.join");
             for (uint32_t k = 0; want_host && k < nacc_s; k++) {
                 int64_t a = C.h_ca[k], b = C.h_cb[k];
                 const uint32_t c0 = C.h_cfn[0][k], c1 = C.h_cfn[1][k];
@@ -2408,6 +2441,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
      * rather than folded into the per-q average. */
     if (rc == 0 && cfg->cofactor && Q.n) {
         const double cf0 = host_ms();
+        wd_phase("band.final_cofq_flush");
         if (cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
                        cfg->cof_rounds, cfg->cof_budget, blocks, cfg->threads, fr))
             rc = -1;
