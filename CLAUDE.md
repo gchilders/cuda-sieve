@@ -23,15 +23,27 @@ distribution to BOINC volunteers on Windows and Linux.
   review having found it in tension with the rule above.
 
 ## Ground rules
-- Do not modify the CUDA build. The HIP port lives alongside it.
-  **ONE authorised exception so far, 2026-09-05**: `pipeline.cuh` carries the
-  soft-failure change (bucket overflow / untrustworthy trial division skip the
-  slab instead of failing the band). It was ported deliberately, on the
-  instruction that this behaviour "should be the same on all platforms",
-  because it is task-survival behaviour rather than a tuning change. It is
-  **UNTESTED ON NVIDIA** -- there is no CUDA toolkit on this box, so it was
-  not even compiled, only diffed line-for-line against the HIP version. Build
-  it before trusting it. Nothing else in the CUDA build has been touched.
+- Do not modify the CUDA build without recording it here. The HIP port lives
+  alongside it. This rule was written when the CUDA build was frozen outright;
+  it is no longer frozen, so what follows is the authoritative list of what has
+  been changed and how far each change was actually verified. **Keep this list
+  current -- an unrecorded CUDA-side edit is the failure this rule exists to
+  prevent, and a stale entry is nearly as bad.**
+
+  | date | CUDA file(s) | change | verified how |
+  |---|---|---|---|
+  | 2026-09-05 | `pipeline.cuh` | soft-failure slab skip (bucket overflow / untrustworthy TD skip the slab instead of failing the band) | compiled and tested on an RTX 4090 on 2026-09-06, `make -C bench check` green, cofcheck.sh 51 PASS / 0 FAIL |
+  | 2026-09-06 | `cofac.cuh` | ECM stage 2 on a shared denominator (`43ea104`) | RTX 4090: -4.46% algebraic queue, cofcheck.sh 51 PASS / 0 FAIL, relations byte-identical at logI 15 |
+  | 2026-09-06 | `bench_kernels.cu`, `pipeline.cuh` | `ss_first` reduction work (`1b779b0`, `3a8049d`, `711cdaf`) | RTX 4090: -13.5% apply, cofcheck.sh 51 PASS / 0 FAIL, relations byte-identical at logI 15 |
+
+  The soft-failure entry was carried for a day as "UNTESTED ON NVIDIA -- not
+  even compiled, only diffed line-for-line against the HIP version". That is no
+  longer true: a k8s pod with a real RTX 4090 has since built and exercised it.
+  **Coverage gap worth knowing**: every CUDA-side differential check above ran
+  at logI 15, which is the default (`bench_main.cu`, `cfg.logI = 15`) and the
+  only geometry cofcheck.sh exercises. `ss_first`'s magic==0 fallback carries
+  roughly 0.2% of entries there; the heavy-fallback geometry (logI 16) was
+  differentially tested on HIP but not on CUDA.
 - Acceptance test: HIP build output must be byte-identical to the CUDA
   build's relations on the oracle jobs, with `make -C bench check` green.
 - Warp width 32 is assumed throughout (`>> 5`, `& 31`, lane 31 broadcasts).
@@ -828,9 +840,26 @@ between a working and a broken target before theorising about the compiler.
 `mz_ecm_stage2_pass` holds its baby steps on one common denominator:
 `bx[k] = X_k * prod_{j!=k} Z_j` against a single `bz = prod_j Z_j`, so
 `(bx[k] : bz)` is the same projective point `(X_k : Z_k)` was. Every cross
-product is the old one scaled by a nonzero factor, which cannot change
-`gcd(d, n)` -- the factors found are provably identical, and cofcheck.sh's
-pinned relation counts confirm it.
+product is the old one scaled by `prod_{j!=k} Z_j`.
+
+**What that scaling does and does not guarantee** -- the original wording here
+claimed it "cannot change `gcd(d, n)`" and that the factors found are "provably
+identical", and that is only true when the scale factor is a UNIT mod n. It
+usually is, which is why cofcheck.sh's pinned relation counts match and why a
+148-q A/B produced identical relations either way -- but that is empirical, not
+a proof. When `gcd(prod_{j!=k} Z_j, n) > 1` the scaled `gcd(d, n)` is a
+superset of the unscaled one, so it can differ in both directions:
+
+- it can surface a genuine factor EARLIER (harmless -- any `gcd` with n is a
+  true divisor of n, so nothing invalid is ever returned), or
+- it can grow to exactly n, which `mz_cmp(&g, n) != 0` then discards -- so a
+  factor the per-point form would have returned at that k can be masked.
+
+Both are vanishingly rare (they need a baby-step Z to share a factor with n,
+which is the lucky-hit case stage 1 normally catches) and neither can produce a
+WRONG factor, which is what makes the change safe to ship. But do not restate
+this as an identity proof: the guarantee is "never returns a non-factor", not
+"returns exactly the same factors".
 
 The gain is in the inner loop: with one denominator for every baby step the
 `X_G * Z` term is common to all k and hoists out, so a selected pair costs ONE

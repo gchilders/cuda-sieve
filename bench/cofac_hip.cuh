@@ -723,9 +723,20 @@ CF_NOINLINE int mz_ecm_stage2_pass(mz<L> *fac, const mpt<L> *Q,
     /* The baby steps are held on a SHARED DENOMINATOR: bx[k] = X_k *
      * prod_{j!=k} Z_j against one bz = prod_j Z_j, so (bx[k] : bz) is the
      * same projective point (X_k : Z_k) was. Every cross product below is
-     * then the old one scaled by prod_{j!=k} Z_j, and scaling by a nonzero
-     * value cannot change gcd(d, n) -- the factors found are identical, which
-     * cofcheck.sh's pinned relation counts confirm.
+     * then the old one scaled by prod_{j!=k} Z_j.
+     *
+     * That scaling leaves gcd(d, n) alone only when the scale factor is a UNIT
+     * mod n. It normally is -- cofcheck.sh's pinned counts match and a 148-q
+     * A/B produced identical relations either way -- but that is empirical,
+     * NOT a proof, and an earlier version of this comment wrongly claimed the
+     * factors were provably identical. When gcd(prod_{j!=k} Z_j, n) > 1 the
+     * scaled gcd is a superset of the unscaled one, so it can surface a real
+     * factor earlier, or grow to exactly n and be discarded by the g != n
+     * guard below -- masking a factor the per-point form would have found at
+     * that k. Both need a baby-step Z sharing a factor with n (the lucky-hit
+     * case stage 1 usually catches), and NEITHER can return a wrong factor:
+     * any gcd with n is a true divisor, and g == n is rejected. That is what
+     * makes this safe -- "never returns a non-factor", not "same factors".
      *
      * The point is the inner loop: with one denominator for every baby step,
      * the X_G * Z term is common to all k and hoists out, so a selected pair

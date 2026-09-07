@@ -273,7 +273,9 @@ __device__ __forceinline__ uint32_t ss_first(uint32_t p, uint32_t rt,
      * concentrated in the thread tier that has the fewest hits to amortize a
      * load over):
      *
-     *   bias  p << kshift, with kshift = logI-2 passed in. Any multiple of p
+     *   bias  p << kshift, with kshift = SS_KSHIFT(logI) derived by the
+     *         caller from the same macro the host builds its bound against.
+     *         Any multiple of p
      *         that is >= Ihalf will do -- it only has to make the numerator
      *         non-negative without moving the residue -- and p >= 2 gives
      *         p<<(logI-2) >= 2^(logI-1) == Ihalf. The stored "least multiple"
@@ -282,8 +284,11 @@ __device__ __forceinline__ uint32_t ss_first(uint32_t p, uint32_t rt,
      *
      * Powers of two take an AND instead: td_magic_build has to special-case
      * them (their general-form magic would be 2^32, which does not fit), and
-     * the AND is cheaper than the reciprocal anyway. p == 1 lands here too and
-     * gives 0, which is the right answer -- every position hits.
+     * the AND is cheaper than the reciprocal anyway. p == 1 never reaches this
+     * branch -- ss_magic_build refuses m < 2 outright, so it takes the
+     * fallback below (t % 1 == 0). Do not relax that guard on the theory that
+     * the AND covers p == 1: td_magic_build's power-of-two case would then
+     * evaluate 1u << 32, which is undefined.
      *
      * The uint32 arithmetic is exact because the true value is non-negative
      * and < 2^31; the host refuses the magic (magic == 0) for any entry where
@@ -309,42 +314,10 @@ __device__ __forceinline__ uint32_t ss_first(uint32_t p, uint32_t rt,
     return (uint32_t)(t % p);
 }
 
-/* Host side of the above: the ONE value ss_first cannot derive for itself.
- * Returns 0 into *magic to mean "no magic, use the 64-bit fallback" -- for
- * m == 1, and, more importantly, whenever the numerator cannot be PROVEN
- * below 2^31, which is the exactness bound on td_mod_magic. kshift is the
- * logI-2 the kernel will shift by, and ihalf is 1 << (logI-1).
- *
- * Refusing rather than assuming matters: --bkthresh and --J are both operator
- * knobs, so m*jmax is not bounded by anything this file controls, and neither
- * is m<<kshift. A silent wrong residue here would corrupt relations, not
- * crash. The bound below is computed in 64-bit against the exact expression
- * ss_first evaluates, so it stays honest if either knob is pushed.
- *
- * Powers of two keep a non-zero magic even though the device ignores it: it
- * is the "bounds proved, take the fast path" flag, and ss_first uses an AND
- * for them. m == 1 is refused here and answered by the fallback (t % 1 == 0),
- * rather than relying on the AND's 0. */
-static inline void ss_magic_build(uint32_t m, uint32_t jmax, uint32_t kshift,
-                                  uint32_t ihalf, uint32_t *magic)
-{
-    uint32_t mg, sh;
-    uint64_t bias, wmax;
-
-    *magic = 0;
-    if (m < 2) return;                     /* every position hits; fallback */
-    td_magic_build(m, &mg, &sh);
-    if (!mg) return;
-
-    bias = (uint64_t)m << kshift;          /* a multiple of m, and >= ihalf */
-    if (bias < ihalf) return;              /* the p >= 2 argument, checked */
-    /* Largest numerator the kernel can form: rt <= m-1, j <= jmax, and the
-     * -ilo term contributes at most +ihalf. */
-    wmax = (uint64_t)(m - 1) * jmax + bias + ihalf;
-    if (wmax >= (1ull << 31)) return;      /* cannot prove exactness */
-
-    *magic = mg;
-}
+/* ss_magic_build (the host side of the above) and SS_KSHIFT live in td.cuh,
+ * next to the td_magic_build they call -- shared by both builds rather than
+ * forked, and reachable from pipeline_hip.cuh without depending on include
+ * order. */
 
 template <int CELLBITS, int ATOMIC, bool SLABBED = false>
 __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_region,
@@ -352,7 +325,7 @@ __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_regi
                             const uint32_t *__restrict srt,
                             const uint32_t *__restrict sg,
                             const uint16_t *__restrict slp,
-                            const uint32_t *__restrict smag, uint32_t kshift,
+                            const uint32_t *__restrict smag,
                             uint32_t nsmall, uint32_t nblk, uint32_t nwrp,
                             uint32_t tid, uint32_t nth, uint32_t j_base)
 {
@@ -362,6 +335,9 @@ __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_regi
     uint32_t j = jlocal;
     if constexpr (SLABBED) j += j_base;
     const int32_t  ilo   = (int32_t)(x0 & ((1u << logI) - 1)) - (int32_t)(1u << (logI - 1));
+    /* Derived here, not plumbed in: the host proves its bound against
+     * SS_KSHIFT(logI) too, so both sides read the same definition. */
+    const uint32_t kshift = SS_KSHIFT(logI);
     const uint32_t warp = tid >> 5, lane = tid & 31, nwarps = nth >> 5;
 
     /* Every entry is (m, rt, g): hits this row only when g | j, and then at
@@ -523,7 +499,7 @@ void k_apply(const uint32_t *__restrict buckets,
                         uint32_t dbg_region,
                         const uint32_t *__restrict sp, const uint32_t *__restrict srt,
                         const uint32_t *__restrict sg, const uint16_t *__restrict slp,
-                        const uint32_t *__restrict smag, uint32_t kshift,
+                        const uint32_t *__restrict smag,
                         uint32_t nsmall, uint32_t nblk, uint32_t nwrp,
                         uint32_t probe_x, uint32_t *__restrict probe_out,
                         uint32_t *__restrict survbits, int not_both_even,
@@ -642,7 +618,7 @@ report spurious cell mismatches. Pricing builds only, never for relations."
     /* ---- small primes: line-sieved straight into the same shared region ---- */
     if (nsmall)
         sieve_small<CELLBITS, ATOMIC, SLABBED>(S, b, logI, log_region, sp, srt, sg, slp,
-                                               smag, (uint32_t)(logI - 2),
+                                               smag,
                                                nsmall, nblk, nwrp, tid, nth, j_base);
 
     /* ---- apply ---- */
@@ -2361,7 +2337,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
         {
             const uint32_t ihalf = 1u << (cfg->logI - 1);
             for (i = 0; i < nsmall; i++)
-                ss_magic_build(hsp[i], cfg->J, (uint32_t)(cfg->logI - 2), ihalf, &hsmag[i]);
+                ss_magic_build(hsp[i], cfg->J, SS_KSHIFT(cfg->logI), ihalf, &hsmag[i]);
         }
 
         for (i = 0; i < nsmall && hsp[i] < SS_BLOCK_CUT; i++) nblk = i + 1;
@@ -2698,7 +2674,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                         N, CINIT, CINIT - BOUND, tconst, D.dumpbuf,            \
                         D.nsurv,                                               \
                         D.dbg, dbgreg, D.sp, D.srt, D.sg, D.slp,             \
-                        D.smag, (uint32_t)(cfg->logI - 2),                    \
+                        D.smag,                                               \
                         nsmall, nblk, nwrp, probe_x, D.probe,                  \
                         D.survbits, cfg->not_both_even, 0u);                   \
                 }                                                              \
