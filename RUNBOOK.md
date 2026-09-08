@@ -789,35 +789,84 @@ allowance, and a job fingerprint.
   Unreadable files, active locks, other filesystem errors, bad inputs,
   band/command mismatches and compute failures remain fatal because deleting
   output cannot repair them.
-- **Some per-slab failures now cost yield rather than the task.** A bucket
-  array overflow, a norm overflow, or a factor list truncated past the
-  per-survivor cap used to fail the whole band -- one field report threw away
-  3373 special-q of completed work over a shortfall of a single record, and
-  ended in `boinc_finish(-1)` that the volunteer could neither see nor act on.
-  Each of these now warns, skips that one slab, and continues. A special-q
-  that loses every one of its slabs is counted and skipped rather than
-  tripping the "no survivors at this q" check, which is otherwise still fatal
-  when the sieve actually ran.
-
-  **No relation is at risk.** All three are tested before the intersect/trial
-  division/emit stage, so a skipped slab contributes nothing to the output
-  file, and dropped bucket records can only lower a position's log sum -- an
-  overflow costs survivors it never invents.
-
-  Warnings are rate-limited; the true totals appear in an end-of-band summary
-  naming how many slabs were skipped, how many of those were for untrustworthy
-  trial division, and how many special-q were lost entirely. Two consequences
-  worth knowing: a host that skips a slab returns fewer relations than one that
-  does not, so a validator comparing results *between* hosts may now reject
-  these rather than seeing an error; and norm overflow or truncated lists
-  usually mean a misconfigured job (mfb too generous, `PIPE_K` too small)
-  rather than a transient, so such a job now yields very little while still
-  exiting 0. The summary line naming mfb/`PIPE_K` is what makes that visible.
   Checkpoints that include candidate output also record the candidate staging
   pathname and file identity. This lets a relaunch that omitted `--candidates`
   remove the matching private staging file without trusting checkpoint text as
   authority to delete some other file. Older checkpoints without that identity
   are preserved rather than partially discarded.
+- **Two per-slab failures now cost yield rather than the task.** A bucket
+  array overflow, or a factor list truncated past the per-survivor cap, used
+  to fail the whole band -- one field report threw away 3373 special-q of
+  completed work over a shortfall of a single record, and ended in
+  `boinc_finish(-1)` that the volunteer could neither see nor act on. Each of
+  these now warns, skips that slab, and continues. A special-q that loses
+  every one of its slabs is counted and skipped rather than tripping the "no
+  survivors at this q" check, which is otherwise still fatal when the sieve
+  actually ran.
+
+  **Norm overflow is deliberately NOT in that set and remains fatal.**
+  `prepare_q` proves the exact-norm width per side per q, over the full `J`,
+  before anything is sieved, and passes over any `(q,rho)` that does not fit
+  -- that is the `PIPE_Q_SKIP`/exit-3 path, whose remedy is a wider
+  `BN_LIMBS`. An overflow reaching trial division therefore means the *bound
+  itself* is wrong, which is a broken invariant rather than a job that needs
+  tuning, and skipping the slab would hide it.
+
+  **No relation is at risk.** Both soft conditions are tested before the
+  intersect/trial division/emit stage, so a skipped slab contributes nothing
+  to the output file, and dropped bucket records can only lower a position's
+  log sum -- an overflow costs survivors it never invents. Under slabbing a
+  skip also **abandons the remaining slabs of that special-q**: the end of the
+  slab loop advances the per-q continuation state (the `k_tdsmall_advance`
+  origin and both sides' walk buffers), so continuing past a skip would leave
+  every later slab a step out of date against its own `j_base`.
+
+  Warnings are rate-limited; the true totals appear in an end-of-band summary
+  naming how many slabs were skipped or abandoned, how many were for a
+  truncated list, and how many special-q were lost entirely. Two consequences
+  worth knowing: a host that skips a slab returns fewer relations than one
+  that does not, so a validator comparing results *between* hosts may now
+  reject these rather than seeing an error; and a truncated list usually means
+  a misconfigured job (mfb too generous, `PIPE_K` too small) rather than a
+  transient. The summary line naming mfb/`PIPE_K` is what makes that visible.
+- **…but only up to a ceiling: `exit 5` means the band ran and is not worth
+  crediting.** Skipping is designed not to fail the task, which means it is
+  silent in one direction: without a limit, a job whose bucket array is too
+  small can skip every slab of every q, emit almost nothing, and still exit 0.
+  Two counters bound that — `PIPE_SLAB_SKIP_MAX` (1000 slabs) and
+  `PIPE_LOST_MAX` (100 whole special-q lost) — and tripping either drains,
+  checkpoints, and exits `BENCH_EXIT_DEGRADED` (5).
+
+  **The relations already earned are kept and are valid** — the stop drains
+  and checkpoints exactly like the norm-width cap, so they are in the `.part`
+  and a rerun of the same command resumes from the last whole-q boundary.
+  They are *not* committed to the final `--relations` name, because the band
+  did not finish. Verified by fault injection: with a synthetic overflow on
+  every 7th slab, the ceiling stopped the band at exit 5 and all 681 relations
+  in the `.part` were byte-identical to the ones a clean build produced for
+  the same special-q. Only the exit status says the band as a whole should not
+  be credited.
+
+  Exit 5 is distinct from 1 (the band failed), 3 (rebuild with a wider
+  `BN_LIMBS`) and 4 (the card wedged), and the remedies really are disjoint:
+  norm overflow is fatal, so the only two conditions that can reach this
+  ceiling are an undersized bucket array and a large-prime list running past
+  `PIPE_K` per survivor. The stop message names whichever dominates and the
+  end-of-band counters separate them. Both counters reset on resume, and a
+  short work unit may finish below them, so this is a backstop against silent
+  waste, not the primary defence.
+
+  **Under BOINC the `.part` does not survive.** Only a clean
+  `BENCH_OUTCOME_STOPPED` takes `boinc_temporary_exit`, which is what leaves
+  the slot intact; exit 5 goes through `boinc_finish(5)`, which the client
+  records as an application error and then cleans the slot directory. That is
+  the intended behaviour — both ceilings reset on resume, so an automatic
+  retry of an unfixed job would loop — but it means the "resume from the
+  `.part`" guarantee above applies to a shell operator, not to a volunteer.
+
+  This matters for **benchmarking** as much as for BOINC: a rate computed from
+  a degraded band reads as a slow card rather than a misconfigured job, and
+  before the ceiling existed nothing in the exit status distinguished them.
 - **`SIGINT`/`SIGTERM` stop cleanly** at the next special-q, draining the queue
   first, so a planned stop loses nothing. A second signal exits at once and
   falls back to the previous checkpoint.

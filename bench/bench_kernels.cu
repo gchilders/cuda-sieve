@@ -255,13 +255,13 @@ __device__ __forceinline__ uint32_t ss_first(uint32_t p, uint32_t rt,
      * concentrated in the thread tier that has the fewest hits to amortize a
      * load over):
      *
-     *   bias  p << kshift, with kshift = SS_KSHIFT(logI) derived by the
-     *         caller from the same macro the host builds its bound against.
-     *         Any multiple of p
-     *         that is >= Ihalf will do -- it only has to make the numerator
-     *         non-negative without moving the residue -- and p >= 2 gives
-     *         p<<(logI-2) >= 2^(logI-1) == Ihalf. The stored "least multiple"
-     *         was never worth a load.
+     *   bias  p << SS_KSHIFT(logI), the same macro the host builds its bound
+     *         against. Any multiple of p that is >= Ihalf will do -- it only
+     *         has to make the numerator non-negative without moving the
+     *         residue -- and p >= 2 gives p<<(logI-2) >= 2^(logI-1) == Ihalf.
+     *         The stored "least multiple" was never worth a load; neither was
+     *         a per-p shift, which is smaller still but costs more per hit
+     *         than the coverage is worth (measured; see SS_KSHIFT in td.cuh).
      *   sh    floor(log2 p) == 31 - clz(p), one instruction.
      *
      * Powers of two take an AND instead: td_magic_build has to special-case
@@ -316,8 +316,9 @@ __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_regi
     uint32_t j = jlocal;
     if constexpr (SLABBED) j += j_base;
     const int32_t  ilo   = (int32_t)(x0 & ((1u << logI) - 1)) - (int32_t)(1u << (logI - 1));
-    /* Derived here, not plumbed in: the host proves its bound against
-     * SS_KSHIFT(logI) too, so both sides read the same definition. */
+    /* Loop-invariant, so it is derived once here rather than per hit: the
+     * host proves its bound against SS_KSHIFT(logI) too, so both sides read
+     * the same definition. */
     const uint32_t kshift = SS_KSHIFT(logI);
     const uint32_t warp = tid >> 5, lane = tid & 31, nwarps = nth >> 5;
 
@@ -2222,11 +2223,10 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
 
         /* Reciprocals AFTER the sort: the key is the modulus itself, so
          * building them earlier would mean permuting them too, for no gain. */
-        {
-            const uint32_t ihalf = 1u << (cfg->logI - 1);
-            for (i = 0; i < nsmall; i++)
-                ss_magic_build(hsp[i], cfg->J, SS_KSHIFT(cfg->logI), ihalf, &hsmag[i]);
-        }
+        for (i = 0; i < nsmall; i++)
+            ss_magic_build(hsp[i],
+                           hsg[i] > 1 ? cfg->J / hsg[i] : cfg->J,
+                           cfg->logI, &hsmag[i]);
 
         for (i = 0; i < nsmall && hsp[i] < SS_BLOCK_CUT; i++) nblk = i + 1;
         for (i = 0; i < nsmall && hsp[i] < SS_WARP_CUT;  i++) nwrp = i + 1;

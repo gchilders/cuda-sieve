@@ -3070,6 +3070,14 @@ resume_artifacts_ready:
             *outcome = BENCH_OUTCOME_UNSUPPORTED;
             prc = BENCH_EXIT_UNSUPPORTED;
             break;
+        case PIPE_RC_DEGRADED:
+            /* Same shape as UNSUPPORTED and for the same reason: the band
+             * drained and checkpointed, so the relations are kept, but it is
+             * not a success. The separate code is what lets a wrapper tell
+             * "rebuild wider" from "fix the job's bucket/mfb/PIPE_K sizing". */
+            *outcome = BENCH_OUTCOME_DEGRADED;
+            prc = BENCH_EXIT_DEGRADED;
+            break;
         default:                    /* 0 = finished, negative = failed */
             break;
         }

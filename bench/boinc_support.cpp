@@ -385,7 +385,8 @@ extern "C" int bench_boinc_finish(enum bench_outcome outcome, int status)
      * turned exactly that case into exit 1 -- the two guards have to agree
      * about which outcomes are errors, and STOPPED is not one of them. */
     if ((outcome == BENCH_OUTCOME_FAILED ||
-         outcome == BENCH_OUTCOME_UNSUPPORTED) && status == 0)
+         outcome == BENCH_OUTCOME_UNSUPPORTED ||
+         outcome == BENCH_OUTCOME_DEGRADED) && status == 0)
         status = 1;
 
     rc = boinc_finish(status);

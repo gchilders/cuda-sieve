@@ -128,9 +128,14 @@ echo "  build width: $LIMIT bits (BN_LIMBS*32)"
 # width covers it. What the width changes is whether such a job can be built and
 # SIEVED, and past 128 bits it cannot be sieved cheaply:
 #
-#   * pipeline.cuh:2018 makes a special-q with no two-sided survivors FATAL, by
-#     design. So the generated job must actually yield relations, not merely
-#     overflow.
+#   * pipeline.cuh's "no survivors at this q" check makes a special-q with no
+#     two-sided survivors FATAL, by design. That is still true for the jobs
+#     this gate builds, but it is no longer unconditional: since the per-slab
+#     soft-skip landed, a q whose slabs were ALL skipped (bucket overflow or a
+#     truncated factor list; norm overflow is fatal) is counted in nq_lost and
+#     passed over instead. Only an explained zero is tolerated; a q that actually
+#     sieved and found nothing still dies. So the generated job must actually
+#     yield relations, not merely overflow.
 #   * A job that overflows 256 bits on one side has ~375 bits of norm across the
 #     two. At toy bounds (lim 2e6, lpb 26) that yields no survivors at all and
 #     the band dies; measured 2026-09-04 at BN_LIMBS=8. At bounds that would
@@ -151,7 +156,7 @@ if [ "$LIMIT" -gt 128 ]; then
     echo "  SKIP: this gate is verified at BN_LIMBS=4 (128 bits); this build is"
     echo "        $LIMIT. A job that overflows $LIMIT bits has norms too large to"
     echo "        yield survivors at any bounds this gate can afford, and"
-    echo "        pipeline.cuh:2018 makes a survivor-less q fatal."
+    echo "        a q that sieved and found no survivors is still fatal."
     echo "        Rebuild with 'make BN_LIMBS=4' to run it."
     exit 0
 fi

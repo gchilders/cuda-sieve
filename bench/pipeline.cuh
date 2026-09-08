@@ -345,6 +345,13 @@ done:
  * #define, so it does not leak an unscoped macro out of this header. */
 enum { PIPE_Q_SKIP = 1 };
 
+/* Rate-limit budgets for the per-slab soft-skip warnings; see the note at the
+ * bucket-overflow site for why these are not static locals. Like the other
+ * file statics here they are never reset, so a second band in one process
+ * inherits the first band's spend and sees only the end-of-band totals. */
+static int g_warned_bucket_ovf = 0;
+static int g_warned_td_trunc   = 0;
+
 /* Skips that end the run. Past this the build is simply too narrow for the job
  * and the band would emit systematically deficient output; ./normscan says so
  * up front and names the width to rebuild with.
@@ -366,6 +373,47 @@ enum { PIPE_Q_SKIP = 1 };
  * resume of the same binary. The stop is deliberate; the SUCCESS was not. */
 #ifndef PIPE_SKIP_MAX
 #define PIPE_SKIP_MAX 100
+#endif
+
+/* The same net, for the per-slab SOFT skips (bucket overflow and a truncated
+ * factor list; norm overflow is fatal, see pipe_td_perq). Those exist so a
+ * one-record shortfall costs a slab's
+ * yield instead of a volunteer's whole task, which is right -- but the trade
+ * is silent in one direction, and without a ceiling it stays silent all the
+ * way down to "emitted almost nothing, exited 0". A job with an undersized
+ * bucket array can skip every slab of every q and still report success; a
+ * rate computed from that band looks like a slow card rather than a
+ * misconfigured job.
+ *
+ * TWO counters, because either can be pathological while the other looks
+ * clean:
+ *
+ *   PIPE_LOST_MAX       whole special-q that produced nothing because every
+ *                       slab of them was skipped. The sharp signal, and
+ *                       deliberately the same 100 as PIPE_SKIP_MAX: past a
+ *                       hundred, the condition is systemic, not transient.
+ *   PIPE_SLAB_SKIP_MAX  slabs LOST, which is not the same as incidents: a
+ *                       bucket overflow abandons the rest of its q (see the
+ *                       skip site), so one incident on slab 0 of a 4-slab
+ *                       plan counts 4, not 1. Counting lost slabs is the
+ *                       point -- it is the yield -- but it means the ceiling
+ *                       trips after correspondingly fewer incidents. Catches
+ *                       the case PIPE_LOST_MAX cannot see: one slab of four
+ *                       failing on EVERY q is a permanent yield loss with
+ *                       nq_lost stuck at zero.
+ *
+ * Absolute counts, not rates, matching PIPE_SKIP_MAX's idiom: a healthy band
+ * needs a thousand separate incidents to trip this, and a broken one trips it
+ * within the first few hundred q. They inherit PIPE_SKIP_MAX's two holes too
+ * -- neither is checkpointed, so a resumed band starts counting again, and a
+ * short work unit may finish before reaching either. Like that cap, this is a
+ * backstop against silent waste, not the primary defence; sizing the bucket
+ * array and mfb correctly is. */
+#ifndef PIPE_LOST_MAX
+#define PIPE_LOST_MAX 100
+#endif
+#ifndef PIPE_SLAB_SKIP_MAX
+#define PIPE_SLAB_SKIP_MAX 1000
 #endif
 
 /* Per-special-q work that is independent of the slab: transform the small
@@ -439,32 +487,38 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
         /* Reciprocals AFTER the sort, same as the standalone path: the sort
          * key is the modulus, so building them earlier would only mean
          * permuting them too. */
-        {
-            const uint32_t ihalf = 1u << (cfg->logI - 1);
-            for (uint32_t i = 0; i < k; i++)
-                ss_magic_build(hsp[i], cfg->J, SS_KSHIFT(cfg->logI),
-                               ihalf, &S->hsmag[i]);
-        }
+        for (uint32_t i = 0; i < k; i++)
+            ss_magic_build(hsp[i], hsg[i] > 1 ? cfg->J / hsg[i] : cfg->J,
+                           cfg->logI, &S->hsmag[i]);
         S->nblk = S->nwrp = 0;
         for (uint32_t i = 0; i < k && hsp[i] < SS_BLOCK_CUT; i++) S->nblk = i + 1;
         for (uint32_t i = 0; i < k && hsp[i] < SS_WARP_CUT; i++) S->nwrp = i + 1;
         /* ASYNC on purpose. A synchronous cudaMemcpy on the legacy default
          * stream cannot begin until prior stream work drains, so once the
-         * transform sync was removed from the end of this function these four
+         * transform sync was removed from the end of this function these
          * copies became the new serialisation point: side 0's uploads blocked
          * on side 1's still-running transform, and the wait was charged to
          * `host per-q` (measured: 1.179 -> 3.220 ms/q). Async keeps the host
          * running ahead and issuing the next launch.
          *
-         * Safe because hsp/hsrt/hsg/hslp are PINNED (cudaHostAlloc, see
+         * Safe because hsp/hsrt/hsg/hslp/hsmag are PINNED (cudaHostAlloc, see
          * pipe_side_init) and are only rewritten by the NEXT q's call, by
-         * which point the stream has drained. TWO paths provide that drain and
-         * BOTH are load-bearing: the normal one ends in the slab loop's
-         * cudaEventSynchronize(ev[3]), and the PIPE_Q_SKIP path -- which never
-         * reaches the slab loop -- carries its own cudaStreamSynchronize for
-         * exactly this reason (see the skip site below). A new early return
-         * added between here and the slab loop needs the same treatment, or
-         * these must go back to synchronous. */
+         * which point the stream has drained. THREE paths provide that drain
+         * and ALL THREE are load-bearing:
+         *
+         *   normal            the slab loop's cudaEventSynchronize(ev[3]);
+         *   PIPE_Q_SKIP       never reaches the slab loop, so it carries its
+         *                     own cudaStreamSynchronize for exactly this
+         *                     reason (see the skip site below);
+         *   every slab soft-skipped
+         *                     reaches the slab loop but may never sync side 0
+         *                     (a side-1 skip short-circuits side 0), and is
+         *                     covered by the post-loop cudaEventSynchronize
+         *                     on ev[4] -- which is recorded AFTER these copies
+         *                     and so subsumes them.
+         *
+         * A new early return added between here and that ev[4] synchronise
+         * needs the same treatment, or these must go back to synchronous. */
         PERQ_CK(cudaMemcpyAsync(S->sp, hsp, (size_t)k * sizeof(*hsp),
                                 cudaMemcpyHostToDevice, 0));
         PERQ_CK(cudaMemcpyAsync(S->srt, hsrt, (size_t)k * sizeof(*hsrt),
@@ -678,14 +732,18 @@ static int pipe_side_sieve_slab(const fb_t *fb, const bench_cfg_t *cfg,
              * Rate-limited: under BOINC stderr is uploaded, and a band that
              * overflows on many q would otherwise ship thousands of identical
              * lines. The end-of-band summary carries the true total. */
-            static int warned;
-            if (warned < 8)
+            /* File scope, not a static local: this function is a TEMPLATE,
+             * and a static local in a template is per-instantiation, so the
+             * documented budget of 8 was really 8 per SLABBED specialisation
+             * (16 in a binary carrying both). */
+            if (g_warned_bucket_ovf < 8)
                 runlog_warn("  side %d: bucket array OVERFLOWED by %u records"
                             " -- slab skipped%s", side, hov,
-                            ++warned == 8 ? " (further overflows summarised"
-                                            " at end of band)" : "");
+                            ++g_warned_bucket_ovf == 8
+                                ? " (further overflows summarised"
+                                  " at end of band)" : "");
             else
-                warned++;
+                g_warned_bucket_ovf++;
             rc = 1;
             goto done;
         }
@@ -1166,8 +1224,9 @@ static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
 
     CK(cudaMemcpy(&hflags, C->d_flags, 4, cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(&hovf, C->d_ovf, 8, cudaMemcpyDeviceToHost));
-    /* Both of these are SOFT (return 1): they say this slab's trial division
-     * is untrustworthy, not that the device or the run is broken. They are
+    /* The TRUNCATED LIST is SOFT (return 1): it says this slab's trial
+     * division is untrustworthy, not that the device or the run is broken.
+     * Norm overflow, immediately below, is NOT -- see its own note. It is
      * tested here, before the caller emits anything, so skipping the slab
      * means no incomplete or wrong record ever reaches the relation file --
      * the cost is the slab's yield. Under BOINC that is the difference
@@ -1175,20 +1234,54 @@ static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
      * nothing at all. Rate-limited for the same reason as the bucket
      * overflow: stderr is uploaded.
      *
-     * Note these two usually mean a MISCONFIGURED job (mfb too generous,
-     * PIPE_K too small) rather than a transient, so a run that trips them on
-     * every slab now yields almost nothing instead of erroring. The
-     * end-of-band counters are what make that visible; do not remove them. */
+     * A truncated list usually means a MISCONFIGURED job (PIPE_K too small)
+     * rather than a transient, so a run that trips it on every slab now
+     * yields almost nothing instead of erroring. The end-of-band counters are
+     * what make that visible; do not remove them. */
+
+    /* NORM OVERFLOW IS FATAL, DELIBERATELY, AND WAS BRIEFLY NOT.
+     *
+     * It is not a condition a well-formed run can reach, so softening it did
+     * not buy robustness -- it converted a broken invariant into a silent
+     * yield loss. pipe_side_prepare_q already refuses any (q,rho) whose norm
+     * bound does not fit: norm_fits_exact tests
+     * norm_exact_bound_bits == log2M + log2(deg+1), evaluated per side per q
+     * over the FULL J, and PIPE_Q_SKIP passes the q over before it is ever
+     * sieved. So by the time k_td runs, the exact norm of every cell in this
+     * q has been PROVEN to fit.
+     *
+     * That proof reaches the intermediates too, which is what actually
+     * matters here, because the flag is raised by bn_mul_u64/bns_addmag
+     * mid-Horner rather than by the finished norm. Each term is built as c_k,
+     * then multiplied by |a| k times and by |b| (deg-k) times, so with
+     * |b| >= 1 every partial product divides the finished term and is <= it;
+     * and every magnitude partial sum is a sum of at most deg+1 terms each
+     * <= M, hence <= (deg+1)*M, which is the bound itself.
+     *
+     * THE ONE GAP, stated because it is real: |b| == 0 breaks that chain,
+     * since the multiply by zero comes last and the intermediate |c_k|*|a|^k
+     * is formed first. It is a single known lattice point, (i,j) == (0,1)
+     * with a == q (see k_classify's COF_DEGENERATE comment), so at most one
+     * survivor per q; its intermediates are smaller than the |c_deg|*q^deg
+     * term the bound already covers by a factor of q per degree; and
+     * k_classify discards it on B[t] == 0 without reading the norm. Closing
+     * the gap formally would mean skipping the norm block for b == 0, which
+     * is not worth leaving `cof` undefined for a downstream reader.
+     *
+     * So if this fires, the bound is wrong -- and a wrong norm bound is
+     * exactly what BN_LIMBS and normscan exist to catch. Skipping the slab
+     * would hide it. */
     if (hflags & TDF_NORM_OVERFLOW) {
-        static int warned;
-        if (warned++ < 4)
-            runlog_warn("  ** NORM OVERFLOW: a norm exceeded %d bits"
-                        " -- slab skipped", BN_LIMBS * 32);
-        return 1;
+        runlog_warn("  ** NORM OVERFLOW: a norm exceeded %d bits during trial"
+                    " division, but pipe_side_prepare_q proved this q's bound"
+                    " fits. That is a BROKEN INVARIANT, not a job that needs"
+                    " tuning: the norm width bound is wrong, or this q reached"
+                    " k_td without being screened. Run ./normscan over the"
+                    " band and report the (q,rho).", BN_LIMBS * 32);
+        return -1;
     }
     if (hflags & TDF_LIST_TRUNCATED) {
-        static int warned;
-        if (warned++ < 4)
+        if (g_warned_td_trunc++ < 4)      /* file scope: see bucket overflow */
             runlog_warn("  ** %llu large-prime records past the %u/survivor"
                         " cap -- slab skipped", hovf, PIPE_K);
         return 1;
@@ -1476,6 +1569,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
      * commit. capped: that stop was PIPE_SKIP_MAX, which is a different thing
      * to tell a job queue -- rerunning the same binary cannot help. */
     int stopped = 0, capped = 0, ckpt_armed = 0, ckpt_written = 0, ckpt_warned = 0;
+    int degraded = 0;               /* PIPE_LOST_MAX/PIPE_SLAB_SKIP_MAX tripped */
     int stop_hooked = 0;
 
     /* A file static, so a second band in one process would inherit the first
@@ -1689,8 +1783,14 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         }
     }
     /* Only meaningful once there is a relation file to point at. */
+    /* Unconditional, NOT under `if (fr)`. pipe_checkpoint returns 0 -- success
+     * -- at its own `if (!fr || !cfg->relations)` guard, so pipe_try_checkpoint
+     * sets ckpt_written even when nothing was written, and the terminal-status
+     * messages below then format ck.nrel/ck.next_q. With ck left indeterminate
+     * that is undefined behaviour, reachable by any policy stop in a run with
+     * no --relations (i.e. plain benchmarking). Zeroing costs nothing. */
+    memset(&ck, 0, sizeof ck);
     if (fr) {
-        memset(&ck, 0, sizeof ck);
         ckpt_fingerprint(POLY, cfg, ck.fp);
         /* --resume starts from an existing valid sidecar; preserve the .part
          * even if this session fails before advancing the checkpoint. */
@@ -1749,6 +1849,26 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         float ts1[3] = {0,0,0}, ts0[3] = {0,0,0}, tis = 0;
         double th1 = 0, th0 = 0, qwall = host_ms(), tv = 0;
         double hspan0 = 0, hreg = 0, prologue_q = 0;
+        /* Per-q locals for the same reason prologue_q is one: the
+         * report divides every region by N == nqdone, so a q that is
+         * abandoned before the accumulation block must contribute to
+         * NEITHER side of that ratio. Charged straight into the
+         * accumulators, they were added by lost q that never reached
+         * nqdone++, inflating exactly these three lines against an
+         * honest acc_qspan/acc_hspan and silently breaking the
+         * region-sum reconciliation -- the hazard the comment at the
+         * accumulation block names for the prologue. */
+        double prep_q = 0, tdprep_q = 0, slab_q = 0;
+        /* Same rule as prep_q/tdprep_q/slab_q, but these two cannot be
+         * localised the same way: acc_td is charged per SLAB inside the loop,
+         * and pipe_td_perq adds into tm several levels down. Snapshot and roll
+         * back instead, on the one path that abandons a q after charging them
+         * -- the all-slabs-skipped `continue` below, which does not increment
+         * nqdone. Left alone, `acc_td / N` and the tm-derived `dev` divide a
+         * numerator that includes lost q by a denominator that excludes them,
+         * and the `unaccounted` residual can go negative. */
+        const double     acc_td_q0 = acc_td;
+        const pipe_tm_t  tm_q0     = tm;
         if (cfg->qspan) { hspan0 = host_ms(); PIPE_CK(cudaEventRecord(qspan0)); }
         uint32_t hn = 0, nacc = 0, ncand = 0, nrel = 0;
         uint64_t side_surv1 = 0, side_surv0 = 0;
@@ -1835,6 +1955,68 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             pipe_try_checkpoint(POLY, cfg, &ck, fr, fc, cur,
                                 base_rel + Q.nrel, base_nq + nqdone,
                                 &ckpt_written, &ckpt_warned);
+
+        /* ---- degradation ceiling ----
+         *
+         * A POLICY STOP, exactly like the norm-width cap above and for the
+         * same reason. The per-slab soft skips trade yield for keeping the
+         * band alive, which is right for a transient; past a point a band
+         * that keeps making that trade has stopped doing the work it was
+         * given, and nothing else will say so -- skipping is designed not to
+         * fail the task, so the alternative is exiting 0 having emitted
+         * almost nothing.
+         *
+         * Checked HERE, at the top of a q with no work done for it, because
+         * that makes `cur` exactly the resume point and because the previous
+         * q's ev[4] synchronise has already drained the stream. Checking it
+         * mid-slab-loop would checkpoint a partial q.
+         *
+         * It drains and checkpoints -- every relation already earned is valid
+         * and is kept -- but reports PIPE_RC_DEGRADED, so the exit status
+         * says the band as a whole is not creditable. Draining is what this
+         * shares with a clean stop; "the work unit succeeded" is not. See
+         * BENCH_EXIT_DEGRADED in bench.h. */
+        if (nq_lost >= (unsigned long long)PIPE_LOST_MAX ||
+            nslab_skipped >= (unsigned long long)PIPE_SLAB_SKIP_MAX) {
+            runlog_warn("  ** stopping at q=%llu: %llu slab(s) skipped and"
+                        " %llu special-q lost entirely (limits %d slab / %d"
+                        " q). The band ran, but its yield no longer means"
+                        " anything. %s Relations already written are kept and"
+                        " are valid.",
+                        (unsigned long long)cur->q, nslab_skipped, nq_lost,
+                        PIPE_SLAB_SKIP_MAX, PIPE_LOST_MAX,
+                        /* Which remedy to name follows the MAJORITY, not
+                         * the mere presence of a trial-division skip: one
+                         * truncated list among a thousand bucket overflows
+                         * used to print the PIPE_K advice and steer the
+                         * operator away from the actual cause. Norm overflow
+                         * is fatal now, so a TD skip can only be a truncated
+                         * list -- a PIPE_K/mfb problem, never a bucket one. */
+                        ntd_skipped * 2 >= nslab_skipped
+                          ? "Mostly trial-division skips: the large-prime list"
+                            " ran past PIPE_K per survivor, so check mfb and"
+                            " PIPE_K rather than the bucket array."
+                          : "Mostly bucket overflow: check this job's bucket"
+                            " array size first (the counts above separate the"
+                            " two).");
+            if (cfg->cofactor && Q.n &&
+                cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
+                           cfg->cof_rounds, cfg->cof_budget, blocks,
+                           cfg->threads, fr)) { rc = -1; break; }
+            /* Guarded on fr like the clean stop above, not unguarded like
+             * the norm-width cap: without a relation file there is nothing to
+             * checkpoint, and letting ckpt_written be set anyway would print a
+             * "resume at q=" line naming a .part that does not exist. */
+            if (fr)
+                pipe_try_checkpoint(POLY, cfg, &ck, fr, fc, cur,
+                                    base_rel + (cfg->cofactor ? Q.nrel
+                                        : (unsigned long long)acc_rel),
+                                    base_nq + nqdone, &ckpt_written,
+                                    &ckpt_warned);
+            stopped = 1;
+            degraded = 1;
+            break;
+        }
 
         /* ---- clean stop ----
          *
@@ -1948,7 +2130,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 }
                 continue;              /* next q; nqdone is not incremented */
             }
-            if (cfg->qspan) { acc_prep += host_ms() - hreg; hreg = host_ms(); }
+            if (cfg->qspan) { prep_q   = host_ms() - hreg; hreg = host_ms(); }
             wd_phase("q.td_prepare");
             if (p1 < 0 || p0 < 0 || pipe_td_prepare_q(&C, fbs1, fbs0, &Lq, cfg, &tm)) {
                 rc = -1; break;
@@ -1962,8 +2144,26 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         /* Only the area-dependent part lives inside this loop. For
          * SLABBED=false slab_plan has exactly one entry and if constexpr
          * removes every continuation-state operation from device code. */
-        if (cfg->qspan) { acc_tdprep += host_ms() - hreg; hreg = host_ms(); }
+        if (cfg->qspan) { tdprep_q = host_ms() - hreg; hreg = host_ms(); }
         uint32_t nslab_skipped_q = 0;   /* soft-skipped slabs, THIS q */
+        /* The per-q continuation advance, factored out because THREE paths
+         * must run it and one of them is a skip: the ordinary end of the slab
+         * loop, and the trial-division skip that keeps going. Returns -1 on a
+         * device failure. Skipping it leaves the next slab reading the
+         * previous slab's walk positions against its own j_base. */
+        auto advance_slab = [&](uint32_t sl, uint32_t rows) -> int {
+            if constexpr (SLABBED) {
+                if (sl + 1 < slab_plan->nslab) {
+                    if (pipe_td_advance_small(&C, rows, blocks, cfg->threads))
+                        return -1;
+                    std::swap(S1.walk_cur, S1.walk_next);
+                    std::swap(S0.walk_cur, S0.walk_next);
+                }
+            } else {
+                (void)sl; (void)rows;
+            }
+            return 0;
+        };
         for (uint32_t slab = 0; slab < slab_plan->nslab; slab++) {
             wd_slab(slab, slab_plan->nslab);
             const uint32_t j_base = slab_jbase_at(slab_plan, slab);
@@ -1991,11 +2191,29 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             if (sv1 < 0 || sv0 < 0) { rc = -1; break; }
             if (sv1 > 0 || sv0 > 0) {
                 /* Skipped BEFORE the intersect/TD/emit below, so nothing from
-                 * this slab reaches the relation file: the cost is yield on
-                 * this slab only, never a wrong record. */
-                nslab_skipped++;
-                nslab_skipped_q++;
-                continue;
+                 * this slab reaches the relation file: never a wrong record.
+                 *
+                 * BREAK, NOT CONTINUE, and that is a correctness requirement
+                 * rather than a policy choice. Under SLABBED the bottom of
+                 * this loop advances the per-q continuation state -- the
+                 * k_tdsmall_advance origin and both sides' walk_cur/walk_next
+                 * swap -- and a `continue` jumps straight over it. Every
+                 * LATER slab of this q would then sieve with the previous
+                 * slab's walk positions against its own j_base: wrong log
+                 * sums, wrong survivors, and a trial division one slab out of
+                 * step, which can leave a composite in the cofactor and emit
+                 * it as a large prime. Skipping a slab is a yield loss;
+                 * carrying stale state into the next one is a bad relation.
+                 *
+                 * Advancing the state here instead does NOT work: side 0's
+                 * fill never ran (`sv0 = sv1 ? 0 : ...` short-circuits), so
+                 * S0.walk_next holds the PREVIOUS slab's output and there is
+                 * nothing correct to swap in. Abandoning the rest of the q is
+                 * the cheap, obviously-correct repair; slabs already emitted
+                 * above keep their relations. */
+                nslab_skipped   += slab_plan->nslab - slab;
+                nslab_skipped_q += slab_plan->nslab - slab;
+                break;
             }
             ts1[1] += sf1; ts1[2] += sa1;
             ts0[1] += sf0; ts0[2] += sa0;
@@ -2035,8 +2253,27 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                                           &n, &nacc_s, &tm, &tv, want_host,
                                           !want_host, cofgate_found);
                 if (tdrc < 0) { rc = -1; break; }
-                if (tdrc > 0) {         /* untrustworthy TD: drop this slab */
-                    nslab_skipped++; nslab_skipped_q++; ntd_skipped++;
+                if (tdrc > 0) {
+                    /* Untrustworthy TD: drop THIS slab only and carry on.
+                     *
+                     * Unlike the bucket-overflow skip above, the continuation
+                     * state here is intact and can simply be advanced. That
+                     * skip has to abandon the whole q because side 0's fill
+                     * never ran (`sv0 = sv1 ? 0 : ...` short-circuits), so
+                     * S0.walk_next holds the PREVIOUS slab's output and there
+                     * is nothing correct to swap in. Reaching HERE means
+                     * sv1 == sv0 == 0: both k_fill_atomic launches completed
+                     * and both walk_next buffers are current, so the ordinary
+                     * end-of-loop advance is exactly right and the remaining
+                     * slabs keep their yield.
+                     *
+                     * What must NOT happen is a bare `continue`, which would
+                     * skip that advance and leave every later slab a step out
+                     * of date against its own j_base. */
+                    if (advance_slab(slab, J_here)) { rc = -1; break; }
+                    ntd_skipped++;
+                    nslab_skipped++;
+                    nslab_skipped_q++;
                     continue;
                 }
                 if (nqdone == 0 && cfg->td_verify && !td_verified && hn_s != 0)
@@ -2152,29 +2389,31 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             tm.join += host_ms() - join_start;
             if (rc) break;
 
-            if constexpr (SLABBED) {
-                if (slab + 1 < slab_plan->nslab) {
-                    if (pipe_td_advance_small(&C, J_here, blocks,
-                                              cfg->threads)) {
-                        rc = -1; break;
-                    }
-                    std::swap(S1.walk_cur, S1.walk_next);
-                    std::swap(S0.walk_cur, S0.walk_next);
-                }
-            }
+            if (advance_slab(slab, J_here)) { rc = -1; break; }
         }
-        if (cfg->qspan) { acc_slab += host_ms() - hreg; hreg = host_ms(); }
+        if (cfg->qspan) { slab_q   = host_ms() - hreg; hreg = host_ms(); }
         if (rc) break;
         /* Deferred from pipe_side_prepare_q, which no longer blocks on the
-         * transform. The slab loop above ended with cudaEventSynchronize on
-         * each side's ev[3], and ev[4] precedes ev[3] in stream order, so both
-         * are complete here. Same events, same subtraction, same reported
-         * number -- only the moment of reading moved. */
-        /* These synchronise on events the slab loop's ev[3] has already
-         * covered, so they are no-ops costing microseconds -- but they make
-         * the read structurally safe instead of dependent on a guarantee
-         * established in another function. time_kernel discards
-         * cudaEventElapsedTime's status (bench_kernels.cu:869), so a
+         * transform. Same events, same subtraction, same reported number --
+         * only the moment of reading moved.
+         *
+         * This USED to argue that the slab loop above always ended with a
+         * cudaEventSynchronize on each side's ev[3], so ev[4] (earlier in
+         * stream order) was complete for free. That argument is DEAD: a slab
+         * that soft-skips on side 1 short-circuits side 0 entirely
+         * (`sv1 ? 0 : pipe_side_sieve_slab(...)`), so S0.ev[3] is not
+         * recorded for that slab, and a q whose every slab skips that way
+         * reaches here having never synchronised side 0 at all. The explicit
+         * ev[4] synchronises below are what make this safe now -- they are
+         * load-bearing, not the belt-and-braces the next comment calls them.
+         * Do not reinstate the ev[3] reasoning. */
+        /* On the ordinary path the slab loop's ev[3] has already covered
+         * these, so they cost microseconds; on the all-slabs-skipped path
+         * above they are the ONLY thing that drains side 0. Either way they
+         * make the read structurally safe rather than dependent on a
+         * guarantee established in another function. time_kernel discards
+         * cudaEventElapsedTime's status (see time_kernel in
+         * bench_kernels.cu), so a
          * not-ready event would silently report 0 ms AND latch
          * cudaErrorNotReady for the next unrelated cudaGetLastError to
          * report as fatal. Do not remove these to save the microseconds. */
@@ -2196,6 +2435,11 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 rc = -1; break;
             }
             nq_lost++;
+            /* Roll back the two accumulators this q already charged; every
+             * other region timer is either held in a local above or added
+             * after this point. */
+            acc_td = acc_td_q0;
+            tm     = tm_q0;
             continue;              /* next q; nqdone is not incremented */
         }
         if (nqdone == 0 && cfg->cofgate &&
@@ -2236,6 +2480,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
              * timer accumulates here too, and N is nqdone. Charging a SKIPPED
              * q's prologue would break the reconciliation silently. */
             acc_prologue += prologue_q;
+            acc_prep     += prep_q;
+            acc_tdprep   += tdprep_q;
+            acc_slab     += slab_q;
             PIPE_CK(cudaEventSynchronize(qspan1));
             acc_qspan += time_kernel(qspan0, qspan1);
         }
@@ -2611,21 +2858,6 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                    fb_ / 1073741824.0);
         }
     }
-    /* Always reported, success or failure, and to the log rather than stdout:
-     * under BOINC stdout dies with the slot directory, and a task that
-     * silently yielded less than it should have is exactly what a validator
-     * operator needs to see. */
-    if (nslab_skipped)
-        runlog_warn("  %llu slab(s) skipped on bucket overflow -- this band's"
-                    " yield is short by whatever those slabs held", nslab_skipped);
-    if (ntd_skipped)
-        runlog_warn("  of those, %llu were dropped for untrustworthy trial"
-                    " division (norm overflow or truncated factor list),"
-                    " which usually means mfb or PIPE_K needs attention",
-                    ntd_skipped);
-    if (nq_lost)
-        runlog_warn("  %llu special-q produced nothing because every slab of"
-                    " them was skipped", nq_lost);
     if (rc) {
         const char *fate = ckpt_written
             ? "the .part is kept; rerun the same command to resume"
@@ -2664,6 +2896,28 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                     " about %d skips into any rerun and emits nothing.",
                     nqdone, base_nq + nqdone, ck.nrel,
                     (unsigned long long)ck.next_q, PIPE_SKIP_MAX);
+    else if (degraded && !fr)
+        /* No --relations at all: nothing was written and nothing was meant to
+         * be, so this is not the "cannot resume" error below. Said plainly
+         * because this is the benchmarking path, where the number the operator
+         * came for is the one the skipping just invalidated. */
+        runlog_warn("\n  stopped after %u q with no relation file requested;"
+                    " nothing to resume. The timings from this band are NOT"
+                    " usable -- it skipped its way to the ceiling.", nqdone);
+    else if (degraded && ckpt_written)
+        /* Same checkpoint, same "opposite advice" trap as the cap above. Both
+         * ceilings reset on resume, so "rerun the same command" would sieve
+         * another PIPE_LOST_MAX q (or PIPE_SLAB_SKIP_MAX slabs) into the same
+         * wall and stop again, forever. The resume point is still real and a
+         * rerun with the job FIXED should start from it. */
+        runlog_warn("\n  stopped after %u q this session (%llu total, %llu"
+                    " relations); checkpoint written, resume at q=%llu. FIX"
+                    " THE JOB BEFORE RESUMING: both ceilings reset on resume,"
+                    " so an unchanged rerun stops again about %d lost q or %d"
+                    " skipped slabs later.",
+                    nqdone, base_nq + nqdone, ck.nrel,
+                    (unsigned long long)ck.next_q,
+                    PIPE_LOST_MAX, PIPE_SLAB_SKIP_MAX);
     else if (stopped && ckpt_written)
         printf("\n  stopped after %u q this session (%llu total, %llu"
                " relations). Rerun the same command to resume at q=%llu.\n",
@@ -2954,6 +3208,32 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
 
 #undef PIPE_CK
 done:
+    /* BELOW `done:`, not above it, so "always reported" is literally true.
+     * Every PIPE_CK failure is `rc = -1; goto done`, so sited above this label
+     * the whole summary was skipped by exactly the runs that most need it: a
+     * band that soft-skipped 400 slabs and then died on a cudaMemcpy reported
+     * "band FAILED" with no hint that the yield had already gone, which is
+     * the difference between "transient device fault" and "the bucket array
+     * was undersized the whole time".
+     *
+     * To the log rather than stdout: under BOINC stdout dies with the slot
+     * directory, and a task that silently yielded less than it should have is
+     * exactly what a validator operator needs to see. */
+    if (nslab_skipped)
+        runlog_warn("  %llu slab(s) skipped or abandoned -- this band's yield"
+                    " is short by whatever those slabs held. (This total"
+                    " covers bucket overflow AND the trial-division causes"
+                    " below; a bucket overflow also abandons the remaining"
+                    " slabs of its special-q, which are counted here too.)",
+                    nslab_skipped);
+    if (ntd_skipped)
+        runlog_warn("  of those, %llu were single slabs dropped for a"
+                    " large-prime list truncated past PIPE_K per survivor,"
+                    " which usually means mfb or PIPE_K needs attention",
+                    ntd_skipped);
+    if (nq_lost)
+        runlog_warn("  %llu special-q produced nothing because every slab of"
+                    " them was skipped", nq_lost);
     if (stop_hooked) bench_stop_hook_remove();
     /* CUDA failures can jump here from any stage. Normal completion already
      * finalized exactly once above; an early jump closes and discards here --
@@ -2980,9 +3260,35 @@ done:
      * A stop with no checkpoint is a FAILURE, not a stop: there is nothing to
      * resume, so calling it resumable is what would make a client restart it
      * forever. See `enum bench_outcome` in bench.h. */
+    /* The ceiling is deliberately NOT re-tested here. By this point a band
+     * that left the loop any way other than the loop-top stop has FINISHED:
+     * `commit` above renamed the .part onto the final --relations name and
+     * removed the checkpoint sidecars. Reporting DEGRADED then would tell a
+     * BOINC client to record an application error for a complete work unit
+     * whose resume state has already been deleted, and would contradict the
+     * one thing exit 5 promises -- that the relations are waiting in the
+     * .part. A band that finishes under its own steam is a success with loud
+     * warnings (see the end-of-band summary above), not an error.
+     *
+     * The cost is the documented hole: a band whose LAST q crosses a limit
+     * exits 0. That is the same hole PIPE_SKIP_MAX has, and for the same
+     * reason -- these counters are a backstop, not the primary defence.
+     *
+     * `degraded` is tested before `stopped` because both are set together by
+     * the ceiling; it carries ckpt_written for the same reason `stopped`
+     * does, since a stop with nothing to resume from is a failure however it
+     * was reached. */
     if (rc == 0) {
-        if (capped)       rc = PIPE_RC_UNSUPPORTED;
-        else if (stopped) rc = ckpt_written ? PIPE_RC_STOPPED : PIPE_RC_FAIL;
+        if (capped)         rc = PIPE_RC_UNSUPPORTED;
+        /* `!fr` is NOT the no-checkpoint failure: with no --relations there was
+         * never any output to resume, which is the plain benchmarking case the
+         * ceiling exists to serve -- a degraded band there must still report
+         * DEGRADED so the rate is not read as a slow card. Only a run that
+         * HAS a relation file and could not checkpoint it is unresumable, and
+         * that is the failure. */
+        else if (degraded)  rc = (!fr || ckpt_written) ? PIPE_RC_DEGRADED
+                                                       : PIPE_RC_FAIL;
+        else if (stopped)   rc = ckpt_written ? PIPE_RC_STOPPED : PIPE_RC_FAIL;
     }
     return rc;
 }

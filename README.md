@@ -39,9 +39,11 @@ in [Current size limits and j-slabbing](bench/STATUS.md#current-size-limits-and-
 ECM stage 2 (`mz_ecm_stage2_pass`) holds its baby steps on a **shared
 denominator** rather than one per point: `bx[k] = X_k * prod_{j!=k} Z_j`
 against a single `bz = prod_j Z_j`, so `(bx[k] : bz)` is still the same
-projective point `(X_k : Z_k)` was, just rescaled by a common nonzero factor
--- which cannot change `gcd(d, n)`, so the factors found are provably
-identical. The payoff is in the inner loop: with one denominator, the
+projective point `(X_k : Z_k)` was, just rescaled by `prod_{j!=k} Z_j`. Every
+cross product below is therefore the old one scaled by that factor; what this
+does to `gcd(d, n)` is spelled out at the end of this paragraph, and it is
+weaker than "unchanged". The payoff is in the inner loop: with one
+denominator, the
 `X_G * Z` term is common to every selected `k` and hoists out, turning two
 multiplies per pair into one (roughly 540 fewer `mz_mul` per curve at
 `B1=200`/`B2=6000`). This started as an AMD-side discovery (RDNA has no

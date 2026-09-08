@@ -399,7 +399,8 @@ enum bench_outcome {
     BENCH_OUTCOME_OK = 0,       /* band finished; output committed          */
     BENCH_OUTCOME_FAILED,       /* error, usage rejection, or unresumable   */
     BENCH_OUTCOME_STOPPED,      /* signal stop: drained AND checkpointed    */
-    BENCH_OUTCOME_UNSUPPORTED   /* norm wider than this BN_LIMBS carries    */
+    BENCH_OUTCOME_UNSUPPORTED,  /* norm wider than this BN_LIMBS carries    */
+    BENCH_OUTCOME_DEGRADED      /* ran, but skipped so much it is not work  */
 };
 
 /* Process exit status for BENCH_OUTCOME_UNSUPPORTED. Distinct from 1 and 2,
@@ -418,6 +419,30 @@ enum bench_outcome {
  * the normal way. Losing the q in flight is the price of not holding a lease
  * on a card that has stopped answering. */
 #define BENCH_EXIT_STALLED 4
+
+/* Process exit status when the band RAN but skipped so many slabs, or lost so
+ * many whole special-q, that its yield can no longer be trusted to mean
+ * anything. Distinct from 1 (the band failed) because the output that IS here
+ * is valid and kept; distinct from 3 because rebuilding wider will not fix it;
+ * distinct from 4 because the card was fine.
+ *
+ * This exists because the per-slab soft-skip is a yield/robustness trade, and
+ * one direction of that trade is silent by construction: skipping is designed
+ * NOT to fail the task, so a job whose bucket array is too small, or whose
+ * mfb/PIPE_K let the large-prime list run past its per-survivor cap, returns
+ * a fraction of the relations it should and still exits 0. (Norm overflow is
+ * NOT in that set: prepare_q proves the width up front, so a norm too wide
+ * for BN_LIMBS skips the whole q and ends at exit 3, and an overflow reaching
+ * trial division is a broken invariant and fatal.) On a volunteer's box that is the
+ * right call for a one-record shortfall. As a *measurement* it is a trap -- a
+ * rate computed from a degraded band looks like a slow card rather than a
+ * misconfigured job -- and past some threshold it is not the right call for a
+ * work unit either. See PIPE_SLAB_SKIP_MAX / PIPE_LOST_MAX in pipeline.cuh.
+ *
+ * Like the norm-width cap, reaching this DRAINS AND CHECKPOINTS first: the
+ * relations already earned are still written and still valid. Only the exit
+ * status says the band is not worth crediting as a whole. */
+#define BENCH_EXIT_DEGRADED 5
 
 /* ---- optional BOINC integration -------------------------------------- */
 
@@ -920,7 +945,9 @@ enum {
     PIPE_RC_STOPPED     =  2,  /* signal/stop file: drained + checkpointed */
     /* NOT an independent 3: bench_main.cu maps this straight onto the exit
      * status, and two constants that must stay equal will not. */
-    PIPE_RC_UNSUPPORTED = BENCH_EXIT_UNSUPPORTED
+    PIPE_RC_UNSUPPORTED = BENCH_EXIT_UNSUPPORTED,
+    /* Same reasoning, same rule: not an independent 5. */
+    PIPE_RC_DEGRADED    = BENCH_EXIT_DEGRADED
 };
 
 int run_pipeline(const fb_t *fb1, const fb_t *fbs1,

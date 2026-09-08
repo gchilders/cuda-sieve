@@ -124,41 +124,120 @@ TD_MOD_HD uint32_t td_mod_magic(uint32_t w, uint32_t m,
  * `rt*j + (p << SS_KSHIFT(logI)) - ilo` on the device and ss_magic_build
  * proves that expression stays below 2^31 on the host; if the two ever
  * disagree the residues are silently wrong, so both sides derive it here
- * rather than open-coding `logI - 2`. */
+ * rather than open-coding `logI - 2`.
+ *
+ * The bias must be (a) a multiple of m, so it does not move the residue, and
+ * (b) >= ihalf == 1<<(logI-1), so the numerator cannot go negative. `m << s`
+ * satisfies (a) for ANY s, and logI-2 is the smallest shift that satisfies
+ * (b) for the WORST case m == 2.
+ *
+ * A PER-M SHIFT WAS TRIED AND REJECTED, on measurement. `(logI-1) -
+ * floor(log2 m)` is the smallest shift that works for each individual m, and
+ * since the bias is part of the very numerator this function has to prove
+ * below 2^31, shrinking it buys magic coverage: over the primes below
+ * bkthresh at the default geometry, the flat shift refuses 0% at logI 15 but
+ * 30.4% at logI 16 and 80.0% at logI 17, while the per-m shift refuses none
+ * at logI 16. floor(log2 m) is even free on the device -- ss_first computes
+ * `31 - __clz(p)` anyway as td_mod_magic's shift.
+ *
+ * It still lost. The refused entries are the LARGEST small primes, which hit
+ * rarest (~1.4% of updates at logI 16 by Mertens, against 30% of table
+ * entries), so the coverage recovered is worth little -- while the two extra
+ * ALU ops to derive the shift run on EVERY small-prime hit. Measured on an
+ * RTX 5070, apply stage, oracle/c183, n=4 interleaved, arms non-overlapping
+ * in both directions:
+ *
+ *   logI 15   flat 28.09 ms   per-m 28.52 ms    per-m is 1.5% SLOWER
+ *   logI 16   flat 117.65 ms  per-m 116.96 ms   per-m is 0.6% faster
+ *
+ * logI 14/15 is the operating point, so the flat shift wins where it counts.
+ * Having both would need either a per-hit select (which costs about what it
+ * saves) or sieve_small's tier loops duplicated under a kernel-uniform
+ * branch, which is real code bloat in a kernel whose occupancy is already
+ * smem-bound. If logI 16 ever becomes the default geometry, revisit: the
+ * change is confined to this macro, ss_magic_build's kshift, and ss_first. */
 #define SS_KSHIFT(logI)  ((uint32_t)((logI) - 2))
 
 /* Returns 0 into *magic to mean "no magic, use ss_first's 64-bit fallback" --
  * for m == 1, and, more importantly, whenever the numerator cannot be PROVEN
- * below 2^31, which is the exactness bound on td_mod_magic above. kshift is
- * SS_KSHIFT(logI) and ihalf is 1 << (logI-1).
+ * below 2^31, which is the exactness bound on td_mod_magic above.
+ *
+ * Takes logI rather than a precomputed shift ON PURPOSE: the shift is per-m
+ * now, and a caller that derived it even slightly differently from the device
+ * would produce silently wrong residues. There is nothing here for a caller
+ * to get wrong.
+ *
+ * jmax is the largest j the DEVICE will pass for this entry, which is not
+ * always cfg->J: an entry with a row divisor g > 1 hits only on rows g | j
+ * and is handed j/g, so its jmax is J/g. Passing the smaller bound is not an
+ * optimisation of the proof, it is the honest value, and it widens coverage.
  *
  * Refusing rather than assuming matters: --bkthresh and --J are both operator
  * knobs, so m*jmax is not bounded by anything this header controls, and
- * neither is m<<kshift. A silent wrong residue here would corrupt relations,
+ * neither is the bias. A silent wrong residue here would corrupt relations,
  * not crash. The bound below is computed in 64-bit against the exact
  * expression ss_first evaluates, so it stays honest if either knob is pushed.
  *
  * Powers of two keep a non-zero magic even though ss_first ignores it for
  * them and uses an AND instead: it is the "bounds proved, take the fast path"
  * flag. m == 1 is refused here and answered by the fallback (t % 1 == 0). */
-static inline void ss_magic_build(uint32_t m, uint32_t jmax, uint32_t kshift,
-                                  uint32_t ihalf, uint32_t *magic)
+static inline void ss_magic_build(uint32_t m, uint32_t jmax, uint32_t logI,
+                                  uint32_t *magic)
 {
-    uint32_t mg, sh;
+    uint32_t mg, sh, kshift, ihalf;
+    /* sh is filled by td_magic_build and deliberately DISCARDED: ss_first
+     * recomputes the same value on device as 31 - __clz(p), which it needs
+     * anyway. That is only correct because td_magic_build's general case sets
+     * sh == floor(log2 m), and its power-of-two case (sh == 0) is diverted to
+     * ss_first's AND branch and never reaches td_mod_magic. Assert the first
+     * half here so a change to that convention cannot silently desynchronise
+     * the device. */
     uint64_t bias, wmax;
 
     *magic = 0;
+    /* The header above claims there is nothing here for a caller to get
+     * wrong, and logI is the one input that could still do it: logI < 2 makes
+     * both `1u << (logI - 1)` and SS_KSHIFT's `logI - 2` enormous shift
+     * counts, which is undefined here AND in the `p << kshift` ss_first would
+     * then evaluate. bench_main.cu pins logI to [2,20] and is the ONLY place
+     * that does -- run_pipeline validates the slab plan but not logI -- so
+     * this refusal is the whole guard, not a second one. Refusing costs only
+     * the 64-bit fallback.
+     *
+     * It protects the MAGIC path only. ss_first's fallback hardcodes its bias
+     * as `p << 20`, which needs p<<20 >= 1<<(logI-1), i.e. logI <= 21 for the
+     * worst case p == 2; beyond that the fallback's numerator goes negative
+     * and wraps. Nothing reaches that today because main() caps logI at 20,
+     * but a second entry point that did not would get silently wrong offsets
+     * from the fallback, not from here. */
+    if (logI < 2 || logI > 20) return;
     if (m < 2) return;                     /* every position hits; fallback */
-    td_magic_build(m, &mg, &sh);
-    if (!mg) return;
 
+    /* THE BOUND IS TESTED BEFORE td_magic_build, not after, because it does
+     * not need the reciprocal: it depends only on m, jmax and logI. Building
+     * first meant every refused entry still paid td_magic_build's 64-bit
+     * divide to have its answer thrown away. Free at logI 15, where nothing
+     * is refused; at logI 17 roughly 80% of entries are refused and skip the
+     * divide entirely. */
+    ihalf  = 1u << (logI - 1);
+    kshift = SS_KSHIFT(logI);
     bias = (uint64_t)m << kshift;          /* a multiple of m, and >= ihalf */
-    if (bias < ihalf) return;              /* the p >= 2 argument, checked */
+    /* Guaranteed for m >= 2 (2 << (logI-2) == 1 << (logI-1)), and checked
+     * anyway: it is the property the whole unsigned-numerator argument rests
+     * on, and the m >= 2 guard above is what makes it true. */
+    if (bias < ihalf) return;
     /* Largest numerator the kernel can form: rt <= m-1, j <= jmax, and the
      * -ilo term contributes at most +ihalf. */
     wmax = (uint64_t)(m - 1) * jmax + bias + ihalf;
     if (wmax >= (1ull << 31)) return;      /* cannot prove exactness */
 
+    td_magic_build(m, &mg, &sh);
+    if (!mg) return;
+    if ((m & (m - 1)) != 0) {           /* general case: device uses 31-clz */
+        uint32_t lg = 0;
+        while ((1u << (lg + 1)) <= m) lg++;
+        if (sh != lg) return;           /* convention changed: refuse, fall back */
+    }
     *magic = mg;
 }
 
