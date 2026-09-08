@@ -242,12 +242,63 @@ __device__ __forceinline__ void ss_add(uint32_t *S, uint32_t c, uint32_t lp)
 
 /* First offset within [0,width) whose i is congruent to rt*j (mod p). */
 __device__ __forceinline__ uint32_t ss_first(uint32_t p, uint32_t rt,
-                                             uint32_t j, int32_t ilo)
+                                             uint32_t j, int32_t ilo,
+                                             uint32_t magic, uint32_t kshift)
 {
-    const int32_t base = (int32_t)(((uint64_t)rt * j) % p);   /* i mod p */
-    int32_t c = (base - ilo) % (int32_t)p;
-    return (uint32_t)(c < 0 ? c + (int32_t)p : c);
+    /* Magic path: no integer division at all, just __umulhi + shift + mad.
+     *
+     * ONE table lookup, not three. Only `magic` has to be stored -- it needs a
+     * 64-bit divide to build, so the host has to. The other two values used to
+     * be stored beside it and are now derived here for free, because the extra
+     * global loads cost more than the arithmetic they saved (measured: the
+     * three-value form left two thirds of the available win on the table,
+     * concentrated in the thread tier that has the fewest hits to amortize a
+     * load over):
+     *
+     *   bias  p << kshift, with kshift = SS_KSHIFT(logI) derived by the
+     *         caller from the same macro the host builds its bound against.
+     *         Any multiple of p
+     *         that is >= Ihalf will do -- it only has to make the numerator
+     *         non-negative without moving the residue -- and p >= 2 gives
+     *         p<<(logI-2) >= 2^(logI-1) == Ihalf. The stored "least multiple"
+     *         was never worth a load.
+     *   sh    floor(log2 p) == 31 - clz(p), one instruction.
+     *
+     * Powers of two take an AND instead: td_magic_build has to special-case
+     * them (their general-form magic would be 2^32, which does not fit), and
+     * the AND is cheaper than the reciprocal anyway. p == 1 never reaches this
+     * branch -- ss_magic_build refuses m < 2 outright, so it takes the
+     * fallback below (t % 1 == 0). Do not relax that guard on the theory that
+     * the AND covers p == 1: td_magic_build's power-of-two case would then
+     * evaluate 1u << 32, which is undefined.
+     *
+     * The uint32 arithmetic is exact because the true value is non-negative
+     * and < 2^31; the host refuses the magic (magic == 0) for any entry where
+     * it could not prove that, matching tdsmall_t's convention in td.cuh.
+     * td_mod_magic is exact only for dividends < 2^31, which is that bound. */
+    if (magic) {
+        const uint32_t w = rt * j + (p << kshift) - (uint32_t)ilo;
+        if ((p & (p - 1)) == 0) return w & (p - 1);
+        return td_mod_magic(w, p, magic, 31u - (uint32_t)__clz((int)p));
+    }
+    /* ONE reduction, not two. base == rt*j (mod p), so (base - ilo) mod p is
+     * just (rt*j - ilo) mod p -- the intermediate reduction to `base` buys
+     * nothing. The bias makes the numerator unsigned so the sign fixup goes
+     * too: p<<20 is a multiple of p (leaves the residue alone) and is >= 2^21
+     * for any p >= 2, while |ilo| <= 2^(logI-1) <= 2^19 because main() pins
+     * logI to [2,20]. No overflow: the uint32 product is < 2^64 and the bias
+     * is < 2^52 for any bkthresh a real job sets.
+     *
+     * Motivation is AMD-specific: there is no integer-divide instruction, so
+     * every % here is a software sequence. Removing one is removing real ALU
+     * work, not one op. */
+    const uint64_t t = (uint64_t)rt * j + ((uint64_t)p << 20) - (uint64_t)(int64_t)ilo;
+    return (uint32_t)(t % p);
 }
+
+/* ss_magic_build (the host side of the above) and SS_KSHIFT live in td.cuh,
+ * next to the td_magic_build they call -- shared by both builds rather than
+ * forked, and reachable from pipeline.cuh without depending on include order. */
 
 template <int CELLBITS, int ATOMIC, bool SLABBED = false>
 __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_region,
@@ -255,6 +306,7 @@ __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_regi
                             const uint32_t *__restrict srt,
                             const uint32_t *__restrict sg,
                             const uint16_t *__restrict slp,
+                            const uint32_t *__restrict smag,
                             uint32_t nsmall, uint32_t nblk, uint32_t nwrp,
                             uint32_t tid, uint32_t nth, uint32_t j_base)
 {
@@ -264,6 +316,9 @@ __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_regi
     uint32_t j = jlocal;
     if constexpr (SLABBED) j += j_base;
     const int32_t  ilo   = (int32_t)(x0 & ((1u << logI) - 1)) - (int32_t)(1u << (logI - 1));
+    /* Derived here, not plumbed in: the host proves its bound against
+     * SS_KSHIFT(logI) too, so both sides read the same definition. */
+    const uint32_t kshift = SS_KSHIFT(logI);
     const uint32_t warp = tid >> 5, lane = tid & 31, nwarps = nth >> 5;
 
     /* Every entry is (m, rt, g): hits this row only when g | j, and then at
@@ -274,7 +329,8 @@ __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_regi
             const uint32_t m = sp[e], g = sg[e], lp = slp[e];                 \
             if (g > 1 && (j % g)) break;                                      \
             {                                                                 \
-                const uint32_t c0 = ss_first(m, srt[e], g > 1 ? j / g : j, ilo); \
+                const uint32_t c0 = ss_first(m, srt[e], g > 1 ? j / g : j, ilo, \
+                                             smag ? smag[e] : 0u, kshift);     \
                 for (uint32_t c = c0 + (first) * m; c < width; c += (step) * m)\
                     ss_add<CELLBITS,ATOMIC>(S, c, lp);                        \
             }                                                                 \
@@ -405,6 +461,7 @@ void k_apply(const uint32_t *__restrict buckets,
                         uint32_t dbg_region,
                         const uint32_t *__restrict sp, const uint32_t *__restrict srt,
                         const uint32_t *__restrict sg, const uint16_t *__restrict slp,
+                        const uint32_t *__restrict smag,
                         uint32_t nsmall, uint32_t nblk, uint32_t nwrp,
                         uint32_t probe_x, uint32_t *__restrict probe_out,
                         uint32_t *__restrict survbits, int not_both_even,
@@ -523,6 +580,7 @@ report spurious cell mismatches. Pricing builds only, never for relations."
     /* ---- small primes: line-sieved straight into the same shared region ---- */
     if (nsmall)
         sieve_small<CELLBITS, ATOMIC, SLABBED>(S, b, logI, log_region, sp, srt, sg, slp,
+                                               smag,
                                                nsmall, nblk, nwrp, tid, nth, j_base);
 
     /* ---- apply ---- */
@@ -861,6 +919,7 @@ struct dev_bufs {
     uint32_t *nsurv, *probe;
     uint16_t *dbg;
     uint32_t *sp, *srt, *sg;
+    uint32_t *smag;
     uint16_t *slp;
     uint8_t  *dumpbuf;
     uint32_t *survbits;
@@ -2093,6 +2152,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
      * the tier boundaries are just two indices. ---- */
     uint32_t nsmall = 0, nblk = 0, nwrp = 0;
     uint32_t *hsp = NULL, *hsrt = NULL, *hsg = NULL; uint16_t *hslp = NULL;
+    uint32_t *hsmag = NULL;
     /* per-q HOST work, billed separately: it is invisible to cudaEvent timing
      * and Goal 1 is a claim about host demand. */
     double h_ms_transform = 0, h_ms_sort = 0, h_ms_xfer = 0;
@@ -2108,6 +2168,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
         CK(cudaHostAlloc((void **)&hsrt, (size_t)fbs->n * 4, cudaHostAllocDefault));
         CK(cudaHostAlloc((void **)&hslp, (size_t)fbs->n * 2, cudaHostAllocDefault));
         CK(cudaHostAlloc((void **)&hsg,  (size_t)fbs->n * 4, cudaHostAllocDefault));
+        CK(cudaHostAlloc((void **)&hsmag, (size_t)fbs->n * 4, cudaHostAllocDefault));
         h_ms_transform = host_ms();
         for (i = 0; i < fbs->n; i++) {
             uint32_t q = fbs->primes[i], r = fbs->roots[i], rt, g, m;
@@ -2159,8 +2220,17 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
         }
         h_ms_sort = host_ms() - h_ms_sort;
 
+        /* Reciprocals AFTER the sort: the key is the modulus itself, so
+         * building them earlier would mean permuting them too, for no gain. */
+        {
+            const uint32_t ihalf = 1u << (cfg->logI - 1);
+            for (i = 0; i < nsmall; i++)
+                ss_magic_build(hsp[i], cfg->J, SS_KSHIFT(cfg->logI), ihalf, &hsmag[i]);
+        }
+
         for (i = 0; i < nsmall && hsp[i] < SS_BLOCK_CUT; i++) nblk = i + 1;
         for (i = 0; i < nsmall && hsp[i] < SS_WARP_CUT;  i++) nwrp = i + 1;
+        CK(cudaMalloc(&D.smag, (size_t)nsmall * 4));
         CK(cudaMalloc(&D.sp,  (size_t)nsmall * 4));
         CK(cudaMalloc(&D.srt, (size_t)nsmall * 4));
         CK(cudaMalloc(&D.sg,  (size_t)nsmall * 4));
@@ -2175,6 +2245,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
         CK(cudaMemcpy(D.srt, hsrt, (size_t)nsmall * 4, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(D.sg,  hsg,  (size_t)nsmall * 4, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(D.slp, hslp, (size_t)nsmall * 2, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(D.smag, hsmag, (size_t)nsmall * 4, cudaMemcpyHostToDevice));
         CK(cudaDeviceSynchronize());
         h_ms_xfer = host_ms() - h_ms_xfer;
         {   double upd = 0; uint32_t xm = (1u << cfg->logI) * cfg->J;
@@ -2649,6 +2720,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                         N, CINIT, CINIT - BOUND, tconst, D.dumpbuf,            \
                         D.nsurv,                                               \
                         D.dbg, dbgreg, D.sp, D.srt, D.sg, D.slp,             \
+                        D.smag,                                               \
                         nsmall, nblk, nwrp, probe_x, D.probe,                  \
                         D.survbits, cfg->not_both_even, 0u);                   \
                 }                                                              \
@@ -3181,12 +3253,14 @@ after_apply:
     free(hslice); free(hlogp);
     if (hsp)  cudaFreeHost(hsp);
     if (hsrt) cudaFreeHost(hsrt);
+    if (hsmag) cudaFreeHost(hsmag);
     if (hsg)  cudaFreeHost(hsg);
     if (hslp) cudaFreeHost(hslp);
     cudaFree(D.primes); cudaFree(D.roots); cudaFree(D.plat); cudaFree(D.cursor);
     cudaFree(D.out); cudaFree(D.overflow); cudaFree(D.nproj); cudaFree(D.nlost);
     cudaFree(D.l1); cudaFree(D.l1cnt); cudaFree(D.slice); cudaFree(D.slice_logp);
     cudaFree(D.nsurv); cudaFree(D.dbg); cudaFree(D.probe);
+    cudaFree(D.smag);
     cudaFree(D.sp); cudaFree(D.srt); cudaFree(D.sg); cudaFree(D.slp); cudaFree(D.dumpbuf); cudaFree(D.survbits);
     return td_failed ? -1 : 0;
 }

@@ -18,6 +18,7 @@
 #ifndef CUDA_SIEVE_PIPELINE_CUH
 #define CUDA_SIEVE_PIPELINE_CUH
 
+#include "td.cuh"      /* ss_magic_build, SS_KSHIFT */
 #include "ckpt.h"
 #include "runlog.h"
 #include "watchdog.h"
@@ -163,6 +164,7 @@ typedef struct {
     uint32_t *survbits;
     uint16_t *slice, *slice_logp;
     uint32_t *sp, *srt, *sg;
+    uint32_t *smag;             /* ss_first reciprocals; see ss_magic_build */
     uint16_t *slp;
     uint32_t  nslice_pow2, nsmall, nblk, nwrp, nfb;
     size_t    apply_smem;
@@ -170,6 +172,7 @@ typedef struct {
     uint32_t  CINIT, BOUND, tconst, nsurv;
     /* persistent across special-q */
     uint32_t *hsp, *hsrt, *hsg; uint16_t *hslp;
+    uint32_t *hsmag;
     uint32_t *d_nsurv, *d_nproj;
     unsigned long long *d_nlost;
     /* ev[0..3] are the transform/fill/apply boundaries. ev[4] is the
@@ -184,12 +187,14 @@ static void pside_free(pside_t *S)
     cudaFree(S->walk_cur); cudaFree(S->walk_next);
     cudaFree(S->survbits); cudaFree(S->slice); cudaFree(S->slice_logp);
     cudaFree(S->sp); cudaFree(S->srt); cudaFree(S->sg); cudaFree(S->slp);
+    cudaFree(S->smag);
     cudaFree(S->d_nsurv);
     cudaFree(S->d_nproj); cudaFree(S->d_nlost);
     if (S->hsp)  cudaFreeHost(S->hsp);
     if (S->hsrt) cudaFreeHost(S->hsrt);
     if (S->hsg)  cudaFreeHost(S->hsg);
     if (S->hslp) cudaFreeHost(S->hslp);
+    if (S->hsmag) cudaFreeHost(S->hsmag);
     for (int k = 0; k < 5; k++) if (S->ev[k]) cudaEventDestroy(S->ev[k]);
     memset(S, 0, sizeof(*S));
 }
@@ -313,10 +318,13 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
                                    cudaHostAllocDefault));
         SIDE_INIT_CK(cudaHostAlloc((void **)&S->hsg, (size_t)fbs->n * 4,
                                    cudaHostAllocDefault));
+        SIDE_INIT_CK(cudaHostAlloc((void **)&S->hsmag, (size_t)fbs->n * 4,
+                                   cudaHostAllocDefault));
         SIDE_INIT_CK(cudaMalloc(&S->sp,  (size_t)fbs->n * 4));
         SIDE_INIT_CK(cudaMalloc(&S->srt, (size_t)fbs->n * 4));
         SIDE_INIT_CK(cudaMalloc(&S->sg,  (size_t)fbs->n * 4));
         SIDE_INIT_CK(cudaMalloc(&S->slp, (size_t)fbs->n * 2));
+        SIDE_INIT_CK(cudaMalloc(&S->smag, (size_t)fbs->n * 4));
     }
     SIDE_INIT_CK(cudaMalloc(&S->d_nsurv, 4));
     SIDE_INIT_CK(cudaMalloc(&S->d_nproj, 4));
@@ -428,6 +436,15 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
             free(tg); tg = NULL;
             free(tlp); tlp = NULL;
         }
+        /* Reciprocals AFTER the sort, same as the standalone path: the sort
+         * key is the modulus, so building them earlier would only mean
+         * permuting them too. */
+        {
+            const uint32_t ihalf = 1u << (cfg->logI - 1);
+            for (uint32_t i = 0; i < k; i++)
+                ss_magic_build(hsp[i], cfg->J, SS_KSHIFT(cfg->logI),
+                               ihalf, &S->hsmag[i]);
+        }
         S->nblk = S->nwrp = 0;
         for (uint32_t i = 0; i < k && hsp[i] < SS_BLOCK_CUT; i++) S->nblk = i + 1;
         for (uint32_t i = 0; i < k && hsp[i] < SS_WARP_CUT; i++) S->nwrp = i + 1;
@@ -455,6 +472,8 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
         PERQ_CK(cudaMemcpyAsync(S->sg, hsg, (size_t)k * sizeof(*hsg),
                                 cudaMemcpyHostToDevice, 0));
         PERQ_CK(cudaMemcpyAsync(S->slp, hslp, (size_t)k * sizeof(*hslp),
+                                cudaMemcpyHostToDevice, 0));
+        PERQ_CK(cudaMemcpyAsync(S->smag, S->hsmag, (size_t)k * sizeof(*S->hsmag),
                                 cudaMemcpyHostToDevice, 0));
     }
 
@@ -634,7 +653,8 @@ static int pipe_side_sieve_slab(const fb_t *fb, const bench_cfg_t *cfg,
         (const uint32_t *)d_bucket, d_cursor, cap, cfg->logI, log_region,
         S->slice_logp, S->nslice_pow2, S->N, S->CINIT, S->CINIT - S->BOUND,
         S->tconst, NULL, S->d_nsurv, NULL, 0xFFFFFFFFu,
-        S->sp, S->srt, S->sg, S->slp, S->nsmall, S->nblk, S->nwrp,
+        S->sp, S->srt, S->sg, S->slp, S->smag,
+        S->nsmall, S->nblk, S->nwrp,
         0xFFFFFFFFu, NULL, S->survbits, cfg->not_both_even, j_base);
     SLAB_CK(cudaEventRecord(S->ev[3]));
     wd_phase(side ? "slab.sync.side1" : "slab.sync.side0");
@@ -647,8 +667,26 @@ static int pipe_side_sieve_slab(const fb_t *fb, const bench_cfg_t *cfg,
         uint32_t hov = 0;
         SLAB_CK(cudaMemcpy(&hov, d_overflow, 4, cudaMemcpyDeviceToHost));
         if (hov) {
-            runlog_warn("  side %d: bucket array OVERFLOWED by %u records",
-                        side, hov);
+            /* SOFT failure: rc = 1, not -1. Dropped bucket records can only
+             * LOWER a position's log sum, so an overflow costs survivors it
+             * never invents -- and every relation that does come out is still
+             * verified downstream. The caller therefore skips this slab and
+             * keeps the band alive, rather than failing a whole BOINC task
+             * over a shortfall that was 1 record in the field report that
+             * prompted this. Hard SLAB_CK failures above still return -1.
+             *
+             * Rate-limited: under BOINC stderr is uploaded, and a band that
+             * overflows on many q would otherwise ship thousands of identical
+             * lines. The end-of-band summary carries the true total. */
+            static int warned;
+            if (warned < 8)
+                runlog_warn("  side %d: bucket array OVERFLOWED by %u records"
+                            " -- slab skipped%s", side, hov,
+                            ++warned == 8 ? " (further overflows summarised"
+                                            " at end of band)" : "");
+            else
+                warned++;
+            rc = 1;
             goto done;
         }
     }
@@ -1128,14 +1166,32 @@ static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
 
     CK(cudaMemcpy(&hflags, C->d_flags, 4, cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(&hovf, C->d_ovf, 8, cudaMemcpyDeviceToHost));
+    /* Both of these are SOFT (return 1): they say this slab's trial division
+     * is untrustworthy, not that the device or the run is broken. They are
+     * tested here, before the caller emits anything, so skipping the slab
+     * means no incomplete or wrong record ever reaches the relation file --
+     * the cost is the slab's yield. Under BOINC that is the difference
+     * between a task that returns slightly less and a task that returns
+     * nothing at all. Rate-limited for the same reason as the bucket
+     * overflow: stderr is uploaded.
+     *
+     * Note these two usually mean a MISCONFIGURED job (mfb too generous,
+     * PIPE_K too small) rather than a transient, so a run that trips them on
+     * every slab now yields almost nothing instead of erroring. The
+     * end-of-band counters are what make that visible; do not remove them. */
     if (hflags & TDF_NORM_OVERFLOW) {
-        runlog_warn("  ** NORM OVERFLOW: a norm exceeded %d bits", BN_LIMBS * 32);
-        return -1;
+        static int warned;
+        if (warned++ < 4)
+            runlog_warn("  ** NORM OVERFLOW: a norm exceeded %d bits"
+                        " -- slab skipped", BN_LIMBS * 32);
+        return 1;
     }
     if (hflags & TDF_LIST_TRUNCATED) {
-        runlog_warn("  ** %llu large-prime records past the %u/survivor cap",
-                    hovf, PIPE_K);
-        return -1;
+        static int warned;
+        if (warned++ < 4)
+            runlog_warn("  ** %llu large-prime records past the %u/survivor"
+                        " cap -- slab skipped", hovf, PIPE_K);
+        return 1;
     }
     CK(cudaMemcpy(&nacc, C->d_nacc, 4, cudaMemcpyDeviceToHost));
     if (nacc > C->ccap) {           /* the scatter clamped; redo it once, larger */
@@ -1353,6 +1409,16 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     unsigned long long *d_pre = NULL;
     uint64_t est1, est0, est;
     uint32_t cap, nqdone = 0, bound1 = 0, bound0 = 0;
+    /* Slabs abandoned to a soft failure (bucket overflow, or trial division
+     * this slab cannot be trusted). Counted rather than fatal: see
+     * pipe_side_sieve_slab. Reported at end of band so the rate-limited
+     * per-slab warnings do not have to carry the total. */
+    unsigned long long nslab_skipped = 0;
+    /* Of nslab_skipped, those dropped for untrustworthy trial division
+     * rather than a bucket overflow. */
+    unsigned long long ntd_skipped = 0;
+    /* q abandoned because every slab of it was skipped. */
+    unsigned long long nq_lost = 0;
     unsigned long long nqskip = 0;   /* special-q passed over on norm width */
     size_t optin_smem_limit = 0;
     double acc_isect = 0, acc_host = 0, acc_wall = 0;
@@ -1897,6 +1963,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
          * SLABBED=false slab_plan has exactly one entry and if constexpr
          * removes every continuation-state operation from device code. */
         if (cfg->qspan) { acc_tdprep += host_ms() - hreg; hreg = host_ms(); }
+        uint32_t nslab_skipped_q = 0;   /* soft-skipped slabs, THIS q */
         for (uint32_t slab = 0; slab < slab_plan->nslab; slab++) {
             wd_slab(slab, slab_plan->nslab);
             const uint32_t j_base = slab_jbase_at(slab_plan, slab);
@@ -1907,15 +1974,28 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             uint32_t hn_s = 0, nacc_s = 0;
             double td_start, tv_before, cf_start, join_start;
 
-            if (pipe_side_sieve_slab<SLABBED>(fb1, cfg, 1, xmax, j_base,
+            /* Split soft from hard. A positive return is "this slab is
+             * unusable, skip it"; negative is a real device/API failure that
+             * the band cannot continue past. Short-circuit || is kept: if
+             * side 1 is unusable there is no point sieving side 0, and the
+             * skip below means neither side's survbits are ever read. */
+            int sv1 = pipe_side_sieve_slab<SLABBED>(fb1, cfg, 1, xmax, j_base,
                                                d_bucket, d_cursor, cap,
                                                d_overflow, fblocks, fthreads,
-                                               &S1, &sf1, &sa1) ||
-                pipe_side_sieve_slab<SLABBED>(fb0, cfg, 0, xmax, j_base,
+                                               &S1, &sf1, &sa1);
+            int sv0 = sv1 ? 0
+                    : pipe_side_sieve_slab<SLABBED>(fb0, cfg, 0, xmax, j_base,
                                                d_bucket, d_cursor, cap,
                                                d_overflow, fblocks, fthreads,
-                                               &S0, &sf0, &sa0)) {
-                rc = -1; break;
+                                               &S0, &sf0, &sa0);
+            if (sv1 < 0 || sv0 < 0) { rc = -1; break; }
+            if (sv1 > 0 || sv0 > 0) {
+                /* Skipped BEFORE the intersect/TD/emit below, so nothing from
+                 * this slab reaches the relation file: the cost is yield on
+                 * this slab only, never a wrong record. */
+                nslab_skipped++;
+                nslab_skipped_q++;
+                continue;
             }
             ts1[1] += sf1; ts1[2] += sa1;
             ts0[1] += sf0; ts0[2] += sa0;
@@ -1949,11 +2029,15 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 const int do_verify = nqdone == 0 && cfg->td_verify && hn_s != 0 &&
                     (!td_verified || cfg->cofgate);
                 wd_phase("slab.trialdiv");
-                if (pipe_td_perq<SLABBED>(&C, &Lq, cfg, &S1, &S0, d_two, xmax,
+                const int tdrc = pipe_td_perq<SLABBED>(&C, &Lq, cfg, &S1, &S0,
+                                          d_two, xmax,
                                           j_base, blocks, cfg->threads, do_verify,
                                           &n, &nacc_s, &tm, &tv, want_host,
-                                          !want_host, cofgate_found)) {
-                    rc = -1; break;
+                                          !want_host, cofgate_found);
+                if (tdrc < 0) { rc = -1; break; }
+                if (tdrc > 0) {         /* untrustworthy TD: drop this slab */
+                    nslab_skipped++; nslab_skipped_q++; ntd_skipped++;
+                    continue;
                 }
                 if (nqdone == 0 && cfg->td_verify && !td_verified && hn_s != 0)
                     td_verified = 1;
@@ -2102,8 +2186,17 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
          * with no two-sided survivors is suspicious and remains fatal. Empty
          * individual slabs are allowed; only their sum is tested here. */
         if (!hn) {
-            fprintf(stderr, "  pipeline: no survivors at this q\n");
-            rc = -1; break;
+            /* Still fatal when the sieve actually RAN: a fully-sieved q with
+             * no two-sided survivor means something is wrong, and that
+             * invariant predates slabbing. But if slabs were soft-skipped
+             * above, zero is explained rather than suspicious -- do not
+             * convert a bucket overflow into a dead task by the back door. */
+            if (!nslab_skipped_q) {
+                fprintf(stderr, "  pipeline: no survivors at this q\n");
+                rc = -1; break;
+            }
+            nq_lost++;
+            continue;              /* next q; nqdone is not incremented */
         }
         if (nqdone == 0 && cfg->cofgate &&
             (!cofgate_found[0] || !cofgate_found[1])) {
@@ -2518,6 +2611,21 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                    fb_ / 1073741824.0);
         }
     }
+    /* Always reported, success or failure, and to the log rather than stdout:
+     * under BOINC stdout dies with the slot directory, and a task that
+     * silently yielded less than it should have is exactly what a validator
+     * operator needs to see. */
+    if (nslab_skipped)
+        runlog_warn("  %llu slab(s) skipped on bucket overflow -- this band's"
+                    " yield is short by whatever those slabs held", nslab_skipped);
+    if (ntd_skipped)
+        runlog_warn("  of those, %llu were dropped for untrustworthy trial"
+                    " division (norm overflow or truncated factor list),"
+                    " which usually means mfb or PIPE_K needs attention",
+                    ntd_skipped);
+    if (nq_lost)
+        runlog_warn("  %llu special-q produced nothing because every slab of"
+                    " them was skipped", nq_lost);
     if (rc) {
         const char *fate = ckpt_written
             ? "the .part is kept; rerun the same command to resume"
