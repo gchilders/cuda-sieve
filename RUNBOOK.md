@@ -326,6 +326,22 @@ Two knobs exist, and neither is tuning advice:
   **shippable** — its relations are byte-identical to a `CF_LMAX=4` binary's, and
   it is a first-class Make variable rather than a `DEFS` value precisely so that
   it is not branded a pricing build and refused `--relations`.
+- **`make PIPE_K=N`** (2..64, default 16) sets how many large primes the
+  trial-division list keeps per survivor. Overrunning it is *detected*, not
+  silently dropped — `k_resieve_scatter` counts what it could not place, `k_td`
+  raises `TDF_LIST_TRUNCATED` on reading a count past `K`, and the slab is
+  skipped — so a value that is too small costs yield and never emits a partial
+  record. Like `CF_LMAX` it is a first-class Make variable rather than
+  a `DEFS` value, and for the same reason: it changes a capacity, not the
+  arithmetic, so a `PIPE_K` build is **shippable** and must not be refused
+  `--relations`. Raising it is legitimate for a job whose `mfb` admits more
+  large primes than 16, at `scap * PIPE_K * 4` bytes of device memory per side
+  — but the accepted range stops at **32, not `TD_FMAX`'s 64**, because `k_td`
+  records the special-q, every small prime *and* up to `PIPE_K` large ones into
+  one 64-entry slot, and overrunning *that* fails the run outright instead of
+  skipping a slab. Raising `PIPE_K` past 32 means raising `TD_FMAX` first.
+  Lowering it to 8 is how `make degradecheck` drives the degradation ceiling;
+  the running binary reports its value in the pipeline allocation banner.
 
 #### Method: ECM for 3LP, rho for 2LP — AUTOMATIC since 2026-08-19
 
@@ -846,6 +862,24 @@ allowance, and a job fingerprint.
   in the `.part` were byte-identical to the ones a clean build produced for
   the same special-q. Only the exit status says the band as a whole should not
   be credited.
+
+  **`make degradecheck` is the standing gate over all of this** — the exit
+  status, the drain, the kept `.part`, the sidecar, the remedy message picking
+  `PIPE_K` over the bucket array, and the no-`--relations` path. It needs a
+  card and a build at `make PIPE_K=8` (~8 min); against any other build it says
+  so and exits 0 rather than passing green on a binary that cannot trigger the
+  ceiling. **8, not 2**, because 8 loses ~6% of q on the c183 and sieves the
+  rest, so the ceiling trips with real work behind it — measured 1552 q and
+  72,902 relations. That is what lets the gate assert the claims above
+  directly rather than by proxy: the kept relations are counted *and* run back
+  through `--check-relations` (72,902 of 72,902 rebuild both norms exactly),
+  and the `band end` log record is checked to carry `[DEGRADED]` — a record
+  guarded on `nqdone`, so unreachable at `PIPE_K=2`. At 2 every q is lost and
+  those three assertions report themselves uncovered rather than passing
+  vacuously. Of the two conditions only the truncated list is drivable that way:
+  the bucket capacity is derived as `est/nregion + 256` from the same factor
+  base `--bkthresh` shapes, so lowering the threshold grows the estimate with
+  it. The bucket arm differs from the covered one only in which string prints.
 
   Exit 5 is distinct from 1 (the band failed), 3 (rebuild with a wider
   `BN_LIMBS`) and 4 (the card wedged), and the remedies really are disjoint:

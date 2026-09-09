@@ -785,7 +785,23 @@ done:
  * only reason a restructure this large is safe to make.
  */
 
-#define PIPE_K 16          /* large primes kept per survivor, as run_td_stage */
+/* Large primes kept per survivor, as run_td_stage. Overrun is DETECTED, not
+ * silently dropped: k_resieve_scatter counts the records it could not place
+ * into d_ovf, and k_td/k_td_leader raise TDF_LIST_TRUNCATED when they read a
+ * count past K -- at CONSUMPTION, not at scatter -- after which the slab is
+ * skipped. So a value that is too small costs yield and never emits a partial
+ * record. Passed to every kernel as a runtime `uint32_t K`, and no fixed-size
+ * array is sized by it, but it is NOT free above: see the Makefile's PIPE_K
+ * for why the accepted range stops at 32 rather than at TD_FMAX's 64.
+ *
+ * OVERRIDABLE FROM THE BUILD, via its own Makefile variable rather than DEFS,
+ * for the reason spelled out for CF_LMAX there: a non-empty DEFS marks a
+ * pricing build and bench refuses to emit relations from one.
+ * degradecheck.sh needs both -- a small PIPE_K so every slab truncates,
+ * and --relations to assert the degraded stop still keeps its .part. */
+#ifndef PIPE_K
+#define PIPE_K 16
+#endif
 
 typedef struct {
     double rank, emit, summary, resieve, td, classify, compact, record;
@@ -1640,6 +1656,14 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         }
         PIPE_CK(cudaMalloc(&d_bucket, need));
     }
+    /* The OTHER capacity a job can undersize, reported beside the bucket array
+     * because the two are the pair the per-slab soft skips fire on and the pair
+     * the degraded stop's remedy message has to choose between. An operator
+     * reading "mostly trial-division skips: check mfb and PIPE_K" needs to know
+     * what PIPE_K this binary actually carries, and it is a build-time knob, so
+     * nothing else in the run says. degradecheck.sh reads it from here to tell
+     * "this build cannot trigger the ceiling" apart from "the ceiling broke". */
+    printf("  large-prime list %d records per survivor (PIPE_K)\n", PIPE_K);
     PIPE_CK(cudaMalloc(&d_cursor, (size_t)nregion_alloc * 4));
     PIPE_CK(cudaMalloc(&d_overflow, 4));
 
@@ -2003,8 +2027,8 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
                            cfg->cof_rounds, cfg->cof_budget, blocks,
                            cfg->threads, fr)) { rc = -1; break; }
-            /* Guarded on fr like the clean stop above, not unguarded like
-             * the norm-width cap: without a relation file there is nothing to
+            /* Guarded on fr, like the clean stop above and like the
+             * norm-width cap: without a relation file there is nothing to
              * checkpoint, and letting ckpt_written be set anyway would print a
              * "resume at q=" line naming a .part that does not exist. */
             if (fr)
@@ -2119,11 +2143,23 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                         cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim,
                                    cfg->lpb, cfg->cof_rounds, cfg->cof_budget,
                                    blocks, cfg->threads, fr)) { rc = -1; break; }
-                    pipe_try_checkpoint(POLY, cfg, &ck, fr, fc, cur,
-                                        base_rel + (cfg->cofactor ? Q.nrel
-                                            : (unsigned long long)acc_rel),
-                                        base_nq + nqdone, &ckpt_written,
-                                        &ckpt_warned);
+                    /* Guarded on fr, like the degradation ceiling above.
+                     * pipe_checkpoint returns 0 -- success -- at its own
+                     * `if (!fr || !cfg->relations)` guard, i.e. it reports
+                     * success for correctly doing nothing, so calling this
+                     * unguarded set ckpt_written with no sidecar on disk and
+                     * the terminal message then printed "checkpoint written,
+                     * resume at q=0" naming a .part that was never created.
+                     * Reachable only by plain benchmarking on a too-narrow
+                     * build, so it cost a wrong message rather than a wrong
+                     * outcome -- but the two policy stops must not disagree
+                     * about the same hazard. */
+                    if (fr)
+                        pipe_try_checkpoint(POLY, cfg, &ck, fr, fc, cur,
+                                            base_rel + (cfg->cofactor ? Q.nrel
+                                                : (unsigned long long)acc_rel),
+                                            base_nq + nqdone, &ckpt_written,
+                                            &ckpt_warned);
                     stopped = 1;
                     capped = 1;
                     break;
@@ -2875,6 +2911,22 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             runlog_warn("  band FAILED after %u of %u q; %s",
                         nqdone, nq, fate);
     }
+    /* THE CHAIN BELOW TESTS cfg->relations, NOT fr, AND MUST.
+     *
+     * pipe_finalize_outputs above closes fr and sets it to NULL, so every `fr`
+     * here is null by construction no matter what the run was asked to do.
+     * Written as `!fr` -- which is what it said -- the "no relation file
+     * requested" arms matched ALWAYS, printing "nothing to resume" at a run
+     * that had just written a perfectly good .part, and shadowing the
+     * `ckpt_written` arms behind them into dead code: the whole "FIX THE JOB
+     * BEFORE RESUMING" warning could never print. degradecheck.sh case A is
+     * what caught it.
+     *
+     * cfg->relations is the honest predicate: it is const config, it survives
+     * finalize, and fr is opened if and only if it is set (a failed open
+     * goto done's with rc = -1 rather than continuing with fr null). The
+     * in-loop `if (fr)` guards are a different question and stay as they are
+     * -- fr is live there. */
     if (stopped && ckpt_written && capped)
         /* runlog_warn, NOT printf: this is the operator-facing half of an
          * exit-3 result, and under BOINC stdout is not uploaded -- stderr.txt
@@ -2896,7 +2948,21 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                     " about %d skips into any rerun and emits nothing.",
                     nqdone, base_nq + nqdone, ck.nrel,
                     (unsigned long long)ck.next_q, PIPE_SKIP_MAX);
-    else if (degraded && !fr)
+    else if (capped && !cfg->relations)
+        /* The counterpart of `degraded && !cfg->relations` below, and it
+         * exists for the same reason: without it this falls through to the
+         * "NO checkpoint
+         * could be written" error, which tells the operator to move a .part
+         * aside or pass --restart over a file that was never requested. The
+         * remedy differs from the degraded one -- the job is fine, the BUILD
+         * is too narrow -- and the width to rebuild at already went to stderr
+         * at the cap itself. */
+        runlog_warn("\n  stopped after %u q with no relation file requested;"
+                    " nothing to resume. The timings from this band are NOT"
+                    " usable -- it skipped its way to the norm-width cap."
+                    " Rebuild wider (see above) before reading any number"
+                    " from it.", nqdone);
+    else if (degraded && !cfg->relations)
         /* No --relations at all: nothing was written and nothing was meant to
          * be, so this is not the "cannot resume" error below. Said plainly
          * because this is the benchmarking path, where the number the operator
@@ -2928,10 +2994,20 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
          * resumable work, and reporting it as a clean stop is what would turn
          * a BOINC temporary exit into a restart loop over a band that always
          * begins again from nothing. See the PIPE_RC_ mapping at the end. */
+        /* DO NOT name rtmp as something to move aside: it is already gone.
+         * This branch is reached only when ckpt_written == 0, which is
+         * exactly the keep_partial = 0 that made pipe_finalize_outputs
+         * remove(rtmp) above -- a .part with no sidecar is not resumable work
+         * and keeping it would strand every rerun on the startup refusal. So
+         * the old advice pointed at a path that no longer exists, which is
+         * the same defect the two branches above were just fixed for. The
+         * session simply produced nothing; say that. */
         fprintf(stderr,
-                "\n  stopped after %u q, but NO checkpoint could be written."
-                " %s cannot be\n  resumed automatically; move it aside or pass"
-                " --restart.\n", nqdone, rtmp);
+                "\n  stopped after %u q, but NO checkpoint could be written,"
+                " so this session\n  produced nothing resumable and its"
+                " staged output was discarded. Fix what\n  prevented the"
+                " checkpoint (the warning above names it) and rerun.\n",
+                nqdone);
 
     /* OUTSIDE the `if (nqdone)` below, because the case that most needs saying
      * is a band where skips left nqdone == 0: guarded, the one run that
@@ -3098,7 +3174,14 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                        * two would read as a contradiction. */
                       (double)(cfg->cofactor ? Q.nrel
                                              : (unsigned long long)acc_rel) / N,
-                      capped  ? "  [stopped: build too narrow]"
+                      /* `degraded` BEFORE `stopped`, because the ceiling
+                       * sets both. Ordered the other way -- which is how this
+                       * read until degradecheck went looking -- an exit-5
+                       * band recorded "[stopped cleanly]" in the one artifact
+                       * that outlives the run, asserting the opposite of its
+                       * own exit status to whoever reads the log later. */
+                      capped   ? "  [stopped: build too narrow]"
+                      : degraded ? "  [DEGRADED: yield not creditable]"
                       : stopped ? "  [stopped cleanly]"
                       : (rc ? "  [FAILED]" : ""));
         if (cfg->cofactor) {
@@ -3279,15 +3362,34 @@ done:
      * does, since a stop with nothing to resume from is a failure however it
      * was reached. */
     if (rc == 0) {
-        if (capped)         rc = PIPE_RC_UNSUPPORTED;
-        /* `!fr` is NOT the no-checkpoint failure: with no --relations there was
-         * never any output to resume, which is the plain benchmarking case the
-         * ceiling exists to serve -- a degraded band there must still report
-         * DEGRADED so the rate is not read as a slow card. Only a run that
-         * HAS a relation file and could not checkpoint it is unresumable, and
-         * that is the failure. */
-        else if (degraded)  rc = (!fr || ckpt_written) ? PIPE_RC_DEGRADED
-                                                       : PIPE_RC_FAIL;
+        /* capped carries the SAME ckpt_written test as degraded below, and
+         * for the same reason: with --relations set and no checkpoint
+         * written, pipe_finalize_outputs ran with keep_partial = 0 and
+         * DELETED the staged relation file. Reporting UNSUPPORTED there
+         * ("rebuild with a wider BN_LIMBS") describes a build problem to
+         * BOINC for a session whose output was destroyed and which has no
+         * resume point -- the operator rebuilds and restarts from q0 with no
+         * indication anything was lost. The rebuild advice is still correct
+         * and still on stderr; the exit status has to say the session failed.
+         * Left unconditional, this was the one hazard the two policy stops
+         * still disagreed about after the rest of this was made symmetric. */
+        if (capped)         rc = (!cfg->relations || ckpt_written)
+                                     ? PIPE_RC_UNSUPPORTED : PIPE_RC_FAIL;
+        /* "No relation file was requested" is NOT the no-checkpoint failure:
+         * with no --relations there was never any output to resume, which is
+         * the plain benchmarking case the ceiling exists to serve -- a
+         * degraded band there must still report DEGRADED so the rate is not
+         * read as a slow card. Only a run that HAS a relation file and could
+         * not checkpoint it is unresumable, and that is the failure.
+         *
+         * cfg->relations, NOT fr, for the reason spelled out at the terminal
+         * messages above: pipe_finalize_outputs has already closed fr and set
+         * it to NULL, so `!fr` was unconditionally true here and the
+         * PIPE_RC_FAIL arm could never be taken. A degraded band that asked
+         * for relations and could not write a single checkpoint reported
+         * DEGRADED -- resumable -- when nothing of it is resumable. */
+        else if (degraded)  rc = (!cfg->relations || ckpt_written)
+                                     ? PIPE_RC_DEGRADED : PIPE_RC_FAIL;
         else if (stopped)   rc = ckpt_written ? PIPE_RC_STOPPED : PIPE_RC_FAIL;
     }
     return rc;

@@ -51,6 +51,13 @@
 #   side 1 driven:  c4*x^4 + 1 with c4 = 2^k and a small Y0, so the quartic's
 #                   bound crosses the limit first and side 0 never does.
 #
+# CASE E IS A DIFFERENT CLAIM from A-D. Those are about the SKIP -- that a q
+# passed over for norm width leaves the band alive, reaches the cap, and stops
+# creditably. E is about the cap stop's TERMINAL MESSAGE on the benchmarking
+# path, where there is no relation file: a stop must not announce a checkpoint
+# it did not write, and must not report one as failed when none was requested.
+# It rides along here because it needs exactly the job case C already built.
+#
 # NEEDS A CARD, so this is NOT in `check` -- same reason fbgpucheck is not.
 set -e
 
@@ -377,6 +384,51 @@ if [ -n "$first" ]; then
     fi
     mv "$TMP/out.first" "$TMP/out"
 fi
+
+# ---- E: the cap stop with NO relation file ---------------------------------
+# THE BENCHMARKING PATH, and it is not covered by case C: run_band always passes
+# --relations, so C only ever exercises the half where a sidecar really exists.
+#
+# pipe_checkpoint returns 0 -- SUCCESS -- at its own `if (!fr || !cfg->relations)`
+# guard, i.e. it reports success for correctly doing nothing. So a stop that
+# calls pipe_try_checkpoint unguarded sets ckpt_written with nothing on disk, and
+# the terminal message then printed "checkpoint written, resume at q=0", naming a
+# resume point that was never computed and a .part that was never created. Before
+# the ck memset it read indeterminate memory outright.
+#
+# Guarding the call on fr fixes that but is not sufficient on its own: with
+# ckpt_written left 0 the band falls through to the "NO checkpoint could be
+# written" branch, which tells the operator to move a .part aside or pass
+# --restart over a file nobody asked for. BOTH failure modes are asserted, in
+# both directions, because the fix for one is what causes the other.
+set +e
+$BENCH --pipeline --poly "$TMP/all.job" --logI 14 --qrange $QMIN:$QHI \
+       --cofactor > "$TMP/out" 2>&1
+est=$?
+set -e
+if [ "$est" -eq 3 ]; then
+    pass "E cap stop exits UNSUPPORTED with no rels" "bench exited 3"
+else
+    bad "E cap stop exits UNSUPPORTED with no rels" "bench exited $est, expected 3"
+    tail -15 "$TMP/out" | sed 's/^/  | /'
+fi
+grep -q 'checkpoint written, resume at q=' "$TMP/out" \
+    && bad  "E invents no resume point" \
+            "$(grep -oE 'checkpoint written, resume at q=[0-9]+' "$TMP/out" | head -1)" \
+    || pass "E invents no resume point" ""
+grep -q 'NO checkpoint could be written' "$TMP/out" \
+    && bad  "E not reported as a failed checkpoint" "fell through to the error branch" \
+    || pass "E not reported as a failed checkpoint" ""
+# The positive: it must still SAY something, and say the right thing. The width
+# to rebuild at already went to stderr at the cap; this is the half that tells
+# the operator the timings in hand are worthless.
+grep -q 'no relation file requested' "$TMP/out" \
+    && pass "E says nothing to resume" "" \
+    || bad  "E says nothing to resume" "not seen"
+grep -q 'skipped its way to the norm-width cap' "$TMP/out" \
+    && pass "E names the cap, not the ceiling" "" \
+    || bad  "E names the cap, not the ceiling" \
+            "$(grep -oE 'skipped its way to [a-z -]*' "$TMP/out" | head -1)"
 
 echo
 if [ $fail -eq 0 ]; then echo "  skipcheck: all cases passed"; else echo "  skipcheck FAILED"; fi

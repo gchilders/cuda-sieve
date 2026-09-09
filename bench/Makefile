@@ -184,6 +184,64 @@ BN_LIMBS_STAMP := .bnlimbs.stamp
 $(shell [ "$$(cat $(BN_LIMBS_STAMP) 2>/dev/null)" = '$(BN_LIMBS)' ] || printf '%s' '$(BN_LIMBS)' > $(BN_LIMBS_STAMP))
 CF_LMAX_DEF += -DBN_LIMBS=$(BN_LIMBS)
 
+# Large primes kept per survivor in the trial-division list. See PIPE_K in
+# pipeline.cuh for what overrunning it does (detected, slab skipped, yield lost
+# -- never a partial record).
+#
+# ITS OWN VARIABLE, NOT A DEFS VALUE, for the reason spelled out for CF_LMAX
+# above: DEFS marks a PRICING build and bench refuses to emit relations from
+# one. This changes a capacity, not the arithmetic -- every relation a smaller
+# PIPE_K does emit is bit-identical to the same relation from a larger one,
+# because a survivor whose list did not fit is dropped rather than recorded
+# short -- so a PIPE_K build is shippable and must not be branded otherwise.
+#
+# It exists mainly so degradecheck.sh can drive the degradation ceiling: a
+# small PIPE_K truncates survivors on a real job, which is the only natural
+# trigger either soft skip has. That gate wants PIPE_K=8 specifically -- small
+# enough to lose ~6% of q on the c183, large enough that the rest still sieve,
+# so the ceiling trips with real relations behind it. A smaller value trips it
+# too but loses every q, leaving nothing to check. Raising it is legitimate
+# too, for
+# a job whose mfb admits more large primes than 16; it costs scap*PIPE_K*4 B of
+# device memory per side.
+#
+# THE CEILING IS 32, NOT TD_FMAX's 64, and the gap is deliberate. k_td records
+# each survivor's factors into a per-thread slot of TD_FMAX (64) entries that
+# holds the special-q AND every small prime AND up to PIPE_K large ones, and
+# overrunning THAT is not the soft slab skip this knob's own comment promises
+# -- k_cand_stats makes fn > fmax fail the run outright ("these must FAIL the
+# run", td.cuh). A PIPE_K anywhere near 64 would therefore convert a documented
+# yield loss into a fatal band error. No survivor under a 384-bit norm carries
+# 32 large primes above bkthresh, so this bound is not reachable in practice;
+# it is here so that raising PIPE_K cannot silently cross into the fatal
+# regime. Raising it past 32 means raising TD_FMAX first.
+#
+# VALIDATED WITH $(filter ...), NOT A $(shell ...) TEST, matching CF_LMAX and
+# BN_LIMBS above. $(shell) runs at parse time -- BEFORE the $(error) below
+# could reject anything -- so a shell test interpolates the value into a
+# command that has already run by the time it is judged, and swallows its own
+# diagnostic besides. Pure make never reaches a shell.
+PIPE_K ?= 16
+PIPE_K_OK := 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 \
+             26 27 28 29 30 31 32
+# TWO tests, not one $(filter ...). $(filter) matches WORDS, so a multi-word
+# value smuggles a legal word past it -- `PIPE_K='2 ] || touch /tmp/x; ['`
+# filters to `2`, passes, and reaches the compile recipe intact, where make
+# hands the whole string to sh. $(filter-out) inverts the question to "is any
+# word NOT allowed", which multi-word junk fails, and $(words) rejects the
+# empty and multi-word cases $(filter-out) alone would let through. The two
+# knobs above share the single-$(filter) shape and the same hole; they are
+# left as they are rather than changed from under an unrelated diff.
+ifneq ($(words $(PIPE_K)),1)
+$(error PIPE_K must be a single integer in 2..32 -- got "$(PIPE_K)")
+endif
+ifneq ($(filter-out $(PIPE_K_OK),$(PIPE_K)),)
+$(error PIPE_K must be an integer in 2..32 -- got "$(PIPE_K)")
+endif
+PIPE_K_STAMP := .pipek.stamp
+$(shell [ "$$(cat $(PIPE_K_STAMP) 2>/dev/null)" = '$(PIPE_K)' ] || printf '%s' '$(PIPE_K)' > $(PIPE_K_STAMP))
+CF_LMAX_DEF += -DPIPE_K=$(PIPE_K)
+
 # Optional BOINC application build.  Keep BOINC dependencies out of the default
 # executable; HAVE_BOINC=1 adds the compile-time API gate and the libraries.
 # BOINC_CPPFLAGS should point at directories containing boinc_api.h and its
@@ -285,7 +343,7 @@ $(shell { [ -f $(DEFS_STAMP) ] && [ "$$(cat $(DEFS_STAMP))" = '$(DEFS)' ]; } || 
 # without going through $(OBJS). Those two escaped the stamp, so
 # `make DEFS=... dumpcmp` reported "up to date" and linked a binary built
 # without the define -- the exact hole the stamp exists to close.
-$(OBJS) $(TEST_OBJS): $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
+$(OBJS) $(TEST_OBJS): $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE_K_STAMP)
 
 GIT_STAMP := .git.stamp
 GIT_RAW  := $(shell git -C . describe --always --abbrev=8 2>/dev/null)
@@ -356,12 +414,12 @@ fbgen_gpu: fbgen_gpu.o fbgen_lib.o fb_load.o fb_cado.o poly.o primes.o platform.
 	$(NVCC) $(NVCC_ARCH) --cudart $(CUDART_LINK) -o $@ \
 		fbgen_gpu.o fbgen_lib.o fb_load.o fb_cado.o poly.o primes.o platform.o -lm
 
-fbgen_gpu.o: $(ARCH_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
+fbgen_gpu.o: $(ARCH_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE_K_STAMP)
 
 # Same CUDA root generator, linked into production bench without the standalone
 # benchmark main().  The generated algebraic FB is now the pipeline default
 # when no --fb1/--cadofb file is supplied.
-fbgen_gpu_lib.o: fbgen_gpu.cu bench.h $(ARCH_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
+fbgen_gpu_lib.o: fbgen_gpu.cu bench.h $(ARCH_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE_K_STAMP)
 	$(NVCC) $(NVCC_FLAGS) -DFBGEN_GPU_LIBRARY -c $< -o $@
 
 # The same exact root finder drives on-the-fly special-q generation in bench.
@@ -378,23 +436,23 @@ sqgentest: sqgentest.c fbgen_lib.o poly.o primes.o
 # Planning-time norm-width survey. Same objects the siever uses -- sqgen for
 # (q,rho), qlat_build/norm_setup for the bound -- so it cannot drift from what
 # pipe_side_prepare_q will actually enforce. CPU only, no CUDA.
-normscan: normscan.c fbgen_lib.o poly.o primes.o $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
+normscan: normscan.c fbgen_lib.o poly.o primes.o $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE_K_STAMP)
 	$(CC) $(CFLAGS) -Wl,--gc-sections -o $@ normscan.c fbgen_lib.o poly.o primes.o -ldl -lm
 
-dumpcmp: dumpcmp.c $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
+dumpcmp: dumpcmp.c $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE_K_STAMP)
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
 # CPU-only checkpoint-format gate. In particular, BOINC output paths may
 # contain whitespace after filename resolution, so candidate identity must not
 # depend on the checkpoint parser's ordinary whitespace tokenisation.
-ckpttest: ckpttest.c ckpt.h bench.h platform.o $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
+ckpttest: ckpttest.c ckpt.h bench.h platform.o $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE_K_STAMP)
 	$(CC) $(CFLAGS) -o $@ ckpttest.c platform.o -ldl -lm
 
-stoptest: stoptest.c platform.h platform.o $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
+stoptest: stoptest.c platform.h platform.o $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE_K_STAMP)
 	$(CC) $(CFLAGS) -o $@ stoptest.c platform.o -ldl -lm
 
 # joins the two per-side --emit-cof files into cofactorisation batch input
-mkcofbatch: mkcofbatch.c $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
+mkcofbatch: mkcofbatch.c $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE_K_STAMP)
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
 %.o: %.cu
@@ -409,9 +467,9 @@ mkcofbatch: mkcofbatch.c $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
 -include $(OBJS:.o=.d) $(TEST_OBJS:.o=.d) fbgen_gpu.d
 
 clean:
-	rm -f bench fbtest fbgen fbgen_gpu sqgentest normscan dumpcmp mkcofbatch ckpttest stoptest slabtest *.o *.d $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP) $(GIT_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
+	rm -f bench fbtest fbgen fbgen_gpu sqgentest normscan dumpcmp mkcofbatch ckpttest stoptest slabtest *.o *.d $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP) $(GIT_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE_K_STAMP)
 
-.PHONY: all clean check ckptcheck stopcheck cofcheck fbgencheck fbgpucheck sqgencheck walkcheck slabcheck skipcheck
+.PHONY: all clean check ckptcheck stopcheck cofcheck fbgencheck fbgpucheck sqgencheck walkcheck slabcheck skipcheck degradecheck
 
 # `check` depended on fbtest alone, so the whole CUDA path -- kernels, the
 # cofactoriser, the pipeline -- could fail to compile while the gates reported
@@ -484,6 +542,23 @@ fbgpucheck: fbgen fbgen_gpu
 # width-independent, so one width is enough.
 skipcheck: bench normscan
 	./skipcheck.sh
+
+# GPU gate for the degradation ceiling (PIPE_LOST_MAX / PIPE_SLAB_SKIP_MAX and
+# the exit-5 stop). RUN IT AT `make PIPE_K=8`: the ceiling's only naturally
+# drivable trigger is a large-prime list too small for a well-formed job, and
+# the default 16 never truncates one. Against any other build it says so and
+# exits 0 rather than passing green on a build that cannot fire it.
+#
+# 8 rather than a smaller value because it makes the band MIXED -- ~6% of q
+# lost, the rest sieved -- which is what lets the gate check that earned
+# relations survive the stop, that they still reconstruct, and that the run
+# log records the band as degraded. All three are guarded on work having been
+# done, so a PIPE_K that loses every q cannot reach them. Takes ~8 min.
+#
+# Not in `check` for the same two reasons skipcheck is not: it needs a card, and
+# it needs a deliberately misconfigured build.
+degradecheck: bench
+	./degradecheck.sh
 
 sqgencheck: sqgentest
 	./sqgentest
