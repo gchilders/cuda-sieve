@@ -142,6 +142,27 @@ exit /b 1
 :cflmax_ok
 set "CF_LMAX_DEF=-DCF_LMAX=%CF_LMAX%"
 
+rem ---- BN_LIMBS ------------------------------------------------------------
+rem Width of the exact-norm big integer, in 32-bit limbs. 12 = 384 bits
+rem (default). ITS OWN VARIABLE, NOT A DEFS VALUE, for the same reason CF_LMAX
+rem is: DEFS marks a pricing build and bench refuses to emit relations from
+rem one, and this knob is needed by skipcheck.sh, which asserts --relations
+rem behaviour at a deliberately narrow width. Even values only: cf_bn_divmod_u64
+rem steps the limb array in 64-bit pairs. Mirrors bench/Makefile's BN_LIMBS
+rem block; update both if this ever changes.
+if not defined BN_LIMBS set "BN_LIMBS=12"
+if "%BN_LIMBS%"=="4"  goto :bnlimbs_ok
+if "%BN_LIMBS%"=="6"  goto :bnlimbs_ok
+if "%BN_LIMBS%"=="8"  goto :bnlimbs_ok
+if "%BN_LIMBS%"=="10" goto :bnlimbs_ok
+if "%BN_LIMBS%"=="12" goto :bnlimbs_ok
+if "%BN_LIMBS%"=="14" goto :bnlimbs_ok
+if "%BN_LIMBS%"=="16" goto :bnlimbs_ok
+echo error: BN_LIMBS must be an even limb count in 4..16 -- got "%BN_LIMBS%".
+exit /b 1
+:bnlimbs_ok
+set "BN_LIMBS_DEF=-DBN_LIMBS=%BN_LIMBS%"
+
 rem ---- PIPE_K ------------------------------------------------------------
 rem Large primes kept per survivor in the trial-division list. See PIPE_K in
 rem pipeline_hip.cuh for what overrunning it does (detected, slab skipped,
@@ -207,8 +228,8 @@ rem reads it (only under HAVE_BOINC) to pick BOINC's "ATI" vendor string
 rem instead of "NVIDIA" when checking a client GPU assignment. Defined here
 rem unconditionally (harmless when HAVE_BOINC is off) so it doesn't need to
 rem be threaded through as a separate knob.
-set "CFLAGS=/nologo /O2 /W3 /MT -D_CRT_SECURE_NO_WARNINGS -DBENCH_HIP_BUILD %CF_LMAX_DEF% %PIPE_K_DEF% %DEFS%"
-set "CXXFLAGS=/nologo /O2 /W3 /MT /EHsc -D_CRT_SECURE_NO_WARNINGS -DBENCH_HIP_BUILD %CF_LMAX_DEF% %PIPE_K_DEF% %DEFS%"
+set "CFLAGS=/nologo /O2 /W3 /MT -D_CRT_SECURE_NO_WARNINGS -DBENCH_HIP_BUILD %CF_LMAX_DEF% %BN_LIMBS_DEF% %PIPE_K_DEF% %DEFS%"
+set "CXXFLAGS=/nologo /O2 /W3 /MT /EHsc -D_CRT_SECURE_NO_WARNINGS -DBENCH_HIP_BUILD %CF_LMAX_DEF% %BN_LIMBS_DEF% %PIPE_K_DEF% %DEFS%"
 rem Flat scratch for the device stack. A CORRECTNESS FIX for gfx10, not a
 rem tuning knob -- without it ECM stage 2 silently accomplishes nothing on
 rem every RDNA1/RDNA2 card. Full rationale and the field before/after numbers
@@ -217,7 +238,7 @@ rem here so the two builds never generate different device code for the same
 rem source.
 if not defined HIP_SCRATCH set "HIP_SCRATCH=-Xclang -target-feature -Xclang +enable-flat-scratch"
 
-set "HIPFLAGS=-O2 -std=c++17 %HIP_ARCH% %HIP_DEVLIB% %HIP_SCRATCH% -D_CRT_SECURE_NO_WARNINGS -DBENCH_HIP_BUILD %CF_LMAX_DEF% %PIPE_K_DEF% %DEFS%"
+set "HIPFLAGS=-O2 -std=c++17 %HIP_ARCH% %HIP_DEVLIB% %HIP_SCRATCH% -D_CRT_SECURE_NO_WARNINGS -DBENCH_HIP_BUILD %CF_LMAX_DEF% %BN_LIMBS_DEF% %PIPE_K_DEF% %DEFS%"
 
 echo Building host C objects with cl.exe... (GFX_ARCH=%GFX_ARCH% CF_LMAX=%CF_LMAX% build=%GIT_DESC%)
 for %%F in (fb_load.c verify_cpu.c poly.c primes.c rfb.c fb_cado.c platform.c watchdog.c) do (

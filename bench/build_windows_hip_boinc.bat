@@ -92,6 +92,23 @@ exit /b 1
 :cflmax_ok
 set "CF_LMAX_DEF=-DCF_LMAX=%CF_LMAX%"
 
+rem ---- BN_LIMBS --------------------------------------------------------------
+rem Same duplication note as CF_LMAX above -- see build_windows_hip.bat's own
+rem BN_LIMBS block for the full rationale (bigint.cuh, skipcheck.sh). Update
+rem it there too if this ever changes.
+if not defined BN_LIMBS set "BN_LIMBS=12"
+if "%BN_LIMBS%"=="4"  goto :bnlimbs_ok
+if "%BN_LIMBS%"=="6"  goto :bnlimbs_ok
+if "%BN_LIMBS%"=="8"  goto :bnlimbs_ok
+if "%BN_LIMBS%"=="10" goto :bnlimbs_ok
+if "%BN_LIMBS%"=="12" goto :bnlimbs_ok
+if "%BN_LIMBS%"=="14" goto :bnlimbs_ok
+if "%BN_LIMBS%"=="16" goto :bnlimbs_ok
+echo error: BN_LIMBS must be an even limb count in 4..16 -- got "%BN_LIMBS%".
+exit /b 1
+:bnlimbs_ok
+set "BN_LIMBS_DEF=-DBN_LIMBS=%BN_LIMBS%"
+
 rem ---- PIPE_K --------------------------------------------------------------
 rem Same duplication note as CF_LMAX above -- see build_windows_hip.bat's own
 rem PIPE_K block for the full rationale (pipeline_hip.cuh, degradation
@@ -137,8 +154,8 @@ rem bench_boinc_* wrapper functions declared in bench.h. It's also MSVC-only
 rem syntax (/I "path"), which hipcc's clang driver (used for HIPFLAGS) does
 rem not accept -- clang wants -I, not /I -- so leaving it out of HIPFLAGS is
 rem both unnecessary and would be a syntax error there.
-set "CFLAGS=/nologo /O2 /W3 /MT -D_CRT_SECURE_NO_WARNINGS %BOINC_DEF% %CF_LMAX_DEF% %PIPE_K_DEF% %DEFS%"
-set "CXXFLAGS=/nologo /O2 /W3 /MT /EHsc -D_CRT_SECURE_NO_WARNINGS %BOINC_DEF% %BOINC_INC% %CF_LMAX_DEF% %PIPE_K_DEF% %DEFS%"
+set "CFLAGS=/nologo /O2 /W3 /MT -D_CRT_SECURE_NO_WARNINGS %BOINC_DEF% %CF_LMAX_DEF% %BN_LIMBS_DEF% %PIPE_K_DEF% %DEFS%"
+set "CXXFLAGS=/nologo /O2 /W3 /MT /EHsc -D_CRT_SECURE_NO_WARNINGS %BOINC_DEF% %BOINC_INC% %CF_LMAX_DEF% %BN_LIMBS_DEF% %PIPE_K_DEF% %DEFS%"
 rem ---- HIP_SCRATCH: flat scratch for the device stack ----------------------
 rem THIS IS A CORRECTNESS FIX, not a tuning knob. The AMDGPU backend does not
 rem enable flat scratch by default on gfx10, so a gfx10 target lowers every
@@ -167,7 +184,7 @@ rem back to stock lowering -- which reintroduces the bug on gfx10. See
 rem CLAUDE.md.
 if not defined HIP_SCRATCH set "HIP_SCRATCH=-Xclang -target-feature -Xclang +enable-flat-scratch"
 
-set "HIPFLAGS=-O2 -std=c++17 %HIP_ARCH% %HIP_DEVLIB% %HIP_SCRATCH% -D_CRT_SECURE_NO_WARNINGS %BOINC_DEF% %CF_LMAX_DEF% %PIPE_K_DEF% %DEFS%"
+set "HIPFLAGS=-O2 -std=c++17 %HIP_ARCH% %HIP_DEVLIB% %HIP_SCRATCH% -D_CRT_SECURE_NO_WARNINGS %BOINC_DEF% %CF_LMAX_DEF% %BN_LIMBS_DEF% %PIPE_K_DEF% %DEFS%"
 
 echo Building host C objects with cl.exe... (GFX_ARCH=%GFX_ARCH% CF_LMAX=%CF_LMAX% HAVE_BOINC=1 build=%GIT_DESC%)
 for %%F in (fb_load.c verify_cpu.c poly.c primes.c rfb.c fb_cado.c platform.c watchdog.c) do (
