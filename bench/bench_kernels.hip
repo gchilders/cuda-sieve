@@ -273,13 +273,13 @@ __device__ __forceinline__ uint32_t ss_first(uint32_t p, uint32_t rt,
      * concentrated in the thread tier that has the fewest hits to amortize a
      * load over):
      *
-     *   bias  p << kshift, with kshift = SS_KSHIFT(logI) derived by the
-     *         caller from the same macro the host builds its bound against.
-     *         Any multiple of p
-     *         that is >= Ihalf will do -- it only has to make the numerator
-     *         non-negative without moving the residue -- and p >= 2 gives
-     *         p<<(logI-2) >= 2^(logI-1) == Ihalf. The stored "least multiple"
-     *         was never worth a load.
+     *   bias  p << SS_KSHIFT(logI), the same macro the host builds its bound
+     *         against. Any multiple of p that is >= Ihalf will do -- it only
+     *         has to make the numerator non-negative without moving the
+     *         residue -- and p >= 2 gives p<<(logI-2) >= 2^(logI-1) == Ihalf.
+     *         The stored "least multiple" was never worth a load; neither was
+     *         a per-p shift, which is smaller still but costs more per hit
+     *         than the coverage is worth (measured; see SS_KSHIFT in td.cuh).
      *   sh    floor(log2 p) == 31 - clz(p), one instruction.
      *
      * Powers of two take an AND instead: td_magic_build has to special-case
@@ -335,8 +335,9 @@ __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_regi
     uint32_t j = jlocal;
     if constexpr (SLABBED) j += j_base;
     const int32_t  ilo   = (int32_t)(x0 & ((1u << logI) - 1)) - (int32_t)(1u << (logI - 1));
-    /* Derived here, not plumbed in: the host proves its bound against
-     * SS_KSHIFT(logI) too, so both sides read the same definition. */
+    /* Loop-invariant, so it is derived once here rather than per hit: the
+     * host proves its bound against SS_KSHIFT(logI) too, so both sides read
+     * the same definition. */
     const uint32_t kshift = SS_KSHIFT(logI);
     const uint32_t warp = tid >> 5, lane = tid & 31, nwarps = nth >> 5;
 
@@ -2334,11 +2335,10 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
 
         /* Reciprocals AFTER the sort: the key is the modulus itself, so
          * building them earlier would mean permuting them too, for no gain. */
-        {
-            const uint32_t ihalf = 1u << (cfg->logI - 1);
-            for (i = 0; i < nsmall; i++)
-                ss_magic_build(hsp[i], cfg->J, SS_KSHIFT(cfg->logI), ihalf, &hsmag[i]);
-        }
+        for (i = 0; i < nsmall; i++)
+            ss_magic_build(hsp[i],
+                           hsg[i] > 1 ? cfg->J / hsg[i] : cfg->J,
+                           cfg->logI, &hsmag[i]);
 
         for (i = 0; i < nsmall && hsp[i] < SS_BLOCK_CUT; i++) nblk = i + 1;
         for (i = 0; i < nsmall && hsp[i] < SS_WARP_CUT;  i++) nwrp = i + 1;
@@ -2451,23 +2451,194 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
         CK(hipMalloc(&D.cursor, (size_t)nregion * 4));
         CK(hipMalloc(&D.out, need));
         CK(hipMemset(D.overflow, 0, 4));
+/* One dispatch for the control fill AND every concurrency arm below. Two copies
+ * of this three-way record-width switch would let the experiment silently
+ * measure a kernel specialisation the control never runs. */
+#define FILL_ONE(GRID, STREAM, PLAT, CUR, OUT, OVF)                          \
+    do {                                                                     \
+        if (cfg->record_bytes == 2)                                          \
+            k_fill_atomic<2, false><<<(GRID), fthreads, 0, (STREAM)>>>(      \
+                (PLAT), D.slice, fb->n, xmax, cfg->logI, log_region,         \
+                (CUR), (OUT), cap, (OVF), NULL, NULL);                       \
+        else if (cfg->record_bytes == 4)                                     \
+            k_fill_atomic<4, false><<<(GRID), fthreads, 0, (STREAM)>>>(      \
+                (PLAT), D.slice, fb->n, xmax, cfg->logI, log_region,         \
+                (CUR), (OUT), cap, (OVF), NULL, NULL);                       \
+        else                                                                 \
+            k_fill_atomic<8, false><<<(GRID), fthreads, 0, (STREAM)>>>(      \
+                (PLAT), D.slice, fb->n, xmax, cfg->logI, log_region,         \
+                (CUR), (OUT), cap, (OVF), NULL, NULL);                       \
+    } while (0)
+
         hipEventRecord(e2);
         for (int rep = 0; rep < cfg->reps; rep++) {
             CK(hipMemset(D.cursor, 0, (size_t)nregion * 4));
-            if (cfg->record_bytes == 2)
-                k_fill_atomic<2, false><<<fblocks, fthreads>>>(D.plat, D.slice, fb->n, xmax,
-                    cfg->logI, log_region, D.cursor, D.out, cap, D.overflow, NULL, NULL);
-            else if (cfg->record_bytes == 4)
-                k_fill_atomic<4, false><<<fblocks, fthreads>>>(D.plat, D.slice, fb->n, xmax,
-                    cfg->logI, log_region, D.cursor, D.out, cap, D.overflow, NULL, NULL);
-            else
-                k_fill_atomic<8, false><<<fblocks, fthreads>>>(D.plat, D.slice, fb->n, xmax,
-                    cfg->logI, log_region, D.cursor, D.out, cap, D.overflow, NULL, NULL);
+            FILL_ONE(fblocks, 0, D.plat, D.cursor, D.out, D.overflow);
         }
         hipEventRecord(e3);
         CK(hipEventSynchronize(e3));
         CK(hipGetLastError());
         t_fill = time_kernel(e2, e3) / cfg->reps;
+
+        /* ---- item 1: is fill's knee per-KERNEL or per-DEVICE? ----
+         *
+         * Every card swept so far plateaus at the same ABSOLUTE block count,
+         * which is the shape of a device limit; but the 4090 is 1.80x SLOWER
+         * at fill than a 5070 with 1.5x its bandwidth, which no device limit
+         * explains. The `ncu` profile named the candidate: waves per SM = 1.00,
+         * so the whole grid is resident at once and a block that draws a heavy
+         * chunk has no queued block to backfill its slot -- SMs idle 26.5% of
+         * elapsed cycles. A second INDEPENDENT kernel could occupy those.
+         *
+         *   CONCURRENT  N workspaces, N streams, fblocks each   -- N workspaces
+         *   SERIAL      the same N launches, one stream         -- N workspaces
+         *   WIDE        one launch at N * fblocks               -- ONE workspace
+         *
+         * CONCURRENT vs SERIAL is the comparison: identical work, identical
+         * launches, only the stream assignment differs. CONCURRENT ~= SERIAL
+         * says the device is saturated and the plateau is real; CONCURRENT <
+         * SERIAL says one kernel cannot feed the card.
+         *
+         * WIDE DOES 1/N THE WORK OF THE OTHER TWO and is not comparable to
+         * them in raw ms. k_fill_atomic is a grid-stride loop over fb->n, so
+         * N*fblocks blocks still process one factor base into one workspace.
+         * It answers a different question -- can a single kernel buy the same
+         * capacity just by being wider? -- and is only ever quoted per
+         * workspace, which is why every row below is normalised.
+         *
+         * ARM ORDER AND DRIFT. Boost clocks decay under sustained load, and a
+         * fixed arm order would bias whichever arm runs first -- here, in
+         * exactly the direction of the conclusion. Arms are therefore
+         * interleaved and each keeps its MINIMUM over the outer repeats, the
+         * same best-of-N every other A/B in this file uses.
+         *
+         * WHAT THE WORKSPACES DO AND DO NOT MODEL. Each gets its own plat,
+         * cursor and bucket arrays, so the concurrent arm streams N x 42 B per
+         * entry from DISTINCT addresses -- sharing one plat would hand it an
+         * L2 advantage no pair of real special-q enjoys. `slice` stays shared
+         * because two real q on one factor base share it too. But the copies
+         * hold IDENTICAL plat values, and the values are the walk: two real q
+         * would write different per-region distributions, while these march
+         * their bucket frontiers in lockstep. Finding 81 makes that exactly
+         * the variable fill is bound by (read-modify-write on partly filled
+         * lines), so this measures the SATURATION question honestly and does
+         * NOT predict how two real q interleave. That needs the pipeline. */
+        if (cfg->fill_streams > 1) {
+            int NS = cfg->fill_streams;
+            /* run_bench is an exported boundary; the argv clamp lives in a
+             * different translation unit and cannot be relied on here. */
+            if (NS > FILL_STREAMS_MAX) NS = FILL_STREAMS_MAX;
+            const size_t wsz = (size_t)nregion * cap * cfg->record_bytes;
+            const size_t psz = (size_t)fb->n * sizeof(plat_t);
+            size_t extra = (size_t)(NS - 1) * (wsz + psz + (size_t)nregion * 4);
+            size_t fnow = 0, tnow = 0;
+            int maxgrid = 0;
+            CK(hipMemGetInfo(&fnow, &tnow));
+            CK(hipDeviceGetAttribute(&maxgrid, hipDeviceAttributeMaxGridDimX, 0));
+            printf("\n  --- fill concurrency, %d workspaces (item 1) ---\n", NS);
+            printf("  extra workspaces need %.2f GB of %.2f GB free\n",
+                   extra / 1073741824.0, fnow / 1073741824.0);
+            if (extra + 64u * 1024 * 1024 > fnow) {
+                printf("  SKIP: %d workspaces need %.2f GB but only %.2f GB is"
+                       " free%s\n", NS, extra / 1073741824.0,
+                       fnow / 1073741824.0,
+                       NS > 2 ? "; try --fill-streams 2" : "");
+            } else if ((double)fblocks * NS > (double)maxgrid) {
+                printf("  SKIP: the WIDE arm would need %d x %d = %.0f blocks,"
+                       " past this device's grid-x limit %d\n",
+                       fblocks, NS, (double)fblocks * NS, maxgrid);
+            } else {
+                plat_t   *wplat[FILL_STREAMS_MAX];
+                uint32_t *wcur [FILL_STREAMS_MAX];
+                uint8_t  *wout [FILL_STREAMS_MAX];
+                hipStream_t st[FILL_STREAMS_MAX];
+                uint32_t *xovf = NULL;   /* NOT D.overflow -- see below */
+                int k;
+                wplat[0] = D.plat; wcur[0] = D.cursor; wout[0] = D.out;
+                for (k = 1; k < NS; k++) {
+                    CK(hipMalloc(&wplat[k], psz));
+                    CK(hipMalloc(&wcur[k], (size_t)nregion * 4));
+                    CK(hipMalloc(&wout[k], wsz));
+                    CK(hipMemcpy(wplat[k], D.plat, psz, hipMemcpyDeviceToDevice));
+                }
+                for (k = 0; k < NS; k++) CK(hipStreamCreate(&st[k]));
+                /* The run's overflow count is REPORTED and gates --verify, and
+                 * these arms issue (2*NS+1)*reps more fills into the same
+                 * buckets. Accumulating them into D.overflow would inflate the
+                 * figure an operator sizes the rerun from, and would fail
+                 * --verify on records this harness dropped rather than the
+                 * measured configuration. Give the experiment its own counter
+                 * and leave D.overflow untouched. */
+                CK(hipMalloc(&xovf, 4));
+                CK(hipMemset(xovf, 0, 4));
+
+                float t_arm[3] = { 1e30f, 1e30f, 1e30f };
+                const int outer = 3;
+                for (int pass = 0; pass < outer; pass++) {
+                    for (int arm = 0; arm < 3; arm++) {
+                        const int grid = (arm == 2) ? fblocks * NS : fblocks;
+                        const int nws  = (arm == 2) ? 1 : NS;
+                        hipEventRecord(e2);
+                        for (int rep = 0; rep < cfg->reps; rep++) {
+                            for (k = 0; k < nws; k++) {
+                                if (arm == 0)
+                                    CK(hipMemsetAsync(wcur[k], 0,
+                                        (size_t)nregion * 4, st[k]));
+                                else    /* same synchronous memset the control
+                                         * fill uses, so SERIAL and the control
+                                         * share one harness */
+                                    CK(hipMemset(wcur[k], 0, (size_t)nregion * 4));
+                            }
+                            for (k = 0; k < nws; k++)
+                                FILL_ONE(grid, arm == 0 ? st[k] : 0,
+                                         wplat[k], wcur[k], wout[k], xovf);
+                        }
+                        /* Do not rely on legacy default-stream semantics to
+                         * fence the blocking streams: one --default-stream
+                         * per-thread in HIPFLAGS would silently turn e3 into
+                         * a launch-issue timestamp and report a 20x win. */
+                        if (arm == 0)
+                            for (k = 0; k < NS; k++) CK(hipStreamSynchronize(st[k]));
+                        hipEventRecord(e3);
+                        CK(hipEventSynchronize(e3));
+                        CK(hipGetLastError());
+                        float t = time_kernel(e2, e3) / cfg->reps;
+                        if (t < t_arm[arm]) t_arm[arm] = t;
+                    }
+                }
+                {
+                    uint32_t xo = 0;
+                    CK(hipMemcpy(&xo, xovf, 4, hipMemcpyDeviceToHost));
+                    printf("  best of %d passes x %d reps, arms interleaved\n",
+                           outer, cfg->reps);
+                    printf("  CONCURRENT %2d x %5d blocks, %d streams : %8.3f ms"
+                           "  = %7.3f ms per workspace\n",
+                           NS, fblocks, NS, t_arm[0], t_arm[0] / NS);
+                    printf("  SERIAL     %2d x %5d blocks, one stream : %8.3f ms"
+                           "  = %7.3f ms per workspace\n",
+                           NS, fblocks, t_arm[1], t_arm[1] / NS);
+                    printf("  WIDE        1 x %5d blocks, ONE workspace: %8.3f ms"
+                           "  = %7.3f ms per workspace\n",
+                           fblocks * NS, t_arm[2], t_arm[2]);
+                    printf("  concurrent/serial %.4f   (<1 = one kernel cannot"
+                           " feed this card; same work, only the streams differ)\n",
+                           t_arm[0] / t_arm[1]);
+                    printf("  concurrent vs the best single kernel: %.4f"
+                           "  (wide %.3f, single %.3f ms per workspace)\n",
+                           (t_arm[0] / NS) / (t_arm[2] < t_fill ? t_arm[2] : t_fill),
+                           t_arm[2], t_fill);
+                    if (xo) printf("  note: %u records overflowed inside the"
+                                   " concurrency arms (own counter; the run's"
+                                   " own overflow figure is unaffected)\n", xo);
+                }
+                hipFree(xovf);
+                for (k = 0; k < NS; k++) CK(hipStreamDestroy(st[k]));
+                for (k = 1; k < NS; k++) {
+                    hipFree(wplat[k]); hipFree(wcur[k]); hipFree(wout[k]);
+                }
+            }
+        }
+#undef FILL_ONE
     } else {
         /* Both levels stage their fan-out in a fixed number of shared buffers,
          * so the split has to fit: L1 needs nsuper <= L1_NBUF and L2 needs

@@ -14,7 +14,14 @@
  * to be decided once, centrally, before work units are distributed. That is
  * planning time, i.e. testsieve.
  *
- * WHY THE SAMPLE MAXIMUM IS NOT THE ANSWER. Measured on the 2,1139+ septic over
+ * The 2,1139+ job named throughout is a DEGREE 8 SNFS form, and an earlier
+ * version of these comments called it a septic in three places. It is an octic
+ * by construction: 1139 = 17 * 67, so the substitution x = 2^67 + 2^-67 leaves
+ * the minimal polynomial of a 17th root of unity plus its inverse, of degree
+ * (17-1)/2 = 8. In the job file that is c8..c0 = 1 1 -7 -6 15 10 -10 -4 1 with
+ * Y1 = 2^67 and Y0 = -(2^134 + 1); F(Y0, Y1) == 0 mod n, checked 2026-09-01.
+ *
+ * WHY THE SAMPLE MAXIMUM IS NOT THE ANSWER. Measured on the 2,1139+ octic over
  * 60M-460M at logI 15: 2,500 (q,rho) sampled at scattered q gave a maximum of
  * 242 bits and the confident, wrong conclusion that 256 was enough. 160,018
  * sampled across the band found q=367699421 at 273.08 bits -- and its
@@ -128,6 +135,14 @@ int main(int argc, char **argv)
     double *v = NULL;
     long n = 0;
     double nprime_tried = 0, nroot = 0;
+    /* Which SIDE drives the width, tracked separately from v[] (which holds
+     * the max of the two and so cannot answer it). This is not cosmetic: side 0
+     * is the degree-1 form G = Y1*x + Y0 and side 1 the degree-d one, and which
+     * dominates decides which side raises the skip in pipe_side_prepare_q --
+     * which checks side 1 FIRST and short-circuits. A band whose width is
+     * driven by side 0 skips on a code path a side-1-driven band never enters. */
+    double mx0 = 0, mx1 = 0;
+    long n0drv = 0, over0 = 0, over1 = 0, overboth = 0;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -190,6 +205,12 @@ int main(int argc, char **argv)
                 norm_setup(&N0, &P0, &L, logI, (uint32_t)J, 1.0, side == 0);
                 b1 = norm_exact_bound_bits(&N1);
                 b0 = norm_exact_bound_bits(&N0);
+                if (b1 > mx1) mx1 = b1;
+                if (b0 > mx0) mx0 = b0;
+                if (b0 > b1) n0drv++;
+                if (b0 > limit && b1 > limit) overboth++;
+                else if (b0 > limit) over0++;
+                else if (b1 > limit) over1++;
                 v[n++] = (b1 > b0) ? b1 : b0;
                 nroot++;
             }
@@ -225,13 +246,28 @@ int main(int argc, char **argv)
                n, N, rpp);
         printf("  exact norm bits: median %.1f  99%% %.1f  99.9%% %.1f  sample max %.2f\n",
                v[n / 2], v[(long)(n * 0.99)], v[(long)(n * 0.999)], v[n - 1]);
-        if (over)
+        /* PER-SIDE, because "rebuild wider" is the same advice either way but
+         * the cause is not: a side-1-driven band is telling you about the
+         * algebraic degree and the sieve area, a side-0-driven one about the
+         * size of Y0. Unconditional -- a reader who does not need it loses one
+         * line, and a reader who needs it has no other way to get it short of
+         * rebuilding the tool. Above the over-limit branch so that branch stays
+         * a single if/else rather than two that have to be kept in sync. */
+        printf("  per side: max side1 (deg %d) %.2f  max side0 (deg 1) %.2f"
+               "  -- side 0 larger on %ld of %ld\n",
+               P.deg, mx1, mx0, n0drv, n);
+        if (over) {
             printf("  %ld of %ld sampled exceed %d bits  ->  ~%.0f of the band\n",
                    over, n, limit, (double)over / (double)n * N);
-        else
+            /* WHICH side crossed decides which skip path a band takes:
+             * pipe_side_prepare_q checks side 1 first and short-circuits. */
+            printf("  over %d bits: side1 only %ld, side0 only %ld, both %ld\n",
+                   limit, over1, over0, overboth);
+        } else {
             printf("  0 of %ld sampled exceed %d bits (an unseen rate up to %.1e,"
                    " i.e. ~%.0f of the band, is still consistent with that)\n",
                    n, limit, 3.0 / (double)n, 3.0 / (double)n * N);
+        }
         if (normscan_project(v, (int)n, N, &proj, &u, &m, &beta))
             printf("  projected band maximum %.1f bits"
                    " (exponential tail, scale %.2f bits, %d points above %.1f)\n",
@@ -253,10 +289,20 @@ int main(int argc, char **argv)
          *
          * Four scales plus a floor. The floor covers a degenerate fit where beta
          * collapses toward zero on a near-constant tail; four is judgement, not
-         * measurement, chosen so the septic against 384 (98 bits clear, beta 5.0)
-         * passes comfortably while AS276 against 256 (7.3 clear, beta 0.15)
-         * also passes and the octic against 256 refuses outright on the
-         * projection alone. */
+         * measurement, chosen so that octic against 384 passes comfortably
+         * while AS276 against 256 (7.3 clear, beta 0.15) also passes and the
+         * same octic against 256 refuses outright on the projection alone.
+         *
+         * The octic's own calibration numbers are NOT reproduced and are
+         * deliberately not repeated here. An earlier draft called this job a
+         * septic in three places, and the pair "(98 bits clear, beta 5.0)"
+         * belongs to that confusion -- one polynomial cannot have the beta 5.9
+         * quoted above and 5.0 here. Re-measured 2026-09-01 on the real
+         * coefficients over 60M-460M: 49.5-57.5 bits clear at beta 5.96-5.99
+         * across three geometries. The VERDICTS are unaffected (pass at 384,
+         * refuse at 256 and 320) and the 4x scale still holds against the
+         * measured beta; the parenthetical did not. See STATUS.md, Known
+         * defects. Re-derive from a fresh survey before tightening this rule. */
         {
             const double margin = (beta > 0.0) ? 4.0 + 4.0 * beta : 16.0;
             const double worst = (proj > v[n - 1]) ? proj : v[n - 1];

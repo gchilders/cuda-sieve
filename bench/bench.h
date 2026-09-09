@@ -381,6 +381,69 @@ uint64_t verify_count_updates(const fb_t *fb, const qlat_t *L,
                               int logI, uint32_t J,
                               int log_region, uint32_t *per_region);
 
+/* ---- how a run ENDED, which is not the same as its exit status --------- *
+ *
+ * Three of these leave a usable .part behind and only one is an error, but a
+ * job queue has to tell them apart. A finished band is a result; a drained and
+ * checkpointed stop is work the SAME host should be handed back; a band whose
+ * norms are wider than this build carries is a permanent mismatch that no
+ * amount of reissuing the same app version fixes.
+ *
+ * This program used to report all four as boinc_finish(0), because rc == 0 was
+ * the only thing main() knew -- so a work unit that stopped after 100 skipped
+ * special-q was credited as a completed band. The --stop-file startup refusal
+ * in bench_main_hip.cpp already rejected the one case of this it could see
+ * locally ("telling a job queue the work succeeded while making no progress,
+ * forever"); this is that rule applied to the two paths that escaped it. */
+enum bench_outcome {
+    BENCH_OUTCOME_OK = 0,       /* band finished; output committed          */
+    BENCH_OUTCOME_FAILED,       /* error, usage rejection, or unresumable   */
+    BENCH_OUTCOME_STOPPED,      /* signal stop: drained AND checkpointed    */
+    BENCH_OUTCOME_UNSUPPORTED,  /* norm wider than this BN_LIMBS carries    */
+    BENCH_OUTCOME_DEGRADED      /* ran, but skipped so much it is not work  */
+};
+
+/* Process exit status for BENCH_OUTCOME_UNSUPPORTED. Distinct from 1 and 2,
+ * which the argument checks use, so an unattended wrapper can tell "this build
+ * cannot sieve this job -- get a wider one" from "you typed the wrong flag". */
+#define BENCH_EXIT_UNSUPPORTED 3
+
+/* Process exit status when the watchdog gives up on a stalled run and kills
+ * it. NOT YET REACHABLE ON THIS BUILD -- the watchdog (watchdog.c/.h on main)
+ * has not been ported here, so nothing currently returns this value. Kept at
+ * the same number as main's anyway: an exit-status table that means something
+ * different on the two builds is worse than one with a gap in it, and porting
+ * the watchdog later should not have to renumber DEGRADED underneath it.
+ *
+ * On main: distinct from 1 so a work client can tell "this host wedged,
+ * reissue elsewhere" from "the band failed"; distinct from 3 so it is not
+ * mistaken for a permanent build/job mismatch that reissuing cannot fix. */
+#define BENCH_EXIT_STALLED 4
+
+/* Process exit status when the band RAN but skipped so many slabs, or lost so
+ * many whole special-q, that its yield can no longer be trusted to mean
+ * anything. Distinct from 1 (the band failed) because the output that IS here
+ * is valid and kept; distinct from 3 because rebuilding wider will not fix it;
+ * distinct from 4 because the card was fine.
+ *
+ * This exists because the per-slab soft-skip is a yield/robustness trade, and
+ * one direction of that trade is silent by construction: skipping is designed
+ * NOT to fail the task, so a job whose bucket array is too small, or whose
+ * mfb/PIPE_K let the large-prime list run past its per-survivor cap, returns
+ * a fraction of the relations it should and still exits 0. (Norm overflow is
+ * NOT in that set: prepare_q proves the width up front, so a norm too wide
+ * for BN_LIMBS skips the whole q and ends at exit 3, and an overflow reaching
+ * trial division is a broken invariant and fatal.) On a volunteer's box that is the
+ * right call for a one-record shortfall. As a *measurement* it is a trap -- a
+ * rate computed from a degraded band looks like a slow card rather than a
+ * misconfigured job -- and past some threshold it is not the right call for a
+ * work unit either. See PIPE_SLAB_SKIP_MAX / PIPE_LOST_MAX in pipeline_hip.cuh.
+ *
+ * Like the norm-width cap, reaching this DRAINS AND CHECKPOINTS first: the
+ * relations already earned are still written and still valid. Only the exit
+ * status says the band is not worth crediting as a whole. */
+#define BENCH_EXIT_DEGRADED 5
+
 /* ---- optional BOINC integration -------------------------------------- */
 
 /* These wrappers are no-ops in the normal build.  When HAVE_BOINC is set,
@@ -408,7 +471,11 @@ void bench_boinc_fraction_done(double fraction_done);
  * it starts. Suspended reports are dropped WITHOUT advancing the monotonic
  * high-water mark, so real progress still begins from zero. Non-BOINC: no-op. */
 void bench_boinc_progress_suspend(int on);
-int  bench_boinc_finish(int status);
+/* `status` is the process exit status; `outcome` is what the run actually did,
+ * and it is the one that decides how BOINC is told. They are separate because
+ * a clean stop exits 0 for the shell -- unattended scripts have always read it
+ * that way -- while BOINC must NOT be told the work unit finished. */
+int  bench_boinc_finish(enum bench_outcome outcome, int status);
 
 /* ---- cofactor WIDTH, in 32-bit limbs ------------------------------------ *
  *
@@ -518,6 +585,16 @@ typedef struct {
      * finding 52. */
     int      fill_blocks;   /* 0 = auto (FILL_BLOCKS_DEFAULT) */
     int      fill_threads;  /* 0 = auto (FILL_THREADS_DEFAULT) */
+    /* Item 1's decisive test, benchmark-only: run N independent fill
+     * workspaces concurrently on N streams and compare against the same N
+     * fills issued back-to-back on one stream, and against a single kernel
+     * given N times the blocks. 0/1 = today's single-workspace behaviour.
+     * Costs a full bucket array per workspace, so N is memory-bound. */
+    int      fill_streams;  /* 0/1 = off; 2..FILL_STREAMS_MAX = concurrency test */
+    /* --qspan: bracket each special-q's GPU work with two events and report
+     * the span, splitting `unaccounted` into host-with-no-GPU-work versus
+     * idle-between-stages. Diagnostic; STATUS item 19 step 2. */
+    int      qspan;         /* 0 = off */
     int      reps;          /* timing repetitions */
     int      verify;        /* run CPU cross-check */
     /* ---- Path 2 ---- */
@@ -696,15 +773,40 @@ typedef struct {
  * resident warps put more concurrent traffic on the constrained resource. The
  * 50% ceiling is benign; do not "fix" it.
  *
+ * CONFIRMED IN-BAND 2026-09-02 (finding 85). The retune above swept --nq 10;
+ * the same sweep at --nq 200, arms interleaved, n=3, gives the SAME RANKING:
+ *
+ *   blocks   2304     4608     9216    18432
+ *   fill    102.34    99.87   102.20   103.49  ms/q, in-band
+ *
+ * NOTE the 1152 arm was NOT re-run in-band -- its 8.6% deficit above stands on
+ * the --nq 10 sweep alone. Only the RANKING reproduces. Against the in-band
+ * table here the 4608-vs-9216 gap is 2.28%; against September's own --nq 10
+ * sweep (103.233 / 100.535 / 102.277 / 103.653, in RESULTS finding 85, not
+ * repeated here) it is 1.70% where August measured 0.84% at an identical
+ * protocol -- so the margin doubled run-to-run while the ordering held.
+ * Rankings are robust; margins are not, which is why STATUS item 2 will not
+ * let a tuner act on one.
+ *
+ * Arms non-overlapping (4608's worst rep 100.104 against 9216's best 102.032).
+ * --nq 10 is a real band -- ten distinct q, each freshly transformed and
+ * filled once -- so this default was never measured in the repeat-fill regime
+ * that broke the deleted autotuner.
+ *
  * KNOWN LIMIT OF THIS RETUNE. 1152 was validated on three cards (5070, 4090,
  * 5090); 4608 is measured on a 5070 only, and only on c194. The c147 shapes
  * are nearly flat across an 8x block range but do not agree on direction:
  * unslabbed prefers MORE blocks (-2.9% at 9216, still improving), slabbed
- * prefers 1152 (+0.8% at 4608, small but ~2.7 sigma). No mechanism explains
- * why two geometries over the same factor base disagree, so no formula is
- * offered. This is a better default for the I16 production class, not a
- * universal optimum -- which is the argument for the startup autotuner in
- * STATUS item 2, not against it.
+ * prefers 1152 (+0.8% at 4608, small but ~2.7 sigma). c183/I15e, unslabbed,
+ * prefers 9216 by 2.4% in-band and puts 4608 at the BOTTOM of four arms
+ * (finding 85: last outright at --nq 10; in-band tied with 18432 for last,
+ * 26.438 against 26.443, inside a 1.46-3.35% spread) -- consistent in
+ * direction with c147-unslabbed. No mechanism explains why two
+ * geometries over the same factor base disagree, so no formula is offered.
+ * This is a better default for the I16 production class, not a universal
+ * optimum -- which is the argument for the startup autotuner in STATUS item 2,
+ * not against it. Do NOT swap in 9216: it wins c183/I15e and loses c194/I16 by
+ * 2.3%, which just moves the loss onto the production class.
  *
  * Applies to k_fill_atomic, the shipping path, and to nothing else by default.
  * k_fill_l1 takes an explicit --fill-blocks but defaults to FILL_L1_BLOCKS
@@ -714,6 +816,23 @@ typedef struct {
  * data-driven (one block per super-bucket) and has no grid to tune. */
 #define FILL_BLOCKS_DEFAULT  4608
 #define FILL_THREADS_DEFAULT 32
+/* Concurrency test only (item 1). Each workspace is a full bucket array, so
+ * the practical ceiling is memory, not this constant -- 2 and 4 fit a 12 GB
+ * card at the I15e/I16 geometries, 8 does not. */
+#define FILL_STREAMS_MAX     8
+/* A startup fill-block autotuner was built and REMOVED on 2026-09-01. The fill
+ * grid stays a constant per run: FILL_BLOCKS_DEFAULT, or whatever
+ * --fill-blocks says, fixed for the whole band. What was learned -- why a
+ * repeated-fill ladder cannot predict band performance, the calibrated
+ * stability and margin guards it needed, and the in-band design that would
+ * work -- is in STATUS.md item 2. Read that before rebuilding it: the failure
+ * was in the measurement regime, not in the code.
+ *
+ * Diagnosis pinned 2026-09-02 (finding 85): it is the REPEAT-FILL structure,
+ * not the sample count. On the same job and geometry the ladder got wrong, a
+ * 10-q band picks the in-band winner, and 15 of 16 interleaved reps rank the
+ * axis correctly on their own. Interleave the candidates and 10 q each is
+ * enough. */
 /* k_apply's block size. On the CUDA build, APPLY_THREADS_MAX is NOT a taste
  * limit: it is the first argument of k_apply's __launch_bounds__ in
  * bench_kernels.cu, which is a hard ceiling -- a launch with more threads per
@@ -835,6 +954,21 @@ void sqgen_free(sqgen_t *G);
  * trial-divide and classify each side against the shared two-sided bitmap,
  * then join. This is the path that becomes the siever; run_bench stays the
  * measurement harness. */
+/* run_pipeline's return values, which map onto `enum bench_outcome` above.
+ * NOT to be confused with PIPE_Q_SKIP in pipeline_hip.cuh: that is one
+ * special-q's third outcome, these describe the whole band. Negative still
+ * means failure, so every `< 0` test in the pipeline stays correct. */
+enum {
+    PIPE_RC_OK          =  0,  /* band finished; output committed          */
+    PIPE_RC_FAIL        = -1,  /* error, or a stop with nothing resumable  */
+    PIPE_RC_STOPPED     =  2,  /* signal/stop file: drained + checkpointed */
+    /* NOT an independent 3: bench_main_hip.cpp maps this straight onto the
+     * exit status, and two constants that must stay equal will not. */
+    PIPE_RC_UNSUPPORTED = BENCH_EXIT_UNSUPPORTED,
+    /* Same reasoning, same rule: not an independent 5. */
+    PIPE_RC_DEGRADED    = BENCH_EXIT_DEGRADED
+};
+
 int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                  const fb_t *fb0, const fb_t *fbs0,
                  const qsel_t *qlist, uint32_t nq, sqgen_t *qgen,

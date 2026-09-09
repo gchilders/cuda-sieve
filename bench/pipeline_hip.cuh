@@ -52,6 +52,19 @@ static void pipe_request_stop(void)
     if (++g_pipe_stop >= 2) bench_fast_exit(130);
 }
 
+/* The widest BN_LIMBS any skipped (q,rho) asked for this session; -1 once some
+ * skip needed more than the 16 limbs the build supports, 0 when nothing was
+ * skipped. It exists so the PIPE_SKIP_MAX stop can put ONE number on stderr --
+ * stderr.txt is what a BOINC project gets back from a failed result, and
+ * "rebuild at N limbs" is the whole content of that failure. Leaving it to be
+ * reconstructed from a hundred per-skip warnings is not a dispatch rule.
+ *
+ * A file static because the skip is raised three call levels down inside
+ * pipe_side_prepare_q, whose return value is already a three-way code; the
+ * alternative was an out-parameter threaded through the per-q path for a value
+ * only the cap ever reads. Reset at the top of every band. */
+static int g_pipe_need_limbs = 0;
+
 /* Record a resume point.
  *
  * THE PRECONDITION IS THE WHOLE DESIGN: the caller must guarantee that the
@@ -339,9 +352,57 @@ enum { PIPE_Q_SKIP = 1 };
  * holes -- nqskip is not checkpointed, so a resumed band starts counting again,
  * and a work unit of a few hundred q can never reach the cap. Both are
  * acceptable only because normscan is supposed to make the whole situation
- * unreachable; neither should be relied on as the primary defence. */
+ * unreachable; neither should be relied on as the primary defence.
+ *
+ * REACHING IT IS NOT A CLEAN STOP. The band still drains and checkpoints --
+ * throwing away the queued relations would be strictly worse -- but it returns
+ * PIPE_RC_UNSUPPORTED, exits nonzero, and reports BENCH_OUTCOME_UNSUPPORTED to
+ * BOINC. It used to exit 0, which credited a work unit for a band that emitted
+ * a hundred skips and, per finding 93 case D, would emit nothing again on every
+ * resume of the same binary. The stop is deliberate; the SUCCESS was not. */
 #ifndef PIPE_SKIP_MAX
 #define PIPE_SKIP_MAX 100
+#endif
+
+/* The same net, for the per-slab SOFT skips (bucket overflow and a truncated
+ * factor list; norm overflow is fatal, see pipe_td_perq). Those exist so a
+ * one-record shortfall costs a slab's
+ * yield instead of a volunteer's whole task, which is right -- but the trade
+ * is silent in one direction, and without a ceiling it stays silent all the
+ * way down to "emitted almost nothing, exited 0". A job with an undersized
+ * bucket array can skip every slab of every q and still report success; a
+ * rate computed from that band looks like a slow card rather than a
+ * misconfigured job.
+ *
+ * TWO counters, because either can be pathological while the other looks
+ * clean:
+ *
+ *   PIPE_LOST_MAX       whole special-q that produced nothing because every
+ *                       slab of them was skipped. The sharp signal, and
+ *                       deliberately the same 100 as PIPE_SKIP_MAX: past a
+ *                       hundred, the condition is systemic, not transient.
+ *   PIPE_SLAB_SKIP_MAX  slabs LOST, which is not the same as incidents: a
+ *                       bucket overflow abandons the rest of its q (see the
+ *                       skip site), so one incident on slab 0 of a 4-slab
+ *                       plan counts 4, not 1. Counting lost slabs is the
+ *                       point -- it is the yield -- but it means the ceiling
+ *                       trips after correspondingly fewer incidents. Catches
+ *                       the case PIPE_LOST_MAX cannot see: one slab of four
+ *                       failing on EVERY q is a permanent yield loss with
+ *                       nq_lost stuck at zero.
+ *
+ * Absolute counts, not rates, matching PIPE_SKIP_MAX's idiom: a healthy band
+ * needs a thousand separate incidents to trip this, and a broken one trips it
+ * within the first few hundred q. They inherit PIPE_SKIP_MAX's two holes too
+ * -- neither is checkpointed, so a resumed band starts counting again, and a
+ * short work unit may finish before reaching either. Like that cap, this is a
+ * backstop against silent waste, not the primary defence; sizing the bucket
+ * array and mfb correctly is. */
+#ifndef PIPE_LOST_MAX
+#define PIPE_LOST_MAX 100
+#endif
+#ifndef PIPE_SLAB_SKIP_MAX
+#define PIPE_SLAB_SKIP_MAX 1000
 #endif
 
 /* Per-special-q work that is independent of the slab: transform the small
@@ -416,12 +477,9 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
         /* Reciprocals AFTER the sort, same as the standalone path: the sort
          * key is the modulus, so building them earlier would only mean
          * permuting them too. */
-        {
-            const uint32_t ihalf = 1u << (cfg->logI - 1);
-            for (uint32_t i = 0; i < k; i++)
-                ss_magic_build(hsp[i], cfg->J, SS_KSHIFT(cfg->logI),
-                               ihalf, &S->hsmag[i]);
-        }
+        for (uint32_t i = 0; i < k; i++)
+            ss_magic_build(hsp[i], hsg[i] > 1 ? cfg->J / hsg[i] : cfg->J,
+                           cfg->logI, &S->hsmag[i]);
         S->nblk = S->nwrp = 0;
         for (uint32_t i = 0; i < k && hsp[i] < SS_BLOCK_CUT; i++) S->nblk = i + 1;
         for (uint32_t i = 0; i < k && hsp[i] < SS_WARP_CUT; i++) S->nwrp = i + 1;
@@ -500,6 +558,12 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
                 else
                     runlog_warn("     no supported BN_LIMBS is wide enough"
                                 " (the maximum is 16, i.e. 512 bits)");
+                /* MAX over the band, and -1 wins outright: a single (q,rho)
+                 * that no supported width covers makes "rebuild at N" wrong
+                 * advice however many others would have fitted at N. */
+                if (!need) g_pipe_need_limbs = -1;
+                else if (g_pipe_need_limbs >= 0 && need > g_pipe_need_limbs)
+                    g_pipe_need_limbs = need;
                 rc = PIPE_Q_SKIP;
                 goto done;
             }
@@ -1387,8 +1451,17 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
      * which is the ONLY thing that makes the .part resumable. Conflating the
      * two keeps a .part that no rerun can consume and that the startup check
      * then refuses, wedging an unattended queue. */
-    int stopped = 0, ckpt_armed = 0, ckpt_written = 0, ckpt_warned = 0;
+    /* stopped: a clean stop of either kind, which is what suppresses the
+     * commit. capped: that stop was PIPE_SKIP_MAX, which is a different thing
+     * to tell a job queue -- rerunning the same binary cannot help. */
+    int stopped = 0, capped = 0, ckpt_armed = 0, ckpt_written = 0, ckpt_warned = 0;
+    int degraded = 0;               /* PIPE_LOST_MAX/PIPE_SLAB_SKIP_MAX tripped */
     int stop_hooked = 0;
+
+    /* A file static, so a second band in one process would inherit the first
+     * one's answer. Nothing does that today; the reset costs nothing and the
+     * bug it prevents is a wrong width in a failure report. */
+    g_pipe_need_limbs = 0;
 
     /* This must precede pipe_est_records(): that helper divides by every
      * modulus, so a zero modulus in an unvalidated object is already too late
@@ -1714,6 +1787,68 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                                 base_rel + Q.nrel, base_nq + nqdone,
                                 &ckpt_written, &ckpt_warned);
 
+        /* ---- degradation ceiling ----
+         *
+         * A POLICY STOP, exactly like the norm-width cap above and for the
+         * same reason. The per-slab soft skips trade yield for keeping the
+         * band alive, which is right for a transient; past a point a band
+         * that keeps making that trade has stopped doing the work it was
+         * given, and nothing else will say so -- skipping is designed not to
+         * fail the task, so the alternative is exiting 0 having emitted
+         * almost nothing.
+         *
+         * Checked HERE, at the top of a q with no work done for it, because
+         * that makes `cur` exactly the resume point and because the previous
+         * q's ev[4] synchronise has already drained the stream. Checking it
+         * mid-slab-loop would checkpoint a partial q.
+         *
+         * It drains and checkpoints -- every relation already earned is valid
+         * and is kept -- but reports PIPE_RC_DEGRADED, so the exit status
+         * says the band as a whole is not creditable. Draining is what this
+         * shares with a clean stop; "the work unit succeeded" is not. See
+         * BENCH_EXIT_DEGRADED in bench.h. */
+        if (nq_lost >= (unsigned long long)PIPE_LOST_MAX ||
+            nslab_skipped >= (unsigned long long)PIPE_SLAB_SKIP_MAX) {
+            runlog_warn("  ** stopping at q=%llu: %llu slab(s) skipped and"
+                        " %llu special-q lost entirely (limits %d slab / %d"
+                        " q). The band ran, but its yield no longer means"
+                        " anything. %s Relations already written are kept and"
+                        " are valid.",
+                        (unsigned long long)cur->q, nslab_skipped, nq_lost,
+                        PIPE_SLAB_SKIP_MAX, PIPE_LOST_MAX,
+                        /* Which remedy to name follows the MAJORITY, not
+                         * the mere presence of a trial-division skip: one
+                         * truncated list among a thousand bucket overflows
+                         * used to print the PIPE_K advice and steer the
+                         * operator away from the actual cause. Norm overflow
+                         * is fatal now, so a TD skip can only be a truncated
+                         * list -- a PIPE_K/mfb problem, never a bucket one. */
+                        ntd_skipped * 2 >= nslab_skipped
+                          ? "Mostly trial-division skips: the large-prime list"
+                            " ran past PIPE_K per survivor, so check mfb and"
+                            " PIPE_K rather than the bucket array."
+                          : "Mostly bucket overflow: check this job's bucket"
+                            " array size first (the counts above separate the"
+                            " two).");
+            if (cfg->cofactor && Q.n &&
+                cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
+                           cfg->cof_rounds, cfg->cof_budget, blocks,
+                           cfg->threads, fr)) { rc = -1; break; }
+            /* Guarded on fr, like the clean stop above and like the
+             * norm-width cap: without a relation file there is nothing to
+             * checkpoint, and letting ckpt_written be set anyway would print a
+             * "resume at q=" line naming a .part that does not exist. */
+            if (fr)
+                pipe_try_checkpoint(POLY, cfg, &ck, fr, fc, cur,
+                                    base_rel + (cfg->cofactor ? Q.nrel
+                                        : (unsigned long long)acc_rel),
+                                    base_nq + nqdone, &ckpt_written,
+                                    &ckpt_warned);
+            stopped = 1;
+            degraded = 1;
+            break;
+        }
+
         /* ---- clean stop ----
          *
          * Checked here, with the next (q, rho) in hand but no work done for it,
@@ -1785,20 +1920,48 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                      * and threw away every relation queued since the last one,
                      * then reported the band as FAILED with no checkpoint. This
                      * is a deliberate stop on a known condition, so it drains
-                     * and checkpoints exactly like the stop-file path. */
-                    runlog_warn("  ** %llu special-q skipped for norm width;"
-                                " this build is too narrow for the job."
-                                " Run ./normscan and rebuild.", nqskip);
+                     * and checkpoints exactly like the stop-file path.
+                     *
+                     * IT DOES NOT EXIT LIKE ONE. `capped` carries the reason
+                     * out to the return mapping, which reports it as
+                     * PIPE_RC_UNSUPPORTED: draining is what the two stops share,
+                     * "this work unit succeeded" is not. */
+                    if (g_pipe_need_limbs > 0)
+                        runlog_warn("  ** %llu special-q skipped for norm width;"
+                                    " this build is too narrow for the job."
+                                    " Rebuild with `make BN_LIMBS=%d` (this"
+                                    " build carries %d) and run ./normscan over"
+                                    " the band first.",
+                                    nqskip, g_pipe_need_limbs, BN_LIMBS);
+                    else
+                        runlog_warn("  ** %llu special-q skipped for norm width;"
+                                    " this build is too narrow for the job and"
+                                    " no supported BN_LIMBS is wide enough for"
+                                    " every skipped (q,rho). Run ./normscan"
+                                    " over the band.", nqskip);
                     if (cfg->cofactor && Q.n &&
                         cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim,
                                    cfg->lpb, cfg->cof_rounds, cfg->cof_budget,
                                    blocks, cfg->threads, fr)) { rc = -1; break; }
-                    pipe_try_checkpoint(POLY, cfg, &ck, fr, fc, cur,
-                                        base_rel + (cfg->cofactor ? Q.nrel
-                                            : (unsigned long long)acc_rel),
-                                        base_nq + nqdone, &ckpt_written,
-                                        &ckpt_warned);
+                    /* Guarded on fr, like the degradation ceiling above.
+                     * pipe_checkpoint returns 0 -- success -- at its own
+                     * `if (!fr || !cfg->relations)` guard, i.e. it reports
+                     * success for correctly doing nothing, so calling this
+                     * unguarded set ckpt_written with no sidecar on disk and
+                     * the terminal message then printed "checkpoint written,
+                     * resume at q=0" naming a .part that was never created.
+                     * Reachable only by plain benchmarking on a too-narrow
+                     * build, so it cost a wrong message rather than a wrong
+                     * outcome -- but the two policy stops must not disagree
+                     * about the same hazard. */
+                    if (fr)
+                        pipe_try_checkpoint(POLY, cfg, &ck, fr, fc, cur,
+                                            base_rel + (cfg->cofactor ? Q.nrel
+                                                : (unsigned long long)acc_rel),
+                                            base_nq + nqdone, &ckpt_written,
+                                            &ckpt_warned);
                     stopped = 1;
+                    capped = 1;
                     break;
                 }
                 continue;              /* next q; nqdone is not incremented */
@@ -2449,26 +2612,124 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             runlog_warn("  band FAILED after %u of %u q; %s",
                         nqdone, nq, fate);
     }
-    if (stopped && ckpt_written)
+    /* THE CHAIN BELOW TESTS cfg->relations, NOT fr, AND MUST.
+     *
+     * pipe_finalize_outputs above closes fr and sets it to NULL, so every `fr`
+     * here is null by construction no matter what the run was asked to do.
+     * Written as `!fr` -- which is what it said -- the "no relation file
+     * requested" arms matched ALWAYS, printing "nothing to resume" at a run
+     * that had just written a perfectly good .part, and shadowing the
+     * `ckpt_written` arms behind them into dead code: the whole "FIX THE JOB
+     * BEFORE RESUMING" warning could never print. degradecheck.sh case A is
+     * what caught it.
+     *
+     * cfg->relations is the honest predicate: it is const config, it survives
+     * finalize, and fr is opened if and only if it is set (a failed open
+     * goto done's with rc = -1 rather than continuing with fr null). The
+     * in-loop `if (fr)` guards are a different question and stay as they are
+     * -- fr is live there. */
+    if (stopped && ckpt_written && capped)
+        /* runlog_warn, NOT printf: this is the operator-facing half of an
+         * exit-3 result, and under BOINC stdout is not uploaded -- stderr.txt
+         * is all a project gets back. The width already went to stderr at the
+         * cap; the resume point and the "do not just rerun it" warning were
+         * going to stdout, where a project triaging the failure cannot see
+         * them.
+         *
+         * Same checkpoint, opposite advice. "Rerun the same command" is what
+         * the ordinary stop wants and it is exactly wrong here: finding 93's
+         * case D measured a resumed capped band advancing ~PIPE_SKIP_MAX q and
+         * emitting nothing, because nqskip is not checkpointed. The resume
+         * point is still printed -- it is real, and a WIDER build should start
+         * from it. The phrase "resume at q=" is load-bearing for skipcheck.sh,
+         * which reads the point back out of this line. */
+        runlog_warn("\n  stopped after %u q this session (%llu total, %llu"
+                    " relations); checkpoint written, resume at q=%llu."
+                    " REBUILD BEFORE RESUMING: this binary hits the same cap"
+                    " about %d skips into any rerun and emits nothing.",
+                    nqdone, base_nq + nqdone, ck.nrel,
+                    (unsigned long long)ck.next_q, PIPE_SKIP_MAX);
+    else if (capped && !cfg->relations)
+        /* The counterpart of `degraded && !cfg->relations` below, and it
+         * exists for the same reason: without it this falls through to the
+         * "NO checkpoint
+         * could be written" error, which tells the operator to move a .part
+         * aside or pass --restart over a file that was never requested. The
+         * remedy differs from the degraded one -- the job is fine, the BUILD
+         * is too narrow -- and the width to rebuild at already went to stderr
+         * at the cap itself. */
+        runlog_warn("\n  stopped after %u q with no relation file requested;"
+                    " nothing to resume. The timings from this band are NOT"
+                    " usable -- it skipped its way to the norm-width cap."
+                    " Rebuild wider (see above) before reading any number"
+                    " from it.", nqdone);
+    else if (degraded && !cfg->relations)
+        /* No --relations at all: nothing was written and nothing was meant to
+         * be, so this is not the "cannot resume" error below. Said plainly
+         * because this is the benchmarking path, where the number the operator
+         * came for is the one the skipping just invalidated. */
+        runlog_warn("\n  stopped after %u q with no relation file requested;"
+                    " nothing to resume. The timings from this band are NOT"
+                    " usable -- it skipped its way to the ceiling.", nqdone);
+    else if (degraded && ckpt_written)
+        /* Same checkpoint, same "opposite advice" trap as the cap above. Both
+         * ceilings reset on resume, so "rerun the same command" would sieve
+         * another PIPE_LOST_MAX q (or PIPE_SLAB_SKIP_MAX slabs) into the same
+         * wall and stop again, forever. The resume point is still real and a
+         * rerun with the job FIXED should start from it. */
+        runlog_warn("\n  stopped after %u q this session (%llu total, %llu"
+                    " relations); checkpoint written, resume at q=%llu. FIX"
+                    " THE JOB BEFORE RESUMING: both ceilings reset on resume,"
+                    " so an unchanged rerun stops again about %d lost q or %d"
+                    " skipped slabs later.",
+                    nqdone, base_nq + nqdone, ck.nrel,
+                    (unsigned long long)ck.next_q,
+                    PIPE_LOST_MAX, PIPE_SLAB_SKIP_MAX);
+    else if (stopped && ckpt_written)
         printf("\n  stopped after %u q this session (%llu total, %llu"
                " relations). Rerun the same command to resume at q=%llu.\n",
                nqdone, base_nq + nqdone, ck.nrel,
                (unsigned long long)ck.next_q);
     else if (stopped)
+        /* Now an ERROR, not a zero exit. A stop with no resume point is not
+         * resumable work, and reporting it as a clean stop is what would turn
+         * a BOINC temporary exit into a restart loop over a band that always
+         * begins again from nothing. See the PIPE_RC_ mapping at the end. */
+        /* DO NOT name rtmp as something to move aside: it is already gone.
+         * This branch is reached only when ckpt_written == 0, which is
+         * exactly the keep_partial = 0 that made pipe_finalize_outputs
+         * remove(rtmp) above -- a .part with no sidecar is not resumable work
+         * and keeping it would strand every rerun on the startup refusal. So
+         * the old advice pointed at a path that no longer exists, which is
+         * the same defect the two branches above were just fixed for. The
+         * session simply produced nothing; say that. */
         fprintf(stderr,
-                "\n  stopped after %u q, but NO checkpoint could be written."
-                " %s cannot be\n  resumed automatically; move it aside or pass"
-                " --restart.\n", nqdone, rtmp);
+                "\n  stopped after %u q, but NO checkpoint could be written,"
+                " so this session\n  produced nothing resumable and its"
+                " staged output was discarded. Fix what\n  prevented the"
+                " checkpoint (the warning above names it) and rerun.\n",
+                nqdone);
 
     /* OUTSIDE the `if (nqdone)` below, because the case that most needs saying
      * is a band where skips left nqdone == 0: guarded, the one run that
      * produced nothing but skips would have reported nothing at all. A band
      * runs for days and scrolls, so this has to survive in the summary and not
      * only in the per-q warnings. Silent is the one thing this must not be. */
-    if (nqskip)
-        printf("\n  ** %llu special-q SKIPPED: exact norm wider than %d bits."
-               " Run ./normscan over the band and rebuild wider. **\n",
-               nqskip, BN_LIMBS * 32);
+    /* runlog_warn for the same reason the capped stop uses it: a band that
+     * skipped 99 q never reaches the cap, exits 0, and reports a completed work
+     * unit -- so this line is the ONLY signal that its output is deficient, and
+     * on stdout a project never sees it. It also names the width now; that
+     * number was computed at every skip and thrown away here. */
+    if (nqskip && g_pipe_need_limbs > 0)
+        runlog_warn("\n  ** %llu special-q SKIPPED: exact norm wider than the"
+                    " %d bits this build carries. Run ./normscan over the band"
+                    " and rebuild with `make BN_LIMBS=%d`. **",
+                    nqskip, BN_LIMBS * 32, g_pipe_need_limbs);
+    else if (nqskip)
+        runlog_warn("\n  ** %llu special-q SKIPPED: exact norm wider than the"
+                    " %d bits this build carries, and no supported BN_LIMBS is"
+                    " wide enough for every one of them. Run ./normscan over the"
+                    " band. **", nqskip, BN_LIMBS * 32);
     if (nqdone) {
         const double N = nqdone;
         const double dev = (tm.rank + tm.emit + tm.summary + tm.resieve + tm.td
@@ -2594,7 +2855,16 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                        * two would read as a contradiction. */
                       (double)(cfg->cofactor ? Q.nrel
                                              : (unsigned long long)acc_rel) / N,
-                      stopped ? "  [stopped cleanly]" : (rc ? "  [FAILED]" : ""));
+                      /* `degraded` BEFORE `stopped`, because the ceiling
+                       * sets both. Ordered the other way -- which is how this
+                       * read until degradecheck went looking -- an exit-5
+                       * band recorded "[stopped cleanly]" in the one artifact
+                       * that outlives the run, asserting the opposite of its
+                       * own exit status to whoever reads the log later. */
+                      capped   ? "  [stopped: build too narrow]"
+                      : degraded ? "  [DEGRADED: yield not creditable]"
+                      : stopped ? "  [stopped cleanly]"
+                      : (rc ? "  [FAILED]" : ""));
         if (cfg->cofactor) {
             printf("\n  --- cofactorisation, cross-q queue ---\n");
             printf("  %-34s %8.2f ms\n", "rational queue", Q.ms_rat / N);
@@ -2718,17 +2988,75 @@ done:
     hipFree(d_two); hipFree(d_n); hipFree(d_pre);
     if (ea) hipEventDestroy(ea);
     if (eb) hipEventDestroy(eb);
+    /* ONE place maps the band's four outcomes onto the return code, and it is
+     * after every cleanup path that can still turn a success into a failure.
+     * Everything above works in the internal 0/-1 convention, so no `rc < 0`
+     * test anywhere in this function had to learn about the new values.
+     *
+     * A stop with no checkpoint is a FAILURE, not a stop: there is nothing to
+     * resume, so calling it resumable is what would make a client restart it
+     * forever. See `enum bench_outcome` in bench.h. */
+    /* The ceiling is deliberately NOT re-tested here. By this point a band
+     * that left the loop any way other than the loop-top stop has FINISHED:
+     * `commit` above renamed the .part onto the final --relations name and
+     * removed the checkpoint sidecars. Reporting DEGRADED then would tell a
+     * BOINC client to record an application error for a complete work unit
+     * whose resume state has already been deleted, and would contradict the
+     * one thing exit 5 promises -- that the relations are waiting in the
+     * .part. A band that finishes under its own steam is a success with loud
+     * warnings (see the end-of-band summary above), not an error.
+     *
+     * The cost is the documented hole: a band whose LAST q crosses a limit
+     * exits 0. That is the same hole PIPE_SKIP_MAX has, and for the same
+     * reason -- these counters are a backstop, not the primary defence.
+     *
+     * `degraded` is tested before `stopped` because both are set together by
+     * the ceiling; it carries ckpt_written for the same reason `stopped`
+     * does, since a stop with nothing to resume from is a failure however it
+     * was reached. */
+    if (rc == 0) {
+        /* capped carries the SAME ckpt_written test as degraded below, and
+         * for the same reason: with --relations set and no checkpoint
+         * written, pipe_finalize_outputs ran with keep_partial = 0 and
+         * DELETED the staged relation file. Reporting UNSUPPORTED there
+         * ("rebuild with a wider BN_LIMBS") describes a build problem to
+         * BOINC for a session whose output was destroyed and which has no
+         * resume point -- the operator rebuilds and restarts from q0 with no
+         * indication anything was lost. The rebuild advice is still correct
+         * and still on stderr; the exit status has to say the session failed.
+         * Left unconditional, this was the one hazard the two policy stops
+         * still disagreed about after the rest of this was made symmetric. */
+        if (capped)         rc = (!cfg->relations || ckpt_written)
+                                     ? PIPE_RC_UNSUPPORTED : PIPE_RC_FAIL;
+        /* "No relation file was requested" is NOT the no-checkpoint failure:
+         * with no --relations there was never any output to resume, which is
+         * the plain benchmarking case the ceiling exists to serve -- a
+         * degraded band there must still report DEGRADED so the rate is not
+         * read as a slow card. Only a run that HAS a relation file and could
+         * not checkpoint it is unresumable, and that is the failure.
+         *
+         * cfg->relations, NOT fr, for the reason spelled out at the terminal
+         * messages above: pipe_finalize_outputs has already closed fr and set
+         * it to NULL, so `!fr` was unconditionally true here and the
+         * PIPE_RC_FAIL arm could never be taken. A degraded band that asked
+         * for relations and could not write a single checkpoint reported
+         * DEGRADED -- resumable -- when nothing of it is resumable. */
+        else if (degraded)  rc = (!cfg->relations || ckpt_written)
+                                     ? PIPE_RC_DEGRADED : PIPE_RC_FAIL;
+        else if (stopped)   rc = ckpt_written ? PIPE_RC_STOPPED : PIPE_RC_FAIL;
+    }
     return rc;
 }
 
 /* Auto-calibrate the j-slab size against the real first special-q, rather
- * than trusting a single build-wide constant. SLAB_PERF_TARGET_LOG2 (see
- * slab.h) is itself a measurement on ONE piece of hardware -- gfx1103's small
- * L2 and shared-DDR5 UMA made 2^27 the winner here, 45.6% faster than the
- * CUDA-tuned 2^29, but a discrete AMD card with a much larger L2 could easily
- * land somewhere else on that same curve. There is no way to know without
- * asking the hardware in front of it, and doing so costs one extra special-q
- * at startup -- negligible against a run measured in hours.
+ * than trusting a single build-wide constant. SLAB_PERF_REGIONS (see slab.h)
+ * is itself a measurement on ONE piece of hardware -- gfx1103's small L2 and
+ * shared-DDR5 UMA made 2^27 positions (8192 regions at the default --region
+ * 14) the winner here, 45.6% faster than the CUDA-tuned 2^29 (32768 regions),
+ * but a discrete AMD card with a much larger L2 could easily land somewhere
+ * else on that same curve. There is no way to know without asking the
+ * hardware in front of it, and doing so costs one extra special-q at
+ * startup -- negligible against a run measured in hours.
  *
  * Bounded to {2^27, 2^28, 2^29} ONLY, deliberately: this session confirmed
  * (Event Viewer, Kernel-Power id 41, no id 4101 recovery) that a single
@@ -2737,6 +3065,12 @@ done:
  * See the SAFETY FINDING in HIP_TUNING_PLAN.md. Calibration must never probe
  * a size this hardware has already shown can crash the box, so 2^30 and
  * above are not candidates here no matter what a future card might prefer.
+ * These candidates are ABSOLUTE position counts, not region counts, and were
+ * measured only at the default --region 14: unlike the static SLAB_PERF_REGIONS
+ * default above, calibration does not yet re-derive them against a caller's
+ * own --region, so a job run at a non-default --region calibrates among the
+ * same three absolute sizes regardless. Flagged rather than silently assumed
+ * correct; revisit if --region-sensitive calibration is ever measured.
  *
  * Skipped entirely when the caller passes an explicit --slab-j (a
  * regression/testing knob, not something auto-tuning should override) or
@@ -2765,7 +3099,7 @@ static uint32_t calibrate_slab_rows(const fb_t *fb1, const fb_t *fbs1,
     int ncand = 0, ntested = 0;
 
     if (cfg->slab_j || !nq || !quantum ||
-        slab_perf_jmax(cfg->logI, cfg->J) == 0xffffffffu)
+        slab_perf_jmax(cfg->logI, cfg->log_region, cfg->J) == 0xffffffffu)
         return 0;
 
     printf("\n  slab auto-calibration: probing 2^27/2^28/2^29-position slabs"
@@ -2780,7 +3114,8 @@ static uint32_t calibrate_slab_rows(const fb_t *fb1, const fb_t *fbs1,
         int k, dup = 0, rc_cal;
 
         rows -= rows % quantum;
-        if (!rows || slab_make_plan(cfg->logI, cfg->J, pmax, rows, &cplan))
+        if (!rows || slab_make_plan(cfg->logI, cfg->log_region, cfg->J, pmax,
+                                    rows, &cplan))
             continue;
 
         /* slab_make_plan() clamps a forced row count down to J (near the
@@ -2900,7 +3235,8 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                                                        pmax);
     const uint32_t forced_j = calibrated_j ? calibrated_j : cfg->slab_j;
 
-    if (slab_make_plan(cfg->logI, cfg->J, pmax, forced_j, &plan)) {
+    if (slab_make_plan(cfg->logI, cfg->log_region, cfg->J, pmax,
+                       forced_j, &plan)) {
         fprintf(stderr,
                 "  pipeline: cannot make a safe slab plan for logI=%d J=%u"
                 " (largest direct-test prime %u, requested --slab-j %u)\n",
@@ -2925,7 +3261,8 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
      * even considers a non-trivial jmax) would still log "static default",
      * indistinguishable from a real static-default decision and diluting
      * exactly the fleet-wide aggregate this line exists to produce. */
-    if (cfg->slab_j || slab_perf_jmax(cfg->logI, cfg->J) != 0xffffffffu)
+    if (cfg->slab_j ||
+        slab_perf_jmax(cfg->logI, cfg->log_region, cfg->J) != 0xffffffffu)
         fprintf(stderr, "BOINC: slab plan: %u rows/slab, %u slab%s%s\n",
                 plan.jmax, plan.nslab, plan.nslab == 1 ? "" : "s",
                 calibrated_j ? " (auto-calibrated)"
@@ -2941,21 +3278,24 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                " --td-record-scalar) -- the pre-finding-77 path, for A/B only\n");
 
     if (plan.enabled) {
-        const uint32_t perf_jmax = slab_perf_jmax(cfg->logI, cfg->J);
+        const uint32_t perf_jmax = slab_perf_jmax(cfg->logI, cfg->log_region,
+                                                  cfg->J);
         if (!cfg->slab_j && perf_jmax != 0xffffffffu)
-            /* SLAB_PERF_TARGET_LOG2 printed directly rather than a literal
-             * "2^29" here: that literal was silently wrong for this HIP
+            /* SLAB_PERF_REGIONS printed directly rather than a literal
+             * "8192" here: that literal was silently wrong for this HIP
              * build the moment slab.h's target became BENCH_HIP_BUILD-gated
              * (see slab.h and HIP_TUNING_PLAN.md) -- this build's real auto
-             * target is 2^27, not 2^29. Deriving it from the same constant
-             * the planner itself uses means the message can't drift out of
-             * sync with the actual policy again. Calibration, when it ran
-             * and produced a different winner, is reported separately above
-             * and takes precedence over this static figure. */
+             * target is 8192 regions, not the CUDA build's 32768. Deriving it
+             * from the same constant the planner itself uses means the
+             * message can't drift out of sync with the actual policy again.
+             * Calibration, when it ran and produced a different winner, is
+             * reported separately above and takes precedence over this
+             * static figure. */
             printf("  j-slabbing: %u slab%s, up to %u rows/slab"
-                   " (auto <=2^%u-position target; safety bounds may reduce it further)\n",
+                   " (auto target %u bucket regions at --region %d;"
+                   " safety bounds may reduce it further)\n",
                    plan.nslab, plan.nslab == 1 ? "" : "s", plan.jmax,
-                   SLAB_PERF_TARGET_LOG2);
+                   (unsigned)SLAB_PERF_REGIONS, cfg->log_region);
         else
             printf("  j-slabbing: %u slab%s, up to %u rows/slab"
                    " (<=2^31 local-position safety bound)\n",

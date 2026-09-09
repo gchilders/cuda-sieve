@@ -27,64 +27,107 @@ typedef struct {
  * number of those groups. For logI >= 8 every complete j row already does. */
 #define SLAB_TD_GROUP_POS 256u
 
-/* Performance policy: once a full sieve reaches 2^30 positions, auto mode
- * targets slabs no larger than 2^29 positions.  Two independent benchmarks
- * (Ampere RTX 3090 and Blackwell RTX 5070) found this working set near the
- * fill/TD crossover; an L40 with a larger L2 cache instead preferred 2^30 for
- * maximum throughput. This is a generic performance/memory tuning cap, not a
- * universal speed optimum. Explicit --slab-j overrides it, while the 2^31
- * position and direct-TD bounds below remain mandatory.
+/* Performance policy: once a full sieve reaches TWICE the region target, auto
+ * mode caps the slab. Both halves are region-relative -- at the default
+ * --region 14 that trigger is 2^30 positions and the cap is 2^29 on the CUDA
+ * build's target (see BENCH_HIP_BUILD below for this build's own), but at
+ * --region 12 they are 2^28 and 2^27. Do not restate either as an absolute.
  *
- * gfx1103 (HIP build) does NOT confirm 2^29 -- it is measurably worse here,
- * not just "not proven better". Swept 2^26..2^31-position slabs at logI=16,
- * J=65536 (33-special-q sample, oracle/c183.poly): 2^27 gave 3889 ms/q,
- * 2^29 (this constant's CUDA-tuned value) gave 5664 ms/q -- 2^29 is 45.6%
- * SLOWER than 2^27 on this hardware, and 2^30 (the L40's preferred point)
- * is catastrophic here (12794 ms/q, 3.3x worse than 2^27). Consistent with
- * gfx1103's small 2 MB L2 (vs. tens of MB on the NVIDIA cards this was
- * tuned against) and its UMA/shared-DDR5 memory subsystem -- a smaller
- * working set matters much more here. BENCH_HIP_BUILD-gated rather than
- * changed outright, so the CUDA build's own tuned value is untouched; see
- * HIP_TUNING_PLAN.md for the full sweep data.
+ * NOTE THE UPWARD DIRECTION, added 2026-09-02. Holding the region COUNT fixed
+ * means the slab AREA scales with the region size, so raising --region raises
+ * the auto slab and with it peak bucket memory: 2x at region 15 and 4x at
+ * region 16 against what the old absolute 2^29 target produced. That is the
+ * intended consequence of the policy, not a regression -- but a --region 16
+ * run that fit before may now need 4x the bucket allocation.
  *
- * TRIGGER moves too, and not by guesswork: TRIGGER_LOG2 = TARGET_LOG2 + 1
- * on the CUDA side is not a coincidence -- slab_perf_jmax() computes rows =
- * TARGET/I independent of J, so a sieve at EXACTLY the trigger (area ==
- * 2*TARGET) gets nslab = ceil(J / (TARGET/I)) = ceil(2) = 2: a clean
- * minimal split right at the boundary, by construction. Leaving TRIGGER at
- * 30 while only dropping TARGET to 27 breaks that invariant (an 8:1 ratio
- * instead of 2:1) and silently reopens the exact problem TARGET was fixed
- * for, just at a smaller size: confirmed by testing a sieve at exactly
- * 2^28 positions (inside the resulting gap) with the old inherited trigger
- * -- it runs unsplit (fill 123.6 ms) since 2^28 < 2^30, versus a forced
- * 2-way split into 2^27 chunks (fill 64.7 ms, 14% faster overall) that
- * TRIGGER=28 would have produced automatically. Restoring TRIGGER = TARGET
- * + 1 keeps the same clean-split-at-boundary property this constant pair
- * was designed around, just recentered on gfx1103's own working set. */
+ * THE TARGET IS A BUCKET-REGION COUNT, NOT AN AREA (finding 79, 2026-08-26).
+ * `fill` is minimised at a fixed number of bucket regions, so the optimal slab
+ * AREA halves with --region: 2^29 at region 14, 2^28 at 13, 2^27 at 12. The
+ * old form of this constant was `2^29` with no reference to log_region, which
+ * left the target wrong by the same factor whenever --region moved -- measured
+ * +28.4% fill at region 13 and +68.3% at region 12 on the CUDA hardware this
+ * was found on. Expressing it as regions and deriving the rows is
+ * behaviour-preserving at the default (32768 << 14 = 2^29) and correct
+ * everywhere else.
+ *
+ * 32768 is the REACHABLE optimum at region 14 on that hardware, not the
+ * global one: finding 80 puts the minimum of L(nregion) at 16,384, but
+ * reaching it from region 14 needs twice the slabs and the factor-base
+ * re-stream cancels the gain. Region 14 remains the joint optimum there
+ * because k_apply launches one block per region and costs +52% at region 13.
+ *
+ * Two independent benchmarks (Ampere RTX 3090 and Blackwell RTX 5070) found
+ * this working set near the fill/TD crossover; an L40 instead preferred twice
+ * it -- i.e. 65,536 regions -- and finding 81 leaves that card's preference
+ * unexplained, since the mechanism is sector-level read-modify-write and not
+ * L2 capacity. So this is a generic performance/memory cap and a per-card
+ * autotune candidate (item 2), not a universal speed optimum. Explicit
+ * --slab-j overrides it; the 2^31 position and direct-TD bounds below remain
+ * mandatory.
+ *
+ * gfx1103 (HIP build) does NOT confirm 32768 regions -- it is measurably
+ * worse here, not just "not proven better". Swept 2^26..2^31-position slabs
+ * at logI=16, J=65536, --region 14 (33-special-q sample, oracle/c183.poly):
+ * 2^27 positions (8192 regions at that --region) gave 3889 ms/q, 2^29
+ * (32768 regions, this build's CUDA-tuned value) gave 5664 ms/q -- 45.6%
+ * SLOWER -- and 2^30 (the L40's preferred point) is catastrophic here (12794
+ * ms/q, 3.3x worse than 8192 regions). Consistent with gfx1103's small 2 MB
+ * L2 (vs. tens of MB on the NVIDIA cards the CUDA value was tuned against)
+ * and its UMA/shared-DDR5 memory subsystem -- a smaller working set matters
+ * much more here. BENCH_HIP_BUILD-gated rather than changed outright, so the
+ * CUDA build's own tuned value is untouched; see HIP_TUNING_PLAN.md for the
+ * full sweep data.
+ *
+ * THE REGION-COUNT REFRAME ITSELF IS NOT INDEPENDENTLY VERIFIED ON gfx1103.
+ * The 8192 figure below was measured only at --region 14, the default this
+ * sweep and every cofcheck.sh/pipeline run on this box has used; it inherits
+ * finding 79's mechanism (fill minimised at a fixed region count) on the
+ * strength of that CUDA-side finding, not a repeat of finding 79's own
+ * --region sweep on AMD hardware. If gfx1103's real invariant turned out to
+ * be something else (an absolute area, say), 8192 regions would still be
+ * exactly right at --region 14 and could drift at other --region values --
+ * flagged here rather than silently assumed solved. */
 #if defined(BENCH_HIP_BUILD)
-#define SLAB_PERF_TARGET_LOG2  27u
+#define SLAB_PERF_REGIONS      8192u
 #else
-#define SLAB_PERF_TARGET_LOG2  29u
+#define SLAB_PERF_REGIONS      32768u
 #endif
-/* Computed, not a second hand-maintained literal: the comment above proves
- * TRIGGER = TARGET + 1 is a required invariant, not a coincidence, and
- * spelling both out by hand is exactly how this session's own TRIGGER/TARGET
- * desync bug happened once already (TARGET dropped to 27, TRIGGER left at
- * the old 30). Changing the policy now only ever means changing TARGET. */
-#define SLAB_PERF_TRIGGER_LOG2 (SLAB_PERF_TARGET_LOG2 + 1u)
+/* THE TRIGGER MUST SCALE WITH THE TARGET, and it keeps its factor of two.
+ *
+ * Splitting begins at TWICE the target, not at it: an area between one and two
+ * target-sized slabs is left alone deliberately, because splitting it buys a
+ * slab of half the target while paying a second full factor-base re-stream
+ * (929 MB, finding 78). That hysteresis is why `{16, J 16383}` -- just under
+ * 2^30 -- is one slab in the gate below, and it must stay.
+ *
+ * What was wrong was expressing it as an ABSOLUTE 2^30 while the target went
+ * region-relative. At --region 12 the target is 32768 << 12 = 2^27, but an
+ * area of 2^29 was still measured against 2^30 and so never split: 131,072
+ * regions in one slab, 4x the target, the exact shape finding 79 measured at
+ * +68.3% fill. Deriving the trigger as `target * 2` fixes that and reproduces
+ * the old 2^30 exactly at the default --region 14, so no default moves. */
+
+/* The one definition of a valid bucket-region exponent. Three sites test it
+ * -- slab_perf_jmax, slab_make_plan and bench_main_hip.cpp's argument
+ * validator -- and three hand-copied `1..30` comparisons is the shape the
+ * finding-79 bug came from. Keep them in step through this. */
+static inline int slab_region_ok(int log_region)
+{
+    return log_region >= 1 && log_region <= 30;
+}
 
 /* The confirmed-safe ceiling for ANYTHING that probes slab sizes at runtime
  * (currently just pipeline_hip.cuh's startup auto-calibration): 2^30 and
  * above measured as a real system-crash risk on gfx1103 (Windows Event
  * Viewer Kernel-Power id 41, two unclean reboots, no softer id 4101
  * recovery -- see HIP_TUNING_PLAN.md's SAFETY FINDING). This is deliberately
- * NOT derived from SLAB_PERF_TARGET_LOG2/TRIGGER_LOG2 above -- those are a
- * performance policy that a future build profile could legitimately want to
- * raise (e.g. a bigger-L2 discrete card), whereas this ceiling is a hardware
- * safety fact that must not move just because the performance target did.
- * Calibration's own candidate list is asserted against this at compile time
- * (see pipeline_hip.cuh) specifically so the two can never silently drift
- * apart the way TRIGGER/TARGET already did once. */
+ * an ABSOLUTE position count, not a region count like SLAB_PERF_REGIONS
+ * above: the crash risk is a property of one kernel launch's raw size,
+ * independent of what --region was used to reach it, whereas SLAB_PERF_REGIONS
+ * is a performance policy that a future build profile could legitimately want
+ * to raise (e.g. a bigger-L2 discrete card). Calibration's own candidate list
+ * is asserted against this at compile time (see pipeline_hip.cuh)
+ * specifically so the two can never silently drift apart. */
 #define SLAB_PERF_MAX_SAFE_LOG2 29u
 
 static inline uint32_t slab_row_quantum(int logI)
@@ -112,18 +155,31 @@ static inline uint32_t slab_area_jmax(int logI)
     return (uint32_t)(((uint64_t)1 << 31) >> logI);
 }
 
-/* Return the auto-mode performance cap in rows. UINT32_MAX means that the
- * geometry is below the performance-slabbing trigger and should not be split
- * for performance alone.  If one row itself exceeds 2^29 positions, one row
- * is the smallest representable slab and the correctness caps still apply. */
-static inline uint32_t slab_perf_jmax(int logI, uint32_t J)
+/* Return the auto-mode performance cap in rows. UINT32_MAX means the geometry
+ * already fits INSIDE THE HYSTERESIS BAND -- an area below *two* target-sized
+ * slabs -- and should not be split for performance alone. If a single row
+ * exceeds the target -- SLAB_PERF_REGIONS << log_region positions, so 2^29 at
+ * the default --region 14 but 2^27 at region 12 on the CUDA build (this
+ * build's own target scales the same way from its own SLAB_PERF_REGIONS) --
+ * one row is the smallest representable slab and the correctness caps still
+ * apply. */
+static inline uint32_t slab_perf_jmax(int logI, int log_region, uint32_t J)
 {
     uint64_t I, area, rows;
     if (logI < 0 || logI > 30 || !J) return 0;
+    if (!slab_region_ok(log_region)) return 0;
     I = (uint64_t)1 << logI;
     area = I * (uint64_t)J;
-    if (area < ((uint64_t)1 << SLAB_PERF_TRIGGER_LOG2)) return 0xffffffffu;
-    rows = ((uint64_t)1 << SLAB_PERF_TARGET_LOG2) / I;
+    /* Target a region COUNT; the area follows from log_region, and so does
+     * the split trigger. The gate is deliberately at TWO targets, not one:
+     * see the hysteresis paragraph in the policy block above before
+     * "correcting" it to `area < target`. An area of 1.9 targets stays
+     * unsplit on purpose. */
+    {
+        const uint64_t target = ((uint64_t)SLAB_PERF_REGIONS) << log_region;
+        if (area < target * 2u) return 0xffffffffu;   /* the hysteresis */
+        rows = target / I;
+    }
     if (!rows) rows = 1u;
     return rows > 0xffffffffull ? 0xffffffffu : (uint32_t)rows;
 }
@@ -152,12 +208,18 @@ static inline uint32_t slab_td_jmax(int logI, uint32_t max_prime)
 /* Build the host-side schedule. forced_j == 0 means auto. A nonzero value is
  * deliberately strict: it is a regression/testing knob, not permission to
  * violate either the position or direct-TD arithmetic bound. */
-static inline int slab_make_plan(int logI, uint32_t J, uint32_t max_small_prime,
+static inline int slab_make_plan(int logI, int log_region, uint32_t J,
+                                 uint32_t max_small_prime,
                                  uint32_t forced_j, slab_plan_t *P)
 {
     uint32_t amax, tmax, perf_jmax, jmax, quantum;
     uint64_t n;
     if (!P || !J) return -1;
+    /* Validate the region on BOTH paths. It is unused when forced_j != 0, but
+     * the parameter is part of this function's contract and a caller passing
+     * a bogus region deserves a failure rather than a plan that silently
+     * ignored one of its arguments. */
+    if (!slab_region_ok(log_region)) return -1;
     quantum = slab_row_quantum(logI);
     if (!quantum || !slab_rows_shape_ok(logI, J)) return -1;
     amax = slab_area_jmax(logI);
@@ -169,7 +231,7 @@ static inline int slab_make_plan(int logI, uint32_t J, uint32_t max_small_prime,
         if (requested > jmax || !slab_rows_shape_ok(logI, requested)) return -1;
         jmax = requested;
     } else {
-        perf_jmax = slab_perf_jmax(logI, J);
+        perf_jmax = slab_perf_jmax(logI, log_region, J);
         if (!perf_jmax) return -1;
         if (perf_jmax < jmax) jmax = perf_jmax;
         jmax -= jmax % quantum;

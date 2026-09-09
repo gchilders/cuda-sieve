@@ -92,6 +92,22 @@ exit /b 1
 :cflmax_ok
 set "CF_LMAX_DEF=-DCF_LMAX=%CF_LMAX%"
 
+rem ---- PIPE_K --------------------------------------------------------------
+rem Same duplication note as CF_LMAX above -- see build_windows_hip.bat's own
+rem PIPE_K block for the full rationale (pipeline_hip.cuh, degradation
+rem ceiling, TD_FMAX gap). Update it there too if this ever changes.
+if not defined PIPE_K set "PIPE_K=16"
+set /a PIPE_K_NUM=%PIPE_K% 2>nul
+if not "%PIPE_K_NUM%"=="%PIPE_K%" goto :pipek_bad
+if %PIPE_K% LSS 2 goto :pipek_bad
+if %PIPE_K% GTR 32 goto :pipek_bad
+goto :pipek_ok
+:pipek_bad
+echo error: PIPE_K must be an integer in 2..32 -- got "%PIPE_K%".
+exit /b 1
+:pipek_ok
+set "PIPE_K_DEF=-DPIPE_K=%PIPE_K%"
+
 rem ---- build stamp ---------------------------------------------------------
 rem Same duplication note as CF_LMAX above.
 set "GIT_RAW="
@@ -121,8 +137,8 @@ rem bench_boinc_* wrapper functions declared in bench.h. It's also MSVC-only
 rem syntax (/I "path"), which hipcc's clang driver (used for HIPFLAGS) does
 rem not accept -- clang wants -I, not /I -- so leaving it out of HIPFLAGS is
 rem both unnecessary and would be a syntax error there.
-set "CFLAGS=/nologo /O2 /W3 /MT -D_CRT_SECURE_NO_WARNINGS %BOINC_DEF% %CF_LMAX_DEF% %DEFS%"
-set "CXXFLAGS=/nologo /O2 /W3 /MT /EHsc -D_CRT_SECURE_NO_WARNINGS %BOINC_DEF% %BOINC_INC% %CF_LMAX_DEF% %DEFS%"
+set "CFLAGS=/nologo /O2 /W3 /MT -D_CRT_SECURE_NO_WARNINGS %BOINC_DEF% %CF_LMAX_DEF% %PIPE_K_DEF% %DEFS%"
+set "CXXFLAGS=/nologo /O2 /W3 /MT /EHsc -D_CRT_SECURE_NO_WARNINGS %BOINC_DEF% %BOINC_INC% %CF_LMAX_DEF% %PIPE_K_DEF% %DEFS%"
 rem ---- HIP_SCRATCH: flat scratch for the device stack ----------------------
 rem THIS IS A CORRECTNESS FIX, not a tuning knob. The AMDGPU backend does not
 rem enable flat scratch by default on gfx10, so a gfx10 target lowers every
@@ -151,10 +167,10 @@ rem back to stock lowering -- which reintroduces the bug on gfx10. See
 rem CLAUDE.md.
 if not defined HIP_SCRATCH set "HIP_SCRATCH=-Xclang -target-feature -Xclang +enable-flat-scratch"
 
-set "HIPFLAGS=-O2 -std=c++17 %HIP_ARCH% %HIP_DEVLIB% %HIP_SCRATCH% -D_CRT_SECURE_NO_WARNINGS %BOINC_DEF% %CF_LMAX_DEF% %DEFS%"
+set "HIPFLAGS=-O2 -std=c++17 %HIP_ARCH% %HIP_DEVLIB% %HIP_SCRATCH% -D_CRT_SECURE_NO_WARNINGS %BOINC_DEF% %CF_LMAX_DEF% %PIPE_K_DEF% %DEFS%"
 
 echo Building host C objects with cl.exe... (GFX_ARCH=%GFX_ARCH% CF_LMAX=%CF_LMAX% HAVE_BOINC=1 build=%GIT_DESC%)
-for %%F in (fb_load.c verify_cpu.c poly.c primes.c rfb.c fb_cado.c platform.c) do (
+for %%F in (fb_load.c verify_cpu.c poly.c primes.c rfb.c fb_cado.c platform.c watchdog.c) do (
     cl %CFLAGS% /std:c11 /c %%F || exit /b 1
 )
 
@@ -170,7 +186,7 @@ hipcc %HIPFLAGS% -DFBGEN_GPU_LIBRARY -c fbgen_gpu.hip -o fbgen_gpu_hip_lib_boinc
 echo Linking bench_hip_boinc.exe...
 hipcc %HIP_ARCH% %HIP_DEVLIB% -o bench_hip_boinc.exe ^
     bench_main_hip_boinc.obj bench_kernels_hip_boinc.obj fbgen_gpu_hip_lib_boinc.obj fb_load.obj verify_cpu.obj poly.obj ^
-    primes.obj rfb.obj fb_cado.obj platform.obj runlog.obj fbgen_lib_boinc.obj ^
+    primes.obj rfb.obj fb_cado.obj platform.obj runlog.obj watchdog.obj fbgen_lib_boinc.obj ^
     boinc_support_boinc.obj %BOINC_LIBS% ^
     -lWs2_32 -lwininet -lpsapi -lPowrprof -lIphlpapi -lAdvapi32 -lUser32 -lCrypt32 -lShell32 -lVersion || exit /b 1
 

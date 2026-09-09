@@ -142,6 +142,39 @@ exit /b 1
 :cflmax_ok
 set "CF_LMAX_DEF=-DCF_LMAX=%CF_LMAX%"
 
+rem ---- PIPE_K ------------------------------------------------------------
+rem Large primes kept per survivor in the trial-division list. See PIPE_K in
+rem pipeline_hip.cuh for what overrunning it does (detected, slab skipped,
+rem yield lost -- never a partial record).
+rem
+rem ITS OWN VARIABLE, NOT DEFS, for the same reason CF_LMAX is: DEFS marks a
+rem pricing build and bench refuses to emit relations from one. This changes
+rem a capacity, not the arithmetic -- every relation a smaller PIPE_K does
+rem emit is bit-identical to the same relation from a larger one, so a
+rem PIPE_K build is shippable and must not be branded otherwise.
+rem
+rem THE CEILING IS 32, NOT TD_FMAX's 64, and the gap is deliberate: k_td's
+rem per-thread slot holds the special-q AND every small prime AND up to
+rem PIPE_K large ones, and overrunning TD_FMAX is a FATAL band error, not
+rem this knob's soft slab skip. No survivor under a 384-bit norm carries 32
+rem large primes above bkthresh, so this bound is not reachable in practice;
+rem it exists so raising PIPE_K cannot silently cross into the fatal regime.
+rem
+rem A numeric range check, not Makefile's $(filter)-based word-list -- there
+rem is no $(shell)-style injection risk in a plain `if` comparison here, so
+rem the simpler check CF_LMAX above already uses is enough.
+if not defined PIPE_K set "PIPE_K=16"
+set /a PIPE_K_NUM=%PIPE_K% 2>nul
+if not "%PIPE_K_NUM%"=="%PIPE_K%" goto :pipek_bad
+if %PIPE_K% LSS 2 goto :pipek_bad
+if %PIPE_K% GTR 32 goto :pipek_bad
+goto :pipek_ok
+:pipek_bad
+echo error: PIPE_K must be an integer in 2..32 -- got "%PIPE_K%".
+exit /b 1
+:pipek_ok
+set "PIPE_K_DEF=-DPIPE_K=%PIPE_K%"
+
 rem ---- build stamp -----------------------------------------------------------
 rem Same duplication note as CF_LMAX above: this block mirrors
 rem build_windows.bat's git-describe/dirty-flag stamping (also already a copy
@@ -174,8 +207,8 @@ rem reads it (only under HAVE_BOINC) to pick BOINC's "ATI" vendor string
 rem instead of "NVIDIA" when checking a client GPU assignment. Defined here
 rem unconditionally (harmless when HAVE_BOINC is off) so it doesn't need to
 rem be threaded through as a separate knob.
-set "CFLAGS=/nologo /O2 /W3 /MT -D_CRT_SECURE_NO_WARNINGS -DBENCH_HIP_BUILD %CF_LMAX_DEF% %DEFS%"
-set "CXXFLAGS=/nologo /O2 /W3 /MT /EHsc -D_CRT_SECURE_NO_WARNINGS -DBENCH_HIP_BUILD %CF_LMAX_DEF% %DEFS%"
+set "CFLAGS=/nologo /O2 /W3 /MT -D_CRT_SECURE_NO_WARNINGS -DBENCH_HIP_BUILD %CF_LMAX_DEF% %PIPE_K_DEF% %DEFS%"
+set "CXXFLAGS=/nologo /O2 /W3 /MT /EHsc -D_CRT_SECURE_NO_WARNINGS -DBENCH_HIP_BUILD %CF_LMAX_DEF% %PIPE_K_DEF% %DEFS%"
 rem Flat scratch for the device stack. A CORRECTNESS FIX for gfx10, not a
 rem tuning knob -- without it ECM stage 2 silently accomplishes nothing on
 rem every RDNA1/RDNA2 card. Full rationale and the field before/after numbers
@@ -184,10 +217,10 @@ rem here so the two builds never generate different device code for the same
 rem source.
 if not defined HIP_SCRATCH set "HIP_SCRATCH=-Xclang -target-feature -Xclang +enable-flat-scratch"
 
-set "HIPFLAGS=-O2 -std=c++17 %HIP_ARCH% %HIP_DEVLIB% %HIP_SCRATCH% -D_CRT_SECURE_NO_WARNINGS -DBENCH_HIP_BUILD %CF_LMAX_DEF% %DEFS%"
+set "HIPFLAGS=-O2 -std=c++17 %HIP_ARCH% %HIP_DEVLIB% %HIP_SCRATCH% -D_CRT_SECURE_NO_WARNINGS -DBENCH_HIP_BUILD %CF_LMAX_DEF% %PIPE_K_DEF% %DEFS%"
 
 echo Building host C objects with cl.exe... (GFX_ARCH=%GFX_ARCH% CF_LMAX=%CF_LMAX% build=%GIT_DESC%)
-for %%F in (fb_load.c verify_cpu.c poly.c primes.c rfb.c fb_cado.c platform.c) do (
+for %%F in (fb_load.c verify_cpu.c poly.c primes.c rfb.c fb_cado.c platform.c watchdog.c) do (
     cl %CFLAGS% /std:c11 /c %%F || exit /b 1
 )
 
@@ -210,7 +243,7 @@ hipcc %HIPFLAGS% -DFBGEN_GPU_LIBRARY -c fbgen_gpu.hip -o fbgen_gpu_hip_lib.obj |
 echo Linking bench_hip.exe...
 hipcc %HIP_ARCH% %HIP_DEVLIB% -o bench_hip.exe ^
     bench_main_hip.obj bench_kernels_hip.obj fbgen_gpu_hip_lib.obj fb_load.obj verify_cpu.obj poly.obj ^
-    primes.obj rfb.obj fb_cado.obj platform.obj runlog.obj fbgen_lib.obj ^
+    primes.obj rfb.obj fb_cado.obj platform.obj runlog.obj watchdog.obj fbgen_lib.obj ^
     boinc_support_hip.obj || exit /b 1
 
 echo Built %CD%\bench_hip.exe (GFX_ARCH=%GFX_ARCH% CF_LMAX=%CF_LMAX% build=%GIT_DESC%)

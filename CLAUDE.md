@@ -1164,3 +1164,158 @@ unbounded per-event logging has already produced hundreds of duplicate lines
 once in this project's history.
 
 Both builds carry this -- see the authorised exception in the ground rules.
+
+## Kyle's main pull (d5e9495..1662629) ported into hip-port
+
+Main moved forward with a large batch of work while hip-port sat still. Two
+requests covered the whole pull: first the `enum bench_outcome`/`PIPE_RC_`
+degradation-and-outcome system specifically, then everything else that
+remained. Both are recorded here together since they are one porting effort
+against the same pull.
+
+**`enum bench_outcome` / `PIPE_RC_`** (`bench.h`, `boinc_support.cpp`,
+`bench_main_hip.cpp`, `pipeline_hip.cuh`): the same soft-skip mechanism above,
+carried one step further -- a degradation ceiling (`PIPE_LOST_MAX`/
+`PIPE_SLAB_SKIP_MAX`) on top of the soft skips, a `BENCH_EXIT_UNSUPPORTED`/
+`BENCH_EXIT_DEGRADED` exit-code split, and `bench_boinc_finish()` taking an
+outcome instead of a bare status so BOINC is told STOPPED/UNSUPPORTED/DEGRADED
+apart from a real success. `watchdog.c`/`.h`'s own exit code
+(`BENCH_EXIT_STALLED`) was reserved at this point but not reachable yet, since
+watchdog itself came later in the same pull -- see below.
+
+Ported by diffing against main's real text throughout, not by paraphrasing --
+worth recording because paraphrasing is exactly where this went wrong the
+first time. A self-check against main's actual source (`git show main:...`)
+found and fixed: an invented end-of-band comment paragraph that did not match
+main's wording; a stale terminal message that still named `rtmp` after
+`pipe_finalize_outputs` had already removed it (main had fixed this, the port
+initially had not); two spots where `PIPE_K` references were dropped on the
+mistaken belief that PIPE_K does not exist on this branch (it does -- see
+below, just not yet configurable from the build script at the time); two
+stale `pipeline.cuh`/`bench_main.cu` filename references left over from
+copying main's comments verbatim; and one real logic bug, not a copy error --
+the `--stop-file` existence check and the `--relations` misconfiguration
+check were in the wrong order relative to main, which would defer forever
+under a managed client instead of reporting the misconfiguration once.
+Verified via full rebuild + cofcheck.sh (52/52) + a real `--pipeline` run.
+
+**Everything else in the pull**, ported next:
+
+- **`watchdog.c`/`.h`, new files, copied verbatim.** Confirmed portable
+  before touching anything: pure host C, no CUDA/HIP API at all ("It never
+  touches CUDA" -- watchdog.h's own header comment), and already handles
+  Windows via `_WIN32`-gated native `HANDLE` threads instead of pthreads --
+  Kyle built it cross-platform from the start, so no HIP-specific work was
+  needed in the file itself. Wired into `bench_main_hip.cpp` (`--watchdog`/
+  `--watchdog-kill`/`--watchdog-log`, `wd_start`/`wd_arm_kill`/`wd_stop`,
+  phase labels at `setup`/`setup.resume`/`setup.factor_base`) and into
+  `cofac_hip.cuh` (`wd_phase("resume.check_relations")` inside the
+  multi-gigabyte `--check-relations` gate). Added `watchdog.c` to both
+  `build_windows_hip.bat` and `build_windows_hip_boinc.bat`'s host-C compile
+  loop and link line -- no `-lpthread` needed on Windows, unlike the Linux
+  Makefile, since the Windows path never touches pthreads at all.
+  **Verified on real hardware**: a real `--pipeline` run with `--watchdog 1`
+  correctly reported `phase setup.factor_base` while loading the 115 MB
+  `c183.fb1` (exactly the `wd_phase("setup.factor_base")` call this port
+  added), to both stderr and `--watchdog-log`; `gpu util n/a` is the correct
+  answer on this hardware, since NVML has nothing to bind to on an AMD card.
+  `BENCH_EXIT_STALLED`'s bench.h comment ("NOT YET REACHABLE ON THIS BUILD")
+  is now WRONG and needs updating once the exit path itself is exercised --
+  flagged, not yet fixed, since wd_arm_kill's actual kill path (as opposed to
+  the reporter, which is verified above) was not exercised this session.
+
+- **`PIPE_K` became a real build knob here** (it already existed as a
+  `#define` on hip-port from the earlier soft-failure work, just not
+  build-script-configurable). Main's Makefile grew a validated
+  `PIPE_K ?= 16` in `[2,32]`; both `.bat` scripts got an equivalent
+  `PIPE_K`/`PIPE_K_DEF` block (numeric range check, not Makefile's
+  `$(filter)`-based word-list -- there is no `$(shell)`-injection risk in a
+  plain `if` comparison, so the lighter check CF_LMAX already used was
+  enough) threaded into `CFLAGS`/`CXXFLAGS`/`HIPFLAGS` in both scripts.
+
+- **`slab.h`'s auto-slab target became region-relative, not just an absolute
+  position count** (finding 79 on main: `fill` is minimised at a fixed
+  *bucket-region count*, so the old flat `2^29`-position target was wrong by
+  a growing factor at any `--region` other than the default 14). This
+  directly intersected this session's own earlier gfx1103 tuning
+  (`SLAB_PERF_TARGET_LOG2`/`TRIGGER_LOG2`, `BENCH_HIP_BUILD`-gated to 27/28):
+  those two macros are gone on main, replaced by one `SLAB_PERF_REGIONS`
+  region count (`trigger = target * 2` is now derived, not hand-maintained).
+  Re-expressed HIP's own measurement in the new unit rather than dropping it:
+  `SLAB_PERF_REGIONS = 8192u` for `BENCH_HIP_BUILD` (main's default is
+  `32768u`), which reproduces the already-measured 2^27-position optimum
+  exactly at the default `--region 14` this box's whole tuning history was
+  measured at. **Not independently re-verified**: whether 8192 *regions* is
+  really gfx1103's invariant at OTHER `--region` values, as opposed to some
+  other quantity that happens to equal 8192 regions at region 14, was not
+  re-measured -- flagged in `slab.h`'s own comment rather than assumed
+  solved, the same way main's own finding-79 fix was itself a real measured
+  correction to an earlier assumption. `slab_perf_jmax`/`slab_make_plan`
+  gained a `log_region` parameter; every hip-port call site (`pipeline_hip.cuh`
+  -- both the real plan and the startup slab-size calibration this session
+  added earlier -- and `bench_main_hip.cpp`'s `--region` validator, now
+  `slab_region_ok()`) was updated to pass it through. Calibration's own
+  candidate set ({2^27, 2^28, 2^29} absolute positions) was deliberately
+  LEFT AS ABSOLUTE rather than re-expressed as regions: those exact values
+  were measured and safety-bounded already, and re-deriving them from a
+  region count would be new, unverified tuning behaviour dressed up as a
+  mechanical port -- flagged in the code as a real gap (calibration does not
+  yet adapt to a non-default `--region`), not silently "fixed" without
+  measurement.
+
+- **`bench_kernels.hip` gained the `--fill-streams` diagnostic** (item 1:
+  is the fill kernel's performance knee per-kernel or per-device, tested by
+  running N independent fill workspaces concurrently on N streams against
+  the same N issued serially and against one kernel at N times the blocks).
+  Retargeted from main's CUDA text via the same cuda*->hip* mapping already
+  established for this file, then verified by reverse-substituting hip*
+  names back to cuda* and diffing the result against main's actual source
+  byte-for-byte -- identical, confirming no logic drift from the mechanical
+  retargeting. Purely a `run_bench` (benchmark harness) diagnostic; the
+  pipeline explicitly refuses the flag (`harness_only[]`) and the CUDA build
+  is untouched.
+
+- **`cofac.cuh`/`cofac_hip.cuh`**: doc-comment corrections to the ECM
+  stage-2 shared-denominator writeup (a "blast radius when the scaling isn't
+  a unit" paragraph, and a correction that the batched baby-step form does
+  NOT reduce peak storage the way an earlier version of that comment
+  claimed) plus the `wd_phase` call above.
+
+- **`td.cuh`'s `ss_magic_build`** (shared, byte-identical between builds)
+  gained a `logI` parameter in place of precomputed `kshift`/`ihalf`, a
+  `[2,20]` `logI` guard, and a bound-before-build reordering (the 2^31-proof
+  is now checked before the 64-bit reciprocal divide, not after, so a
+  refused entry no longer pays for a divide whose answer gets thrown away).
+  Its callers (`bench_kernels.hip`, `pipeline_hip.cuh`) were updated to the
+  new signature and to pass a row divisor's actual `J/g`, not a flat `cfg->J`
+  -- `hsg`/`S->hsg` (the row-divisor array) already existed on hip-port
+  before this pull, so this was a call-site fix, not a new feature.
+
+- **hip-port's own CUDA-mirror copies** (`pipeline.cuh`, `bench_kernels.cu`,
+  `cofac.cuh`, `bench_main.cu`, `slabtest.cpp`, `normscan.c`, `testsieve.sh`)
+  were confirmed byte-identical to old-main before this pull and were synced
+  wholesale to new-main's content -- these are meant to mirror main exactly
+  and had no HIP-specific divergence to preserve. `RESULTS.md`/`STATUS.md`
+  (main's own CUDA-hardware experiment log, no HIP equivalent or relevance of
+  their own) were synced too, purely so the "finding 79", "finding 85", etc.
+  references now scattered through the ported comments resolve to something
+  in this tree.
+
+- **`skipcheck.sh`/`degradecheck.sh`**, main's new test scripts for the
+  norm-width skip and degradation-ceiling paths respectively, were copied
+  over (`./bench`-invoking shell scripts, no CUDA-specific content beyond one
+  negative "no CUDA error" grep in skipcheck.sh that passes regardless of
+  HIP's actual error-string wording, since it is checking for absence).
+  **NOT YET RUN on hip-port**: both need one-time setup this session did not
+  do -- `degradecheck.sh` needs a `PIPE_K=8` rebuild (now possible via the
+  new build-script knob above) and `skipcheck.sh` needs a `BN_LIMBS=6`
+  rebuild plus a standalone `normscan.exe`, which has no Windows build target
+  yet (main's Makefile builds it from `normscan.c` + the same host objects
+  `fbgen_gpu_hip.exe` already used; likely buildable the same way, not
+  attempted). Flagged as follow-up, not claimed done.
+
+**Verification for the whole pull**: full `build_windows_hip.bat` rebuild,
+exit 0, at each major milestone; `cofcheck.sh` 52/52 on the final build; a
+real `--pipeline` run against `oracle/c183` confirming both the ordinary path
+(7 relations, matching prior runs) and `--watchdog`'s reporting path (above)
+work end to end on real gfx1103 hardware.

@@ -78,6 +78,7 @@
 #ifndef CUDA_SIEVE_COFAC_CUH
 #define CUDA_SIEVE_COFAC_CUH
 
+#include "watchdog.h"
 #include <stdint.h>
 #include <errno.h>          /* strtoull ERANGE in the relation gate */
 /* Directly, not by luck of translation-unit ordering: this header calls
@@ -723,19 +724,34 @@ CF_NOINLINE int mz_ecm_stage2_pass(mz<L> *fac, const mpt<L> *Q,
      * mod n. It normally is -- cofcheck.sh's pinned counts match and a 148-q
      * A/B produced identical relations either way -- but that is empirical,
      * NOT a proof, and an earlier version of this comment wrongly claimed the
-     * factors were provably identical. When gcd(prod_{j!=k} Z_j, n) > 1 the
-     * scaled gcd is a superset of the unscaled one, so it can surface a real
-     * factor earlier, or grow to exactly n and be discarded by the g != n
-     * guard below -- masking a factor the per-point form would have found at
-     * that k. Both need a baby-step Z sharing a factor with n (the lucky-hit
-     * case stage 1 usually catches), and NEITHER can return a wrong factor:
-     * any gcd with n is a true divisor, and g == n is rejected. That is what
+     * factors were provably identical.
+     *
+     * Note the BLAST RADIUS when it is not. Every bx[k] except k's own carries
+     * Z_k as a factor, so ONE baby step whose Z shares a factor f with n
+     * contaminates the cross product of every OTHER k. All of those gcds
+     * become multiples of f, which may surface f earlier than the per-point
+     * form would, or may grow to exactly n and be discarded by the g != n
+     * guard -- losing chances the per-point form kept independent. Z_k == 0
+     * mod n is the extreme: every other k's d collapses to 0 and is rejected
+     * outright, while k's own term survives. The per-point form has no such
+     * coupling between k.
+     *
+     * It needs a baby-step Z sharing a factor with n (the lucky-hit case
+     * stage 1 usually catches), and it can NEVER return a wrong factor: any
+     * gcd with n is a true divisor, and g == n is rejected. That is what
      * makes this safe -- "never returns a non-factor", not "same factors".
      *
      * The point is the inner loop: with one denominator for every baby step,
      * the X_G * Z term is common to all k and hoists out, so a selected pair
      * costs ONE multiply instead of two. At B1=200/B2=6000 that is ~540 fewer
-     * mz_mul per curve against ~3*NBABY to build the rescale once. Measured
+     * mz_mul per curve against the rescale's one-off cost -- 4*NBABY mz_mul
+     * issued, two per k in each of the forward and backward passes. Three of
+     * those are provably redundant (both passes open by multiplying into
+     * acc == one, which is the identity in Montgomery form, and the backward
+     * pass's final acc update is never read), so 4*NBABY - 3 do real work.
+     * Peeling them is left alone deliberately: 3 multiplies per replay is
+     * ~1% of the ~540 this change saves, and it is not worth restructuring
+     * delicate modular arithmetic for. Measured
      * A/B on gfx1103 (oracle/c183, 148 q, only this function differing):
      * algebraic queue 52.62/52.18 -> 50.19/49.75 ms, ~4.6%, with the rational
      * (rho) queue unchanged as the control and 596 relations either way.
@@ -756,11 +772,16 @@ CF_NOINLINE int mz_ecm_stage2_pass(mz<L> *fac, const mpt<L> *Q,
     for (int replay = 0; replay < 2; replay++) {
         prod = *one;
         {
-            /* Never hold the full (X:Z) points as an array: each baby step is
-             * built in ONE scratch point, then split into bx[k] and bzs[k], so
-             * the peak here is bx[] + bzs[] rather than bx[] + a full mpt<L>
-             * array. bx[] doubles as the running accumulator, so no separate
-             * prefix array is needed either. Deliberately NOT unrolled --
+            /* Each baby step is built in ONE scratch point, then split into
+             * bx[k] and bzs[k]; bx[] doubles as the running accumulator, so
+             * no separate prefix array is needed.
+             *
+             * This does NOT reduce peak storage, and an earlier version of
+             * this comment wrongly implied it did: an mpt<L> is (X, Z), so
+             * the baby[CF_ECM_NBABY] this replaced was already 2*NBABY mz
+             * values -- exactly what bx[] + bzs[] is. With p, acc, t and gx
+             * live on top, the peak is slightly HIGHER, which is what the
+             * measured scratch 336 -> 384 below is. Deliberately NOT unrolled --
              * x_mul_s2 is __noinline__, and unrolling its call sites widens
              * the live range of every argument across all NBABY calls. */
             mz<L> bzs[CF_ECM_NBABY], acc, t;
@@ -2292,6 +2313,10 @@ static int cf_check_relations(const char *path, const poly_t *poly,
         fclose(f); return -1;
     }
     while (bench_getline(&line, &cap, f) > 0) {
+        /* A full gate over a multi-gigabyte .part runs for minutes. Without a
+         * heartbeat the watchdog reports it as a stall, which trains the
+         * operator to ignore the one message that matters. */
+        wd_phase("resume.check_relations");
         const int r = cf_check_one(line, tp, lpb0, lpb1, &nprime, &ncomp, &nonprim);
         /* r == 1 only: r == 2 is "reconstructs but is not primitive", which
          * this gate must fail. */
