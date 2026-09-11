@@ -35,6 +35,7 @@ distribution to BOINC volunteers on Windows and Linux.
   | 2026-09-05 | `pipeline.cuh` | soft-failure slab skip (bucket overflow / untrustworthy TD skip the slab instead of failing the band) | compiled and tested on an RTX 4090 on 2026-09-06, `make -C bench check` green, cofcheck.sh 51 PASS / 0 FAIL |
   | 2026-09-06 | `cofac.cuh` | ECM stage 2 on a shared denominator (`43ea104`) | RTX 4090: -4.46% algebraic queue, cofcheck.sh 51 PASS / 0 FAIL, relations byte-identical at logI 15 |
   | 2026-09-06 | `bench_kernels.cu`, `pipeline.cuh` | `ss_first` reduction work (`1b779b0`, `3a8049d`, `711cdaf`) | RTX 4090: -13.5% apply, cofcheck.sh 51 PASS / 0 FAIL, relations byte-identical at logI 15 |
+  | 2026-09-11 | `cofac.cuh`, `pipeline.cuh`, `bench_main.cu`, `bench.h` | record-axis cofactor launch chunking (`--cof-chunk`, auto by default) + stage-2 watchdog warning, so a slow device cannot run one cofactor launch past its GPU watchdog | RTX 3090: cofcheck.sh 51 PASS / 0 FAIL, relations byte-identical across auto / one-launch / `--cof-chunk 16384`; occupancy cost curve measured (chunk at or above `blocks*threads` is free, below it costs up to +150%) |
 
   The soft-failure entry was carried for a day as "UNTESTED ON NVIDIA -- not
   even compiled, only diffed line-for-line against the HIP version". That is no
