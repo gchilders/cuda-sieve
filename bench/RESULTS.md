@@ -2101,6 +2101,13 @@ number from another session on this box** — rerun the control.
 
 ## Finding 53 — host contention costs 29% of wall clock and every GPU counter we have is blind to it
 
+> **Not the current magnitude -- see finding 96 (2026-09-13).** These are c147
+> figures from August. Finding 56 had already measured only +6.4% wall at 15
+> spinners on c147 itself, and finding 96 measures +2.8% on c183 at `2^29`, so
+> sieve area explains only part of the gap to the +28.7% below (16 spinners);
+> the rest is unexplained. That the GPU counters cannot see contention still
+> holds.
+
 Reported by the 3090 tester: a saturated CPU leaves the CUDA timings untouched
 but moves wall clock. Reproduced here on the 5070, c147 band, 1340 q, same
 binary, load applied with N spinning shells:
@@ -2476,6 +2483,12 @@ likely difference is the competitor: pure-ALU spinners contend for scheduling
 slots and core resources, while finding 53's real workloads also contend for
 memory bandwidth and L3. Finding 53 remains canonical for the memory-bound
 case.
+
+> **This explanation does not fit finding 53's record (noted 2026-09-13,
+> finding 96).** Finding 53's load was spinning shells, not real workloads, so
+> competitor type cannot account for the gap, and finding 96 measured real
+> `I16e` sievers costing about what spinners do. Why finding 53 was so much
+> larger remains open.
 
 **`SCHED_FIFO` and `--blocking-sync` fail too, closing the list.** Run with
 root 2026-08-17, 15 spinners, four arms interleaved within each rep so the
@@ -8388,3 +8401,89 @@ Leave `--cof-chunk` on auto. 0.72% of wall buys watchdog protection for the
 slower volunteer hardware the BOINC build targets, which is the entire point
 of the change. `--cof-chunk 131072` recovers the fraction on a dedicated run
 and is measured indistinguishable from the pre-merge single-launch path.
+
+## Finding 96 — CPU contention at c183 `2^29` costs ~3% at up to one busy thread per logical CPU and ~6% at 1.7x: about half of finding 56's c147 cost, while finding 53's size is not reproduced and stays unexplained
+
+**Date:** 2026-09-13, RTX 5070 + 9800X3D, commit `3e15fec`, rebuilt before the
+run. c183 `oracle/input.job`, area `2^29` (`--J` defaults to `2^(logI-1)`):
+
+    ./bench --pipeline --cofactor --poly ../oracle/input.job --fb1 ../oracle/c183.fb1 \
+            --logI 15 --qrange 130000000: --nq 200
+
+Findings 53 and 56 measured contention on c147 at `2^27` in August. Since
+then the job class moved up, finding 89 took the transforms off the blocking
+path, and nobody re-measured. The question was whether a busy desktop still
+costs the sieve enough to matter. **This is the canonical figure for current
+jobs; STATUS and RUNBOOK point here rather than copying the numbers.**
+
+### Arms
+
+- **I16e** -- the owner's live `ggnfs-sieve-client` queue: 12
+  `gnfs-lasieve4I16e` workers, i.e. 13 runnable threads on 16 with the feeder
+  (**below** 1:1), load average ~14.4. Three reps run back to back **before**
+  the other arms, not interleaved with them.
+- **idle, s15, s26** -- after the queue drained and a 60 s settle, interleaved
+  idle / 15 spinners / 26 spinners within each of three reps. 15 spinners plus
+  the feeder is one runnable thread per logical CPU; 26 is 1.7x subscribed.
+  (Finding 56's 1.7x arm was a different load -- 12 real sievers plus 15
+  spinners -- so only the 1:1 arm is a like-for-like comparison with it.)
+- **"Idle" was not perfectly idle.** An unrelated single-threaded `ecm` held
+  one logical CPU at 100% during the idle and spinner arms. Its CPU time at
+  09:09 (5:36 at 100%) dates its start to ~09:03, after the I16e reps ended at
+  08:56, so it was **absent** from the I16e arm. The idle/spinner penalties are
+  therefore slightly understated, and the I16e arm had one fewer competitor
+  than the idle baseline it is compared against.
+
+### Result
+
+Relations were identical in every run: 9053 over the band, 45.27 rel/q.
+"Wall" is `wall clock per q` (`acc_wall / N`, which already includes the
+in-loop cofactor flushes); percentages are against the idle mean.
+
+| arm | wall ms/q (reps) | mean | range/mean | vs idle | **rel-rate loss** | acc/wall |
+|---|---|---:|---:|---:|---:|---:|
+| idle | 81.88 / 82.09 / 82.54 | 82.17 | 0.8% | -- | -- | 0.950 |
+| 12 x `I16e` (13 on 16) | 83.60 / 85.83 / 85.17 | 84.87 | 2.6% | +3.3% | **3.2%** | 0.931 |
+| 15 spinners (1:1) | 84.22 / 84.82 / 84.47 | 84.50 | 0.7% | +2.8% | **2.8%** | 0.924 |
+| 26 spinners (1.7x) | 86.94 / 88.99 / 87.57 | 87.83 | 2.3% | +6.9% | **6.4%** | 0.886 |
+
+**Do not quote the COMPLETE wall for this.** It adds the band's final cofactor
+flush, 5.17 ms/q in every arm at 200 q, which amortises to nothing on a
+production band and dilutes the penalty (on it the losses read 3.0 / 2.6 /
+6.1%). Idle GPU utilisation was a steady 98%; the spinner arms settled at ~96%
+and ~92%. Within the interleaved arms, idle < s15 < s26 in every rep.
+
+### What it means
+
+- **At 1:1, the penalty is about half of c147's.** Finding 56's 15-spinner
+  arm on c147 at `2^27` was +6.4% wall, a 6.0% rate loss; here it is 2.8%
+  (0.46x). That is the direction finding 56's area table predicts, since host
+  work per q is fixed while GPU work scales with area. It still rises steeply
+  past one thread per CPU (2.8% -> 6.4%, ~2.3x); finding 56's c147 1.7x arm
+  (6.0% -> 12.1%, ~2.0x) used a mixed load, so the ratios are not directly
+  comparable. A C195 at `2^30` should be lower again; small jobs remain the
+  exposed case.
+- **Real `I16e` sievers are not obviously worse than spinners.** 13 runnable
+  threads of memory-heavy work cost 3.2% against 15 spinners' 2.8%, but that
+  0.4 pp difference is inside the I16e arm's own 2.6% range, that arm was not
+  interleaved, and it was compared against a baseline carrying one extra
+  competitor. Read it as "similar", not "the same".
+- **Finding 53's size is not explained.** Finding 56 attributed finding 53's
+  much larger figure to real workloads contending for memory, but **finding
+  53's loads were spinning shells too**, and finding 56 had already measured
+  only +6.4% at 15 spinners on the same c147 job. Area accounts for the step
+  from ~6% to ~3%; nothing here accounts for finding 53's +28.7%. Do not quote
+  it as the worst case for current jobs, and do not attribute it to area.
+- **`acc/wall` tracks contention coarsely, not precisely.** It orders the
+  interleaved arms (0.950 / 0.924 / 0.886), but the I16e arm reads 0.931,
+  above s15, while losing slightly more rate. Good enough to flag a contended
+  run; not good enough to rank two similar loads.
+- **Nothing here bears on item 19's environmental regression.** This run's
+  idle `acc/wall` (0.950) sits between the unregressed 0.967 and regressed
+  0.878 that finding 87 recorded (the drop finding 88 traced to the
+  environment), on newer code at a different band length, so it neither shows
+  the regression nor rules it out.
+- **Operationally:** co-scheduling ordinary NFS work at up to one thread per
+  logical CPU costs roughly 3% of relation rate on c183-class jobs. `nproc - 1`
+  remains the right rule; oversubscribing to 1.7x costs ~6%. Item 4's host
+  work is correspondingly less urgent.

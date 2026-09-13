@@ -1169,7 +1169,10 @@ where the standalone gain is largest (16.7%).
   wall-clock or ETA comparison is invalid without knowing host load on both.**
   The pipeline prints `GPU-accounted / wall (excl cofac)` to expose it; the
   first published pair used a formula since corrected, so current values await
-  a confirmed-idle box. Finding 53 is canonical for all of this.
+  a confirmed-idle box. Finding 53 is canonical for the GPU counters'
+  blindness, **not for the current magnitude: see finding 96** (2026-09-13,
+  c183 `2^29`), which measures a few percent and holds the figures. Only part
+  of the gap to these c147 numbers is explained by sieve area.
 
 ## Open experiments, in order
 
@@ -2175,7 +2178,9 @@ finding 92.
 
    Two numbers now bound the prize. On a **verified-idle box** `acc/wall` is
    0.885 and GPU utilisation 89.5%, so the structural gap is **11.5%** on the
-   c147 — contention adds ~6% at 12 workers and ~14% at saturation on top.
+   c147 — contention adds ~6% at 12 workers and ~14% at 1.7x subscription
+   (a mixed sieve-plus-spinner load, not saturation) on top. **Those are c147
+   figures; at c183 `2^29` the 1:1 cost is about half -- finding 96.**
    But the gap **shrinks with area**, because host work per q is fixed while
    GPU work is not: 11.5% at `2^27`, 5.4% at `2^29`, **3.8% at `2^30`**. At the
    geometry a C195 would deploy at, this whole item is worth under 4%, part of
@@ -3673,6 +3678,8 @@ finding 92.
     real deployment runs in -- a BOINC host has other tasks -- and because the
     sieve's host thread is on the critical path (item 4: identifiable host work
     is 7% of an idle wall and **triples** under CPU contention, finding 53).
+    At the geometry we run it is a few percent, not tens: worth minimising,
+    but no longer a large lever (finding 96 holds the figures).
 
     **`acc/wall` is the discriminator between the two, and it is already in every
     runlog record and every band summary.** It falls when host time appears with
