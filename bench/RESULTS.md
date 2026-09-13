@@ -7345,3 +7345,1046 @@ Two mistakes worth keeping, both caught by measurement rather than review:
   each other — 2336 "samples" from a range holding 118 (q,rho). `--windows 1`
   enumerates exactly what the band will sieve. Harmless for the wide bands the
   tool was written for, misleading for anything short.
+
+## Finding 94 — concurrent fill lands in the pipeline as a per-SIDE option, output-identical over six bands. The 5070 meets item 1's own ~2% projection and that is not a deployment case; the flag's value is that the rental now costs no development
+
+`--fill-streams` (finding 84) measured the saturation question on **N synthetic
+workspaces marching in lockstep**, and said in its own comment that it "does NOT
+predict how two real q interleave. That needs the pipeline." This is the
+pipeline form of it, built 2026-09-09.
+
+### The concurrency unit is the side, and that is forced by the memory
+
+Per slab the pipeline runs side 1's fill+apply, then side 0's, **on one shared
+bucket array** — `pipe_side_sieve_slab` took `d_bucket`/`d_cursor` as arguments
+precisely because the two sides take turns with them. So overlapping the sides
+is exactly what the sharing forbids, and the whole cost of the option is a
+second bucket array. The function is now split into `pipe_side_sieve_issue`
+(launches, no sync) and `pipe_side_sieve_join` (awaits, classifies), so the
+caller picks the order:
+
+    serial      issue(1) join(1) issue(0) join(0)     -- unchanged
+    concurrent  issue(1) issue(0) join(1) join(0)
+
+Both sides keep their own `pbkt_t` workspace and their own stream. In serial
+mode both point at the one array on the legacy default stream, which is what
+keeps that path identical to the pre-split code — same launches, same stream,
+same order.
+
+**Nothing may touch the legacy default stream between the two issues.** The side
+streams are created blocking, so a default-stream operation slipped in between
+implicitly synchronises with side 1 and quietly serialises the arm — *while
+still emitting correct relations*, so no output gate would catch it. That is
+also why the four `cudaMemset` calls became `cudaMemsetAsync` on the side's
+stream: the synchronous form runs on the default stream and would do exactly
+that.
+
+### Output identity is the gate, and it holds
+
+| band | geometry | relations | arms agree |
+|---|---|---|---|
+| q 120000053, single | `2^15 x 2^14` | 37 | md5 `60644c99...` |
+| q 120000000-500, x3 pairs | `2^15 x 2^14`, unslabbed | 1,596 | md5 `b6318c7a...`, all 6 files |
+| q 120000000-200 | `2^15 x 2^15`, **2 slabs** | 943 | md5 `b79b42ed...` |
+
+`--check-relations` rebuilds **1,596 of 1,596** norms exactly on the concurrent
+output. `make check` passes (one earlier `cofcheck` exit 255 did not reproduce
+and was foreign GPU load — the same binary passed `cofcheck.sh` standalone
+minutes later).
+
+The slabbed band matters more than its size suggests: it is the path where the
+walk-continuation state is advanced per slab, and where a soft skip must
+abandon the whole q rather than `continue`. The concurrent arm issues side 0
+before side 1's overflow is known, so it *does* leave S0's walk state current
+where the serial arm leaves it stale — but both arms `break`, so no later slab
+reads it and the two stay behaviourally identical. **Do not use that to turn the
+break into a continue:** it would be correct in one arm and wrong in the other,
+which is the one class of divergence output identity cannot catch.
+
+### The 5070 numbers, and why the first set should not be quoted
+
+Three interleaved pairs on an **idle** card:
+
+| pair | sieve stage | wall |
+|---|---:|---:|
+| 1 | −4.61% | −1.85% |
+| 2 | −4.48% | −2.46% |
+| 3 | −2.33% | +0.16% |
+
+Every pair favours concurrent on the sieve stage; **one of three is a wash at
+the wall**, and the −1.4% mean sits inside this box's own day-to-day variance
+(item 19). **This is item 1's own "~2% of wall on a 5070 — do not build it for
+that", met.** It is not a case for deploying the flag on this card.
+
+**An earlier set of pairs read −3.28% and is withdrawn.** Those ran with a
+foreign process on the card, which is precisely the condition that flatters a
+concurrency arm: a contended device has idle SMs to sell. The idle-card numbers
+are the ones that count, and they are the smaller ones. Same lesson as finding
+84's arm-order correction, from the other direction.
+
+### The accounting broke first, and the broken version is instructive
+
+The first working build reported `sieve, both sides 95.08 ms` inside a
+**79.38 ms** q, with `unaccounted` at **−41.22 ms**. Nothing was wrong with the
+sieving: fill and apply are still measured per side, and under concurrency those
+two spans *overlap*, so their sum exceeds the wall time the pair took. Each
+side's kernel is genuinely slower (they share the SMs) while the pair finishes
+sooner — which is the effect, stated backwards.
+
+The band report now accumulates the overlap explicitly, as
+`(sf1+sa1+sf0+sa0) − span` where `span` runs from side 1's `ev[1]` to whichever
+`ev[3]` landed later, and subtracts it from the stage total:
+
+          fill                             41.295 ms
+          apply                            48.805 ms
+          less: sides overlapped          -39.966 ms   <- --fill-concurrent
+        ...
+        unaccounted                         -0.51 ms
+      GPU-accounted / wall (excl cofac)     0.992
+
+The children still visibly add to the parent, and `unaccounted` returns to its
+normal fraction of a millisecond. Zero when the flag is off, so the serial
+report is unchanged to the last digit. **This is findings 90/91's rule applied
+to a new quantity**: a stage total that cannot be reconciled with the wall clock
+is not a measurement, and shipping one would have poisoned the rental it exists
+to inform.
+
+### The admission check has to run last, and one branch is still untriggered
+
+Checking free memory beside the *first* bucket array passes on memory the factor
+bases, bitmaps, trial-division context and cofactor queue have not claimed yet —
+the run then dies at the next `cudaMalloc` instead of refusing cleanly. Measured
+at 16e it admitted a 4.83 GB second array with 1.08 GB left and fell over
+immediately. The check now runs after all one-time setup, where the remainder is
+real; the 512 MB margin then only covers the per-q buffers that grow on demand,
+**measured at 0.12 GB at 15e** (free 8.64 GB after setup, 8.52 GB at steady
+state).
+
+**FIRED 2026-09-10, on this 12 GB box, and it never needed the rental.** The
+first two attempts starved the card with a second `bench` holding 3-4 GB and were
+both admitted anyway -- under WSL those allocations are evictable, exactly as the
+RUNBOOK's VRAM section says. The hog was the wrong instrument. The right one is a
+**geometry** whose second array does not fit, and the knob is `--slab-j`:
+
+    --logI 16 --J 32768 --region 15 --slab-j 32768     (bucket array 4.87 GB)
+      serial      steady state 10.50 GB of 11.91 GB, band completes
+      concurrent  "--fill-concurrent needs a second bucket array + cursors of
+                   4.87 GB and only 1.43 GB is free after setup"
+
+A clean startup refusal naming both figures, and **it also confirms the check's
+placement is what makes it work**: beside the first array the run would have seen
+5.92 GB free and admitted a 4.87 GB second one, then died at the next
+`cudaMalloc`. After all one-time setup the remainder is 1.43 GB and the refusal
+is correct.
+
+Two things this cost a wrong turn to learn. `--logI` is NOT the knob -- the
+auto-slabber targets ~2^29 positions per slab, so raising `logI` *shrinks* the
+slab and the array with it (2.43 -> 2.16 -> 1.90 GB across logI 16/17/18,
+measured). And `--region` is capped by **shared memory**, not VRAM (see the
+region-16 note below), so a region ladder fails for a reason unrelated to either
+array.
+
+**It cannot be fired on a big card with this job, and that is a property of the
+job, not a gap.** The array scales with slab area, area is capped at `2^31`
+positions by the `uint32_t` offsets, and that ceiling puts the array at ~4.9 GB.
+Two of those is nothing to a 32 GB card. Firing it there would need a much larger
+factor base, not a larger geometry -- so the 12 GB box was the right one, and
+`rental5090.sh` carries the reproducer as an **opt-in** phase rather than
+spending card-hours on a rung that cannot separate there.
+
+### An xhigh review the same day, and the three things it caught that mattered
+
+Fourteen findings; the substantive ones were all in the *accounting and the
+unwind paths*, not in the sieving — the relations were byte-identical before and
+after every fix below.
+
+- **`acc_ovl` was not rolled back on the `nq_lost` path.** A q whose every slab
+  soft-skips rolls back `acc_td` and `tm` and `continue`s without incrementing
+  `nqdone`; `ts1`/`ts0` are locals so `acc_fi`/`acc_ap` never see it. `acc_ovl`
+  is banked *per slab* inside the loop, so it survived the rollback and
+  subtracted an overlap from a sieve total never charged the matching per-side
+  time. That is the same un-reconcilable stage total this finding is about,
+  reintroduced by the fix for it, on a rarer path. The rollback's comment
+  ("every other region timer is either held in a local above or added after
+  this point") had become false and now says what the rule is.
+- **The transform → fill dependency was ambient, not structural.** `k_transform`
+  writes `plat`/`walk_cur` on the legacy default stream; `k_fill_atomic` reads
+  them on a side stream. Only the *blocking* property of `cudaStreamCreate`
+  ordered them. `--default-stream per-thread` in `NVCC_FLAGS`, or one
+  `cudaStreamNonBlocking`, removes that silently — and the failure would be
+  wrong log sums **in the concurrent arm only**, which no serial gate can see.
+  Now an explicit `cudaStreamWaitEvent(st, S->ev[4])`, free on stream 0.
+- **The second bucket array was invisible to the by-stage memory table**, because
+  `#undef VRAM_MARK` sat above the admission block — while the RUNBOOK
+  paragraph added by this same change tells an operator to size a concurrent job
+  as `2 x bucket + the rest`, and the paragraph after it points at that table as
+  the authority. It now prints (`second bucket array 1.38 GB`), and steady state
+  moves 3.39 → 4.77 GB, which is exactly one array.
+
+Also fixed: the per-slab clamp on the overlap made it a **biased** estimator
+(both side streams are released by the same fence, so which `ev[1]` lands first
+is launch noise; keeping every over-estimate and dropping the under-estimates
+biases the reported sieve stage low) — it is now measured from a signed origin
+and clamped once at print time. The serial arm got the same `cudaDeviceSynchronize`
+the concurrent arm had: an `issue` that fails does so *after* `k_fill_atomic` is
+launched, so joining side 1 before side 0 is issued does not rule the hazard out,
+and the comment claiming it did was wrong. `slab.sync.side1` is now
+`slab.sync.both` under the flag, because all four fill/apply phases are async
+issues that flash past and the run parks on the sync for the duration of *both*
+sides — so a hang was being attributed to side 1 whatever was actually stuck.
+
+Two were rejected. A `if (sv1 > 0 && sv0 > 0) sv0 = 0;` collapse was correctly
+called **dead code** and removed — but the real divergence it claimed to fix is
+that a both-sides-overflow slab warns twice, spending the rate-limit budget of 8
+in 4 slabs; that is recorded in place rather than papered over, since two lines
+naming two sides is the better report. And the proposal to measure the sieve
+stage as a span in *both* arms and delete the correction term does not hold:
+in the serial arm the host time inside `join(1)` falls between side 1's `ev[3]`
+and side 0's `ev[1]`, so a span would **not** equal today's sum and the serial
+report would change — which is the one thing this change may not do.
+
+### THE 5090 ANSWER, 2026-09-10: -7.62% of wall, and the gain is inversely proportional to how well the geometry already feeds the card
+
+Rented RTX 5090 (32 GB, 575 W limit), `bench/rental5090.sh` start to finish,
+native Linux. The pre-registered bracket was **5.8% to 8.3%** and the ship
+threshold ~4%.
+
+| geometry | serial | concurrent | **wall** | sieve stage | rel/J |
+|---|---:|---:|---:|---:|---:|
+| c147 `I14/J8192` | 10.685 | 9.220 | **-13.71%** | -19.38% | (not sampled) |
+| c183 `I15e` (3 pairs) | 38.967 | 35.997 | **-7.62%** | -12.42% | **+5.4%** |
+| c183 `I16/J32768` (1 pair) | 127.08 | 120.16 | **-5.45%** | -7.97% | **-1.4%** |
+
+The three c183 I15e pairs are -7.77 / -6.86 / -8.24%, every one favouring
+concurrent. **The prediction held**: synthetic N=2 is 23.7% off fill, fill is
+39.9% of this card's wall, so full realisation would be 9.43% and the pipeline
+returned 7.62% -- a **realisation of 0.81**, against the 5070's 0.70 on the same
+protocol. The wide card realises MORE of its synthetic gain, not less.
+
+The synthetic sweep reproduces finding 84 to within a quarter of a percent, and
+the two passes agree with each other to 0.3%, which is what says the box was
+idle:
+
+| N | this session (a / b) | finding 84, 2026-09-01 |
+|---:|---|---:|
+| 2 | 0.7630 / 0.7640 | 0.7654 |
+| 4 | 0.6970 / 0.6950 | 0.6959 |
+| 8 | 0.6981 / 0.6978 | 0.6957 |
+
+### The finding nobody predicted: the gain shrinks as the geometry grows
+
+-13.71% at c147 I14, -7.62% at c183 I15e, -5.45% at c183 I16. **Fill's share of
+wall is not the explanation** -- it is 39.9% at I15e and 39.3% at I16, flat. What
+changes is how much work one fill kernel is given: 8,192 regions, then 32,768,
+then a `2^31` slab. The bigger the geometry, the better a single kernel already
+feeds the card, and the less idle capacity the second stream has to sell. Finding
+84 said this about the synthetic arms ("the underfeeding gets WORSE as the
+per-kernel work gets smaller") and predicted it would show in production. It
+does, across a 2.5x range of gain.
+
+**That inverts the usual sizing intuition.** The wide rectangle is cheaper per
+relation and higher-yielding (RUNBOOK), so production wants big geometries -- and
+big geometries are exactly where this flag is worth least. The flag is not a
+free-standing win; it is a *repair for underfeeding*, and it pays in proportion
+to the underfeeding that is left.
+
+### The 16e energy result did not survive its own repeat, and the instrument is why
+
+The first 16e pair read **-1.4% rel/J** and was written up here as the row that
+decides deployment, with an explicit warning not to act on it until it was
+repeated. **It was repeated the same afternoon on the same card and came back
++4.6%.** The claim is withdrawn.
+
+| 16e pair | wall | board | rel/J |
+|---|---:|---:|---:|
+| run 1 | -5.45% | **+7.27%** | **-1.41%** |
+| run 2 | -5.26% | **+0.95%** | **+4.56%** |
+
+**The wall figure is solid and the energy figure was never a measurement.** Two
+independent pairs agree on wall to 0.2 points (pooled **-5.35%**) while the board
+term disagrees by six points and straddles zero. The board readings for the
+*same arm* across the two runs differ by 2.6% (serial, 412.6 vs 423.2 W) and
+3.5% (concurrent, 442.6 vs 427.2 W) — larger than the effect being measured.
+
+The cause is the instrument, and it was named in this file before the run:
+`board=` in the runlog is **one instantaneous reading per log tick**, and the
+16e arm produced four of them. Four spot checks cannot estimate the energy of a
+63-second run to better than several percent, so a 5% question was being asked of
+a 3.5%-noise reading. Finding 83 had already said ambient temperature moves the
+energy number by several percent; this is the same warning arriving as a false
+result.
+
+**Fixed by measuring it properly.** `rental5090.sh` now wraps every timed arm in
+`nvidia-smi --query-gpu=power.draw -lms 200`, averages the whole arm, and reports
+`J/q` and `rel/J` from the measured wall and that mean.
+
+**The first evidence offered for that here was worthless and is replaced.** It
+read: "on the 5070 at c147 the new instrument gives 12 samples per arm and board
+draw that barely moves (190.2 W serial against 190.6 W concurrent, +0.2%), so the
+-5.0% wall passes almost undiminished into +5.1% rel/J." Twelve samples at 200 ms
+is **2.4 seconds of arm** -- a smoke test of the plumbing, at exactly the length
+`rental5090.sh`'s own `NQ` comment says is dominated by the boost-clock ramp. It
+was quoted as a measurement because it was the first output the new code
+produced.
+
+The full-length arms say something different and more useful: **the board term is
+card-dependent and is NOT negligible.** Serial to concurrent, 2,000-q bands,
+~1,100 samples per arm:
+
+| card | board delta | wall | rel/J |
+|---|---:|---:|---:|
+| RTX 5070, stock | **+3.02%** | -4.31% | +1.44% |
+| RTX 5070, undervolted | **+2.93%** | -3.73% | +0.92% |
+| RTX 3090 | **+0.25%** | -3.79% | +3.69% |
+
+On the 3090 the board term is noise and rel/J is essentially the reciprocal of
+wall. **On the 5070 it eats two thirds of the wall gain.** So the earlier
+generalisation below -- "rel/J tracks wall closely ... on both cards and at every
+geometry tested" -- was a 3090 result stated as a law; it holds there and not on
+the 5070. What survives across both cards is only the sign.
+
+**What this leaves standing.** rel/J tracks wall *on the 3090*, and is positive
+but materially smaller than wall on the 5070, once board draw is measured rather
+than sampled. The
+"turn it off at 16e" recommendation is **withdrawn**; the honest position is that
+16e gains less than I15e because the geometry already feeds the card better
+(-5.35% against -7.62%), not because it costs energy. **The confirmation run with
+the new instrument was attempted and had to be discarded for host contention --
+see below -- so 16e still rests on two single pairs.**
+
+### The three-pair 16e rerun is DISCARDED, and how the data says so on its own
+
+The repeat was run with other work already restarted on the box. It shows, and
+the useful part is the **signature**, because "the box was busy" is normally only
+knowable from outside the data.
+
+| exec order | arm | wall | board |
+|---|---|---:|---:|
+| 1 | serial | 130.67 | 386.1 |
+| 2 | concurrent | 130.74 | 392.4 |
+| 3 | concurrent | 130.13 | 395.2 |
+| 4 | serial | **142.93** | **377.6** |
+| 5 | serial | **143.74** | **364.5** |
+| 6 | concurrent | 125.61 | 404.6 |
+
+The three serial arms spread **10.00%** against the concurrent arms' 4.08%, and
+the pairwise deltas come out **+0.05% / -8.96% / -12.61%** -- a range so wide it
+cannot be reporting one effect. Every arm is 3-5% slower than the clean singles
+taken hours earlier (serial 126.71/127.08, concurrent 120.05/120.16).
+
+**The mechanism is legible in the board column.** The two slowest serial arms
+have the *lowest* board draw of the six -- 142.93 ms at 377.6 W and 143.74 at
+364.5 W. Thermal throttling or GPU-side contention would raise wall while board
+stayed at or above the limit. Wall up *and* watts down is the host failing to
+feed the device: a starved GPU idles, and an idle GPU draws less. **That pairing
+is the tell**, and it needs both instruments -- the wall clock alone would have
+looked like ordinary variance, and this session only has the board column because
+the sampling fix landed the same afternoon.
+
+**The bias points at the concurrency arm**, which is why this cannot be quietly
+kept: the contention landed on serial arms 2 and 3, and a slowed serial arm
+inflates the measured gain. Finding 94 already withdrew a -3.3% 5070 reading for
+the same reason from the other direction. **Discarded. The 16e figure remains the
+two clean pairs' -5.35%.**
+
+### Three fixes the discarded run paid for
+
+- **`GPU-accounted / wall` was dropped from the summary line** when the power
+  columns were added -- a regression, and precisely the wrong line to lose. It is
+  the run's own contention detector: it falls when host time appears with the GPU
+  idle (findings 90/91). Restored.
+- **A repeatability check per arm GROUP.** Interleaving cancels a monotonic drift
+  such as boost decay; it does **not** cancel a burst of host load landing on one
+  arm, which is what happened here. The summary now prints min/max/spread within
+  each arm type and marks anything over 2% as SUSPECT. On the discarded data it
+  flags `25-wide-serial` at 10.00% immediately.
+- **A reused output directory is now refused.** This rerun wrote into the
+  previous run's directory, so the summary globs picked up that session's single
+  pair and printed it beside the new three with nothing to mark it -- two
+  different experiments in one table.
+
+### THE 3090 REFUTES THE PREDICTOR, 2026-09-10: 82 SM behaves like 48, not like something in between
+
+Rented RTX 3090 (GA102, 82 SM, 24 GB, 290 W limit), the same script, the cleanest
+run of the three: arm spreads **0.03-0.36%** and board draw flat to **0.25%**
+across ~1,100 samples per arm.
+
+**The pre-registration was explicit and it failed.** If the stream count follows
+the SM count, an 82-SM card should have given `concurrent/serial` at N=2 in
+**0.78-0.82** and saturated at N=2 or N=3.
+
+| card | arch | SM | N=2 ratio | saturates |
+|---|---|---:|---:|---|
+| RTX 5070 | Blackwell | 48 | 0.8490 | N=2 |
+| **RTX 3090** | **Ampere** | **82** | **0.8653** | **N=2** |
+| RTX 5090 | Blackwell | 170 | 0.7635 | N=4 |
+
+**0.8653 — outside the band, and WORSE than the 48-SM card's 0.849.** Both passes
+agree to 0.0001, and N=4 (0.8573/0.8569) and N=8 (0.8561/0.8558) are flat against
+N=2, so it saturates at two streams like the narrowest card in the corpus. An
+82-SM part sits between 48 and 170 on every device property one would reach for
+and behaves like the small end on the only one that matters.
+
+**Item 1's open TODO is answered: the stream count cannot be derived from device
+properties. An autotuner has to measure it.** That was the whole reason for a
+third card, and it is the answer that costs the most, because a measured
+autotune is a startup cost on every device rather than a table lookup.
+
+### And the anomaly is Ampere's too, so it is not Ada's alone
+
+This session's own single-kernel control, ms per workspace at c183 I15e:
+
+| card | single 4608 | wide | bandwidth |
+|---|---:|---:|---:|
+| RTX 5070 | 18.964 | 17.741 | 672 GB/s |
+| **RTX 3090** | **21.463** | 20.369 | 936 GB/s |
+| RTX 5090 | 8.527 | 8.115 | 1792 GB/s |
+
+**The 3090 is 13% SLOWER at fill than a 5070** while carrying 1.7x the SMs and
+1.4x the bandwidth. That is finding 51's 4090 anomaly (1.80x slower than a 5070
+at 1.5x the bandwidth) reproduced on a second non-Blackwell architecture, on the
+current binary and the current 4608-block default -- which retires the standing
+caveat that the 4090 table was taken at 256 threads before finding 76 moved the
+default. **Ampere and Ada both show it; both Blackwell parts do not.**
+
+Item 1 asked what to conclude if a non-Blackwell card did not recover under
+concurrency the way Blackwell did. It does not: the 3090 recovers **13.5%** off
+fill where the 5090 recovers **23.7%**. Concurrency is not the remedy for
+whatever the pre-Blackwell mechanism is, and a design that assumed it would be
+was about to be built on the 5090's number alone.
+
+### The pipeline numbers, and the geometry law holding on a third card
+
+| geometry | serial | concurrent | wall | sieve | rel/J | fill share |
+|---|---:|---:|---:|---:|---:|---:|
+| c147 `I14/J8192` | 24.875 | 23.145 | **-6.95%** | -8.78% | **+7.67%** | 39.9% |
+| c183 `I15e` | 110.247 | 106.063 | **-3.79%** | -5.78% | **+3.69%** | 38.7% |
+| c183 `I16/J32768` | 429.707 | 422.613 | **-1.65%** | -2.68% | **+1.68%** | 37.8% |
+
+Same monotone ordering as the 5090 (-13.71 / -7.62 / -5.35) at roughly half the
+magnitude, with fill's share of wall flat at ~38-40% across all three geometries.
+**The gain is not predicted by fill's share of wall; it is predicted by how much
+work one fill kernel is handed.** That law now holds on two architectures.
+
+The pipeline gain came in at -3.79% against a pre-registered ~5%, on the low
+side, which follows directly from the synthetic ratio landing at 0.8653 instead
+of 0.78-0.82. The realisation of the synthetic prediction is
+`0.0379 / (0.135 x 0.387)` = **0.73**, between the 5070's 0.70 and the 5090's
+0.81. **That part of the model is intact**: what broke is the input, not the
+transfer function.
+
+### The 16e energy scare is now definitively dead
+
+Board draw across the 16 arms of this run spans **282.0 to 284.8 W** — a 0.99%
+range — with ~1,100 samples behind each figure. The quantity that decides the A/B
+is tighter still: the **serial-to-concurrent** delta is **+0.25% / 0.00% /
+-0.18%** at I15e / I16 / c147.
+
+That pins rel/J to wall arithmetically. rel/J is the reciprocal of the wall ratio
+divided by the board ratio, so with the board term under a quarter of a percent,
+**wall alone predicts every measured rel/J to within 0.01 points**:
+
+| geometry | wall | board | rel/J predicted | rel/J measured |
+|---|---:|---:|---:|---:|
+| c147 | -6.95% | -0.18% | +7.66% | **+7.67%** |
+| I15e | -3.79% | +0.25% | +3.68% | **+3.69%** |
+| I16 | -1.65% | +0.00% | +1.68% | **+1.68%** |
+
+(An earlier draft of this paragraph said "moved at most 0.25% — 282.0 to 284.8 W"
+and "rel/J tracks wall to within 0.1 points". Both were wrong: 282.0 to 284.8 is
+0.99%, not 0.25% — the 0.25% is the arm-type delta, a different quantity — and
+c147's +7.67 against -6.95 differs by 0.72 points, because a wall *ratio* inverts
+rather than negating. The corrected form above is stronger, not weaker.)
+
+There is no geometry at which overlapping the sides costs energy on this card. The 5090's "-1.4% at 16e" was
+four spot samples and nothing else, exactly as its own repeat suggested.
+
+### Where that leaves relations per joule across the corpus
+
+At c183 I15e, concurrent arm, board draw integrated rather than sampled:
+
+| card | wall/q | board | J/q | **rel/J** |
+|---|---:|---:|---:|---:|
+| RTX 5090 | 35.997 | 405.8* | 14.61 | **2.87** |
+| RTX 3090 | 106.063 | 283.2 | 30.04 | **1.40** |
+
+*the 5090's figure is the **sampled** one.
+
+**SUPERSEDED LATER THE SAME NIGHT, and the reasoning is kept because the error is
+the point.** This paragraph originally read a 2.06x 5090-over-3090 ratio off the
+table above and drew a conclusion about volunteer hardware from it. Both halves
+were unsound: the 5090's row is `board=` data, which the section below shows is
+**aliased by tens of percent in either direction**, so the ratio was built on a
+number that no longer exists. The 5070's row, described here as "missing and
+staying missing", was supplied two hours later by the retaken idle band -- see
+"Two cards with trustworthy energy figures" below, which is the table of record.
+
+What survives: **only the 5070 and 3090 have integrated power**, the comparison
+between those two is sound, and **the 5090 still owes an integrated figure that
+cannot now be taken, because the card is released.** One outstanding measurement,
+not two.
+
+### The runlog's `board=` is ALIASED, not merely noisy — and the bias is ARM-DEPENDENT
+
+**2026-09-10, and it retro-explains every energy surprise in this finding.** The
+5 Hz sampler and the runlog ticks were recorded over the *same* 5070 band arms.
+They do not agree, and the disagreement is not scatter.
+
+| serial arm 2 | |
+|---|---|
+| 5 Hz sampler, 848 samples | min 53.8, **p10 150.7, median 215.1, p90 217.2**, max 218.7 W |
+| the nine runlog ticks | 129.8, 147.8, 135.4, 127.4, 145.2, 133.9, 145.2, 132.3, 141.6 W |
+
+**Nine ticks out of nine landed 70-90 W below the median, and not one came near
+it.** That is not a noisy estimator of 215 W; it is a systematically different
+quantity. The concurrent arm of the same pair behaves quite differently -- ticks
+of 153.7, 203.6, 223.2, 223.1, 225.2, 222.1, 222.2, 222.6 against a median of
+221.9 -- i.e. **straddling** its median, barely biased at all.
+
+So the bias is **arm-dependent**, and it points one way: it makes the SERIAL arm
+look far more efficient than it is. The sidecar table from this very run reads
+serial 2.84-3.47 rel/J against concurrent 2.19-2.47 -- "concurrency is 30% WORSE
+on energy" -- while the integrated figures from the same six arms say
+**2.326 -> 2.360, +1.45% in concurrency's favour.** The sign is inverted.
+
+**This is the mechanism behind the 5090's `-1.4% at 16e`**, which was flagged,
+repeated, and withdrawn as noise. It was not noise. It was this, and the repeat
+disagreed because the aliasing depends on where each arm's tick happens to fall
+relative to its own per-q cycle.
+
+The code was never wrong about it. `pipeline.cuh` says in place that the reading
+is "a spot check that says whether the box was busy, **not a power measurement**"
+and that "a board sensor cannot be promoted to" the metric of record. **The error
+was entirely in the reading of it here**: "spot check" was taken to mean noisy
+but unbiased, and it is neither. `runlog_gpu_watts` is called at a q boundary in
+the band loop, right after the per-q host work, which is exactly when the device
+has drained -- so the tick samples an idle moment on a duty cycle rather than the
+work.
+
+**Every rel/J figure in this finding that came from `board=` is withdrawn**, and
+the three cards' numbers are only comparable where an integrated sampler ran.
+`rental5090.sh` keeps the sidecar column because it is still the right instrument
+for "was the box busy", now labelled as aliased rather than merely indicative.
+
+### The clean 5070 band, and what the contaminated baseline cost
+
+The 5070's original -3.01% was measured with ~5 GB of foreign GPU memory in use
+and the host at load 11. Retaken on an idle box (load 2.3), the same band runs at
+**90.5 ms/q against 131.4** -- the card was 45% slower all morning, at *lower*
+board draw and the same `acc/wall`, which is the signature of another context
+time-slicing the GPU under WDDM rather than of host-CPU starvation.
+
+| | serial | concurrent | wall | rel/J (integrated) |
+|---|---:|---:|---:|---:|
+| morning, contended | 132.72 | 128.72 | -3.01% | -- |
+| **tonight, idle** | **90.547** | **86.647** | **-4.31%** | **2.326 -> 2.360, +1.45%** |
+
+Pairwise the clean run gives -3.14 / -3.70 / **-6.07%**, and the repeatability
+check flags the concurrent group at **2.62%** spread on the strength of that
+third arm (85.27 against 87.17 and 87.50, and its `acc` is 0.931 against 0.914
+and 0.909 -- it genuinely had a quieter host). Excluding that pair the figure is
+**-3.42%**. So the clean-regime gain is *at least* as large as the contended one,
+which is the opposite of the worry that a contended card had flattered the
+concurrency arm -- worth recording, because that worry was reasonable and wrong.
+
+### Two cards with trustworthy energy figures, and the 5070 wins on both axes
+
+| card | SM | wall/q | board (integrated) | **rel/J** |
+|---|---:|---:|---:|---:|
+| **RTX 5070** | 48 | **90.55** | 199.0 W | **2.326** |
+| RTX 3090 | 82 | 110.25 | 283.2 W | **1.345** |
+| RTX 5090 | 170 | 38.97 | *sampled only* | *unusable* |
+
+**A 48-SM 5070 is 22% faster per special-q than an 82-SM 3090 and 1.73x its
+relations per joule**, on the same job, geometry and binary. The fill anomaly
+predicted the first half; the 290 W board limit does the rest. The 5090's row
+cannot be filled without renting it again, because its only power data is the
+aliased kind -- **and the card is already released.** That is the direct cost of
+having trusted `board=` for one session.
+
+### The reboot dropped the undervolt, so today's earlier 5070 numbers are OFF-CONVENTION
+
+`STATUS.md` records that **this box has been undervolted since 2026-08-17** and
+that every timing taken after that date is ~6.7% slower than one taken before it
+(finding 61). The reboot cleared it and it was not reapplied until tonight.
+**So every 5070 figure in this finding above -- the morning's -3.01%, the clean
+-4.31%, `rel/J 2.326` -- was taken at STOCK, which is not this box's documented
+configuration.** That is finding 61's own warning arriving in reverse: it exists
+so a post-undervolt measurement is not read as a regression, and here a *stock*
+measurement was about to be read as the corpus baseline.
+
+The canonical 5070 row is the undervolted one below.
+
+### The undervolt, measured properly, and it confirms finding 61
+
+Finding 61 characterised the undervolt from sampled power. This is the same
+change measured with the integrated sampler, on a different band, three
+interleaved pairs, both arm groups passing the repeatability check (1.69% and
+1.62%):
+
+| | finding 61 (2026-08-17) | **tonight, integrated** |
+|---|---|---|
+| throughput cost | -6.7% | **-5.10%** |
+| board draw | -28% | **-29.57%** (199.0 -> 140.1 W) |
+| board figure | ~140 W | **140.1 W** |
+| whole-box rel/J | +14.6% | **+17.09%** |
+
+An independent re-derivation on a different job and a better instrument, landing
+within a point or two on every term. **Finding 61 stands, and its board figure is
+exact.**
+
+Stated for the grading metric: **the undervolt buys 35.1% board rel/J, or 17.1%
+whole-box, for 5.1% of wall clock.** Nothing else measured in this finding comes
+close -- `--fill-concurrent`'s whole-box gain is 2.5%, an order of magnitude
+smaller for a far larger change.
+
+### The concurrency gain SURVIVES the undervolt, and the undervolted pairs are the cleanest A/B of the session
+
+| regime | pairwise wall delta | mean |
+|---|---|---:|
+| stock | -3.14% / -3.70% / **-6.07%** (third flagged, 2.62% group spread) | -4.31% |
+| **undervolted** | **-3.78% / -3.72% / -3.68%** | **-3.73%** |
+
+Three pairs inside **0.1 points of each other** — tighter than anything else in
+this finding, on either card. The open question was whether the flag's benefit is
+partly an artifact of running at stock voltage, since concurrency works by
+selling idle SM capacity and undervolting lowers the ceiling. **It is not:**
+-3.73% undervolted against -3.42% for the two unflagged stock pairs. The honest
+5070 figure is **~-3.7%** in both regimes, and the stock -6.07% pair was the
+outlier its own check flagged.
+
+### Priced on the metric of record, concurrency is worth MORE than board-only says
+
+Host draw on this box is ~115 W with the sieve's own core (item 6), and it is
+approximately *fixed* — so a change that saves wall-clock time amortises it over
+less host energy, while a change that only lowers board watts does not.
+
+| | board rel/J | **whole-box rel/J** |
+|---|---:|---:|
+| stock, `--fill-concurrent` | +1.44% | **+2.54%** |
+| undervolted, `--fill-concurrent` | +0.92% | **+2.23%** |
+| undervolt itself | +35.10% | **+17.09%** |
+
+**The two changes are mispriced in opposite directions by board-only power.** It
+under-prices concurrency (which buys time at slightly higher watts) by roughly
+half, and over-prices the undervolt (which buys watts at a small time cost) by
+roughly double. Every `--fill-concurrent` rel/J figure in this finding is
+board-only and is therefore a *lower* bound on the metric that decides the
+project.
+
+### The aliasing reverses direction under the undervolt, which settles what it is
+
+At stock the runlog under-read the **serial** arm (ticks 127-148 W against a
+215 W median) and tracked the concurrent arm well. Undervolted it is the other
+way round: the **concurrent** arm's ticks read 90.0-92.4 W against an integrated
+144.2 W -- a 37% under-read -- while serial's 119.5-133.7 W sit much closer to
+its 140.1 W. Read from the sidecar alone, tonight's undervolted run says
+concurrency is worth **+50% rel/J**; the integrated figure says **+0.92%**.
+
+**A third instance settles it beyond argument.** Three *serial* arms, same card,
+same geometry, same instrument, all at stock: the morning band's ticks read
+152.8-211.4 W, the arm that later wedged read 216.8-218.9 W, and the clean
+evening band read 129.8-147.8 W against an integrated 197-200 W. **An 80 W spread
+between runs of the identical configuration** -- the tick is not measuring board
+draw with error, it is sampling a duty cycle at whatever phase it happens to
+lock to.
+
+So the bias is not a property of either arm. It is aliasing against whatever the
+per-q duty cycle happens to be, and it can err by tens of percent **in either
+direction**. That retires the last defence of the sidecar column as an energy
+instrument, and it is why the 5090's 16e sign flip was never going to resolve by
+repeating it.
+
+### A third xhigh review, on the harness, and the four that mattered
+
+**2026-09-10.** Fifteen findings against `rental5090.sh` and the two docs. The
+docs are this project's memory, so their errors cost more than the script's.
+
+- **The reused-OUTDIR refusal broke the phase-by-phase workflow its own header
+  documents.** `00-env.log` is written unconditionally on every invocation, so
+  the directory is never empty after a first run -- which means
+  `rental5090.sh out build fb ident` followed by `rental5090.sh out band`, the
+  exact recipe STATUS gives for surviving a cut-short session, aborted with
+  exit 1. The guard also patched the symptom its own comment identified: the
+  defect was that **the summary globs by name**, not that the directory was
+  reused. Each invocation now records the arms it ran and the summary reads that
+  manifest, which restores the workflow and fixes the mixing properly.
+- **The watchdog was armed and then never inspected.** `--watchdog-kill` exits
+  `BENCH_EXIT_STALLED` through a bare `_exit()` from the watchdog thread with no
+  stdio flush, so a killed arm leaves a **truncated log with no `band of`
+  summary** and a **truncated `.rels`**. Globbing for results made that arm
+  vanish: three pairs silently became two, the spread check's `n` dropped, and
+  the relation list printed the short count and the wrong md5 in a bare list
+  beside five correct ones. Arms and their exit codes are now recorded, a
+  non-zero rc prints `*** NO RESULT`, and the relation list marks disagreement
+  instead of listing it. **The fix for the silent hang had a silent failure mode
+  of its own.**
+- **The watchdog was also not armed on the phase that gates everything.** The
+  ident phase runs first, unattended, and every later number is meaningless
+  without it; a card wedging there hung the session with no report. Armed, along
+  with the streams sweep in its report-only form (`--watchdog-kill` is
+  pipeline-only, `--watchdog` alone is legal outside it).
+- **The `>2%` SUSPECT verdict sits inside the clean range this very finding
+  reports** -- clean groups at 0.03%, 1.62%, 1.69%, and a 2.62% group whose
+  outlier arm had a *higher* `acc` than its siblings, i.e. a quieter host rather
+  than a worse one. One constant separates nothing, and `pipeline.cuh` refuses to
+  hardcode a comparable "good" number for exactly that reason. Worse, the
+  message named a mechanism -- "a burst of host load" -- that a wall-clock-only
+  check **cannot** distinguish from thermal throttling, contradicting this
+  finding's own two-instrument diagnosis three sections above. The verdict is
+  gone; the spread now prints beside `acc` and `board`, which are what identify
+  the cause, and both were already computed and unused.
+
+Also fixed: the restored-`acc` bullet above was **incomplete** -- the same
+regression dropped `cmplt` and `apply`, both still assigned in the awk and never
+printed, and `cmplt` is the only column carrying the end-of-band cofactor flush,
+i.e. the only total wall figure; the spread check carried a **second copy** of
+the summary's `wall clock per q` parser, so a label change would have broken one
+and left the other quietly matching (one parser now feeds both); the spread awk
+divided by `lo` with no zero guard, reachable from a log torn mid-line by that
+unflushed `_exit()`, and reported an all-arms-failed group as "1 arm, no spread";
+and the c147 phase duplicated four near-identical invocations where the
+`S_ARM`/`C_ARM` alternation used by band and wide says the same thing once.
+
+**Four doc errors, all of them the kind that outlive the session.** STATUS still
+carried "OPEN TODO -- one more rented card ... a third architecture settles it"
+twelve lines below the new text declaring it answered, with the 3090 buying guide
+intact underneath -- a reader scrolling to the TODO rents a second 3090. Its
+status table still quoted `+5.4% / -1.4% rel/J` from `board=` after this finding
+withdrew every such figure. This file claimed the 5070's integrated row "stays
+missing" two sections before supplying it. And the `2.06x per joule` conclusion
+rested on a withdrawn 5090 number while mixing serial and concurrent arms between
+two tables, so "the 3090's rel/J" had two answers. All four are corrected in
+place with the original text quoted, because a retraction that deletes the claim
+teaches nothing.
+
+Two arithmetic slips went with them: "board moved at most 0.25% -- 282.0 to
+284.8 W" (that range is 0.99%; 0.25% was the arm-type delta, a different
+quantity), and "rel/J tracks wall to within 0.1 points" (c147's +7.67 against
+-6.95 differs by 0.72, because a wall *ratio* inverts rather than negating). The
+corrected statement is stronger: rel/J is the reciprocal of the wall ratio
+divided by the board ratio, and with the board term under a quarter of a percent,
+**wall alone predicts every measured rel/J to within 0.01 points.**
+
+### A fourth xhigh review, and the three that were measurement errors rather than code
+
+**2026-09-10/11.** Fifteen findings. The code one first, then the ones that mean
+numbers in this finding are wrong.
+
+- **The hard-failure rollback restored `acc_ovl` and left `acc_td` and `tm`
+  charged.** The fix for the un-reconcilable stage total, applied to whichever
+  accumulator prompted it. A q dying on slab 3 of 4 leaves `acc_td` (banked per
+  slab) and `tm.join`/`tm.td`/`tm.rank` holding work `nqdone` never counts, so
+  `TD + classify, wall` and `= device total` print over an N that excludes it and
+  `unaccounted` can go negative. The comment directly above already stated the
+  rule -- "any future band-level accumulator written inside the slab loop has to
+  be added here too" -- and the rule is not satisfied by restoring one of three.
+- **`rel/J` paired a relation count that INCLUDES the cofactor tail with a wall
+  clock that EXCLUDES it**, while the power window spanned the tail. `ALL
+  RELATIONS/q` counts what the queue emitted during the post-band drain;
+  `wall clock per q` is `acc_wall/N` and drops `cofac_tail`. So the numerator was
+  long by the tail's relations and the denominator short by its seconds. It now
+  uses `wall clock per q, COMPLETE`, which the awk had been parsing and
+  discarding. **On a c147 band the correction is ~8% of rel/J** -- larger than
+  most effects this finding reports.
+- **The power sampler was not pinned to a device.** `nvidia-smi --query-gpu`
+  with no `-i` emits one line per GPU per sample, so on a 2x or 4x rental -- a
+  common shape for a rented 5090 -- the sieving card's ~380 W would have been
+  averaged with idle siblings' ~20 W, collapsing the mean toward idle, halving
+  `J/q` and inflating `rel/J`, with a healthy-looking sample count. **This is the
+  instrument that replaced `board=` because `board=` was biased.** Now `-i $DEV`.
+- **And its window bracketed the whole process, not the band.** Factor-base load
+  (115 MB from file, or a full GPU regeneration when `--fb1` is omitted), the
+  resume scan and teardown all run at near-idle draw. The dilution is 15-25% and
+  **differs per geometry**, which corrupts precisely the cross-geometry
+  comparison the geometry law rests on -- the c147 arms were worst, rebuilding
+  the entire algebraic factor base inside the window on every one of four arms.
+  The mean is now taken over the final `COMPLETE x nq` seconds of samples, and
+  c147 gets a staged `--fb1` like every other geometry.
+
+**Two claims in this finding were therefore built on bad inputs.** The `+5.1%
+rel/J` offered as proof the new instrument worked came from a **2.4-second arm** --
+twelve samples at 200 ms, a plumbing smoke test at exactly the length this
+script's own `NQ` comment says is dominated by the boost ramp. And the wide (16e)
+arms ran `--logI 16` without `--maxbits`, so `maxbits` defaulted to `logI` and
+they built rational powers to 2^16 against an algebraic file pinned at 15, while
+the band arms built to 2^15. The A/B inside each geometry survives that; the
+**cross-geometry** claim did not, and `--maxbits 15` is now pinned on every arm
+so the geometry is the only variable.
+
+Also fixed: the identity phase, documented as THE abort, **discarded the exit
+status of all five of its runs** -- including `--check-relations`, the only gate
+that can see a wrong relation, since the two arms are byte-identical by
+construction and md5 equality holds just as well when both are wrong; a zero
+power mean passed the `pw != ""` guard and then divided by zero, killing the
+whole arm row rather than degrading to the no-power format; the manifest fix was
+applied to the summary table and spread check but **not** to the power-sidecar
+and relation-count sections, which still globbed -- the same defect, one section
+over; `rental5090.sh band` created a directory named `band` and ran the full
+35-minute protocol, because `$1` is taken as the OUTDIR unconditionally; and the
+watchdog comment overclaimed, since `wd_arm_kill()` has one call site inside
+`run_pipeline_impl` and `--watchdog-kill` is pipeline-only, so the eight
+`--fill-streams` arms get reporting and no kill. That limit is now stated rather
+than implied.
+
+### A fifth review, and the finding that half a fix reads exactly like a whole one
+
+**2026-09-11.** Fifteen more. The headline is the shape of the mistake, not any
+one instance of it.
+
+**The band-scoping power fix never reached a single published number.** The
+previous review established that averaging board draw over the whole *process*
+diluted the mean by 15-25%, differently per geometry. A `pw_mean` function was
+written to take only the final `COMPLETE x nq` seconds of samples, it was called
+from `runp`, and it printed a correctly scoped figure to the terminal during
+every arm -- while the SUMMARY table, the thing every `J/q` and `rel/J` in this
+finding is read off, went on recomputing a fresh whole-file average two hundred
+lines below. The scroll said the fix worked. The numbers did not have it. And
+the bullet added to this file asserted "the mean is now taken over the final
+`COMPLETE x nq` seconds of samples" on the strength of the scroll. Verified
+after the repair: the same c147 arm reads **141.7 W band-scoped against 137.0 W
+whole-process**, so the correction was real and was simply not applied.
+
+**The same shape, twice more in the same diff.** `-i $DEV` was added to pin the
+sampler to a card -- without pinning `./bench` to the same ordinal, and CUDA
+renumbers under `CUDA_VISIBLE_DEVICES` independently of NVML, so the fix moved
+the failure rather than closing it (both are now pinned). And `--maxbits 15` was
+described here as "now pinned on every arm" when the `refuse` ladder still ran
+`--logI 16` with no pin -- the phase whose entire purpose is to read memory
+thresholds off a specific configuration.
+
+**The rollback is now a macro, because open-coding it is what keeps producing
+the bug.** There are **three** abandon sites, not one: `nq_lost`, the
+hard-failure break out of the slab loop, and two more further down (`no
+survivors at this q`, and the cofactor-gate abort). `acc_ovl` was added to the
+first alone; `acc_td` and `tm` were then added to the second and missed at the
+other two. `PIPE_Q_ROLLBACK()` is defined once beside the `_q0` snapshots and
+called at all four. Its comment also names what is deliberately *excluded* --
+`nslab_skipped` and `ntd_skipped` are raw counts, never divided by N, and a skip
+that really happened should stay counted -- because the previous comment claimed
+"every band-level accumulator" and two visible counters contradicted it, which is
+how a reader concludes the rule does not bind.
+
+Also fixed: the relation-count section still globbed while the sidecar section
+had been converted, so a smoke run followed by a real run into the same OUTDIR
+would have printed `ARMS DISAGREE` on a run whose arms were identical; `pw_mean`
+fell back to the whole-process mean on an unparseable log and still labelled it
+"(band only)", which would have reinstated the dilution invisibly, and now says
+`WHOLE PROCESS, diluted`; `W` kept the emptiness test that `pw` had just had
+replaced with a numeric one, so a degenerate COMPLETE figure would still divide
+by zero and take the arm's whole row and its spread-check entry with it; the
+c147 factor-base build had no `|| exit 1`, so a truncated `fbgen` would be reused
+by every later session because `[ -s ]` is true for a partial file; the refuse
+ladder shared one `--watchdog-log` path between its serial and concurrent arms,
+letting the second truncate the first's diagnostic and making a watchdog kill
+indistinguishable from the memory refusal the ladder exists to demonstrate; an
+unquoted command substitution word-split the sidecar list, dropping the whole
+section for any OUTDIR containing a space; the manifest was deleted on the
+success path and leaked on every error path, exactly backwards for the one file
+that records each arm's exit code; and the phase vocabulary lived in three
+hand-maintained copies, so a typo ran the full default protocol.
+
+**Two more documents disagreed with this one.** RUNBOOK's 5070 row paired the
+*undervolted* wall figure with the *stock* board and rel/J figures, which does
+not close -- `(1/0.963)/1.030` is +0.8%, not +1.4% -- and the 5070 now appears
+twice, once per voltage state. STATUS said board draw "is measured over the whole
+arm", which contradicted this file's claim of the fix and, as it happens,
+described what the code was actually doing.
+
+### Cross-card relation identity, gated for the first time
+
+Every arm on the 5090 **and on the 3090** is byte-identical to its serial
+partner, and identical to the RTX 5070's output for the same command: c183 I15e band `fa63611436ad`
+(83,809 relations), c147 `9f39929a0d0c` (129,237), the identity gate's
+`6e33c6b8...` (1,591) and `1604756a...` (937). Different card, different
+architecture generation of the same family, different CUDA install, native Linux
+against WSL -- same bytes. **The 3090 then made it three architectures**: Ampere
+`sm_86` reproduces every one of those md5s, including the 16e band's
+`9e688c00c977`. That was never gated before; `rental5090.sh` prints the 5070 md5s
+beside the run precisely because nobody knew which way it would go.
+
+### A second xhigh review, on the rental protocol, and the one that would have cost the card-hours
+
+**2026-09-10.** Fifteen findings over the commit plus the new
+`bench/rental5090.sh`. Three are worth recording.
+
+- **`cfg.fill_concurrent` had no default, and `bench_cfg_t cfg;` is an
+  uninitialised stack struct.** Every other field is assigned explicitly in the
+  defaults block — including `cfg.fill_streams = 0` on the adjacent line — and
+  this one was missed when the flag landed. A nonzero byte in that slot makes a
+  run that never passed the flag allocate a second bucket array and sieve
+  concurrently, which is exactly the "operator quotes a run as something it was
+  not" defect the refusal path exists to prevent; on a tight card it instead
+  refuses at startup for a flag nobody passed. It is indeterminate across
+  builds, compilers and stack layouts, so **it passes every local test and fires
+  on the rented card** — the one machine where the failure costs money and
+  cannot be reproduced afterwards. Fixed twice over: the default is now set, and
+  `cfg` is zero-initialised so the next omission reads 0 rather than garbage.
+- **The identity gate could not abort.** `rental5090.sh` compared md5 sums
+  without checking either run's exit code or the relation count — and two empty
+  files have the same md5. A `bench` that creates the relations file and then
+  dies (bad `--fb1` path, OOM, a bad `--region`) would have printed
+  `IDENTITY OK` and sent the session on to ~35 minutes of timing arms with no
+  correctness gate behind them at all. The gate now requires a nonzero count on
+  both sides and reports the 5070 reference count beside it.
+- **The refusal ladder's status column conflated three different messages.**
+  `grep -i "second bucket array"` also matches the SUCCESS banner, and
+  `"does not fit"` also matches the FIRST array's refusal — which is precisely
+  the failure the ladder exists to distinguish from the second array's. The PASS
+  criterion was to be read off that column.
+
+Also fixed: `acc_ovl` was rolled back on the `nq_lost` path but not on the
+hard-error `break`, and the band summary still prints after `rc = -1` — the same
+un-reconcilable stage total, on the other exit (the comment now covers both);
+the cross-stream `time_kernel(S1.ev[1], S0.ev[1])` relied on a completion
+guarantee established inside `join`, which is the exact reasoning the ev[4]
+reads three hundred lines below refuse to rely on, and it now syncs explicitly;
+the overlap clamp was spelled out at both the runlog and the summary, which are
+meant to be the running and final forms of one ratio, and is now one
+`pipe_ovl_credit`; the 512 MB margin lived in two admission checks and is now
+one `PIPE_VRAM_MARGIN`; the refusal message charged bucket+cursors while the
+grant message charged bucket only, under the same label; two comments justified
+the correctness-critical `break` by citing `sv0 = sv1 ? 0 : ...`, code this
+change had deleted, and the cited reason is **false in the concurrent arm**,
+where side 0's fill did run; `--nq $((NQ/4))` was 0 for `NQ < 4` and the parser
+refuses `--nq 0`; the c147 arms — the geometry the script itself calls the most
+likely to win — carried no `--log`, so the one arm most worth a rel/J figure
+would have produced none, unrecoverably, after the session ended.
+
+One was declined again. `bk0.stream = 0` in the serial branch is a provable
+no-op, flagged by both reviews. It stays, now with the reason in place: it pins
+the serial arm to the legacy default stream at the one place a reader looks to
+see which side gets which stream, so a later edit to the ternary above cannot
+hand the serial path a side stream by accident. The duplicated admission block
+also stays — the two checks print different things at different points in setup
+— but the margin they share is now a single constant, which was the part of that
+finding that could actually rot.
+
+Identity holds through all of it: the same `6e33c6b8...` / `1604756a...` the
+pre-fix build produced, and `--check-relations` still rebuilds 1,591 of 1,591
+norms exactly. **The md5s are also unchanged between a default build and
+`CF_LMAX=3`**, which confirms empirically what finding 84 asserted — the
+cofactor width cannot touch the relations on this job.
+
+### Unrelated, found on the way: `--region 16` is refused for SHARED MEMORY, not VRAM
+
+`--logI 16 --J 32768 --region 16` (a `2^31` single slab, 4.83 GB bucket array)
+stops after the bucket-array line with 5.92 GB free. **It fails identically with
+and without `--fill-concurrent`**, so it is pre-existing and not this change.
+
+**The first draft of this section attributed it to the factor-bases allocation
+and to VRAM. Both are wrong, and the correction is worth more than the
+observation.** Forcing a small slab (`--slab-j 8192`) drops the bucket array to
+**1.21 GB with 9.55 GB free** and it fails in exactly the same place. Memory was
+never involved. The real message is there and was missed because it goes to
+**stderr, which is unbuffered, so in a merged stream it lands ahead of the
+block-buffered stdout it appears to follow** — a `tail -3` of the run shows the
+memory table and not the diagnostic:
+
+    apply needs 131200 B of shared memory for 64 padded slices;
+    selected device supports at most 101376 B opt-in per block
+
+`pipe_side_init` computes `(1 << log_region) * 2 + nslice_pow2 * 2` and refuses
+above the device's opt-in limit. At `--region 16` that is 128 KB of region bytes
+alone against the 5070's 99 KB. So **`--region 16` is not a memory question at
+all**: it is unavailable on any card whose opt-in shared memory is under ~128 KB,
+and it *would* run on an A100 or H100 (164 KB). Item 2's "a `--region 16` run
+that fit before may not now" is a different mechanism and this is NOT a datapoint
+for it.
+
+Two consequences beyond the note. `bench/rental5090.sh`'s refusal ladder keeps
+every rung at `--region 15` and grows the array with `logI` instead, because a
+region-16 rung would fail for a reason that has nothing to do with either bucket
+array — and its message column matches the shared-memory refusal explicitly, so
+such a rung cannot read as "no diagnostic". And the general lesson: **when a run
+appears to die silently, check whether the diagnostic was reordered ahead of the
+stdout it belongs after** before concluding there isn't one.
+
+
+## Finding 95 — cofactor chunking is output-identical at the BYTE level, and its auto mode costs the 5070 0.72% of wall, not the ~20% the 3090 table appears to project. The floor is what makes the difference, and it is doing its job
+
+Greg's `--cof-chunk` (merge `a84998f`, 2026-09-11) slices a cofactor round
+across several launches on the RECORD axis so no single launch can outrun a
+slow device's GPU watchdog. Two things needed checking on real hardware: that
+it cannot change a result, and what auto mode costs the card we actually run.
+
+Measured 2026-09-12 on the RTX 5070 (48 SMs, 12 GB, CUDA 13.4, 7-target fat
+build), `oracle/c183`.
+
+### Output identity: byte-identical, which is stronger than the gate asserts
+
+`cofcheck.sh` passed **51 of 51** cases. But its `expect_rel` pins relation
+COUNTS, and a count is not an identity -- so the claim was tested directly:
+
+    ./bench --pipeline --cadofb ../oracle/c183.fb1 --poly ../oracle/c183.poly \
+            --qrange 120000000:120002000 --nq 300 --cofactor --cof-chunk <N>
+
+| `--cof-chunk` | relations | bytes | md5 |
+|---|---:|---:|---|
+| 131072 (one launch) | 5245 | 769,448 | identical |
+| 0 (auto, 2 launches) | 5245 | 769,448 | identical |
+| 4096 (32 launches) | 5245 | 769,448 | identical |
+
+**One distinct hash across all three.** On the golden single q (120000053) the
+same holds across `{0, 131072, 16384, 4096, 512}` x `{rho, ECM}` -- ten
+configurations, 37 relations each, with `512` genuinely running four launches
+per round rather than one. Greg's argument for the record axis (every record's
+`mz_split` is independent and untouched by the slicing) is confirmed
+empirically, not just structurally.
+
+### What auto costs this card: +1.86% of the cofactor stage, +0.72% of wall
+
+The 5070's floor is `blocks * threads` = 48 SMs x 6 = 288 blocks x 256 =
+**73,728**, against a flush of **130,031** records. Auto therefore opens at
+73,728 -- two launches per round -- and PARKS there: the flush stage runs
+~1.5 s, far above the 250 ms halve threshold, so it never doubles, and the
+floor stops it halving. It reports exactly once per band:
+
+    cofactor chunk: 73728 records/launch, 2 launches per round over 130031 records (auto)
+
+Paired A/B, n=5, arms alternated:
+
+| | pinned `131072` | auto (73,728 x2) | delta |
+|---|---:|---:|---:|
+| cofactor device time / q | 15.660 ms (sd 0.098) | 15.952 ms (sd 0.050) | **+1.86%** |
+| wall clock / q, COMPLETE | 89.43 ms | 90.08 ms | **+0.72%** |
+
+Auto was slower in all five pairs, so the effect is real; it is simply small.
+
+### THE CORRECTION, and it is the part worth keeping: the floor separates free from costly, and 65536 on a 3090 was never the free case
+
+An earlier reading of this merge projected roughly a **20%** cofactor-stage
+penalty for auto on the 5070, by carrying across the RTX 3090 table in
+`cofac.cuh`'s `cof_chunk_floor` comment (chunk 65536 = +21.7%). **That
+extrapolation was wrong by an order of magnitude, and the reason is the floor
+itself.**
+
+The 3090's floor is 82 SMs x 6 x 256 = **125,952**. Lay its own measurements
+against that:
+
+| 3090 chunk | vs unchunked | position relative to its 125,952 floor |
+|---|---:|---|
+| 131072 | +0.5% | **at or above** the floor |
+| 65536 | +21.7% | below |
+| 32768 | +50.7% | below |
+| 16384 | +150.7% | far below |
+
+The floor cleanly partitions that table: at or above it, chunking is free;
+below it, the cost is threads idling with no record to work on. The +21.7%
+datapoint is a measurement of the regime **the floor exists to prevent**, and
+auto can never select it. On the 5070 auto picks 73,728, which IS the floor --
+exactly one record per thread, the designed-free point -- and the measured
++1.86% is what "free" costs in practice there.
+
+So the mechanism flagged as a risk is real (auto does park at the floor for a
+whole band, and on this card the floor is below the flush so it never reaches
+one launch), but the magnitude was mis-derived. **Do not quote the 3090's
+below-floor numbers as a projection for a card whose auto slice sits at its
+own floor.**
+
+### Recommendation
+
+Leave `--cof-chunk` on auto. 0.72% of wall buys watchdog protection for the
+slower volunteer hardware the BOINC build targets, which is the entire point
+of the change. `--cof-chunk 131072` recovers the fraction on a dedicated run
+and is measured indistinguishable from the pre-merge single-launch path.

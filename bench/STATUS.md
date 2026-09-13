@@ -4,7 +4,7 @@
 the order they were discovered, including the ones later refuted, because the
 refutations are the most useful part. That makes them bad at answering "what
 does this thing do today". This file answers only that, and holds nothing that
-is not current. **Last updated 2026-09-01.**
+is not current. **Last updated 2026-09-10.**
 
 ## Architecture
 
@@ -961,8 +961,32 @@ Cards with measured band data: **RTX 5070** (WSL2), **RTX 5090**, **RTX 4090**,
   answer — the local 5070 against the local CPU box, item 0 — because both
   sides of that comparison are on this UPS. Treat cross-card rel/J as an
   architecture note, not as a verdict input.
-- **THE BOX IS UNDERVOLTED AS OF 2026-08-17, and every timing taken after that
-  date is ~6.7% slower than one taken before it.** The card's V/F curve is
+- **THE UNDERVOLT IS BEING REMOVED, 2026-09-11**, on the owner's hypothesis that
+  it is the cause of this box's intermittent GPU hangs rather than a free
+  efficiency win. **Reasonable, cheap to test, and NOT supported by the one hang
+  that was actually instrumented.** On 2026-09-10 a band arm wedged for 57
+  minutes -- main thread `R` at 100% user CPU with zero syscall time, GPU at 3%
+  and 30 W, which is what a wedged card looks like when CUDA's default sync
+  policy spin-waits -- and it happened while the undervolt was **OFF**, cleared
+  by a reboot and not yet reapplied. The undervolted band run later the same
+  night completed cleanly. That is one hang at stock against one clean run at
+  stock and one clean run undervolted: too little to conclude anything, and what
+  little there is points away from the undervolt.
+  **If the hangs continue at stock, the 35% board rel/J was given up for
+  nothing** -- so treat this as an experiment with a stated outcome, not a fix.
+  The watchdog is now armed on every timed arm and `--watchdog-log` records the
+  phase, so the next hang produces evidence instead of an anecdote.
+
+  **And it moves the corpus convention a second time.** Finding 61 exists so a
+  post-undervolt timing is not read as a regression; removing the undervolt fires
+  that warning in reverse, and **every number taken between 2026-08-17 and
+  2026-09-11 is the undervolted kind.** The conversion is measured rather than
+  estimated, on a paired same-night band with integrated board draw:
+  **stock is 5.10% faster and draws 29.57% more** (90.547 ms/q at 199.0 W against
+  95.163 at 140.1 W, c183 I15e, three interleaved pairs each). Finding 94.
+
+  *The undervolt as it stood:* **THE BOX IS UNDERVOLTED AS OF 2026-08-17, and
+  every timing taken after that date is ~6.7% slower than one taken before it.** The card's V/F curve is
   pinned to ~2900 MHz at 950 mV (stock was 2910 MHz at 1080 mV), which trades
   6.7% of throughput for 28% of board power — **+14.6% whole-box rel/J**,
   finding 61. It is *not* a code change and it is *not* reflected in any
@@ -1168,7 +1192,7 @@ not by size.
 | 3b | Decide whether a capped band should advance faster than ~`PIPE_SKIP_MAX` q per invocation | policy | **DECIDED 2026-09-05: it should not advance at all** — case D's ~100-q-per-run crawl is only pathological while the cap reports SUCCESS. A capped band now exits `BENCH_EXIT_UNSUPPORTED` (3) and reports `BENCH_OUTCOME_UNSUPPORTED`, so a client stops reissuing it to the same app version instead of burning slots on it. Checkpointing `nqskip` would make it fail on the first q rather than the hundredth — cosmetic once the outcome is right, and not done |
 | 3c | Exit outcomes: a finished band, a checkpointed stop and a too-narrow build must not all be `boinc_finish(0)` | nothing | **DONE 2026-09-05, UNTESTED UNDER A CLIENT** — `enum bench_outcome` in `bench.h`, `PIPE_RC_*` out of `run_pipeline`; stop → `boinc_temporary_exit`, cap → `boinc_finish(3)`, and only a completed band reports fraction 1.0. `--stop-file` stays available under a client and now DEFERS (temporary exit) when the file is present at startup instead of erroring — an xhigh review caught that refusing it removed the only clean stop a Windows task has, since the client stops those with `TerminateProcess` (README "use `--stop-file` for a clean stop there"). `skipcheck.sh` case C asserts exit 3 and the named rebuild width. `skipcheck` passes at `BN_LIMBS=4` (cap exits 3, names `make BN_LIMBS=6`); `make check` passes at the default 12. **The `HAVE_BOINC` branch is type-checked only against a stub `boinc_api.h`, never against real BOINC** — no install on this box. Two things need Greg: that `boinc_temporary_exit(int delay, const char *reason, bool is_notice)` still matches upstream, and whether the project wants a specific error convention for "build too narrow" so the scheduler reassigns to a wider app version instead of retrying |
 | 4 | Three-position `--qspan` delay calibration (before first launch, between, after last) | local GPU, idle box | **optional** — settles the unreconciled `wall - span`; frame it as testing event-endpoint/submission semantics, not as perf work |
-| 5 | Next rental: **concurrent fill primary, concurrent resieve as a second arm**, interleaved, fresh baseline | rented card (3090/L40S/4090) | **not started** — item 1 below, the largest open item |
+| 5 | Next rental: **concurrent fill primary, concurrent resieve as a second arm**, interleaved, fresh baseline | rented card (3090/L40S/4090) | **ANSWERED ON A 5090, 2026-09-10: -7.62% of wall** — `--fill-concurrent` sieves the two sides on two streams; finding 94. The rental is now pure measurement rather than development, which is the point: card-hours are the scarce resource and this needed none of them. The number came in at **-7.62% of wall** on c183 I15e (three interleaved pairs, -7.77/-6.86/-8.24), inside the pre-registered 5.8-8.3% bracket and above the ~4% ship threshold; rel/J on the 5090 is **withdrawn** — its only power data is `board=`, now shown to be aliased by tens of percent in either direction. Finding 94. **The session is one script, `bench/rental5090.sh`** (build, factor base, identity gate, three interleaved band pairs, the c147 small-geometry arm, the `--fill-streams` sweep including the N=8 a 12 GB card refuses) — about 35 minutes of card time, smoke-tested end to end on the 5070 2026-09-10 |
 | 6 | Leave `pipeline.cuh:1924`'s `cudaDeviceSynchronize` alone | — | **decided, no action** |
 
 **On (5), why both arms in one session.** Card-hours are the scarce resource
@@ -1475,16 +1499,139 @@ finding 92.
    is bucket-structured work and nobody has looked at it under this lens. Not
    part of this item; the next place to look.
 
-   **OPEN TODO -- one more rented card, before any production design.**
-   Both data points are Blackwell (48 SM -> 2 streams, 170 SM -> 4), so nothing
-   says whether an autotuner can PREDICT the stream count from device
-   properties or has to measure it. A third architecture settles it.
+   **BUILT IN THE PIPELINE 2026-09-09 (finding 94): `--fill-concurrent`, and
+   the concurrency unit is the SIDE.** `--fill-streams` measured N synthetic
+   lockstep workspaces; the production form of the same question is the two
+   sides of a slab, which have their own factor bases and their own plat
+   distributions. They ran back to back only because they SHARE ONE BUCKET
+   ARRAY, so the flag's whole cost is a second one -- allocated after all other
+   setup (checking free memory beside the first array passes on memory the
+   factor bases have not claimed yet, and the run then dies at the next
+   `cudaMalloc`), and refused rather than silently downgraded.
 
-   *Pick on price, not model.* A **3090** (GA102, 82 SM) is the best value: a
-   third architecture, an SM count between the two we have, an existing 3090
-   datapoint in the corpus to cross-check, and `GPU_ARCH=native` builds sm_86
-   in ~15 s against sm_120's 277 s. An **L40/L40S** (AD102, 142 SM) is the next
-   best -- same silicon family as the 4090 and it re-uses finding 72's L40.
+   **Output identity is the gate, and it holds**: six bands on the c183 --
+   unslabbed and 2-slab, three interleaved pairs -- are byte-identical between
+   the arms (`md5 b6318c7a...`, 1,596 relations; the slabbed pair 943), and
+   `--check-relations` rebuilds 1,596 of 1,596 norms exactly. `make check`
+   passes.
+
+   **Two things this cannot settle, and the honest read of the 5070 numbers.**
+   On an IDLE card the sieve stage falls 2.3-4.6% (three pairs of three) but
+   wall moves only -1.85% / -2.46% / +0.16% -- one pair of three is a wash, and
+   the mean of -1.4% sits inside this box's own day-to-day variance (item 19).
+   **That is item 1's own ~2% projection for a 5070, met, and it is not a
+   reason to deploy the flag here.** An earlier set of pairs read -3.3% and
+   should not be quoted: the card was carrying foreign load, which is exactly
+   the condition that flatters a concurrency arm.
+
+   And the unit caps the ceiling: **two sides is N=2**, while the 5090
+   saturated at N=4. Reaching N=4 means multiple q in flight, which doubles
+   per-q state rather than one array. So the rental measures what N=2 is worth
+   on a wide card; it does not measure the 27.4% figure, which was an N=4
+   number.
+
+   **N=2 on the 5090 is already measured synthetically, so the rental has a
+   prediction to falsify rather than a blank to fill.** Finding 84 records
+   `concurrent/serial` **0.7654 at N=2** against 0.6959 at N=4 — 23.5% off fill
+   relative to the shipped single-kernel default (8.42 → 6.44 ms per workspace).
+   Fill is **35.3% of the 5090's wall**, so full realisation is **8.3% of wall**.
+   The 5070 realises **0.70** of its own synthetic prediction in the pipeline
+   (4.33% predicted, **3.01% measured 2026-09-10** on the rental's own band and
+   protocol), which puts the 5090 at **~5.8%**. Pre-registered bracket:
+   **5.8% to 8.3%**, above the ~4% at which the flag is worth shipping on wide
+   cards. Below ~3% instead, side-level concurrency is finished and the question
+   becomes whether multiple q in flight (the N=4 shape) earns the per-q state.
+
+   **MEASURED 2026-09-10 on a rented 5090: -7.62% of wall**, three interleaved
+   pairs at -7.77 / -6.86 / -8.24%, realisation **0.81** of the synthetic
+   prediction against the 5070's 0.70. The synthetic sweep reproduced finding
+   84's rows to a quarter of a percent and both passes agreed to 0.3%. Every arm
+   byte-identical, **and identical to the 5070's output for the same command** —
+   cross-card relation identity, gated for the first time.
+
+   **Two things the run changed that the plan did not anticipate.** The gain is
+   **inversely proportional to how well the geometry already feeds the card**:
+   -13.71% at c147 I14, -7.62% at c183 I15e, -5.45% at c183 I16, with fill's
+   share of wall flat at ~39% across the last two. The flag is a repair for
+   underfeeding and pays in proportion to the underfeeding left, which means
+   production's preference for wide rectangles works against it. And on rel/J,
+   **every 5090 figure is withdrawn.** They came from `board=`, which is
+   not noisy-but-unbiased but **aliased**: on a 5070 band, nine runlog ticks out
+   of nine read 127-148 W against an integrated median of 215 W, and the bias
+   flips direction between arms and between voltage regimes. The 16e sign flip
+   (-1.4%, then +4.6% on repeat) was never going to resolve by repeating it. `rental5090.sh` now averages
+   `nvidia-smi -lms 200` over each timed arm instead; with that instrument board
+   draw is integrated at 5 Hz over the BAND -- not the whole arm, which would
+   fold factor-base load and teardown at idle draw into the mean by a different
+   amount per geometry. That term is card-dependent: serial to
+   concurrent it is **+0.25% on a 3090** (so rel/J is the reciprocal of wall,
+   +3.69%) and **+3.0% on a 5070** (so rel/J is +1.44% against a -4.31% wall --
+   two thirds of the gain eaten). **16e gains
+   less than I15e (-5.35% pooled) because the geometry already feeds the card
+   better, not because it costs energy.** The three-pair confirmation was
+   attempted and **discarded for host contention** — serial arms spread 10% and
+   the two slowest drew the LEAST board power, which is a starved GPU, not a hot
+   one — so 16e still rests on two single pairs and is the one number worth
+   retaking on an idle box. Finding 94.
+
+   **THE 3090 IS THE CARD THIS ITEM ACTUALLY ASKED FOR, and it runs the same
+   script unchanged** (`GPU_ARCH=native` builds sm_86 in ~15 s; 24 GB clears the
+   `--fill-streams 8` rung a 12 GB card refuses). GA102, 82 SM, third
+   architecture, and the SM count sits between the two Blackwell points — which
+   is the whole question: 48 SM saturates at N=2, 170 SM at N=4, and **nothing
+   yet says whether an autotuner can PREDICT that from device properties or has
+   to measure it.**
+
+   *Pre-registered 2026-09-10, and* ***REFUTED THE SAME DAY.*** The prediction was
+   `concurrent/serial` at N=2 in **0.78-0.82**, saturating at N=2 or N=3. The
+   3090 returned **0.8653** (both passes, agreeing to 0.0001) and saturated at
+   **N=2** — outside the band, and **worse than the 48-SM 5070's 0.849**. An
+   82-SM card sits between 48 and 170 on every device property one would reach
+   for and behaves like the small end.
+
+   **THIS ITEM'S OPEN TODO IS THEREFORE ANSWERED, and expensively: the stream
+   count cannot be derived from device properties. An autotuner has to MEASURE
+   it**, which is a startup cost on every device rather than a table lookup.
+
+   **The anomaly is Ampere's too.** On this session's own control the 3090 is
+   **13% slower at fill than a 5070** while carrying 1.7x the SMs and 1.4x the
+   bandwidth (21.463 against 18.964 ms per workspace) — finding 51's 4090 result
+   reproduced on a second non-Blackwell architecture, on the current binary and
+   the 4608-block default, which retires the caveat that the 4090 table predated
+   finding 76. And concurrency does **not** rescue it: the 3090 recovers 13.5%
+   off fill where the 5090 recovers 23.7%. A design assuming otherwise would have
+   been built on the 5090's number alone.
+
+   *Pipeline, and the geometry law on a third card:* **-6.95% / -3.79% / -1.65%**
+   of wall at c147 I14 / c183 I15e / c183 I16, the same monotone ordering as the
+   5090 at about half the magnitude, with fill's share of wall flat at 38-40%
+   throughout. The realisation of the synthetic prediction is **0.73**, between
+   the 5070's 0.70 and the 5090's 0.81 — **the transfer function held; the input
+   is what broke.** Finding 94.
+
+   **THAT TODO IS CLOSED. Do not rent a third card for it.** It read "one more
+   rented card, before any production design -- both data points are Blackwell,
+   so nothing says whether an autotuner can PREDICT the stream count from device
+   properties. A third architecture settles it." The 3090 was rented and it did
+   settle it: **the stream count cannot be predicted and must be measured.** The
+   buying guide below is kept for the cards it still speaks to, and its 3090
+   recommendation is now spent.
+
+   *If a fourth card is ever bought, pick on price, not model.* A **3090** (GA102, 82 SM) *was* the best value and
+   **has now been run** — see the result above; its recommendation is spent. An
+   **L40/L40S** (AD102, 142 SM) is what is left worth buying: same silicon family
+   as the 4090, it re-uses finding 72's L40, and it would test whether Ada shares
+   the pre-Blackwell fill mechanism that Ampere just demonstrated.
+   A **3060** (GA106, 28 SM) is NOT a substitute, however cheap: it is
+   narrower than the narrowest card in the corpus, so it extrapolates below the
+   measured range instead of interpolating inside it, and the only prediction it
+   can test is "N=2 at the floor" — which 48 SM already says. Its value is a
+   different question this project does care about: **rel/J on volunteer-class
+   hardware.** The grading metric is relations per joule, the distribution story
+   is BOINC, and the modal volunteer GPU is an xx60 at ~170 W, not a 5090. There
+   is no Ampere rel/J point and no mid-range point at all. Buy it for that and
+   for the sm_86 build check, bank the `--fill-streams` sweep as a cheap floor
+   datapoint, and do not let it retire this item.
    A **4090** adds the historical anomaly (1.80x SLOWER at fill than a 5070
    despite 1.5x the bandwidth) but is not required: that table was taken at 256
    threads before the 4608 default, finding 52 already showed that axis
@@ -1492,11 +1639,19 @@ finding 92.
    too -- which is free, locally.
 
    ```sh
-   make GPU_ARCH=native CF_LMAX=3 -j$(nproc) bench && make fbgen
-   ./fbgen --poly input.job --maxbits 15 --threads $(nproc) --out c183.fb1
-   for N in 2 4 8; do ./bench --poly input.job --fb1 c183.fb1        --logI 15 --J 16384 --reps 20 --fill-streams $N; done
-   ./bench --pipeline --cofactor --poly input.job --fb1 c183.fb1        --logI 15 --J 16384 --qrange 190000000: --nq 2000        --relations g.rels --log g.log --log-every 60
+   git clone ... && cd cuda-sieve && bench/rental5090.sh          # ~35 min
    ```
+
+   `bench/rental5090.sh` is the whole protocol and replaces the loose commands
+   this item used to carry: build (`GPU_ARCH=native CF_LMAX=3`, ~5 min at
+   sm_120), factor base, **identity gate as an abort** (unslabbed and slabbed,
+   both arms, byte-compare — every number after it is meaningless if the arms
+   differ), three **interleaved** band pairs with the arm order alternating
+   inside the pair as well as between them, the c147 `I14/J8192` arm, the
+   `--fill-streams` sweep at N=1/2/4/8, and the refusal-branch recipe. Phases
+   are selectable (`bench/rental5090.sh out band c147`) so a session that gets
+   cut short still leaves the earlier ones usable, and `NQ=20` shrinks the bands
+   for a dry run. It prints a parsed summary at the end.
 
    Wanted from it: `concurrent/serial` at each N, the N where per-workspace
    time stops falling, and the pipeline `band of` stage breakdown so fill's
@@ -1505,9 +1660,13 @@ finding 92.
    `k_fill_atomic`. `ncu` is blocked on Vast.ai (three boxes now), so do not
    plan on a profile.
 
-   If Ada does NOT recover under concurrency the way Blackwell did, it has a
-   second mechanism and that changes the design before anyone writes it. **When it is built, the two SIDES of one q are the
-   cheaper pairing than two q**: they already share the factor bases and run
+   **That conditional is half-answered.** It read: "if Ada does NOT recover under
+   concurrency the way Blackwell did, it has a second mechanism and that changes
+   the design." **Ampere does not recover** — the 3090 takes 13.5% off fill where
+   the 5090 takes 23.7%, and it is 13% SLOWER at fill than a 48-SM 5070. So there
+   is a pre-Blackwell mechanism and concurrency is not its remedy. Whether Ada
+   shares it is still open and is what an L40S would answer. **The two SIDES of
+   one q remain the cheaper pairing than two q**: they already share the factor bases and run
    sequentially through one bucket allocation today. Note the production gain
    is not the benchmark gain -- the pipeline number needs a pipeline run, and
    real special-q do not march their bucket frontiers in lockstep the way this
@@ -2818,6 +2977,63 @@ finding 92.
     **cannot explain a wrong relation** — it wedges rather than corrupts, which
     is consistent with a long history of msieve never rejecting a relation from
     this card.
+
+    **12e. The OTHER watchdog -- the DEVICE's, not ours -- MERGED 2026-09-11,
+    MEASURED 2026-09-12 (RESULTS finding 95).** 12d is a host thread watching
+    for a stall. This is the opposite direction: the HOST OS killing a kernel
+    that runs too long. Windows' display watchdog (TDR) terminates a kernel at
+    ~2 s by default, surfacing as `cudaErrorLaunchTimeout`; AMD's reports the
+    vaguer "unspecified launch failure". Both were seen in the field on slower
+    volunteer hardware. A cofactor round's duration is set by its parameters
+    (rho runs `budget << r` iterations, ECM runs `curves` curves, both over
+    every selected record), so a slow enough device crosses the limit on a
+    launch a fast one completes comfortably.
+
+    `--cof-chunk` (Greg, in `cofac.cuh`) slices a round across several launches
+    on the RECORD axis, which is the only axis that cannot change a result --
+    each record's `mz_split` is independent and untouched. 0 = AUTO, sized from
+    the device: the slice floor is `blocks * threads`, one record per thread.
+
+    Verified on the 5070 2026-09-12: relation files are BYTE-IDENTICAL across
+    `--cof-chunk` 131072 / 0 / 4096 (one md5, 769,448 bytes, 5245 relations
+    over a 300-q band), and `cofcheck.sh` passes 51 of 51. Auto costs **+1.86%
+    of the cofactor stage and +0.72% of wall** on this card, where the floor
+    (73,728) sits below the flush (130,031) so auto parks at two launches per
+    round for the whole band. **An earlier reading of this projected ~20% by
+    carrying across the RTX 3090 numbers in `cofac.cuh`; that was wrong by an
+    order of magnitude. The 3090's floor is 125,952, and its table's +21.7%
+    datapoint is at chunk 65,536 -- BELOW that floor, the regime the floor
+    exists to prevent and which auto cannot select. Its 131,072 datapoint is
+    at or above the floor and costs +0.5%, which is the one that actually
+    establishes the floor works.** Finding 95 has the full partition.
+    Recommendation: leave it on auto.
+
+    **What chunking CANNOT bound, in two forms -- the floor is one record, and
+    one record's work is whatever its parameters say.** `cofac.cuh` documents
+    the ECM form: a large enough `--ecm-b2` makes a single record's stage 2
+    exceed a watchdog no matter how the list is sliced. `cofq_init` warns above
+    20,000 giant steps/curve; the derived default is ~194-500, and the
+    configuration known to kill gfx1103 is `--ecm-b1 400000` (~320,000 steps).
+
+    The RHO form is not documented there and is worth stating (found in review
+    2026-09-12). Slices are cut against the batch `n`, but each round compacts
+    the survivors into the low indices, so once the live count falls below the
+    slice the whole round lands in `[0, step)` and the remaining slices launch
+    empty -- `k_cofac`'s own comment concedes this ("what the later rounds
+    mostly do"). Those late rounds carry `budget << r`, the LONGEST per-thread
+    work in the flush, and they are the ones that end up unsplit. Slicing
+    harder cannot help: below one record per thread the launch duration stops
+    falling and only idle threads are added.
+
+    This is a real limit on the protection, not a defect in it. At the
+    pipeline default of 4 rounds it still cuts the peak launch roughly in half
+    on a small device (round 0 unchunked is ~15 records x `budget`; chunked,
+    1 x `budget`; round 3 is 1 x `budget << 3`, which is below the unchunked
+    round 0). It would stop helping at 6 rounds -- the `--cofac` default,
+    which does not auto-chunk anyway. **So `--cof-chunk` bounds the FIRST
+    rounds well and the last rounds not at all**, and a device that still trips
+    its watchdog should be given fewer rounds or a smaller budget, not a
+    smaller chunk.
 13. **Validate the BOINC GPU assignment — CLOSED 2026-08-17.** Greg Childers,
     who reported the original failure (every task on a multi-GPU host landing
     on device 0), reviewed and signed off on the assignment change, and a BOINC
@@ -2873,8 +3089,11 @@ finding 92.
     read 2026-08-20, NOT tested on any such card.** **Fixed 2026-08-21:** both
     the production pipeline and standalone apply benchmark now query
     `cudaDevAttrMaxSharedMemoryPerBlockOptin` from the selected device at runtime;
-    the default remains `--region 14`. `GPU_ARCH_all` starts at sm_80, but the
-    apply path no longer assumes one architecture family's opt-in limit.
+    the default remains `--region 14`. `GPU_ARCH_all` started at sm_80 at the
+    time (sm_75 joined it later, 2026-09-09 -- see below, this item is now
+    stale on that specific point), but the apply path no longer assumes one
+    architecture family's opt-in limit regardless of which target sits at
+    the fat binary's floor.
 
     Before the fix, both `pipeline.cuh` and `bench_kernels.cu` hardcoded
     `101376` bytes as "the opt-in limit". CUDA does not define one universal
@@ -2900,16 +3119,286 @@ finding 92.
     kernel is launched. This is capability detection only: `--region 14` is
     still the default because larger regions have not been shown to be faster.
 
-    **What is NOT established.** No card older than the current sm_80 build
-    floor has been qualified by this change. Lowering `GPU_ARCH_all` would still
-    require compilation and byte-comparison testing on that hardware.
-    Launch-bounds/shared-memory tuning remains a separate constraint, and as of
-    2026-08-25 it is **no longer confined to the fill kernels**: `k_apply`
-    carries `__launch_bounds__(512, 3)` too (finding 75), so it targets 1536
-    threads/SM and three blocks of ~33 KB. On a 1024-thread/SM part such as
-    sm_75 that annotation both trips the `.minnctapersm` warning and cannot
-    reach its three-block target — on the kernel that is 54% of the sieve
-    chain. Qualify apply alongside fill, not after it.
+    **QUALIFIED on sm_61 AND sm_75, 2026-09-09.** Real GTX 1080 (Pascal,
+    compute 6.1, 8 GB) and RTX 2080 Ti (Turing, compute 7.5, 11 GB), each via
+    a k8s pod (`nvidia/cuda:12.8.1-devel-ubuntu22.04`, toolkit 12.8.93), built
+    with `GPU_ARCH=61` / `GPU_ARCH=75` respectively. On both: `make bench`
+    compiled clean, `--verify-only` passed, `fbgen_gpu` reproduced
+    `oracle/c183.fb1` byte-for-byte identically (7,605,616 entries, matching
+    the RTX 4090's own generation of the same file), `cofcheck.sh` passed all
+    ~52 cases (including the 4-slab apply path this item is actually about),
+    and a real `--pipeline --cofactor` band against `oracle/c183` reproduced
+    the SAME candidate/relation counts on both cards as on the RTX 3090/4090
+    (44 relations from the sieve pass, 254 total after cofactorisation,
+    identical side-0/side-1 split/dead/stuck counts) -- correctness, not just
+    "it ran".
+
+    **The Turing warning: this item's 2026-09-09 note named the wrong kernel,
+    and the correction is the opposite of what it claimed. CORRECTED
+    2026-09-12.** `k_fill_l1`/`k_fill_l2` DO trip
+    `ptxas warning: ... .minnctapersm will be ignored` on sm_75, exactly as
+    this note originally predicted. The 2026-09-09 note then added that
+    `k_apply` does NOT trip it on either Pascal or Turing. **That is wrong on
+    Turing.** Compiling `bench_kernels.cu` for sm_75 alone emits TWELVE such
+    warnings, and NINE of them are `k_apply` template instantiations
+    (`k_apply<8,...>` and `k_apply<16,...>`); only three are fill kernels.
+    Reproduced identically under nvcc 13.4 and nvcc 12.8.93 -- 12.8.93 being
+    the very toolkit the original claim was measured under, so this is not a
+    toolchain difference and not a CUDA 13 regression.
+
+    **The Pascal half of the claim stands, and is stronger than stated:**
+    sm_61 emits NO `.minnctapersm` warning at all, not even on
+    `k_fill_l1`/`k_fill_l2`.
+
+    **The mechanism was already in this item, and it predicts the warning the
+    note said did not happen.** `__launch_bounds__(512, 3)` asks for 1536
+    resident threads/SM. Pascal allows 2048 -- clears it, hence silence on
+    sm_61. Turing allows 1024 -- cannot satisfy it, hence the warning on
+    sm_75. sm_86/89 permit exactly 1536, which is why the rest of
+    `GPU_ARCH_all` is silent. The superseded note reasoned that "Pascal's 2048
+    max resident threads/SM and Turing's 1024 are both apparently enough
+    headroom for `k_apply`'s three-block target"; 1024 < 1536, so that
+    sentence contradicted itself and should have been the tell. The likely
+    origin of the error is that the 2026-09-09 hardware runs confirmed sm_75
+    *ran correctly* and that was read as the warning not firing -- but this is
+    a compile-time ptxas diagnostic, so a runtime test cannot observe it
+    either way.
+
+    **What this does and does not change.** It does NOT touch the correctness
+    qualification above: the relation counts, the byte-identical `fb1`, and
+    the ~52 `cofcheck.sh` cases all still stand, and `.minnctapersm` is an
+    occupancy hint that ptxas discards while still generating correct code.
+    What it changes is the claim that "the tuning floor turned out not to bite
+    the kernel that is actually in the production pipeline" -- it does bite
+    it, on Turing. `k_apply` runs on sm_75 without its three-block occupancy
+    target, and **nobody has measured what that costs.** sm_75 is in the
+    default fat binary as a CORRECTNESS-qualified target, not a tuned one.
+    Measuring `k_apply` throughput on real Turing with and without the
+    annotation is the open question this leaves behind; `-Xptxas -v` on an
+    sm_75 build would at least report the occupancy ptxas settled on.
+
+    **THE UNFINISHED HALF OF THE "LET THE BLACKWELL VALUE FLOAT" ITEM.
+    DRAFTED 2026-09-12. NOT IMPLEMENTED, NOT MEASURED.** The shared-memory
+    opt-in limit was the half that got fixed (`c2c4104`, 2026-08-21, above):
+    it is queried per device at `bench_kernels.cu:69` and applied at
+    `pipeline.cuh:1824`, and no `101376` literal survives in code. The
+    OCCUPANCY TARGET is the half that did not. `__launch_bounds__(512, 3)`
+    is still written literally at three sites -- `k_apply`
+    (`bench_kernels.cu:453`), `k_fill_l1` (`:720`), `k_fill_l2` (`:831`) --
+    and asks for 3 x 512 = 1536 resident threads/SM, an Ampere-consumer
+    number. There is no `__CUDA_ARCH__` in that file today.
+
+    **Max threads/SM is a property of COMPUTE CAPABILITY, not of a product
+    line.** Derived 2026-09-12 by compiling a probe kernel at
+    `__launch_bounds__(512, N)` for N = 1..4 against each target and recording
+    which N ptxas rejects. Cross-checked on both toolchains: nvcc 13.4 gives
+    an identical verdict on all six archs it accepts (sm_75/80/86/89/90/120);
+    sm_61 is nvcc 12.8.93 only, since CUDA 13 rejects that arch outright:
+
+    | target | max N at 512 thr/blk | max threads/SM | trips the warning? |
+    |---|---:|---:|---|
+    | sm_61 Pascal | >= 4 | 2048 | no -- clears 1536 outright |
+    | **sm_75 Turing** | **2** | **1024** | **YES -- 12 warnings, 9 of them k_apply** |
+    | sm_80 A100 | >= 4 | 2048 | no |
+    | sm_86 / sm_89 / sm_120 | 3 | 1536 | no -- permits exactly 1536 |
+    | sm_90 Hopper | >= 4 | 2048 | no |
+
+    Note that "Ampere" is NOT a unit: sm_80 (2048) and sm_86 (1536) disagree
+    on this very number, and on the shared-memory side sm_86 (99 KB) and
+    sm_87 Orin (163 KB) disagree too. Only `sm_XX` can be keyed off. Within
+    one compute capability the value IS uniform, so every sm_86 part
+    (3090/3080/A10) is 1536 and every sm_75 part (2080 Ti/T4/Quadro RTX) is
+    1024.
+
+    **`GPU_ARCH=<CC>` DOES NOT SUBSTITUTE FOR THE FIX, and assuming it does
+    is the trap here.** `GPU_ARCH=75` is this project's equivalent of
+    msieve's `CUDA=75` (both emit a single
+    `-gencode arch=compute_75,code=sm_75`), but `__launch_bounds__` lives in
+    the SOURCE, not the build. A single-`-gencode` sm_75 compile was measured
+    2026-09-12 and emits the SAME 12 warnings, 9 of them `k_apply`, as the
+    fat build does. Narrowing the target list buys smaller binaries and
+    faster builds and nothing at all here.
+
+    **A Makefile `-D` cannot do it either, for the build that ships.** The
+    default fat binary compiles one source once per `-gencode`, and all of
+    those passes share one set of `-D` flags, so a define cannot differ per
+    target. It would work only for single-arch builds -- exactly the ones
+    that do not need it. `__CUDA_ARCH__` is the mechanism, because nvcc
+    defines it per device-compilation pass; it covers the fat and single-arch
+    builds with one lever and cannot fall out of step with the target the way
+    an operator-supplied `-D` would:
+
+        #if   __CUDA_ARCH__ == 750
+        #  define APPLY_MINBLK 2      /* Turing: 1024 thr/SM */
+        #elif __CUDA_ARCH__ >= 800
+        #  define APPLY_MINBLK 3      /* 1536 thr/SM */
+        #else
+        #  define APPLY_MINBLK 4      /* Pascal/Volta: 2048 thr/SM */
+        #endif
+
+    **BUT THE ANNOTATION ALONE BUYS NO OCCUPANCY ON TURING -- SHARED MEMORY
+    BINDS FIRST.** `k_apply` sizes shared memory as
+    `(1 << log_region) * 2 + nslice_pow2 * 2`, so at the shipping default
+    `--region 14` that is ~33 KB/block against Turing's 64 KB per SM:
+
+    | region | smem/block | blocks/SM by smem | by threads | actual | occupancy |
+    |---|---:|---:|---:|---:|---:|
+    | 13 | ~17 KB | 3 | 2 | **2** | **100%** |
+    | 14 (default) | ~33 KB | **1** | 2 | **1** | **50%** |
+    | 15 | ~65 KB | 0 | 2 | -- | will not launch |
+
+    So `__launch_bounds__(512, 2)` on sm_75 makes the hint HONEST -- ptxas
+    stops discarding `.minnctapersm` -- but does not make a second block
+    resident, because there is no 66 KB to put it in. The configuration that
+    actually reaches 100% on Turing is `APPLY_MINBLK 2` TOGETHER WITH
+    `--region 13`. That second half needs no build machinery at all: region
+    is already a runtime flag and the device's compute capability is already
+    read, so it is an arch-aware DEFAULT, not a portability change.
+
+    **MEASURED 2026-09-12, AND IT COLLAPSES THE EXPERIMENT: THE ANNOTATION
+    CHANGE IS COSMETIC.** `-Xptxas -v` was the free step and it answered the
+    question outright -- no card needed. Compiling `bench_kernels.cu` for
+    sm_75 twice, once as shipped (`minblk 3`, hint discarded) and once with
+    `k_apply` alone patched to `minblk 2` (hint honoured), gives BYTE-IDENTICAL
+    register allocation across all nine `k_apply` instantiations:
+
+    | instantiation | minblk 3 | minblk 2 | delta |
+    |---|---:|---:|---:|
+    | `<16,0,0,0>` / `<16,1,0,0>` / `<8,0,0,0>` / `<8,1,0,0>` | 26 | 26 | 0 |
+    | `<16,0,1,0>` / `<16,1,1,0>` / `<16,1,1,1>` | 35 | 35 | 0 |
+    | `<8,0,1,0>` / `<8,1,1,0>` | 36 | 36 | 0 |
+
+    `minblk 2` does silence all nine `k_apply` warnings (12 -> 3, the
+    remaining three being the fill kernels), but it changes no generated code
+    whatsoever. **So the `__CUDA_ARCH__` fix buys build hygiene and an honest
+    hint -- not throughput.** Anyone expecting a speedup from it should stop
+    here.
+
+    **WHY, and it is the register file that settles it.** The production
+    instantiation `k_apply<16,1,1,1>` uses 35 registers. At 512 threads/block
+    on Turing (65,536 registers, 1024 threads and 64 KB shared per SM):
+
+    | limiter | arithmetic | blocks/SM |
+    |---|---|---:|
+    | registers | 65536 / (512 x 35) = 3.66 | 3 |
+    | threads | 1024 / 512 | 2 |
+    | **shared memory @ region 14** | **64 KB / ~33 KB** | **1 <- BINDS** |
+
+    Registers were never the constraint -- ptxas settled on 35, slack enough
+    for three blocks, more than Turing's own thread cap allows. That is why
+    discarding `.minnctapersm` costs nothing in codegen, and why forcing it
+    back changes nothing. Note this also does not match the prediction at
+    `bench_kernels.cu:417` that ptxas "otherwise settles on 45-46 registers";
+    that figure is for dropping the annotation entirely, whereas `.maxntid`
+    (512) survives here even when `.minnctapersm` does not.
+
+    **THE ONLY REAL LEVER ON TURING IS `--region`, AND IT REMAINS
+    UNMEASURED.** Shared memory is the binding constraint at every region, so
+    region is the one axis that can move occupancy: region 13 (~17 KB) admits
+    3 blocks by smem, the thread cap takes it to 2, and 2 x 512 = 1024 is
+    100% of Turing. The open questions are now only two, and both need a
+    card:
+
+    1. Whether region 13's occupancy gain survives the extra passes per slab
+       it costs. Could easily be a wash.
+    2. Whether `k_apply` at 50% occupancy is occupancy-bound on Turing at
+       all. If it is latency- or bandwidth-bound, region 13 wins nothing
+       either.
+
+    The rental target is **Turing (20x0 / 2080 Ti / T4) ONLY**. Pascal (10x0,
+    sm_61) is NOT affected -- it clears 1536 outright and emits no warning at
+    all, so a 10x0 rental measures nothing for this item. sm_61 also cannot
+    join the default fat binary under CUDA 13 regardless (`GPU_ARCH=full`,
+    CUDA <= 12.8, above). The run is now a **1 x 2, not a 2 x 2**: `--region
+    14` vs `--region 13` on stock `minblk 3`, since the annotation axis is
+    measured inert. Use the c183 band from the 2026-09-09 qualification so
+    relation counts stay comparable, and report as % of apply-stage time AND
+    % of wall, since apply is only part of the band.
+
+    **The two halves now have different cases.** The `__CUDA_ARCH__`
+    annotation change is measured to be codegen-neutral, so it carries no
+    performance risk and no performance reward: it removes nine warnings from
+    every sm_75 build and makes the hint honest. Judge it as build hygiene.
+    Its one real cost is coupling -- it would be the first `__CUDA_ARCH__`
+    conditional in `bench_kernels.cu`, and `APPLY_THREADS_MAX`
+    (`bench.h:856`) is host-side validation of the same `512`, enforcing a
+    hard CLI ceiling on `--apply-threads`, so the two must stay in step.
+
+    The arch-aware `--region` default is the half that could actually pay,
+    and the half nobody has measured. It needs no build machinery at all
+    (region is already a runtime flag and the compute capability is already
+    read), but it is a real behaviour change on a target that is
+    correctness-qualified and in nobody's production fleet. A few percent
+    does not justify carrying an arch-special default; a large win on cards
+    volunteers actually still run might.
+
+    **`GPU_ARCH_all` UPDATED 2026-09-09: sm_75 added.** `sm_75` is now in the
+    default fat binary (both `Makefile` and `build_windows.bat`) alongside
+    sm_80/86/89/90/120 -- it is qualified above and compiles clean under this
+    project's CUDA 13.2/13.3 canonical toolchain. `sm_61` was NOT added to
+    `GPU_ARCH_all`: CUDA 13 hard-rejects it (`nvcc fatal: Unsupported gpu
+    architecture 'compute_61'`, confirmed the same day against real nvcc
+    13.0), so it cannot live in the same fat binary as sm_75/80/86/89/90/120
+    at all, qualified or not -- this is an nvcc floor, not a caution.
+
+    A second, opt-in target -- `GPU_ARCH=full` -- was added instead, covering
+    every `GPU_ARCH_all` target plus sm_50/52/60/61/70: sm_50 through sm_120
+    in one binary. It needs CUDA <= 12.8 (verified: nvcc 12.8.93 accepts the
+    whole span; nvcc 13.0 accepts only sm_75-and-later) and the Makefile/
+    batch script both detect and reject a >=13 nvcc with an explicit error
+    rather than failing with a bare "Unsupported gpu architecture". Same
+    qualification split as above: only sm_61/sm_75 are hardware-confirmed;
+    sm_50/52/60/70 are in the list because nvcc accepts them, not because a
+    card has.
+
+    (An intermediate design briefly split this into two opt-in targets --
+    `GPU_ARCH=legacy` for just sm_50-through-sm_75, and `GPU_ARCH=full` as
+    their union -- before `legacy` was dropped as redundant: `full` is a
+    strict superset, and item 16's -t 0 concurrency argument says adding a
+    target is free WHEN the build host has at least as many free threads as
+    targets. **Not re-measured for this 12-target case** -- item 16's table
+    was 6-7 targets on a 16-thread box, so "no real extra cost" here is
+    inference from that mechanism, not a fresh measurement; a host with
+    fewer than 12 free threads would see the extra legacy targets queue
+    rather than run concurrently.)
+
+    Both the Makefile and `build_windows.bat` paths for `GPU_ARCH=full` were
+    exercised directly (dry-run against real nvcc 13.0 and 12.8 in k8s pods
+    for the Makefile; fake `nvcc`/`cl` stubs under real cmd.exe for the
+    batch script) -- and that exercise caught a real bug in the first draft
+    of the batch script, back when it still had a separate `:arch_legacy`
+    target sharing this gate: `exit /b 1` inside a `call`ed subroutine only
+    returns to the caller with an errorlevel set, it does not stop the
+    calling script, so the version-gate error printed and the build
+    continued anyway. Fixed at the time by checking `if errorlevel 1 exit /b
+    1` after the `call`.
+
+    **A code review of this whole change (same day) found 14 more issues**
+    before it was committed -- most were documentation drift this entry
+    itself was causing (the sm_80-floor claim above, the six/seven-target
+    count, the repetition just edited out of the two paragraphs above), but
+    two were real: `bench/testsieve.sh`'s `gpu_arch_arg()` counted
+    `-gencode` entries in `.arch.stamp` to reconstruct which `GPU_ARCH` a
+    tree was built with, and its `>1 means the default all list` assumption
+    silently broke the moment `full` also became a multi-gencode option --
+    it would have told an operator to rebuild a `full` tree with a bare
+    `make fbgen_gpu`, quietly reverting it to `all` and invalidating every
+    object in it. Fixed by teaching it the two known counts (7 and 12)
+    instead of treating any count over 1 as "the default". Separately, the
+    batch script's `call`-based subroutine was inlined into `:arch_full`
+    (removing the `call`/`errorlevel` trap by construction, not just
+    documenting it), and `:arch_all`/`:arch_full` were changed to compose
+    their gencode lists from one shared SASS string instead of each
+    re-spelling it -- which, while re-verifying the composed lists against
+    real cmd.exe, surfaced a THIRD real bug: the shared string was
+    initialized after the `GPU_ARCH=all`/`full` dispatch `goto`s, so both
+    branches read it before it was ever set. Two deliberate exclusions from
+    that review, left as-is: `bench.h`'s `TD_RECORD_THREADS` comment still
+    enumerates sm_80/86/89/90 as the "512 threads may be fine" set without
+    sm_75 (a real gap, but out of scope for this entry), and the version
+    gate still checks only that nvcc isn't *too new* (>= 13) and not that
+    it's new enough for sm_90/sm_120 (CUDA >= 11.8 / >= 12.8) -- a real
+    asymmetry, deliberately deferred rather than fixed here.
 16. **Build wall time — MEASURED 2026-08-20, and the cause is `CF_LMAX=4`.**
     **See first: the default-goal trap, fixed 2026-08-25 (finding 75).** Until
     that date the Makefile had no `.DEFAULT_GOAL`, and its first explicit rule
@@ -2945,6 +3434,9 @@ finding 92.
        The fat binary is free and adding sm_90 cost nothing measurable — the
        one target that cannot be dropped is the expensive one. This confirms
        the stale table's *conclusion* even though its numbers are wrong.
+       (`GPU_ARCH_all` is seven targets as of 2026-09-09, sm_75 having
+       joined after this measurement; not re-timed, so "free" above is this
+       table's finding, not a re-verified one for today's default.)
     3. **The ptxas asymmetry widened.** sm_120/sm_80 was ~15x when the table
        was written and is **29x** now (754/26). The 4th limb costs sm_120
        disproportionately, so this is a ptxas scaling problem on Blackwell
@@ -3166,7 +3658,32 @@ finding 92.
     weighed against the risk of rewriting the hot dense path before anyone
     starts. **Build it only if item 8's geometry measurement forces slabs below
     16.**
-19. **An ENVIRONMENTAL ~10%-of-wall regression, cause still open -- MEASURED
+19. **NOW THE TOP OPEN ITEM** -- item 1 closed, so nothing outranks it.
+
+    **GPU contention is NOT this item and must not be filed under it.** On
+    2026-09-10 the same box, binary and band gave 131.4 ms/q in the morning and
+    90.5 ms/q at night, and a draft of this note offered that 45% swing as
+    evidence the regression is bigger than 10%. It is not evidence of anything
+    here: the morning run had another process on the CARD, and **a sieve sharing
+    a GPU running slowly is expected behaviour, not an unexplained regression.**
+    The measurement is simply discarded. This item is about a slowdown with the
+    box to itself, which is a different question.
+
+    **CPU contention is the one worth minimising**, because it is the condition
+    real deployment runs in -- a BOINC host has other tasks -- and because the
+    sieve's host thread is on the critical path (item 4: identifiable host work
+    is 7% of an idle wall and **triples** under CPU contention, finding 53).
+
+    **`acc/wall` is the discriminator between the two, and it is already in every
+    runlog record and every band summary.** It falls when host time appears with
+    the GPU idle, so CPU contention drives it DOWN while GPU contention leaves it
+    flat. That is exactly what the two runs showed: `acc/wall` was **0.92 in
+    both**, which is what says the morning's loss was all device-side. Quote it
+    beside any timing taken on a shared box; a wall figure alone cannot tell the
+    two apart, and `rental5090.sh` now prints `acc` and mean board draw beside
+    each arm group's spread for that reason.
+
+    *Original statement follows.* **An ENVIRONMENTAL ~10%-of-wall regression, cause still open -- MEASURED
     2026-09-02 (finding 88). Worth more than every open item except 1.**
 
     Rebuilding `4b581b33` -- the exact commit August was built from --

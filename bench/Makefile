@@ -28,8 +28,8 @@ CXX       ?= g++
 # finding 48's --reps 100 floor is calibrated against, and it recurs every
 # process start if the cache is disabled or evicted.
 #
-# sm_80 is also the floor, and it is a tuning floor rather than an instruction
-# one. The only warp intrinsics used are __syncwarp, __shfl{,_up}_sync and
+# sm_80 was the floor at the tuning level, but not at the instruction one. The
+# only warp intrinsics used are __syncwarp, __shfl{,_up}_sync and
 # __ballot_sync (k_apply's threshold scan), which all long predate Ampere --
 # but k_fill_l1's, k_fill_l2's AND k_apply's __launch_bounds__(512, 3) target
 # 1536 threads/SM and 3 x 33 KB of shared memory, which are Ampere-and-later
@@ -37,21 +37,79 @@ CXX       ?= g++
 # finding 75); its opt-in per-block shared-memory LIMIT is still queried from
 # the selected device at runtime rather than hardcoded, but the three-block
 # occupancy target it now carries is not. sm_75 still compiles with ptxas
-# warning that .minnctapersm is out of range on every fill kernel -- and now on
-# k_apply too, Turing offering 1024 threads/SM against the annotation's 1536 --
-# and then oversubscribes Turing's 64 KB of shared memory in the fill path.
-# Below that nothing is possible anyway: CUDA 13 dropped Volta, so nvcc 13.2
-# rejects sm_70 outright.
-GPU_ARCH_all := -gencode arch=compute_120,code=sm_120 \
-                -gencode arch=compute_90,code=sm_90 \
-                -gencode arch=compute_89,code=sm_89 \
-                -gencode arch=compute_86,code=sm_86 \
-                -gencode arch=compute_80,code=sm_80 \
-                -gencode arch=compute_80,code=compute_80
+# warning that .minnctapersm is out of range -- on k_fill_l1, k_fill_l2 AND
+# k_apply (STATUS.md item 15).
+#
+# CORRECTED 2026-09-12. An earlier version of this comment said k_apply does
+# NOT trip that warning on either Turing or Pascal, citing real GTX 1080 and
+# RTX 2080 Ti hardware 2026-09-09. The PASCAL half is right; the TURING half
+# is wrong. Compiling bench_kernels.cu for sm_75 alone emits 12 of these
+# warnings, NINE of them k_apply template instantiations, under BOTH nvcc
+# 13.4 and nvcc 12.8.93 -- 12.8.93 being the toolkit the original claim was
+# measured under, so this is not a toolchain difference. The arithmetic says
+# it has to: __launch_bounds__(512, 3) asks for 1536 resident threads/SM and
+# Turing caps at 1024. sm_86/89 permit exactly 1536, which is why every other
+# target in the default list is silent.
+#
+# The Pascal half is worth keeping for the reason behind it: sm_61 emits NO
+# .minnctapersm warning at all -- not even on the fill kernels -- because
+# Pascal's 2048 threads/SM clears the 1536 target outright.
+#
+# What the warning costs is the occupancy HINT, not correctness: ptxas drops
+# .minnctapersm and schedules k_apply on its own heuristic. sm_75's
+# correctness qualification below is unaffected -- but sm_75 is NOT
+# occupancy-tuned, and what k_apply's Turing throughput is without the
+# annotation has never been measured.
+#
+# sm_61 and sm_75 are QUALIFIED on real hardware
+# (STATUS.md item 15: correctness-matched against the RTX 3090/4090, same
+# relation counts, same split/dead/stuck candidates); sm_50/52/60/70 below are
+# NOT -- added because nvcc accepts them, not because a card confirmed them.
+#
+# sm_70 and below are a harder floor: CUDA 13 dropped Maxwell/Pascal/Volta
+# outright, confirmed 2026-09-09 by direct compile test against real nvcc
+# 13.0 in a k8s pod -- `nvcc fatal: Unsupported gpu architecture 'compute_70'`
+# (and the same for 50/52/60/61). Only sm_75-and-later compiles under the
+# CUDA 13.2/13.3 line this project's canonical build uses, which is why
+# GPU_ARCH_all stops at sm_75 rather than reaching down to sm_50. Building
+# for sm_50/52/60/61/70 needs CUDA <= 12.8 (confirmed the same day against
+# real nvcc 12.8.93: all five compile, deprecation warning only) -- use
+# `make GPU_ARCH=full` on a toolchain that old, not this default target.
+# Split into a shared SASS list and the PTX-fallback suffix so GPU_ARCH_full
+# below can compose from GPU_ARCH_all_SASS instead of re-spelling it -- one
+# list to update when a target joins or leaves the fat binary, not two.
+GPU_ARCH_all_SASS := -gencode arch=compute_120,code=sm_120 \
+                      -gencode arch=compute_90,code=sm_90 \
+                      -gencode arch=compute_89,code=sm_89 \
+                      -gencode arch=compute_86,code=sm_86 \
+                      -gencode arch=compute_80,code=sm_80 \
+                      -gencode arch=compute_75,code=sm_75
+GPU_ARCH_PTX_FALLBACK := -gencode arch=compute_80,code=compute_80
+GPU_ARCH_all := $(GPU_ARCH_all_SASS) $(GPU_ARCH_PTX_FALLBACK)
+
+# A second, opt-in fat-binary set (`make GPU_ARCH=full`): every target above
+# plus sm_50/52/60/61/70, sm_50 through sm_120 in one binary. Needs CUDA <=
+# 12.8: CUDA 13 hard-rejects sm_50/52/60/61/70 outright (see the
+# sm_70-and-below note above) -- verified 2026-09-09 that nvcc 12.8.93 alone
+# accepts the WHOLE span (sm_90/sm_120 are not a 12.8 problem, only
+# sm_50/52/60/61/70 under 13.x are). Only sm_61 and sm_75 are
+# hardware-qualified (STATUS.md item 15); sm_50/52/60/70 are untested --
+# included because nvcc accepts them, not because a card confirmed them.
+# Carries the same PTX floor as GPU_ARCH_all, for the same
+# forward-compatibility reason.
+GPU_ARCH_full := $(GPU_ARCH_all_SASS) \
+                 -gencode arch=compute_70,code=sm_70 \
+                 -gencode arch=compute_61,code=sm_61 \
+                 -gencode arch=compute_60,code=sm_60 \
+                 -gencode arch=compute_52,code=sm_52 \
+                 -gencode arch=compute_50,code=sm_50 \
+                 $(GPU_ARCH_PTX_FALLBACK)
 
 # `make GPU_ARCH=native` builds only for the card in this machine,
 # `make GPU_ARCH=86` cross-builds for a named one (bare compute capability, no
-# "sm_" and no dot), and the default builds the portable fat binary.
+# "sm_" and no dot), `make GPU_ARCH=full` builds sm_50 through sm_120 in one
+# binary (needs CUDA <= 12.8, see GPU_ARCH_full above), and the default
+# builds the portable sm_75-and-later fat binary.
 #
 # Named GPU_ARCH, not ARCH: ARCH is exported by kernel-build and cross-compile
 # shells and by some CI images, and make imports the environment, so an inherited
@@ -65,7 +123,7 @@ GPU_ARCH_all := -gencode arch=compute_120,code=sm_120 \
 #                              CF_LMAX=3   CF_LMAX=4 (default)
 #     sm_120 alone                 277 s         754 s
 #     sm_80 alone                   15 s          26 s
-#     all six targets, -t 0           --         750 s   <- the default
+#     six targets, -t 0               --         750 s   <- measured here
 #
 # Two conclusions, and only the second one changed. ptxas on sm_120 is ~29x
 # slower than on sm_80 and swamps everything else, so the six-target fat build
@@ -73,6 +131,13 @@ GPU_ARCH_all := -gencode arch=compute_120,code=sm_120 \
 # its job, adding sm_90 was free, and dropping targets buys nothing. Keep the
 # fat binary here. GPU_ARCH=native is the real win on an Ampere or Ada host,
 # where it drops sm_120 and takes the build to well under a minute.
+#
+# GPU_ARCH_all is SEVEN targets today, not six: sm_75 joined it 2026-09-09,
+# after this table was measured, and was not re-timed. The conclusion above
+# ("adding a target was free, sm_120 alone dominates") is almost certainly
+# still true -- sm_75 is a cheap ptxas target, cheaper than sm_90 was -- but
+# that is inference from the same mechanism, not a re-measurement, and this
+# table is not evidence for a seven-target default until someone re-times it.
 #
 # What changed is the CAUSE. The 4th cofactor limb costs sm_120 2.72x, and
 # that -- not the target list -- is why a full build now takes ~12.5 min. For
@@ -104,11 +169,42 @@ $(error GPU_ARCH=native: no usable compute capability from nvidia-smi (got "$(GP
 endif
 NVCC_ARCH := -gencode arch=compute_$(GPU_CC),code=sm_$(GPU_CC)
 else
+ifeq ($(GPU_ARCH),full)
+# sm_50-through-sm_120 fat binary -- see GPU_ARCH_full above. Needs CUDA <=
+# 12.8: CUDA 13 hard-rejects sm_50/52/60/61/70 with "Unsupported gpu
+# architecture", confirmed 2026-09-09 against real nvcc 13.0; nvcc 12.8.93
+# accepts all of them.
+#
+# Skipped when every requested goal is `clean` -- clean touches no
+# compiler at all, and build_windows.bat's own `clean` argument bypasses
+# all GPU_ARCH logic the same way (its `clean` check runs before arch
+# parsing even begins). A bare `make GPU_ARCH=full clean` should not need a
+# working nvcc. $(MAKECMDGOALS) empty means no goal was named on the
+# command line, i.e. the default goal (`all`, which does need nvcc) runs.
+GPU_ARCH_FULL_NEEDS_NVCC := $(strip $(if $(MAKECMDGOALS),$(filter-out clean,$(MAKECMDGOALS)),1))
+ifneq ($(GPU_ARCH_FULL_NEEDS_NVCC),)
+# override, not plain :=, on all three: a command-line NVCC_MAJOR=/
+# NVCC_MAJOR_VALID=/NVCC_TOO_NEW= would otherwise take precedence over the
+# assignment below (GNU Make command-line variables always win over a
+# simple in-makefile assignment) and could silently defeat this gate.
+override NVCC_MAJOR := $(shell $(NVCC) --version 2>/dev/null | grep -oE 'release [0-9]+' | grep -oE '[0-9]+')
+override NVCC_MAJOR_VALID := $(shell echo '$(NVCC_MAJOR)' | grep -qxE '[0-9]+' && echo yes)
+ifneq ($(NVCC_MAJOR_VALID),yes)
+$(error GPU_ARCH=full: could not read nvcc's version (got "$(NVCC_MAJOR)" from `$(NVCC) --version`))
+endif
+override NVCC_TOO_NEW := $(shell [ $(NVCC_MAJOR) -ge 13 ] && echo yes)
+ifeq ($(NVCC_TOO_NEW),yes)
+$(error GPU_ARCH=full needs CUDA <= 12.8 -- $(NVCC) reports release $(NVCC_MAJOR).x, and CUDA 13 dropped Maxwell/Pascal/Volta outright (verified 2026-09-09: nvcc 13.0 refuses sm_50/52/60/61/70 with "Unsupported gpu architecture"; nvcc 12.8.93 accepts all of them). Point NVCC at a 12.x toolchain, e.g. the nvidia/cuda:12.8.1-devel-ubuntu22.04 image already used for the cross-GPU qualification in STATUS.md item 15)
+endif
+endif
+NVCC_ARCH := $(GPU_ARCH_full)
+else
 GPU_ARCH_VALID := $(shell echo '$(GPU_ARCH)' | grep -qxE '[0-9]+' && echo yes)
 ifneq ($(GPU_ARCH_VALID),yes)
-$(error GPU_ARCH must be all, native, or a bare compute capability like 86 or 120 -- got "$(GPU_ARCH)". Not sm_86, not 8.6)
+$(error GPU_ARCH must be all, native, full, or a bare compute capability like 86 or 120 -- got "$(GPU_ARCH)". Not sm_86, not 8.6)
 endif
 NVCC_ARCH := -gencode arch=compute_$(GPU_ARCH),code=sm_$(GPU_ARCH)
+endif
 endif
 endif
 
@@ -184,6 +280,64 @@ BN_LIMBS_STAMP := .bnlimbs.stamp
 $(shell [ "$$(cat $(BN_LIMBS_STAMP) 2>/dev/null)" = '$(BN_LIMBS)' ] || printf '%s' '$(BN_LIMBS)' > $(BN_LIMBS_STAMP))
 CF_LMAX_DEF += -DBN_LIMBS=$(BN_LIMBS)
 
+# Large primes kept per survivor in the trial-division list. See PIPE_K in
+# pipeline.cuh for what overrunning it does (detected, slab skipped, yield lost
+# -- never a partial record).
+#
+# ITS OWN VARIABLE, NOT A DEFS VALUE, for the reason spelled out for CF_LMAX
+# above: DEFS marks a PRICING build and bench refuses to emit relations from
+# one. This changes a capacity, not the arithmetic -- every relation a smaller
+# PIPE_K does emit is bit-identical to the same relation from a larger one,
+# because a survivor whose list did not fit is dropped rather than recorded
+# short -- so a PIPE_K build is shippable and must not be branded otherwise.
+#
+# It exists mainly so degradecheck.sh can drive the degradation ceiling: a
+# small PIPE_K truncates survivors on a real job, which is the only natural
+# trigger either soft skip has. That gate wants PIPE_K=8 specifically -- small
+# enough to lose ~6% of q on the c183, large enough that the rest still sieve,
+# so the ceiling trips with real relations behind it. A smaller value trips it
+# too but loses every q, leaving nothing to check. Raising it is legitimate
+# too, for
+# a job whose mfb admits more large primes than 16; it costs scap*PIPE_K*4 B of
+# device memory per side.
+#
+# THE CEILING IS 32, NOT TD_FMAX's 64, and the gap is deliberate. k_td records
+# each survivor's factors into a per-thread slot of TD_FMAX (64) entries that
+# holds the special-q AND every small prime AND up to PIPE_K large ones, and
+# overrunning THAT is not the soft slab skip this knob's own comment promises
+# -- k_cand_stats makes fn > fmax fail the run outright ("these must FAIL the
+# run", td.cuh). A PIPE_K anywhere near 64 would therefore convert a documented
+# yield loss into a fatal band error. No survivor under a 384-bit norm carries
+# 32 large primes above bkthresh, so this bound is not reachable in practice;
+# it is here so that raising PIPE_K cannot silently cross into the fatal
+# regime. Raising it past 32 means raising TD_FMAX first.
+#
+# VALIDATED WITH $(filter ...), NOT A $(shell ...) TEST, matching CF_LMAX and
+# BN_LIMBS above. $(shell) runs at parse time -- BEFORE the $(error) below
+# could reject anything -- so a shell test interpolates the value into a
+# command that has already run by the time it is judged, and swallows its own
+# diagnostic besides. Pure make never reaches a shell.
+PIPE_K ?= 16
+PIPE_K_OK := 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 \
+             26 27 28 29 30 31 32
+# TWO tests, not one $(filter ...). $(filter) matches WORDS, so a multi-word
+# value smuggles a legal word past it -- `PIPE_K='2 ] || touch /tmp/x; ['`
+# filters to `2`, passes, and reaches the compile recipe intact, where make
+# hands the whole string to sh. $(filter-out) inverts the question to "is any
+# word NOT allowed", which multi-word junk fails, and $(words) rejects the
+# empty and multi-word cases $(filter-out) alone would let through. The two
+# knobs above share the single-$(filter) shape and the same hole; they are
+# left as they are rather than changed from under an unrelated diff.
+ifneq ($(words $(PIPE_K)),1)
+$(error PIPE_K must be a single integer in 2..32 -- got "$(PIPE_K)")
+endif
+ifneq ($(filter-out $(PIPE_K_OK),$(PIPE_K)),)
+$(error PIPE_K must be an integer in 2..32 -- got "$(PIPE_K)")
+endif
+PIPE_K_STAMP := .pipek.stamp
+$(shell [ "$$(cat $(PIPE_K_STAMP) 2>/dev/null)" = '$(PIPE_K)' ] || printf '%s' '$(PIPE_K)' > $(PIPE_K_STAMP))
+CF_LMAX_DEF += -DPIPE_K=$(PIPE_K)
+
 # Optional BOINC application build.  Keep BOINC dependencies out of the default
 # executable; HAVE_BOINC=1 adds the compile-time API gate and the libraries.
 # BOINC_CPPFLAGS should point at directories containing boinc_api.h and its
@@ -239,7 +393,9 @@ C_OBJS   = $(C_SRCS:.c=.o)
 CPP_OBJS = $(CPP_SRCS:.cpp=.o)
 # runlog.o is deliberately NOT in C_SRCS: fbtest links C_OBJS, and it is a
 # CPU-only gate that must keep building on a machine with no driver library.
-OBJS     = $(CU_OBJS) $(C_OBJS) $(CPP_OBJS) runlog.o fbgen_lib.o fbgen_gpu_lib.o
+# watchdog.o is out for the same reason once removed -- it is the only object
+# that needs a thread, and the CPU-only gates must not grow a pthread link.
+OBJS     = $(CU_OBJS) $(C_OBJS) $(CPP_OBJS) runlog.o watchdog.o fbgen_lib.o fbgen_gpu_lib.o
 TEST_OBJS = slabtest.o
 
 # Switching HAVE_BOINC on an existing tree must rebuild boinc_support.o; make
@@ -283,7 +439,7 @@ $(shell { [ -f $(DEFS_STAMP) ] && [ "$$(cat $(DEFS_STAMP))" = '$(DEFS)' ]; } || 
 # without going through $(OBJS). Those two escaped the stamp, so
 # `make DEFS=... dumpcmp` reported "up to date" and linked a binary built
 # without the define -- the exact hole the stamp exists to close.
-$(OBJS) $(TEST_OBJS): $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
+$(OBJS) $(TEST_OBJS): $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE_K_STAMP)
 
 GIT_STAMP := .git.stamp
 GIT_RAW  := $(shell git -C . describe --always --abbrev=8 2>/dev/null)
@@ -323,9 +479,13 @@ all: bench fbtest fbgen fbgen_gpu sqgentest normscan dumpcmp mkcofbatch
 # linking it: the heartbeat's GPU columns must not become a build dependency,
 # and a host with a driver but no toolkit still has the versioned soname. On
 # glibc 2.34 and later dlopen is in libc and this resolves to an empty stub.
+# -lpthread for watchdog.o. On glibc 2.34+ the symbols are in libc and this
+# resolves to an empty stub, exactly as -ldl does above; it is spelled out so
+# the link keeps working on an older host and on a build without BOINC, whose
+# BOINC_LIBS supplies it by accident today.
 bench: $(OBJS) $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP)
 	$(NVCC) $(NVCC_ARCH) --cudart $(CUDART_LINK) -Xlinker --gc-sections \
-		$(BENCH_LINKFLAGS) -o $@ $(OBJS) $(BENCH_LIBS) -lm -ldl
+		$(BENCH_LINKFLAGS) -o $@ $(OBJS) $(BENCH_LIBS) -lm -ldl -lpthread
 
 # Only the CUDA objects care about the arch; the C objects are host-only.
 $(CU_OBJS): $(ARCH_STAMP)
@@ -350,12 +510,12 @@ fbgen_gpu: fbgen_gpu.o fbgen_lib.o fb_load.o fb_cado.o poly.o primes.o platform.
 	$(NVCC) $(NVCC_ARCH) --cudart $(CUDART_LINK) -o $@ \
 		fbgen_gpu.o fbgen_lib.o fb_load.o fb_cado.o poly.o primes.o platform.o -lm
 
-fbgen_gpu.o: $(ARCH_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
+fbgen_gpu.o: $(ARCH_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE_K_STAMP)
 
 # Same CUDA root generator, linked into production bench without the standalone
 # benchmark main().  The generated algebraic FB is now the pipeline default
 # when no --fb1/--cadofb file is supplied.
-fbgen_gpu_lib.o: fbgen_gpu.cu bench.h $(ARCH_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
+fbgen_gpu_lib.o: fbgen_gpu.cu bench.h $(ARCH_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE_K_STAMP)
 	$(NVCC) $(NVCC_FLAGS) -DFBGEN_GPU_LIBRARY -c $< -o $@
 
 # The same exact root finder drives on-the-fly special-q generation in bench.
@@ -372,23 +532,23 @@ sqgentest: sqgentest.c fbgen_lib.o poly.o primes.o
 # Planning-time norm-width survey. Same objects the siever uses -- sqgen for
 # (q,rho), qlat_build/norm_setup for the bound -- so it cannot drift from what
 # pipe_side_prepare_q will actually enforce. CPU only, no CUDA.
-normscan: normscan.c fbgen_lib.o poly.o primes.o $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
+normscan: normscan.c fbgen_lib.o poly.o primes.o $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE_K_STAMP)
 	$(CC) $(CFLAGS) -Wl,--gc-sections -o $@ normscan.c fbgen_lib.o poly.o primes.o -ldl -lm
 
-dumpcmp: dumpcmp.c $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
+dumpcmp: dumpcmp.c $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE_K_STAMP)
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
 # CPU-only checkpoint-format gate. In particular, BOINC output paths may
 # contain whitespace after filename resolution, so candidate identity must not
 # depend on the checkpoint parser's ordinary whitespace tokenisation.
-ckpttest: ckpttest.c ckpt.h bench.h platform.o $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
+ckpttest: ckpttest.c ckpt.h bench.h platform.o $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE_K_STAMP)
 	$(CC) $(CFLAGS) -o $@ ckpttest.c platform.o -ldl -lm
 
-stoptest: stoptest.c platform.h platform.o $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
+stoptest: stoptest.c platform.h platform.o $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE_K_STAMP)
 	$(CC) $(CFLAGS) -o $@ stoptest.c platform.o -ldl -lm
 
 # joins the two per-side --emit-cof files into cofactorisation batch input
-mkcofbatch: mkcofbatch.c $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
+mkcofbatch: mkcofbatch.c $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE_K_STAMP)
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
 %.o: %.cu
@@ -403,9 +563,9 @@ mkcofbatch: mkcofbatch.c $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
 -include $(OBJS:.o=.d) $(TEST_OBJS:.o=.d) fbgen_gpu.d
 
 clean:
-	rm -f bench fbtest fbgen fbgen_gpu sqgentest normscan dumpcmp mkcofbatch ckpttest stoptest slabtest *.o *.d $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP) $(GIT_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
+	rm -f bench fbtest fbgen fbgen_gpu sqgentest normscan dumpcmp mkcofbatch ckpttest stoptest slabtest *.o *.d $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP) $(GIT_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE_K_STAMP)
 
-.PHONY: all clean check ckptcheck stopcheck cofcheck fbgencheck fbgpucheck sqgencheck walkcheck slabcheck
+.PHONY: all clean check ckptcheck stopcheck cofcheck fbgencheck fbgpucheck sqgencheck walkcheck slabcheck skipcheck degradecheck
 
 # `check` depended on fbtest alone, so the whole CUDA path -- kernels, the
 # cofactoriser, the pipeline -- could fail to compile while the gates reported
@@ -463,6 +623,38 @@ fbgencheck: fbgen
 # remain runnable on build hosts with no NVIDIA device.
 fbgpucheck: fbgen fbgen_gpu
 	./fbgpucheck.sh
+
+# The PIPE_Q_SKIP gate: a special-q too wide for this build's exact-norm type is
+# passed over and the band continues. Needs a CARD, so it is deliberately NOT in
+# `check` -- same reason fbgpucheck is not.
+#
+# Needs `normscan` as well as `bench`: the jobs are generated to overflow THIS
+# build's width, and normscan is the oracle that says the construction landed.
+#
+# RUN IT AT `make BN_LIMBS=4`. Above 128 bits it skips itself with an
+# explanation rather than failing: a job that overflows a wider type has norms
+# too large to yield survivors at bounds a gate can afford, and a survivor-less
+# special-q is fatal by design (pipeline.cuh:2018). The path it covers is
+# width-independent, so one width is enough.
+skipcheck: bench normscan
+	./skipcheck.sh
+
+# GPU gate for the degradation ceiling (PIPE_LOST_MAX / PIPE_SLAB_SKIP_MAX and
+# the exit-5 stop). RUN IT AT `make PIPE_K=8`: the ceiling's only naturally
+# drivable trigger is a large-prime list too small for a well-formed job, and
+# the default 16 never truncates one. Against any other build it says so and
+# exits 0 rather than passing green on a build that cannot fire it.
+#
+# 8 rather than a smaller value because it makes the band MIXED -- ~6% of q
+# lost, the rest sieved -- which is what lets the gate check that earned
+# relations survive the stop, that they still reconstruct, and that the run
+# log records the band as degraded. All three are guarded on work having been
+# done, so a PIPE_K that loses every q cannot reach them. Takes ~8 min.
+#
+# Not in `check` for the same two reasons skipcheck is not: it needs a card, and
+# it needs a deliberately misconfigured build.
+degradecheck: bench
+	./degradecheck.sh
 
 sqgencheck: sqgentest
 	./sqgentest

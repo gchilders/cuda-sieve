@@ -1035,8 +1035,36 @@ host-side arithmetic, zero API, duplicated for no reason.
 
 | # | CUDA file | What it is missing | HIP commit |
 |---|---|---|---|
-| 1 | `pipeline.cuh` | BOINC progress pinned at 99% | `eb72ede` |
-| 2 | `bench_main.cu` | GPU-ordinal fallback + BOINC diagnostics | `e769470` |
+| 1 | `bench_main.cu` | out-of-range remap of a client-assigned GPU ordinal | `e769470` |
+
+**Re-audited 2026-09-12** against main at `3e15fec`, after the mirror sync.
+Both original entries were stale; the table above is what survived.
+
+**Resolved: `pipeline.cuh`'s "BOINC progress pinned at 99%" (was #1,
+`eb72ede`).** The core of it -- `if (rc == 0 && !stopped)
+bench_boinc_fraction_done(0.99)`, so a band that took a signal partway does
+not report 99% -- is now byte-identical in `pipeline.cuh` and
+`pipeline_hip.cuh`. It reached main independently; nothing was ported for it
+here. `pipeline_hip.cuh` does still carry a second progress guard the CUDA
+build has not got (`bench_boinc_progress_suspend` around the slab-size
+calibration pass, without which the throwaway pass's 1/1 sets a 99%
+high-water mark for the whole workunit), but that is NOT a divergence to
+port: the calibration pass is HIP-only (`cplan` appears 12 times in
+`pipeline_hip.cuh` and 0 times in `pipeline.cuh`), so there is nothing on the
+CUDA side for the guard to wrap. It becomes portable only if HIP_TUNING_PLAN
+item 7's auto-calibration is ever ported.
+
+**Narrowed: entry 1 above (was #2).** The original wording -- "GPU-ordinal
+fallback + BOINC diagnostics" -- claims more than is still true.
+`bench_main.cu` DOES have the client assignment winning over `--device`, the
+ordinal bounds check, and the stderr diagnostics. What it does not have is
+the treatment of an assignment this process cannot honour: `bench_main_hip.cpp`
+distinguishes a client assignment from an operator `--device` (`device_from_boinc`)
+and, when the ordinal exceeds the device count, runs on `ordinal % ndev` with a
+stderr note rather than failing the task -- the case where a host runs more
+than one task per GPU, or the client counts devices the runtime will not
+enumerate. `device_from_boinc` and the remap appear 0 times in `bench_main.cu`.
+A CUDA volunteer in that position loses the task outright.
 
 **Resolved, 2026-09-06: `cofac.cuh`'s ECM stage 2 shared denominator.** This
 was divergence #2 (`43ea104`, HIP-only) until a k8s pod with a real RTX 4090

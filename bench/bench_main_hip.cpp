@@ -306,6 +306,9 @@ static void usage(void)
 "                   against the same N issued serially and against 1 kernel\n"
 "                   at N x the blocks. 0/1 = off [0]. Costs a bucket array\n"
 "                   per workspace (item 1)\n"
+"  --fill-concurrent  --pipeline only; sieve the two sides of a slab on two\n"
+"                   streams instead of back to back. Costs a second bucket\n"
+"                   array and is refused if it does not fit [off]\n"
 "  --fill-threads N fill only; 0 = auto (32), else a multiple of 32 in\n"
 "                   [32,1024]. Independent of --threads: fill wants many\n"
 "                   narrow blocks, the other kernels do not.            [0]\n"
@@ -534,6 +537,20 @@ static int resolve_and_check_cofactor_config(bench_cfg_t *cfg, uint32_t alim,
     }
     if (cfg->cof_rounds < 1 || cfg->cof_rounds > 24) {
         fprintf(stderr, "pipeline cof-rounds %d: must be 1..24\n", cfg->cof_rounds);
+        bad = 1;
+    }
+    /* A pinned slice below one full block is never what anyone means: the
+     * grid is blocks x threads, so a chunk under `threads` leaves all but one
+     * block with nothing to do AND multiplies the launch count by the same
+     * factor it shrinks the slice. --cof-chunk 1 is 131072 launches per round
+     * per side, hundreds of times a band -- an effective hang with no
+     * diagnostic, which is exactly the failure this file's other validators
+     * exist to turn into a message. 0 stays AUTO and is not a small value. */
+    if (cfg->cof_chunk && cfg->cof_chunk < (uint32_t)cfg->threads) {
+        fprintf(stderr, "--cof-chunk %u: must be 0 (auto) or at least"
+                " --threads (%d); a slice below one block idles the grid and"
+                " multiplies the launch count\n",
+                cfg->cof_chunk, cfg->threads);
         bad = 1;
     }
     /* Validate each method's knobs whenever ANY side uses it. Keyed on the
@@ -1018,7 +1035,11 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     const char *fbpath = "../oracle/input.job.afb.0";
     int fbpath_set = 0;
     const char *polypath = "../oracle/c183.poly";
-    bench_cfg_t cfg;
+    /* Zero-initialised so a field whose explicit default below is ever
+     * forgotten reads 0 rather than stack garbage -- --fill-concurrent was
+     * exactly that omission. The explicit defaults still stand: this is a
+     * floor, not the configuration of record. */
+    bench_cfg_t cfg = {0};
     uint64_t q = 120000011ull;          /* prime, mid-range of [50M,190M] */
     uint32_t bkthresh = 0, fbbound = 0;
     int fbbound_set = 0, scale_set = 0;
@@ -1034,6 +1055,15 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
      * reproduced a path nobody would ship. */
     cfg.logI = 15; cfg.J = 16384; cfg.slab_j = 0; cfg.log_region = 14;
     cfg.record_bytes = 4; cfg.fill_mode = FILL_ATOMIC; cfg.fill_streams = 0;
+    /* Every field gets its default HERE; the zero-init above is only a floor.
+     * This one was omitted when the flag landed, and before the zero-init that
+     * left --fill-concurrent reading indeterminate stack memory: a nonzero byte
+     * in that slot silently allocates a second bucket array and sieves
+     * concurrently on a run that never asked for it, which is precisely the
+     * "quoted as something it was not" defect the refusal path exists to
+     * prevent. Non-deterministic across builds, so it passes locally and fires
+     * on a rented card. */
+    cfg.fill_concurrent = 0;
     cfg.qspan = 0;
     cfg.threads = 256; cfg.blocks = 0; cfg.fill_blocks = 0; cfg.fill_threads = 0;
 
@@ -1166,6 +1196,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
                                     1024, &cfg.fill_threads)) return 1;
         }
         else if (!strcmp(argv[i], "--qspan")) { cfg.qspan = 1; }
+        else if (!strcmp(argv[i], "--fill-concurrent")) { cfg.fill_concurrent = 1; }
         else if (!strcmp(argv[i], "--fill-streams") && i + 1 < argc) {
             if (parse_int_range_arg("--fill-streams", argv[++i], 0,
                                     FILL_STREAMS_MAX, &cfg.fill_streams)) return 1;
@@ -1284,7 +1315,15 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         else if (!strcmp(argv[i], "--cofactor")) cfg.cofactor = 1;
         else if (!strcmp(argv[i], "--cof-rounds") && i + 1 < argc) { cof_rounds = atoi(argv[++i]); cfg.cof_rounds = cof_rounds; }
         else if (!strcmp(argv[i], "--cof-budget") && i + 1 < argc) { cof_budget = (uint32_t)strtoul(argv[++i], 0, 10); cfg.cof_budget = cof_budget; }
-        else if (!strcmp(argv[i], "--cof-chunk") && i + 1 < argc) { cfg.cof_chunk = (uint32_t)strtoul(argv[++i], 0, 10); }
+        else if (!strcmp(argv[i], "--cof-chunk") && i + 1 < argc) {
+            /* Through the shared parser, not a bare strtoul: strtoul maps
+             * "abc" and "-1" to 0 and 4294967295 silently, and 0 is AUTO --
+             * so a typo became a mode rather than a message. */
+            int v;
+            if (parse_int_range_arg("--cof-chunk", argv[++i], 0, INT_MAX, &v))
+                return 1;
+            cfg.cof_chunk = (uint32_t)v;
+        }
         else if (!strcmp(argv[i], "--cof-ecm")) cfg.cof_ecm = COF_METHOD_ECM;
         else if (!strcmp(argv[i], "--cof-rho")) cfg.cof_ecm = COF_METHOD_RHO;
         /* Deriving is now unconditional, so this is accepted and ignored
@@ -2117,7 +2156,8 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
                          cfg.blocks ? cfg.blocks : 48 * 6, cfg.threads,
                          cfg.cof_meth0, cfg.cof_meth1, cfg.ecm_b1,
                          cfg.ecm_b2, cfg.ecm_curves,
-                         cfg.cof_limbs0, cfg.cof_limbs) ? 1 : 0;
+                         cfg.cof_limbs0, cfg.cof_limbs,
+                         cfg.cof_chunk) ? 1 : 0;
     }
 
     /* Only the pipeline reads these, so outside it they were silent no-ops --
@@ -2134,7 +2174,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
              * still freeze forever. --watchdog itself is NOT here; its
              * reporting works in any mode. */
             "--watchdog-kill",
-            "--slab-j", "--qspan", NULL
+            "--slab-j", "--qspan", "--fill-concurrent", NULL
         };
         int nbad = 0;
         for (int i = 1; i < argc; i++)

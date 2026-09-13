@@ -171,8 +171,18 @@ Thus `2^29` is not claimed to be the universal maximum-throughput setting. On
 the L40 it is 4.6% slower than the `2^30` optimum, but it remains 1.5% faster
 than the former `2^31` default while using 59% less steady VRAM (3.20 vs
 7.76 GB). That performance/memory tradeoff is why `2^29` remains the generic
-default. More measurements are needed on cards with large L2 caches before
-introducing an L2-size or model-specific automatic slab target.
+default.
+
+**What `2^29` actually tunes is a bucket-region COUNT, not a slab area**
+(findings 79-81, 2026-08-26). `fill` is minimised at a fixed number of regions,
+so the optimal area halves with `--region`: `2^29` is what 32,768 regions means
+at the default `--region 14`, and the L40's preference above is a preference for
+65,536 regions. The mechanism is read-modify-write on partially-filled bucket
+lines — DRAM read sectors rise 135% past the knee while L2 reads stay flat — so
+it is traffic, not cache capacity, which is why a 6 MB 3090 and a 48 MB 5070
+agree. **No operator action:** the default already runs at 1.28x the write floor,
+`--region` 14 is the joint optimum (`k_apply` costs +52% at 13), and an
+automatic per-card target is still open work.
 
 `--slab-j N` remains a regression/tuning override and may select a larger or
 smaller slab subject to the mandatory safety bounds.
@@ -188,12 +198,47 @@ The remaining representation limits are:
 - `lpbr` or `lpba` above 64;
 - `mfbr` or `mfba` above 128 (above 96 in a `CF_LMAX=3` build — see
   [Cofactorisation](#cofactorisation-width-and-method-both-per-side) below);
-- a ratio `ceil(mfb/lpb)` above 3 on either side; or
+- a ratio `ceil(mfb/lpb)` above 3 on either side;
 - `lim^2 <= 2^lpb` on either side, which makes the "prime by size" test in the
-  splitter unsound (it binds around `lpb 55` at an `alim` of 240M).
+  splitter unsound (it binds around `lpb 55` at an `alim` of 240M); or
+- an exact norm wider than this build's `BN_LIMBS * 32` bits — 384 by default
+  since 2026-08-27, previously 256.
 
 These are checked limits, not tuning advice, and there is no unsafe override.
-The non-pipeline harness still requires its whole `I*J` area to fit in `2^31`.
+The non-pipeline harness still requires its whole `I*J` area to fit in `2^31`;
+**`--pipeline` has no total-area cap** and slabs anything through `logI 20`.
+
+**The norm-width limit is the one that bites mid-band, so survey it first.**
+A q-lattice whose exact norm does not fit is *skipped* with a warning rather
+than wrapped, and the band stops after `PIPE_SKIP_MAX` of them — so a job that
+needs more width than the binary has bleeds special-q until it dies, and the
+fix is a rebuild (`make BN_LIMBS=N`, even limbs 4..16) that every client would
+have to carry. The width therefore has to be decided centrally, before work
+units go out. `normscan` answers it; see [Sizing a job
+first](#sizing-a-job-first-testsievesh). A wider build is byte-identical to a
+narrower one on any job the narrower one could run, so widening is safe to ship
+mid-project. Cost measured on AS276: +0.45 ms on a 90 ms special-q, and
+`sizeof(bn_t)` 32 -> 48 bytes per survivor and per candidate.
+
+**Read the side in the warning — it names the cause.** Each skip prints
+`exact side-N degree-D norm may require ... bits`. Side 1 is the algebraic form
+and side 0 the degree-1 rational one `G = Y1*x + Y0`, and *which one overflows
+is a property of the job, not a constant*. A side-1 skip is telling you about
+the algebraic degree and the sieve area; a side-0 skip is telling you about the
+size of `Y0`, and no change of geometry will help much, because side 0 gains
+only ~1 bit per logI step against side 1's ~5. `normscan` now prints the same
+split up front (`per side:` and `over N bits: side1 only / side0 only / both`),
+so the cause is visible before any work unit goes out. Measured examples in
+finding 93: the c194 quintic is algebraic-driven by 79–91 bits, while a degree-4
+SNFS with `Y0 ~ 2^171` is rational-driven by 73 — both entirely ordinary jobs.
+
+**A capped band resumes, but slowly.** `nqskip` is not checkpointed, so a run
+that stops at `PIPE_SKIP_MAX` writes a checkpoint and the next invocation starts
+counting again — advancing roughly `PIPE_SKIP_MAX` special-q per run and
+producing no relations while it does. That is progress, not a deadlock, but it
+is not a way to finish a band: it means the build is too narrow, and the answer
+is still a rebuild. `make skipcheck` (needs a card, and a build at
+`BN_LIMBS=4`) is the gate over all of this.
 
 The p-lattice **increments** are 64-bit, and were so even when positions were
 still 32-bit. This is required for correctness: realistic large factor-base
@@ -281,6 +326,22 @@ Two knobs exist, and neither is tuning advice:
   **shippable** — its relations are byte-identical to a `CF_LMAX=4` binary's, and
   it is a first-class Make variable rather than a `DEFS` value precisely so that
   it is not branded a pricing build and refused `--relations`.
+- **`make PIPE_K=N`** (2..64, default 16) sets how many large primes the
+  trial-division list keeps per survivor. Overrunning it is *detected*, not
+  silently dropped — `k_resieve_scatter` counts what it could not place, `k_td`
+  raises `TDF_LIST_TRUNCATED` on reading a count past `K`, and the slab is
+  skipped — so a value that is too small costs yield and never emits a partial
+  record. Like `CF_LMAX` it is a first-class Make variable rather than
+  a `DEFS` value, and for the same reason: it changes a capacity, not the
+  arithmetic, so a `PIPE_K` build is **shippable** and must not be refused
+  `--relations`. Raising it is legitimate for a job whose `mfb` admits more
+  large primes than 16, at `scap * PIPE_K * 4` bytes of device memory per side
+  — but the accepted range stops at **32, not `TD_FMAX`'s 64**, because `k_td`
+  records the special-q, every small prime *and* up to `PIPE_K` large ones into
+  one 64-entry slot, and overrunning *that* fails the run outright instead of
+  skipping a slab. Raising `PIPE_K` past 32 means raising `TD_FMAX` first.
+  Lowering it to 8 is how `make degradecheck` drives the degradation ceiling;
+  the running binary reports its value in the pipeline allocation banner.
 
 #### Method: ECM for 3LP, rho for 2LP — AUTOMATIC since 2026-08-19
 
@@ -391,9 +452,32 @@ and **rho rational / ECM algebraic** on its own, which is the measured optimum.
 
 That is `A = 31`. NFS@Home sieve this job at `I16e -J 16`, which in our
 coordinates is `2^17 x 2^15` — `A = 32` (finding 65's rule: our rectangle =
-`2^(J_bits+1) x 2^(I_bits-1)`). The production pipeline now runs that geometry
-through j-slabbing rather than refusing it; `--logI 17 --J 16384` gives the
-same total area with their full `i` range if you want the other nesting.
+`2^(J_bits+1) x 2^(I_bits-1)`). The production pipeline runs that geometry
+through j-slabbing rather than refusing it:
+
+```sh
+../../bench/fbgen --poly AS276.job --maxbits 17 --threads 12 --out as276.roots1.m17
+../../bench/bench --pipeline --cofactor --poly AS276.job --fb1 as276.roots1.m17 \
+    --logI 17 --J 32768 --maxbits 17 --qrange 80000023: --nq 10 \
+    --relations as276.a32.rels.txt
+```
+
+The planner picks **8 slabs of 4096 rows** on its own — no `--slab-j` — and
+setup allocates 2.71 GB, so this fits a 12 GB card. Validated 2026-09-01
+(finding 82): every relation rebuilds both norms exactly, and `relgeom.py
+extent` recovers `2^17 x 2^15` from the relations themselves, matching the
+extent GGNFS produced for the same job.
+
+`--logI 17 --J 16384` is a smaller job, not an alternative nesting of this one:
+same `i` range, half the area (`2^17 x 2^14` = `2^31`). It is what findings 69
+and 77 ran, and it is the right choice only if you want the smaller rectangle.
+
+**Check the rectangle from the relations, never from the flags**, before any
+cross-siever claim:
+
+```sh
+./relgeom.py --band 80000023:80000200 --skew 51059252.11 extent as276.a32.rels.txt
+```
 
 Note the ceiling that actually binds first is **not** the width. `CF_MAXFAC`
 caps a split at 3 large primes, so `mfb <= 3 * lpb` regardless — and at
@@ -404,8 +488,8 @@ not another limb.
 
 For the current status, A=32 memory/slabbing options, and why the end metric is
 time to a filterable matrix rather than raw relations/s, see [Current size
-limits, and what lifting them
-entails](bench/STATUS.md#current-size-limits-and-what-lifting-them-entails).
+limits and
+j-slabbing](bench/STATUS.md#current-size-limits-and-j-slabbing).
 
 ### Will it fit? VRAM sizing
 
@@ -467,6 +551,44 @@ with `I` rather than `J` is not a trade — both effects come from the same plac
 16` carries only 26 more ideals than `--maxbits 15` on this job, so the whole
 geometry difference is the bucket array.
 
+**`--fill-concurrent` needs the bucket array TWICE.** The two sides share one
+allocation *because* they sieve back to back; the flag overlaps them on two
+streams, and a second array is its entire cost. Size it as `2 x bucket + the
+rest`, and note that the bullet above — "the bucket array is sized by the larger
+side, so raising the smaller side's lim is nearly free" — **stops holding under
+the flag**: both sides carry a full-size array. The run refuses at startup with
+the two figures if the second one does not fit, so a geometry that is close will
+tell you rather than fail mid-band. It is off by default. Measured on three cards
+(`bench/RESULTS.md` finding 94), at c183 `I15e` with board draw integrated over
+each arm:
+
+| card | wall | board | relations per joule |
+|---|---:|---:|---:|
+| RTX 5070, 48 SM, stock | **-4.3%** | +3.0% | **+1.4%** |
+| RTX 5070, 48 SM, undervolted | **-3.7%** | +2.9% | **+0.9%** |
+| RTX 3090, 82 SM | **-3.8%** | +0.25% | **+3.7%** |
+| RTX 5090, 170 SM | **-7.6%** | not measured | not measured |
+
+(The 5070 appears twice because this box's undervolt state changes all three
+columns; an earlier version of this table had one 5070 row pairing the
+undervolted wall figure with the stock board and rel/J figures, which does not
+close arithmetically -- `(1/0.963)/1.030` is +0.8%, not +1.4%.)
+
+**The gain grows as the geometry shrinks** — on a 5090, -13.7% at c147
+`I14/J8192` against -5.4% at c183 `I16` — because the flag repairs *underfeeding*,
+and a big rectangle already feeds the card well. So it is worth most where one
+fill kernel is handed least work, which is the opposite of the geometry
+production prefers. Quote the card and the geometry with any figure from it.
+
+**On relations per joule it is positive but small**, and how small depends on
+the card: overlapping the sides raises board draw ~3% on a 5070 and 0.25% on a
+3090, and that term eats most of the 5070's wall gain and almost none of the
+3090's. **An earlier version of this paragraph said the flag buys "no
+measurable gain in relations per joule, because the busier card draws
+proportionally more." That was read off the runlog's `board=` column, which is
+aliased, and it is withdrawn** — see finding 94. Turn the flag on if you want the
+wall clock; the energy case is real but thin.
+
 **Do not size a job from an aborted startup.** The startup table lists only the
 bucket array, factor bases, bitmaps, trial-division context and cofactor queue
 — roughly 2.2 GB of the 3.63 GB above at 15e — and per-q buffers grow on demand
@@ -488,6 +610,16 @@ cd bench
     --target-rels 300 --geom 15,16384 --geom 15,32768
 ```
 
+**`--width` is a q-INTERVAL WIDTH, not a count of special-q.** The default
+`--width 2000` sieves a 2,000-*integer*-wide window, which at the default
+`--qmin 20` holds `2000 / ln(2e7)` ~= **119 (q, rho) pairs** -- so the default
+5-point run sieves about **600 pairs in total**, not 10,000. On the c183 at
+`15e` (97.46 ms/pair, finding 83) that is ~58 s of sieving plus ~15-20 s of
+per-geometry startup: **about a minute and a half**. Reading "5 points x 2000"
+as 10,000 special-q over-estimates the run by 17x, and the same misreading in
+reverse makes a real band look impossibly fast. Widen `--width` to buy
+precision; it is the knob that costs time.
+
 **`--qmin`, `--qmax` and `--target-rels` are in millions.** That run sieves
 `[2e7, 2e8)` and reports where 3e8 relations are met. Fractions work
 (`--qmin 2.5`), and a value that still looks like an absolute count is
@@ -496,6 +628,19 @@ cd bench
 asked for. The units stop there: `--width`, `--rlim` and `--alim` are absolute,
 and so is `bench`'s own `--target-rels`, which is a different flag on a
 different program and unchanged.
+
+**Each geometry's block begins with a `normscan` verdict on the exact-norm
+width.** It surveys the whole projected band for that poly and geometry and
+reports a *projected* band maximum from a fit to the upper tail, not the sample
+maximum — on the 2,1139+ job, 2,500 samples said 242 bits and "256 is fine",
+while 160,018 samples found a lattice at 273.08. The answer moves with the
+geometry (250 bits at 15e, 257 at 16e on that job), which is why it runs per
+geometry. Exit codes are verdicts: **0 pass, 2 will overflow, 3 too little
+margin, 1 the survey could not run**. A non-zero verdict is recorded and
+repeated in the summary but does **not** abort the sweep — you still want the
+yield numbers that say whether this is even the geometry to rebuild for. Act on
+it before distributing work: see [Current hard size
+limits](#current-hard-size-limits-and-j-slabbing).
 
 Each geometry's block ends with its measured device memory, so the sizing
 question and the yield question are answered by the same run. On the **c183** at
@@ -703,6 +848,97 @@ allowance, and a job fingerprint.
   remove the matching private staging file without trusting checkpoint text as
   authority to delete some other file. Older checkpoints without that identity
   are preserved rather than partially discarded.
+- **Two per-slab failures now cost yield rather than the task.** A bucket
+  array overflow, or a factor list truncated past the per-survivor cap, used
+  to fail the whole band -- one field report threw away 3373 special-q of
+  completed work over a shortfall of a single record, and ended in
+  `boinc_finish(-1)` that the volunteer could neither see nor act on. Each of
+  these now warns, skips that slab, and continues. A special-q that loses
+  every one of its slabs is counted and skipped rather than tripping the "no
+  survivors at this q" check, which is otherwise still fatal when the sieve
+  actually ran.
+
+  **Norm overflow is deliberately NOT in that set and remains fatal.**
+  `prepare_q` proves the exact-norm width per side per q, over the full `J`,
+  before anything is sieved, and passes over any `(q,rho)` that does not fit
+  -- that is the `PIPE_Q_SKIP`/exit-3 path, whose remedy is a wider
+  `BN_LIMBS`. An overflow reaching trial division therefore means the *bound
+  itself* is wrong, which is a broken invariant rather than a job that needs
+  tuning, and skipping the slab would hide it.
+
+  **No relation is at risk.** Both soft conditions are tested before the
+  intersect/trial division/emit stage, so a skipped slab contributes nothing
+  to the output file, and dropped bucket records can only lower a position's
+  log sum -- an overflow costs survivors it never invents. Under slabbing a
+  skip also **abandons the remaining slabs of that special-q**: the end of the
+  slab loop advances the per-q continuation state (the `k_tdsmall_advance`
+  origin and both sides' walk buffers), so continuing past a skip would leave
+  every later slab a step out of date against its own `j_base`.
+
+  Warnings are rate-limited; the true totals appear in an end-of-band summary
+  naming how many slabs were skipped or abandoned, how many were for a
+  truncated list, and how many special-q were lost entirely. Two consequences
+  worth knowing: a host that skips a slab returns fewer relations than one
+  that does not, so a validator comparing results *between* hosts may now
+  reject these rather than seeing an error; and a truncated list usually means
+  a misconfigured job (mfb too generous, `PIPE_K` too small) rather than a
+  transient. The summary line naming mfb/`PIPE_K` is what makes that visible.
+- **…but only up to a ceiling: `exit 5` means the band ran and is not worth
+  crediting.** Skipping is designed not to fail the task, which means it is
+  silent in one direction: without a limit, a job whose bucket array is too
+  small can skip every slab of every q, emit almost nothing, and still exit 0.
+  Two counters bound that — `PIPE_SLAB_SKIP_MAX` (1000 slabs) and
+  `PIPE_LOST_MAX` (100 whole special-q lost) — and tripping either drains,
+  checkpoints, and exits `BENCH_EXIT_DEGRADED` (5).
+
+  **The relations already earned are kept and are valid** — the stop drains
+  and checkpoints exactly like the norm-width cap, so they are in the `.part`
+  and a rerun of the same command resumes from the last whole-q boundary.
+  They are *not* committed to the final `--relations` name, because the band
+  did not finish. Verified by fault injection: with a synthetic overflow on
+  every 7th slab, the ceiling stopped the band at exit 5 and all 681 relations
+  in the `.part` were byte-identical to the ones a clean build produced for
+  the same special-q. Only the exit status says the band as a whole should not
+  be credited.
+
+  **`make degradecheck` is the standing gate over all of this** — the exit
+  status, the drain, the kept `.part`, the sidecar, the remedy message picking
+  `PIPE_K` over the bucket array, and the no-`--relations` path. It needs a
+  card and a build at `make PIPE_K=8` (~8 min); against any other build it says
+  so and exits 0 rather than passing green on a binary that cannot trigger the
+  ceiling. **8, not 2**, because 8 loses ~6% of q on the c183 and sieves the
+  rest, so the ceiling trips with real work behind it — measured 1552 q and
+  72,902 relations. That is what lets the gate assert the claims above
+  directly rather than by proxy: the kept relations are counted *and* run back
+  through `--check-relations` (72,902 of 72,902 rebuild both norms exactly),
+  and the `band end` log record is checked to carry `[DEGRADED]` — a record
+  guarded on `nqdone`, so unreachable at `PIPE_K=2`. At 2 every q is lost and
+  those three assertions report themselves uncovered rather than passing
+  vacuously. Of the two conditions only the truncated list is drivable that way:
+  the bucket capacity is derived as `est/nregion + 256` from the same factor
+  base `--bkthresh` shapes, so lowering the threshold grows the estimate with
+  it. The bucket arm differs from the covered one only in which string prints.
+
+  Exit 5 is distinct from 1 (the band failed), 3 (rebuild with a wider
+  `BN_LIMBS`) and 4 (the card wedged), and the remedies really are disjoint:
+  norm overflow is fatal, so the only two conditions that can reach this
+  ceiling are an undersized bucket array and a large-prime list running past
+  `PIPE_K` per survivor. The stop message names whichever dominates and the
+  end-of-band counters separate them. Both counters reset on resume, and a
+  short work unit may finish below them, so this is a backstop against silent
+  waste, not the primary defence.
+
+  **Under BOINC the `.part` does not survive.** Only a clean
+  `BENCH_OUTCOME_STOPPED` takes `boinc_temporary_exit`, which is what leaves
+  the slot intact; exit 5 goes through `boinc_finish(5)`, which the client
+  records as an application error and then cleans the slot directory. That is
+  the intended behaviour — both ceilings reset on resume, so an automatic
+  retry of an unfixed job would loop — but it means the "resume from the
+  `.part`" guarantee above applies to a shell operator, not to a volunteer.
+
+  This matters for **benchmarking** as much as for BOINC: a rate computed from
+  a degraded band reads as a slow card rather than a misconfigured job, and
+  before the ceiling existed nothing in the exit status distinguished them.
 - **`SIGINT`/`SIGTERM` stop cleanly** at the next special-q, draining the queue
   first, so a planned stop loses nothing. A second signal exits at once and
   falls back to the previous checkpoint.
@@ -710,6 +946,61 @@ allowance, and a job fingerprint.
   for a run with no terminal to press `^C` in.
 - **`--restart`** discards an existing `.part` and its checkpoint, and clears
   the BOINC automatic-recovery counter.
+- **`--watchdog S`** (**off by default**; `S` is the threshold in seconds)
+  prints a report to stderr when the sieve makes no progress for `S` seconds,
+  naming the phase it was last in, the `(q, rho)`, the slab, and the GPU's
+  utilisation and board watts. It repeats every `S` seconds and says how long
+  the stall lasted once progress resumes.
+
+  **Turning it on also arms a kill**: `--watchdog-kill` defaults to 600 s, so
+  a run that stalls inside the band for ten minutes is terminated with exit 4.
+  Pass **`--watchdog-kill 0`** for report-only observation. **`--watchdog-log
+  PATH`** also appends the reports to a file, for a run whose stderr goes
+  somewhere inconvenient (a work client, a BOINC slot).
+
+  The GPU columns are the reason it exists. A stall with **utilisation near
+  100%** means a *kernel* is not terminating: the host is parked in
+  `cudaEventSynchronize` doing what it was told, and the phase names the
+  kernel. **Near 0%** means the *host* is stuck. Nothing written after the fact
+  distinguishes those two, because every other instrument in the build lives on
+  the thread that stopped. From the second report onward it also sends itself
+  `SIGUSR2` once to print the stalled thread's backtrace (glibc builds); frames
+  in `libcuda` confirm a device-side hang, and `addr2line -e bench -f -C -i
+  <addr>` resolves our own.
+- **`--watchdog-kill S`** (default **600** *once `--watchdog` is on*; `0` =
+  report only) exits **4**
+  (`BENCH_EXIT_STALLED`) rather than staying frozen once a stall inside the
+  band reaches `S` seconds. A frozen process is the worst outcome available: it
+  holds the card, the work-unit lease and the output file for as long as nobody
+  is watching, and failing hardware does not always return an error
+  `CUDA_CHECKED` can see — it can simply stop answering. Exit 4 is distinct
+  from 1 (band failed) and 3 (build cannot sieve this job), so a client can
+  read it as "this host wedged, reissue elsewhere".
+
+  **Nothing committed is lost.** The exit is a bare `_exit` from the watchdog
+  thread, which writes no output file; the last checkpoint is intact and a
+  resume replays from the last whole special-q, so the cost is the q in flight.
+  The kill is armed only once the band loop starts — factor-base generation and
+  a multi-gigabyte resume scan are legitimately slow under one coarse phase
+  label, and killing a healthy run there would be the watchdog causing the
+  failure it exists to report. A stall during startup still reports.
+
+  If exit 4 repeats on one host, suspect the card before the code: `dmesg |
+  grep -i xid` and `nvidia-smi -q -d PAGE_RETIREMENT,ECC` for retired pages and
+  ECC counts. **Under WSL2 neither of those sees anything** — the driver lives
+  on the Windows side, and its faults are logged there:
+
+  ```sh
+  powershell.exe -NoProfile -Command \
+    "Get-WinEvent -FilterHashtable @{LogName='System';Id=153;ProviderName='nvlddmkm'} | Select -First 10"
+  ```
+
+  **Why it is off by default.** The give-up threshold is a claim about how long
+  a phase can legitimately take, and that claim has been measured on one card,
+  one job and one geometry. On a slower host or a much larger per-q workload, a
+  phase that is merely slow would be killed by a default its owner never chose.
+  Turn it on for a host suspected of freezing — that is the case its thresholds
+  were checked against.
 - `NAME.lock` refuses a second writer and clears itself if the recorded pid is
   gone.
 - In standalone mode, a `.part` whose fingerprint disagrees with the current
@@ -891,7 +1182,7 @@ derived, on stdout, including when `--blocks` overrides it:
 
 ```
 grid: 48 SMs x 6 = 288 blocks (dev 0: NVIDIA GeForce RTX 5070, 48 MB L2)
-grid: 1152 x 32 for fill (absolute, not per SM)
+grid: 4608 x 32 for fill (absolute, not per SM)
 ```
 
 **Check that line first**, and check it names the card you meant. The SM count
@@ -911,12 +1202,17 @@ fails and the task errors out. Use `--device`, or the client's own
 `cc_config.xml` `<exclude_gpu>`, instead.
 
 **Fill has its own grid AND its own block width, and neither scales with the
-card.** `--blocks` is 6 per SM; fill instead uses a fixed **1152 blocks of 32
-threads** (`--fill-blocks` / `--fill-threads` to override). A 48-SM 5070, a
-128-SM 4090 and a 170-SM 5090 all reach the knee at that same absolute
-geometry. Above it every card is flat, so overshooting is nearly free; below it
-the cost is steep (288 blocks is 15–38% worse), so undershoot is the expensive
-mistake.
+card.** `--blocks` is 6 per SM; fill instead uses a fixed **4608 blocks of 32
+threads** (`--fill-blocks` / `--fill-threads` to override). Above the knee every
+card is flat, so overshooting is nearly free; below it the cost is steep (288
+blocks is 15–38% worse), so undershoot is the expensive mistake.
+
+**The default was 1152 until finding 76 retuned it to 4608** on the c194
+production shape (fill −8.6%, wall −5.7%). Read the two numbers with different
+confidence: the "same absolute knee on a 48-SM 5070, a 128-SM 4090 and a 170-SM
+5090" result was measured **at 1152**, and 4608 was swept **on a 5070 only**.
+So the cross-card claim has not been re-established at the shipped default —
+which is one reason the banner prints the number.
 
 **`--fill-threads` is separate from `--threads` on purpose.** Fill wants many
 narrow blocks; transform, intersect, TD, resieve and the cofactor kernels are
