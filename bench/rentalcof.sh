@@ -96,8 +96,24 @@ prep() {  # arm patch|-   -> fresh HEAD export with the patch applied
     [ "$p" = - ] && return 0
     # --check first: a patch that no longer matches this checkout must refuse,
     # not half-apply and build an arm that silently measures something else.
-    ( cd "$SRC/$arm" && git apply --check "$PATCHES/$p" && git apply "$PATCHES/$p" ) || {
+    # GIT_CEILING_DIRECTORIES is load-bearing. OUTDIR defaults to a path INSIDE the
+    # clone, and inside a repository `git apply` resolves bench/... against the
+    # repository root, finds it outside the cwd, and SILENTLY SKIPS it: --check
+    # passes, the exit code is 0, and nothing is patched. The first 5090 run
+    # (2026-09-14) built three copies of HEAD that way. The ceiling stops git
+    # discovering the enclosing clone, so the export is patched as a plain tree.
+    ( cd "$SRC/$arm" && export GIT_CEILING_DIRECTORIES="$SRC" &&
+      git apply --check "$PATCHES/$p" && git apply "$PATCHES/$p" ) || {
         echo "   *** $p does not apply to this checkout's HEAD -- arm $arm unusable"; return 1; }
+    # And prove it rather than trust an exit code: every file the patch names must
+    # now differ from HEAD's copy.
+    local f
+    for f in $(sed -n 's#^+++ b/##p' "$PATCHES/$p"); do
+        if git -C .. show "HEAD:$f" | cmp -s - "$SRC/$arm/$f"; then
+            echo "   *** $p reported success but $f is unchanged -- arm $arm unusable"; return 1
+        fi
+    done
+    echo "   $arm: $p applied ($(sed -n 's#^+++ b/##p' "$PATCHES/$p" | tr '\n' ' '))"
 }
 build_arm() {  # arm [make args...]; ptxas -v so the register report comes with it
     local arm=$1; shift
