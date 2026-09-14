@@ -1220,6 +1220,12 @@ all tuned at 256. At a constant 576 blocks the 5090 measures 2.711 ms at 128
 threads against 3.147 at 256 — **16%** — so tuning fill through `--threads`
 would have cost five other stages to buy one.
 
+**`--threads` above 256 does not reach the cofactor kernel.** `k_cofac` carries
+`__launch_bounds__(256, 2)`, a hard ceiling (a wider launch fails outright), so
+the cofactor rounds clamp to 256 whatever `--threads` says while every other
+kernel takes the full width. Nothing to set; just do not read a `--threads 512`
+experiment as having widened cofactorisation (RESULTS.md finding 97).
+
 Don't expect a faster card to fix a slow fill: a 5090 with 3.5× the 5070's
 hardware still returns far less than that ratio on this stage. The geometry was
 measured at one job shape (8192 buckets, 77.4M records) and plausibly moves

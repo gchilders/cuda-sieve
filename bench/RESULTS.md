@@ -8487,3 +8487,226 @@ and ~92%. Within the interleaved arms, idle < s15 < s26 in every rep.
   logical CPU costs roughly 3% of relation rate on c183-class jobs. `nproc - 1`
   remains the right rule; oversubscribing to 1.7x costs ~6%. Item 4's host
   work is correspondingly less urgent.
+
+## Finding 97 — the cofactor queue's rise since September was a 128-register CLIFF: ECM stage 2's shared denominator crossed it on CUDA 13.4 and halved `k_cofac`'s blocks per SM. `__launch_bounds__(256, 2)` keeps the arithmetic win and the occupancy: it wins on both sm_120 cards, is neutral on an sm_86 card that had no cliff, and is md5-identical on all three
+
+**Date:** 2026-09-14. RTX 5070 (sm_120, CUDA 13.4) on base commit `39a9298`;
+rented RTX 5090 (sm_120, CUDA 13.2) and RTX 3060 (sm_86, CUDA 12.1) via
+`bench/rentalcof.sh`. Idle box for every timed arm here (load <= ~1). The
+fix is `__launch_bounds__(256, 2)` on `k_cofac` in `cofac.cuh`, plus a clamp of
+the cofactor launch to `COFAC_THREADS_MAX` so `--threads` above 256 keeps working
+(see the last bullet under "What it means").
+
+### It started as a stage breakdown
+
+Findings 90/91 were the last idle per-stage profile (2026-09-03), and several
+merges since then (`ss_first`, ECM stage 2 on a shared denominator, cofactor
+chunking) were measured only on a 4090. Three reps, `--qspan`, spread <= 0.6%:
+
+| stage, ms/q | c183 I15e (1 slab) | % wall | C194 I16/J32768 (4 slabs) | % wall |
+|---|---:|---:|---:|---:|
+| **wall** | **82.53** | | **325.51** | |
+| apply | 27.18 | 32.9% | 111.25 | 34.2% |
+| fill | 24.12 | 29.2% | 92.03 | 28.3% |
+| cofactorisation, in-loop flushes | 10.73 | 13.0% | 46.87 | 14.4% |
+| resieve + scatter | 8.50 | 10.3% | 32.30 | 9.9% |
+| transform | 3.06 | 3.7% | 6.08 | 1.9% |
+| norms + trial division | 2.95 | 3.6% | 14.81 | 4.5% |
+| host, nothing in flight | 2.88 | 3.5% | 11.51 | 3.5% |
+| `acc/wall` | 0.945 | | 0.948 | |
+
+Against finding 90's rep on the same c183 command, wall fell 92.39 -> 82.53
+(-10.7%): sieve 63.49 -> 54.36, TD device 14.49 -> 13.06 -- and **cofactor
+ROSE, 9.27 -> 10.73 ms/q (+16%)**, although the one cofactor change that
+landed was supposed to make it cheaper. That is what this finding runs down.
+(C194 dense TD 10.39 -> 14.81 against finding 78 is the 256 -> 384-bit norm
+widening, which measured +40% on `k_td` at the time; accounted for.)
+
+### Attribution: chunking ~0.4 ms, the rest ECM stage 2
+
+**Chunking** (`--cof-chunk` auto against 131072, three interleaved pairs,
+relations identical): cofactor device time 15.31 vs 14.73 (+3.9%), algebraic
+queue +5.2%, rational flat, in-loop flush +0.38 ms/q. About twice finding 95's
++1.86%, but on a different band, so this is not a regression claim. It leaves
+~1.1 ms unexplained. (The watchdog's markers were also checked and cleared:
+`wd_phase` and friends are plain stores behind an `armed` test.)
+
+**ECM stage 2** (4ae5308) has no switch, so `mz_ecm_stage2_pass` was spliced
+back to its `4ae5308^` form into an otherwise-HEAD `cofac.cuh` ("old s2"; the
+only later edits inside that function were comment-only). Both built
+identically, `GPU_ARCH=120`, ABBA:
+
+| mean ms/q | c183 HEAD | c183 old s2 | C194 HEAD | C194 old s2 |
+|---|---:|---:|---:|---:|
+| algebraic queue | 12.89 | **11.80 (-8.5%)** | 38.52 | **35.21 (-8.6%)** |
+| rational queue (control) | 2.47 | 2.46 | 12.90 | 12.90 |
+| cofactor device time | 15.43 | **14.32** | 51.60 | **48.29** |
+| wall | 83.24 | 82.44 | 328.68 | 323.49 |
+
+Four c183 pairs and two C194 pairs, arms non-overlapping, relation files
+md5-identical in every run. **On this card the "optimisation" was a net loss
+of 1.1 ms/q (c183) and 3.3 ms/q (C194)** -- exactly the unexplained residue.
+
+### The mechanism: registers, and a cliff at exactly 128
+
+`-Xptxas -v`, sm_120, CUDA 13.4:
+
+| `k_cofac<L, method, stage2>` | HEAD | old s2 |
+|---|---|---|
+| `<3,ECM,s2>` (c183 algebraic, production) | **130 reg**, 288 B stack | **126 reg**, 368 B stack |
+| `<4,ECM,s2>` (AS276 shape) | 154, 352 B | 160, 448 B |
+| every other instantiation | identical | identical |
+
+Registers are charged in 8s, so 130 costs 136 and 126 costs 128. The pipeline
+launches `k_cofac` at `cfg->threads` = 256 per block (the same grid the
+selection kernels use), and **256 x 128 x 2 = 65,536 is exactly two blocks per
+SM.** `ncu` on the production kernel confirms it is the binding limit:
+
+| `k_cofac<3,ECM,s2>`, one launch | HEAD | old s2 |
+|---|---:|---:|
+| Block Limit Registers | **1** | **2** |
+| theoretical / achieved occupancy | **16.67% / 14.11%** | 33.33% / 24.68% |
+| SM throughput | 32.23% | 33.14% |
+| launch duration | 119.62 ms | 117.70 ms |
+
+The shared denominator saves ~4.5% of instructions (4ae5308's own gfx1103
+figure; its 4090 measurement said -4.46%) and costs half the warps. On a single
+launch the two nearly cancel, which is why nobody saw it; across a band the
+occupancy loss wins.
+
+A `--threads 128` signal run was tried first and is **confounded, do not
+quote**: the grid is a fixed `SMs*6` blocks, so halving threads per block also
+halves total threads.
+
+### The fix: `__launch_bounds__(256, 2)`
+
+The same lever finding 75 used on `k_apply`. It covers all six instantiations,
+so it was priced for spill first. sm_120, CUDA 13.4: `<3,ECM,s2>` 128 reg with
+**8 B** spill; `<4,ECM,s2>` 128 reg with **88 B stores / 144 B loads**; the
+others gain registers and do not spill (rho<3> 72 -> 80, ECM<3> 82 -> 88). The
+fat build's other targets (sm_75/80/86/89/90) compile both stage-2 kernels to
+122-124 registers with **zero spill**. Timed on the 5070, three arms, ABC/CBA:
+
+| c183 mean ms/q | HEAD | old s2 | **bound** | bound vs HEAD |
+|---|---:|---:|---:|---:|
+| algebraic queue | 12.83 | 11.78 | **11.25** | **-12.3%** |
+| rational queue | 2.48 | 2.47 | 2.47 | flat |
+| cofactor device time | 15.38 | 14.32 | **13.79** | **-1.59 ms (-10.3%)** |
+| wall | 84.33 | 83.08 | **82.33** | -2.4% |
+| COMPLETE | 89.54 | 87.97 | **87.02** | -2.8% |
+
+Four rounds, wall ranges non-overlapping (bound max 82.46 < old s2 min 82.71 <
+HEAD min 83.54; HEAD drifted up after round 1, so read the device-time row).
+**Bound beats old s2 by 4.5% on the algebraic queue: it keeps the arithmetic
+win AND the second block.** With side 1 forced to 4 limbs (`--cof-limbs 4`, two
+rounds) the algebraic queue reads HEAD 20.12 / old s2 20.98 / **bound 18.47
+(-8.2%)** -- the 88/144 B spill is cheaper than the block it buys. On C194 (two
+rounds) bound's algebraic queue is 34.59 against HEAD's 38.53 (-10.2%) and
+cofactor device time 48.25 against 52.21; that session's round 2 moved wall by
+~7% in both arms from an unidentified source, so its wall is not quoted. **All
+18 c183 relation files and all 4 C194 files are md5-identical.**
+
+### Three cards, three toolkits
+
+`rentalcof.sh` built HEAD / bound / old s2 on each card's own target, gated
+identity (c183 130M, 200 q), and timed the arms interleaved at NQ 500:
+
+| card | toolkit | `<3,ECM,s2>` reg: HEAD / old s2 / bound | cofactor device, bound vs HEAD | old s2 vs HEAD |
+|---|---|---|---:|---:|
+| RTX 5070 | CUDA 13.4 | 130 / 126 / 128 (8 B spill) | **-10.3%** | -6.9% |
+| RTX 5090 | CUDA 13.2 | 150 / 122 / 128 (no spill) | **-5.2%** | -1.4% |
+| RTX 3060 | CUDA 12.1 | 118 / 116 / 109 (no spill) | **-1.0%** | **+4.6%** |
+
+5090 detail: algebraic queue 4.923 / 4.837 / **4.593**, cofactor device 6.540 /
+6.447 / **6.203**, arms non-overlapping; 4-limb algebraic queue 7.705 / 8.020 /
+**7.595** (bound's 4-limb kernel spills 60/132 B on 13.2 and still wins). One
+bound round had a 40.52 ms wall outlier with normal device times -- host noise;
+wall otherwise ~-0.9%.
+
+3060 detail: algebraic queue 15.590 / 16.547 / **15.543**, and bound's
+**rational** queue 5.243 against 5.400 (-2.9%, non-overlapping) -- unexplained;
+`ptxas` gave rho<3> 62 registers under the bound against 56 without. 4-limb
+algebraic queue 27.03 / 29.33 / 27.05. Wall is flat at 274 ms/q, where
+cofactorisation is ~7.7% of it.
+
+Every arm on every card was md5-identical, and the identity gate's hash
+(`a6545ecf84f411a7192dc30514d57f89`, 9053 relations) matched across all three
+cards -- **cross-card, cross-toolkit relation identity on sm_86 and sm_120.**
+
+### What it means
+
+- **Keep 4ae5308 and keep the bound.** Where registers do not interfere (the
+  3060, and every 4-limb case) the old stage 2 is 4-9% slower on the algebraic
+  queue, so the shared denominator is a real win. What lost on sm_120 was the
+  cliff, not the arithmetic.
+- **Where the cliff falls depends on the toolkit and the target, not on the
+  source alone.** On sm_120 the same `k_cofac<3,ECM,s2>` is 130 registers on
+  13.4, 150 on 13.2 and 168 on 12.8 (local build; the 12.8 bound gives 128 with
+  36/40 B spill) -- that is the toolkit by itself. The 3060's 118 is sm_86 on
+  12.1, so it mixes target and toolkit; 13.4's fat build puts the bounded sm_86
+  kernel at 122-124.
+  A local 13.2 build reproduced the 5090's table row for row. A hand trim to 126
+  on one toolkit could be 150 on the next; the annotation holds on all of them.
+- **The win shrinks on the wide card** (5090 -5.2% against 5070 -10.3%; old s2's
+  gain -1.4% against -6.9%). Consistent with a 5090 grid that already exceeds the
+  cofactor batch, so halved occupancy idles fewer real jobs -- inferred, not
+  measured.
+- **Check `Block Limit Registers` on every kernel launched at a fixed block
+  size**, not only `k_apply` (finding 75's lesson, again). A kernel that lands
+  one register over a power-of-two budget loses half its warps with no warning.
+- **The bound is a hard 256-thread ceiling, and the first version of this fix
+  broke `--threads` above 256** (caught in code review, reproduced: `--threads
+  512 --cofactor` died with `invalid argument` at the first cofactor flush,
+  exit 255). `k_cofac` launches at `--threads`, which accepts up to 1024, so the
+  shipped form clamps the launch to `COFAC_THREADS_MAX` (256, `bench.h`) in
+  `cf_run_rounds` and applies the same width to `cof_chunk_floor`. Every other
+  kernel still takes the full `--threads`. Same class of rule as
+  `APPLY_THREADS_MAX`, clamped rather than refused because there is no separate
+  cofactor flag.
+
+### Measured on the way, and recorded here so nobody repeats it
+
+- **`2^29` stands.** C194 slab sweep at fixed area, two reps: wall 420.4 / 362.4
+  / **331.4** / 334.4 ms/q at 1 / 2 / 4 / 8 slabs; one rep's apparent 4-8 tie
+  did not repeat.
+- **"Host, nothing in flight" does not scale per slab** (13.9-15.0 / 12.3-12.7 /
+  11.7-12.0 / 12.2-12.5 ms at 1 / 2 / 4 / 8 slabs). It tracks the job (c183 2.9,
+  C194 ~12); the per-slab lead from the stage table is dead.
+- **`ss_first` did not break `k_apply`'s register budget**: `ncu` reads 40
+  registers, Block Limit Registers 3, occupancy 99.63%, SM throughput 85.86%,
+  DRAM 10.45%, L2 6.03% -- compute-bound, not memory-bound. **The pipe mix has
+  flipped since finding 60:** Shared FMA Heavy is now 67.7% of elapsed cycles
+  (finding 60: FMA 19% of a balanced mix). `ncu`'s other estimates (52.9%
+  uncoalesced shared accesses, 39/30% global store/load strides, 7% bank
+  conflicts) point at the random scatter into the region and the thread stride
+  -- mostly inherent -- and 6.4% at non-fused FP32 in norm init.
+- **Norm init is ~25% of apply** (standalone `--stage apply --reps 100`, c183
+  algebraic side, GGNFS `.afb.0`, four rounds ABCD/DCBA): HEAD 13.41 ms (median
+  13.33), no `|.|` Horner chain and no fp64 guard 12.73 (-5.0%), `NORM_FAST_LOG2`
+  12.85 (-4.2%), `--norm const` 10.05 (-25%). Both middle arms are pricing
+  builds that change cells and cannot ship. Note `NORM_CANCEL_TOL=0.0f` does
+  NOT price the `|.|` chain -- without fast-math `0*aabs` cannot fold, so the
+  chain still runs; that is likely why finding 60 priced the guard at 1.8%. The
+  shippable form is a guard with identical decisions from a cheaper bound,
+  worth at most ~5% of apply on the algebraic side. Not built.
+
+### Method notes
+
+- **`git apply` inside a repository silently skips paths outside the cwd.** The
+  first 5090 and 3060 runs wrote their variant trees under `bench/`, `git apply`
+  resolved `bench/cofac.cuh` against the clone's root, exited 0, passed
+  `--check`, and patched nothing: three copies of HEAD, identical register tables,
+  timings equal to 0.01 ms. The tell was the register table, not the timings.
+  Fixed with `GIT_CEILING_DIRECTORIES` plus a check that every patched file
+  differs from HEAD; the local smoke run had written to `/tmp` and could not
+  see it.
+- A background runner that waited on `pgrep -f "make GPU_ARCH=120"` matched its
+  own command line and deadlocked for ~14 minutes. Wait on PIDs or sentinel
+  files, never on a pattern the waiter itself contains.
+- `bench/rentalcof.sh`, `bench/rentalcof/*.patch` (the bound and old-s2
+  variants, and the `|.|`-chain pricing patch) and `bench/rental5090.sh` were removed after
+  this finding; they live at `e47f205`. **`rentalcof.sh` predates the fix and
+  does not run against it as-is**: it exports HEAD, which is now already
+  bounded, so `cofbound.patch` no longer applies and there is no un-bounded arm.
+  Reusing it on a new card means restoring the patch directory as well and
+  replacing the bound arm with a patch that REMOVES the bound.

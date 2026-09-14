@@ -4,7 +4,7 @@
 the order they were discovered, including the ones later refuted, because the
 refutations are the most useful part. That makes them bad at answering "what
 does this thing do today". This file answers only that, and holds nothing that
-is not current. **Last updated 2026-09-10.**
+is not current. **Last updated 2026-09-14.**
 
 ## Architecture
 
@@ -746,6 +746,23 @@ misled at least one reader into the opposite conclusion as well.)*
 been priced at an over-large budget rather than swept from below — the same
 one-sided-tuning error the finding was written to expose. Corrected in place.)*
 
+**`k_cofac` carries `__launch_bounds__(256, 2)` since 2026-09-14 -- finding 97.**
+At 256 threads per block, 128 registers per thread is exactly two blocks per
+SM, and where the stage-2 kernel lands depends on the toolkit and the target,
+not on the source alone (the same code: 130 registers on CUDA 13.4, 150 on
+13.2, 168 on 12.8 for sm_120; 118 on 12.1 for sm_86). ECM stage 2's shared
+denominator (4ae5308) crossed it on 13.4 and made the change a net loss on
+sm_120; with the bound the change is kept and the kernel is back to two blocks.
+Cofactor device time -10.3% (5070) and -5.2% (5090); on a 3060 that had no
+cliff it is -1.0% with wall flat. Relations md5-identical on all three cards.
+**The 256 is a hard launch ceiling** (`COFAC_THREADS_MAX`, bench.h):
+`cf_run_rounds` launches `k_cofac` at `min(--threads, 256)` and the chunk floor
+uses the same width, so a wider `--threads` still applies to every other kernel
+instead of failing at the first cofactor flush. The measurement protocol
+(`rentalcof.sh` and `rentalcof/*.patch` at `e47f205`) predates the fix and does
+not run against it as-is: its bound patch no longer applies and its HEAD arm is
+already bounded.
+
 ### Performance accounting
 
 **`k_fill_atomic` is L2-bound, measured 2026-08-25 (finding 76).** ncu on a
@@ -1195,7 +1212,7 @@ not by size.
 | 3b | Decide whether a capped band should advance faster than ~`PIPE_SKIP_MAX` q per invocation | policy | **DECIDED 2026-09-05: it should not advance at all** — case D's ~100-q-per-run crawl is only pathological while the cap reports SUCCESS. A capped band now exits `BENCH_EXIT_UNSUPPORTED` (3) and reports `BENCH_OUTCOME_UNSUPPORTED`, so a client stops reissuing it to the same app version instead of burning slots on it. Checkpointing `nqskip` would make it fail on the first q rather than the hundredth — cosmetic once the outcome is right, and not done |
 | 3c | Exit outcomes: a finished band, a checkpointed stop and a too-narrow build must not all be `boinc_finish(0)` | nothing | **DONE 2026-09-05, UNTESTED UNDER A CLIENT** — `enum bench_outcome` in `bench.h`, `PIPE_RC_*` out of `run_pipeline`; stop → `boinc_temporary_exit`, cap → `boinc_finish(3)`, and only a completed band reports fraction 1.0. `--stop-file` stays available under a client and now DEFERS (temporary exit) when the file is present at startup instead of erroring — an xhigh review caught that refusing it removed the only clean stop a Windows task has, since the client stops those with `TerminateProcess` (README "use `--stop-file` for a clean stop there"). `skipcheck.sh` case C asserts exit 3 and the named rebuild width. `skipcheck` passes at `BN_LIMBS=4` (cap exits 3, names `make BN_LIMBS=6`); `make check` passes at the default 12. **The `HAVE_BOINC` branch is type-checked only against a stub `boinc_api.h`, never against real BOINC** — no install on this box. Two things need Greg: that `boinc_temporary_exit(int delay, const char *reason, bool is_notice)` still matches upstream, and whether the project wants a specific error convention for "build too narrow" so the scheduler reassigns to a wider app version instead of retrying |
 | 4 | Three-position `--qspan` delay calibration (before first launch, between, after last) | local GPU, idle box | **optional** — settles the unreconciled `wall - span`; frame it as testing event-endpoint/submission semantics, not as perf work |
-| 5 | Next rental: **concurrent fill primary, concurrent resieve as a second arm**, interleaved, fresh baseline | rented card (3090/L40S/4090) | **ANSWERED ON A 5090, 2026-09-10: -7.62% of wall** — `--fill-concurrent` sieves the two sides on two streams; finding 94. The rental is now pure measurement rather than development, which is the point: card-hours are the scarce resource and this needed none of them. The number came in at **-7.62% of wall** on c183 I15e (three interleaved pairs, -7.77/-6.86/-8.24), inside the pre-registered 5.8-8.3% bracket and above the ~4% ship threshold; rel/J on the 5090 is **withdrawn** — its only power data is `board=`, now shown to be aliased by tens of percent in either direction. Finding 94. **The session is one script, `bench/rental5090.sh`** (build, factor base, identity gate, three interleaved band pairs, the c147 small-geometry arm, the `--fill-streams` sweep including the N=8 a 12 GB card refuses) — about 35 minutes of card time, smoke-tested end to end on the 5070 2026-09-10 |
+| 5 | Next rental: **concurrent fill primary, concurrent resieve as a second arm**, interleaved, fresh baseline | rented card (3090/L40S/4090) | **ANSWERED ON A 5090, 2026-09-10: -7.62% of wall** — `--fill-concurrent` sieves the two sides on two streams; finding 94. The rental is now pure measurement rather than development, which is the point: card-hours are the scarce resource and this needed none of them. The number came in at **-7.62% of wall** on c183 I15e (three interleaved pairs, -7.77/-6.86/-8.24), inside the pre-registered 5.8-8.3% bracket and above the ~4% ship threshold; rel/J on the 5090 is **withdrawn** — its only power data is `board=`, now shown to be aliased by tens of percent in either direction. Finding 94. **The session was one script, `bench/rental5090.sh`** (removed 2026-09-14; `git show e47f205:bench/rental5090.sh`) (build, factor base, identity gate, three interleaved band pairs, the c147 small-geometry arm, the `--fill-streams` sweep including the N=8 a 12 GB card refuses) — about 35 minutes of card time, smoke-tested end to end on the 5070 2026-09-10 |
 | 6 | Leave `pipeline.cuh:1924`'s `cudaDeviceSynchronize` alone | — | **decided, no action** |
 
 **On (5), why both arms in one session.** Card-hours are the scarce resource
@@ -1562,7 +1579,7 @@ finding 92.
    not noisy-but-unbiased but **aliased**: on a 5070 band, nine runlog ticks out
    of nine read 127-148 W against an integrated median of 215 W, and the bias
    flips direction between arms and between voltage regimes. The 16e sign flip
-   (-1.4%, then +4.6% on repeat) was never going to resolve by repeating it. `rental5090.sh` now averages
+   (-1.4%, then +4.6% on repeat) was never going to resolve by repeating it. `rental5090.sh` (removed 2026-09-14; recover from `e47f205`) averaged
    `nvidia-smi -lms 200` over each timed arm instead; with that instrument board
    draw is integrated at 5 Hz over the BAND -- not the whole arm, which would
    fold factor-base load and teardown at idle draw into the mean by a different
@@ -1641,20 +1658,20 @@ finding 92.
    manufactures artifacts, and closing it properly needs a fresh 5070 baseline
    too -- which is free, locally.
 
-   ```sh
-   git clone ... && cd cuda-sieve && bench/rental5090.sh          # ~35 min
-   ```
+   **The script was removed 2026-09-14 once this item was answered; recover it
+   with `git show e47f205:bench/rental5090.sh`.** What it did, for whoever writes
+   the next rental protocol:
 
-   `bench/rental5090.sh` is the whole protocol and replaces the loose commands
+   `bench/rental5090.sh` was the whole protocol and replaced the loose commands
    this item used to carry: build (`GPU_ARCH=native CF_LMAX=3`, ~5 min at
    sm_120), factor base, **identity gate as an abort** (unslabbed and slabbed,
    both arms, byte-compare — every number after it is meaningless if the arms
    differ), three **interleaved** band pairs with the arm order alternating
    inside the pair as well as between them, the c147 `I14/J8192` arm, the
    `--fill-streams` sweep at N=1/2/4/8, and the refusal-branch recipe. Phases
-   are selectable (`bench/rental5090.sh out band c147`) so a session that gets
-   cut short still leaves the earlier ones usable, and `NQ=20` shrinks the bands
-   for a dry run. It prints a parsed summary at the end.
+   were selectable (`bench/rental5090.sh out band c147`) so a session that got
+   cut short still left the earlier ones usable, and `NQ=20` shrank the bands
+   for a dry run. It printed a parsed summary at the end.
 
    Wanted from it: `concurrent/serial` at each N, the N where per-workspace
    time stops falling, and the pipeline `band of` stage breakdown so fill's
@@ -3687,7 +3704,7 @@ finding 92.
     flat. That is exactly what the two runs showed: `acc/wall` was **0.92 in
     both**, which is what says the morning's loss was all device-side. Quote it
     beside any timing taken on a shared box; a wall figure alone cannot tell the
-    two apart, and `rental5090.sh` now prints `acc` and mean board draw beside
+    two apart, and `rental5090.sh` (removed 2026-09-14; `e47f205`) printed `acc` and mean board draw beside
     each arm group's spread for that reason.
 
     *Original statement follows.* **An ENVIRONMENTAL ~10%-of-wall regression, cause still open -- MEASURED
