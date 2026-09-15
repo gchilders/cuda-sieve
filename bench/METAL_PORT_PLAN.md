@@ -397,12 +397,62 @@ Two implementation notes worth keeping:
   identically. Recorded in `sf_sites.h` rather than left for someone to
   rediscover.
 
-### Phase 3 — Runtime shim
-`metal_rt` + `LAUNCH` + a pipeline-state cache, proven end to end on one
-trivial kernel.
+### Phase 3 — Runtime shim — **DONE**
+`metal_rt.h` (plain C++, no Metal headers) over `metal_rt.mm` (the only
+Objective-C++ in the port), plus `MTL_LAUNCH` and a pipeline-state cache.
 
-**Gate:** a kernel launches, writes a buffer, and the host reads the
-expected values back.
+**The central trick is the allocation registry.** CUDA code does pointer
+arithmetic on device pointers freely — `bk->bucket + i * stride` is handed to
+a kernel as though it were a base pointer — but Metal binds an `MTLBuffer`
+plus an offset, not an address. So every allocation is a shared-storage
+`MTLBuffer`, `mtlMalloc` returns its `contents` pointer, and a sorted registry
+maps any pointer back to (buffer, offset) at bind time in O(log n). Ported
+code keeps doing arithmetic on real addresses and never learns Metal is
+underneath.
+
+**Streams** own one `MTLCommandQueue` and at most one open command buffer with
+one open encoder; dispatches accumulate into that encoder and it is closed
+only when something demands ordering. **Events** commit the command buffer,
+because `GPUEndTime` is the only timestamp reachable without counter sample
+buffers — so every `cudaEventRecord` becomes a pipeline flush. With 78 record
+sites in the CUDA source, a faithful port will serialise more than CUDA does.
+That is a Phase 8 question (sample counters inside the encoder, or drop the
+harness-only records), and it is recorded at the function rather than
+discovered later.
+
+**Binding convention, the thing that keeps each launch site mechanical:** CUDA
+parameter *i* becomes `[[buffer(i)]]`, same order. Templated kernels reach MSL
+through `[[host_name]]` under the rule *base, then each template argument,
+joined by `_`, bools as 0/1* — `k_td<1,0,0,false>` is `"k_td_1_0_0_0"`.
+
+**Gate: PASSING.** `make -f Makefile.metal rtcheck` — 17 checks covering
+grid-stride launches, interior-pointer binding, blit `memset`, dynamic
+threadgroup memory with a device atomic, the threadgroup-ceiling refusal,
+both templated instantiations, a missing kernel name, a `__constant__` symbol,
+a by-value struct, streams, events, elapsed time, and unregistered-pointer
+detection.
+
+Two things the gate found or failed to find, both worth carrying forward:
+
+- **A real bug, fixed:** `mtl_launch_end` originally returned the *sticky*
+  error, so a launch reported a failure that had happened somewhere else
+  earlier. CUDA's launch returns its own status and only `cudaGetLastError()`
+  is sticky. Conflating them would have produced spurious failures deep in a
+  ported band and cost far more to find later.
+- **A limitation, recorded rather than papered over:** the cross-stream
+  ordering check does *not* isolate `mtlStreamWaitEvent`. Its negative control
+  — the same sequence with the wait removed — gives the same answer every
+  time, so Metal is already ordering the two queues itself, almost certainly
+  via the automatic hazard tracking a default (tracked) `MTLBuffer` gets. The
+  pair establishes that the wait does not deadlock, corrupt or reorder; it
+  does **not** establish that the wait is load-bearing. Re-test in Phase 5,
+  when two sides run genuinely concurrent work.
+
+**Still deliberately absent:** a struct containing device pointers cannot pass
+through `mtl_launch` — a host pointer means nothing to a shader. The tree has
+exactly one such kernel, `k_cof_enqueue` taking `cofq_t` by value
+(`cofac.cuh:1410`, ~27 pointers); it needs an argument buffer, which is
+Phase 6. `mtl_launch` rejects it loudly rather than binding garbage.
 
 ### Phase 4 — `fbgen_gpu.metal` + scan/select
 Self-contained and independently gated, which is why it goes first — the HIP
