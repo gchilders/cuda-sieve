@@ -26,14 +26,32 @@ CF_LMAX   ?= 4
 # -ffp-contract=off on the host side is equally load-bearing: the host must
 # not fuse a*b+c into an fma the device build does not, or the two builds of a
 # shared header stop agreeing and every bit-exactness gate here becomes a lie.
-# -std=metal3.2 rather than metal4.0 for portability: metal4.0 compiles this
-# tree warning-free but needs macOS 26, while metal3.2 reaches macOS 15. The
-# only cost is a pedantic `if constexpr is a C++17 extension` warning, since
-# MSL 3.2 is nominally C++14; the construct itself works (clang treats it as
-# the same extension it always has), and Phase 4's byte-identical gate is the
-# proof that it does.
-MSLFLAGS  := -std=metal3.2 -fno-fast-math -Wno-c++17-extensions -I metal
+# TARGET FLOOR: Apple M1 (MTLGPUFamilyApple7) on macOS 13 Ventura.
+#
+# MSL 3.0 is not a preference, it is this toolchain's floor: Xcode 26.5's
+# Metal compiler lists metal2.0-2.4 in its own -std help text but refuses
+# every one of them ("invalid value 'metal2.3'"). MSL 3.0 in turn requires
+# macOS 13 at runtime. Reaching macOS 11/12 would mean building the metallib
+# with an older Xcode (14.x emits MSL 2.4) -- a toolchain problem, not a
+# source problem, and nothing in this port uses a feature newer than MSL 2.x
+# in the first place.
+#
+# Every Apple silicon Mac ever shipped runs macOS 13 or later, so this floor
+# costs no HARDWARE coverage: M1 through M4 are all in range. It only excludes
+# an M1 deliberately held back on Big Sur or Monterey.
+#
+# -fno-fast-math is NOT optional. Metal defaults to fast math, which would
+# relax the fp32 sequences the sieve's cell values depend on.
+#
+# -Wno-c++17-extensions: MSL 3.0 is nominally C++14 and `if constexpr` warns
+# as an extension. The construct works (clang has always accepted it), and
+# Phase 4's byte-identical gate is the proof.
+METAL_MIN_MACOS ?= 13.0
+MSLFLAGS  := -std=metal3.0 -mmacos-version-min=$(METAL_MIN_MACOS) \
+             -fno-fast-math -Wno-c++17-extensions -I metal
+
 HOSTFLAGS := -std=c++17 -O2 -ffp-contract=off -I . -I metal \
+             -mmacosx-version-min=$(METAL_MIN_MACOS) \
              -DBN_LIMBS=$(BN_LIMBS) -DCF_LMAX=$(CF_LMAX)
 
 BUILD := .metal-build

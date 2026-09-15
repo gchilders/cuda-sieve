@@ -66,6 +66,7 @@ std::map<std::string, void *>                      g_symbols;
 std::mutex           g_lock;
 mtlError_t           g_last_error = mtlSuccess;
 int                  g_core_count = 0;
+bool                 g_width_checked = false;
 
 /* the encoder a launch is currently binding into */
 id<MTLComputeCommandEncoder> g_bind_enc = nil;
@@ -260,6 +261,28 @@ static mtlError_t init_locked(const char *metallib_path)
                 path.UTF8String, err.description.UTF8String);
         return fail(mtlErrorInitialization);
     }
+    /* FAIL CLOSED ON UNSUPPORTED HARDWARE.
+     *
+     * The sieve assumes a 32-lane warp everywhere -- `>> 5`, `& 31`, lane 31
+     * broadcasts, and td.cuh:647's ballot-ordering argument. Apple GPUs are
+     * 32-wide and MTLGPUFamilyApple7 (M1) is the floor this port targets, but
+     * Metal also runs on Intel Macs with AMD or Intel GPUs, where the SIMD
+     * width is 64 or 8. Those would not crash; they would quietly compute a
+     * different factor base. Refuse them by name instead.
+     *
+     * The threadExecutionWidth cross-check happens at the first launch
+     * (mtl_launch_begin), because it is a pipeline property, not a device one. */
+    if (![g_dev supportsFamily:MTLGPUFamilyApple7]) {
+        fprintf(stderr,
+                "metal_rt: '%s' is not an Apple silicon GPU of family Apple7 or\n"
+                "          later (M1 and up). This build assumes a 32-lane SIMD\n"
+                "          group throughout and would produce wrong results on\n"
+                "          a 64-lane or 8-lane device, so it refuses to run.\n",
+                g_dev.name.UTF8String);
+        g_lib = nil; g_dev = nil;
+        return fail(mtlErrorUnsupported);
+    }
+
     g_default.q = [g_dev newCommandQueue];
     g_core_count = query_core_count();
     return mtlSuccess;
@@ -605,6 +628,16 @@ extern "C" mtlError_t mtl_launch_begin(const char *kernel, mtlStream_t s,
     g_lock.lock();
     if (ensure_init_locked() != mtlSuccess) { g_lock.unlock(); return fail(mtlErrorInitialization); }
     id<MTLComputePipelineState> pso = pso_for(kernel);
+    if (pso && !g_width_checked) {
+        g_width_checked = true;
+        if (pso.threadExecutionWidth != 32) {
+            fprintf(stderr, "metal_rt: SIMD width is %lu, not 32 -- this build's"
+                    " warp arithmetic is invalid on this device\n",
+                    (unsigned long)pso.threadExecutionWidth);
+            g_lock.unlock();
+            return fail(mtlErrorUnsupported);
+        }
+    }
     if (!pso) {
         fprintf(stderr, "metal_rt: no kernel named '%s' in the shader library\n", kernel);
         g_lock.unlock();
