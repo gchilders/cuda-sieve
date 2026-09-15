@@ -1018,6 +1018,45 @@ records (`bench_kernels.cu:2660`), so `--pipeline` never reaches it — so
 refusing costs nothing today, and refusing rather than warning is this tree's
 own convention for a path known to compute the wrong thing.
 
+### 8a. Launch-geometry tuning, measured
+
+Permitted now that this box counts as a tuning vehicle, and every number below
+was taken on **a 10-core M3 in a fanless MacBook Air that also drives the
+display**. Say that wherever these are quoted.
+
+**Fill geometry: leave CUDA's alone.** Both axes are flat here.
+
+| fill threads | 32 | 64 | 128 | 256 |
+|---|---|---|---|---|
+| fill (ms) | 21.85 | 21.44 | 21.43 | 21.47 |
+
+Run-to-run spread at a fixed configuration is **±0.44 ms (~2%)**, so that
+entire sweep sits inside the noise band — CUDA's 32, chosen for a 23% win on a
+5090 driven by NVIDIA L2 behaviour, is marginally the *worst* point here but
+not meaningfully so. The block sweep (60 → 9216) spans 21.25–22.47 ms, about
+three times the noise band but with no structure, and the shipped 4608 is
+within noise of the best. **No change.** That is a result, not an absence of
+one: the NVIDIA tuning does not transfer, and it also does not hurt.
+
+**Apply width: 512 → 192, a 26% win.** This one is real and large.
+
+| apply threads | 64 | 128 | 192 | 256 | 512 (CUDA) |
+|---|---|---|---|---|---|
+| harness, ms | 83.9 | 56.2 | **54.6** | 57.8 | 77.4 |
+| production pipeline, ms | — | 369.1 | **351.5** | 374.0 | 477.9 |
+
+A **bracketed interior minimum** on both, which is the standard `bench.h`
+itself demands, with under 1% spread between repeats at each point. 192 is six
+SIMD groups and keeps `(athr & 31) == 0`, which `k_apply`'s warp-ballot path
+requires. Relations are unchanged — 1,845 candidates and 7 relations either
+way — so this is a pure throughput change.
+
+Shipped as the Metal build's default at both sites (`pipeline.cuh` and
+`bench_kernels.cu`'s harness copy); `--apply-threads` still overrides and the
+CUDA build is untouched. **The shape of the curve should carry to other Apple
+GPUs; the exact optimum may not, and an M3 Max has four times the cores.
+Re-measure there rather than trusting 192.**
+
 ### Phase 8 (continued) — original scope
 `log_region <= 13` default; threadgroup sizing measured from scratch —
 `bench.h`'s 32-thread `k_fill_atomic` result is an NVIDIA L2-bound finding
