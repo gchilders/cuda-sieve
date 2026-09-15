@@ -61,7 +61,7 @@ $(BUILD)/sites_msl.air: metal/sf_sites.h metal/softfp64.h | $(BUILD)
 	$(METAL) $(MSLFLAGS) -c $(BUILD)/sites_msl.metal -o $@
 
 .PHONY: metalcheck
-metalcheck: $(BUILD)/sf_test_host $(BUILD)/sf_test.metallib $(BUILD)/sf_test_device \
+metalcheck: rtcheck $(BUILD)/sf_test_host $(BUILD)/sf_test.metallib $(BUILD)/sf_test_device \
             $(BUILD)/sf_sites_test $(BUILD)/sites_msl.air
 	@echo "== softfp64 vs hardware fp64 (host) =="
 	@$(BUILD)/sf_test_host
@@ -74,3 +74,17 @@ metalcheck: $(BUILD)/sf_test_host $(BUILD)/sf_test.metallib $(BUILD)/sf_test_dev
 .PHONY: clean
 clean:
 	rm -rf $(BUILD)
+
+# ---- Phase 3 gate: the metal_rt runtime shim ----------------------------
+
+$(BUILD)/rt_test.metallib: metal/rt_test.metal | $(BUILD)
+	$(METAL) $(MSLFLAGS) -c $< -o $(BUILD)/rt_test.air
+	$(METALLIB) $(BUILD)/rt_test.air -o $@
+
+$(BUILD)/rt_test: metal/rt_test.cpp metal/metal_rt.mm metal/metal_rt.h | $(BUILD)
+	$(CXX) $(HOSTFLAGS) metal/rt_test.cpp metal/metal_rt.mm \
+	    -framework Metal -framework Foundation -framework IOKit -o $@
+
+.PHONY: rtcheck
+rtcheck: $(BUILD)/rt_test $(BUILD)/rt_test.metallib
+	@$(BUILD)/rt_test $(BUILD)/rt_test.metallib
