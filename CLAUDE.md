@@ -73,8 +73,24 @@ lane order (so `td.cuh:647` holds), `simd_shuffle_up` matching CUDA,
   `cd bench && make -f Makefile.metal metalcheck` — 6.6M results compared,
   0 mismatches. `softfp64.h` (IEEE binary64 in integer ops),
   `portable_log2.h`, `msl_compat.h`, `sf_sites.h`.
-- Phases 3-9: not started. Next is Phase 3, the `metal_rt` runtime shim —
-  the decision the rest of the port's effort hinges on (plan section 6).
+- **Phase 3 (metal_rt runtime shim): DONE, gate green.**
+  `cd bench && make -f Makefile.metal rtcheck` — 17 checks.
+  `metal/metal_rt.h` is plain C++; `metal/metal_rt.mm` is the only
+  Objective-C++ in the port. Ported orchestration compiles as ordinary C++.
+- Phases 4-9: not started. Next is Phase 4, `fbgen_gpu.metal` plus the
+  hand-rolled scan/select that replaces CUB — self-contained and
+  independently gated against the CUDA build's `oracle/c183.fb1`.
+
+**Two conventions the rest of the port depends on** (plan Phase 3):
+- CUDA kernel parameter *i* becomes MSL `[[buffer(i)]]`, same order.
+- A templated kernel is reached through `[[host_name]]` named *base, then each
+  template argument, joined by `_`, bools as 0/1*: `k_td<1,0,0,false>` is
+  `"k_td_1_0_0_0"`.
+
+**Known gate limitation, do not mistake for coverage:** the Phase 3
+cross-stream check does not isolate `mtlStreamWaitEvent`. Its negative control
+shows Metal already orders the two queues without it, almost certainly via
+automatic hazard tracking on a shared tracked buffer. Re-test in Phase 5.
 
 **Phase 2 changed a Phase 7 option.** "Portable log2 in the Metal build only"
 is not a real choice: `pl_log2f` differs from the host's `log2f` on 1.02% of
