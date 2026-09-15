@@ -261,7 +261,20 @@ call site cannot do one and forget the other.
   `--region 13` silently quartered CUDA's intent; `SLAB_PERF_REGIONS` is now
   overridable (default unchanged) and set to 8192 here.
 
-  **`--threads` 256 is right. `--blocks` IS NOT (plan 8i).** Its default is
+  **The cofactor grid is now sized from the work (plan 8j):**
+  `max(multiProcessorCount * 6, ceil(CQ_FLUSH / threads))` = 512 blocks here,
+  and `cof_chunk_floor()` is decoupled from it so subdivision stays reachable
+  on a slow part. **But `--cof-chunk auto` is NOT adaptive on this hardware and
+  never was:** it halves whenever `stage > COF_CHUNK_TARGET_MS`, and `stage` --
+  a whole side's device time summed over rounds and slices -- is 39-45x that
+  250 ms target at EVERY chunk size, so it parks at the floor forever. An
+  always-true test is not a safety mechanism. Harmless on CUDA (there the floor
+  is a full grid, so parking is free); costs **25% of the cofactor stage** here.
+  `--cof-chunk 131072` gets it back today: 348.5 vs 465.5 ms/q, wall 1085 vs
+  1202. Fixing auto means retargeting a watchdog constant for macOS — open
+  decision, see 8j.
+
+  **`--threads` 256 is right. `--blocks` was NOT (plan 8i).** Its default is
   `multiProcessorCount * 6` = **60** on a 10-core M3 = 15,360 threads, against
   a `CQ_FLUSH` batch of 131,072 records — a grid 8.5x smaller than the work.
   CUDA's formula works only because NVIDIA SM counts are large (a 4090 gets

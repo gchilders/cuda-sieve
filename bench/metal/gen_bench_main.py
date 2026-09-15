@@ -108,6 +108,68 @@ src = src.replace('#include <cuda_runtime.h>', '#include "metal/metal_rt.h"')
 if '#include "metal/metal_rt.h"' not in src:
     src = src.replace('#include "bench.h"', '#include "bench.h"\n#include "metal/metal_rt.h"', 1)
 
+# ---- cofactor grid: size it from the WORK, not from the core count --------
+# multiProcessorCount * 6 is an NVIDIA-shaped rule. It works there because SM
+# counts are large -- a 4090 gets 768 blocks, 196,608 threads, which cofac.cuh
+# notes "exceed CQ_FLUSH outright". Apple reports 10-40 GPU cores, so the same
+# formula gives a 10-core M3 sixty blocks: 15,360 threads against a flush of
+# 131,072 records, a grid 8.5x smaller than its own work, with every thread
+# walking ~8.5 records end to end.
+#
+# Plan 8i measured the cost at --nq 72: 465.3 ms/q of cofactor time at 60
+# blocks against 357.0 at 512, and 512 is indistinguishable from 576 because
+# this is a THRESHOLD -- clear CQ_FLUSH and you are done, since threads past
+# the record count have no records to take.
+#
+# max(), not replacement: the core-count rule stays as a floor and takes over
+# on a hypothetical very large Apple GPU. Uses the live cfg.threads, since
+# --threads moves and a literal 256 would silently mis-size the grid with it.
+_ab_old = "            const uint64_t ab = (uint64_t)prop.multiProcessorCount * 6u;"
+_ab_new = (
+    "            const uint64_t ab_cores = (uint64_t)prop.multiProcessorCount * 6u;" + chr(10) +
+    "            /* One record per thread for a full CQ_FLUSH batch. */" + chr(10) +
+    "            const uint64_t ab_work = (mtl_cof_flush_capacity() + (uint64_t)cfg.threads - 1)" + chr(10) +
+    "                                     / (uint64_t)cfg.threads;" + chr(10) +
+    "            const uint64_t ab = ab_cores > ab_work ? ab_cores : ab_work;")
+assert _ab_old in src, 'auto_blocks shape changed'
+src = src.replace(_ab_old, _ab_new, 1)
+
+_pr_old = (
+    '            printf("grid: %d SMs x 6 = %d blocks (dev %d: %s, %d MB L2)' + chr(92) + 'n",' + chr(10) +
+    "                   prop.multiProcessorCount, cfg.blocks, dev, prop.name," + chr(10) +
+    "                   prop.l2CacheSize >> 20);")
+_pr_new = (
+    '            printf("grid: %d blocks = max(%d cores x 6, %u records / %d threads)"' + chr(10) +
+    '                   " (dev %d: %s, %d MB L2)' + chr(92) + 'n",' + chr(10) +
+    "                   cfg.blocks, prop.multiProcessorCount," + chr(10) +
+    "                   (unsigned)mtl_cof_flush_capacity(), cfg.threads, dev, prop.name," + chr(10) +
+    "                   prop.l2CacheSize >> 20);")
+assert _pr_old in src, 'grid report shape changed'
+src = src.replace(_pr_old, _pr_new, 1)
+print('  cofactor grid sized from CQ_FLUSH, core count kept as a floor')
+
+# Hand the chunk floor its own, core-derived notion of a loaded device, so it
+# does NOT inherit the work-sized grid above. Without this the floor would
+# equal a whole flush and auto chunking could never subdivide on any Apple GPU
+# -- see gen_cofac_host.py for why that protection has to survive.
+_set_old = "            auto_blocks = (int)ab;"
+_set_new = (
+    "            auto_blocks = (int)ab;" + chr(10) +
+    "            mtl_set_cof_floor_blocks((int)ab_cores);")
+assert _set_old in src, 'auto_blocks assignment shape changed'
+src = src.replace(_set_old, _set_new, 1)
+
+_decl_anchor = '#include "metal/metal_rt.h"'
+assert _decl_anchor in src, 'metal_rt.h include not found'
+src = src.replace(
+    _decl_anchor,
+    _decl_anchor + chr(10) +
+    "/* metal/cofac_host.inc, compiled into bench_host.cpp. Declared rather than" + chr(10) +
+    " * included: this file needs the one setter, not the cofactor host. */" + chr(10) +
+    "void mtl_set_cof_floor_blocks(int b);" + chr(10) +
+    "uint32_t mtl_cof_flush_capacity(void);", 1)
+print('  chunk floor given its core-derived blocks at init')
+
 open(OUT, 'w').write(src)
 print('wrote %s (%d lines)' % (OUT, src.count('\n')))
 left = sorted(set(re.findall(r'\bcuda[A-Z]\w*|CUDART_VERSION', src)))

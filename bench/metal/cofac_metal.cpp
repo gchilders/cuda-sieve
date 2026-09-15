@@ -1304,9 +1304,20 @@ static int cf_run_rounds_dyn(int L, const uint32_t *d_n, uint64_t lim,
  * launch by 14x. The small devices that trip the watchdog subdivide for free;
  * the large ones (a 4090's 196,608 threads exceed CQ_FLUSH outright) get one
  * slice and the original code path. */
+/* Blocks' worth of records the DEVICE can keep loaded, independent of the
+ * grid actually launched. Zero until mtl_set_cof_floor_blocks() runs, in
+ * which case the floor falls back to the caller's grid -- the CUDA
+ * behaviour, and the safe direction if initialisation order ever moves. */
+static int g_cof_floor_blocks;
+
+void mtl_set_cof_floor_blocks(int b) { g_cof_floor_blocks = b > 0 ? b : 0; }
+
+uint32_t mtl_cof_flush_capacity(void) { return CQ_FLUSH; }
+
 static uint32_t cof_chunk_floor(int blocks, int threads)
 {
-    const uint64_t f = (uint64_t)(blocks > 0 ? blocks : 1)
+    const int fb = g_cof_floor_blocks ? g_cof_floor_blocks : blocks;
+    const uint64_t f = (uint64_t)(fb > 0 ? fb : 1)
                      * (uint64_t)(threads > 0 ? threads : 1);
     return f > 0xffffffffull ? 0xffffffffu : (uint32_t)f;
 }
