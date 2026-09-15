@@ -25,7 +25,9 @@ for nm in NAMES:
     m = re.search(r'^#define\s+' + nm + r'\b[^\n]*$', src, re.M)
     if not m:
         raise SystemExit('td.cuh no longer defines ' + nm)
-    picked.append(m.group(0))
+    # Guarded, not bare -- see gen_msl_headers.py: an unguarded lifted define
+    # overrides a -D of the same name and desyncs host from device.
+    picked.append('#ifndef %s\n%s\n#endif' % (nm, m.group(0)))
 
 open(OUT, 'w').write(
 '''/* SPDX-License-Identifier: LGPL-2.1-or-later

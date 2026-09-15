@@ -178,7 +178,10 @@ def convert(src_path, out_path, guard, fn_macros, first_marker, extra_head='',
         picked = []
         for nm in names:
             m = re.search(r'^#define\s+' + nm + r'\b[^\n]*$', src2, re.M)
-            if m: picked.append(m.group(0))
+            # Guarded, not bare: a lifted #define that is not #ifndef'd
+            # silently overrides a -D the build passes for the same name, and
+            # the two sides then disagree about a constant they both use.
+            if m: picked.append('#ifndef %s\n%s\n#endif' % (nm, m.group(0)))
         if picked:
             body = ('\n/* Bounds the source keeps inside its own __CUDACC__ guard;\n'
                     ' * lifted here so every Metal translation unit shares one copy. */\n'

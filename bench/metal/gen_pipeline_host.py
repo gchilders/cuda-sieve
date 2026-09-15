@@ -155,6 +155,7 @@ _n += 1
 assert 'cofq_flush' not in src or src.count('cfg->cof_rounds,') == 0 or True
 print('  %d cofq_flush site(s) use the derived round count' % _n)
 
+
 open(OUT, 'w').write(src)
 print('wrote %s (%d lines, %d launches rewritten)' % (OUT, src.count('\n'), nl))
 left = sorted(set(re.findall(r'\bcuda[A-Z]\w*', src)))

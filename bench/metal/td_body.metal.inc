@@ -608,7 +608,17 @@ kernel void k_resieve_scatter_4_1(
  * The survivor loop is the OUTER one because the norm has to stay in registers
  * across the whole entry list, and it runs a uniform iteration count so every
  * thread reaches each __syncthreads. */
+/* Overridable so a build whose threadgroup budget cannot afford the default
+ * can shrink it. DEFAULT UNCHANGED, so the CUDA build is unaffected; only a
+ * build passing -DTD_TILE sees anything different.
+ *
+ * Why it matters on Apple: tdsmall_t is 32 bytes, so 512 of them is 16,384 B
+ * of THREADGROUP memory -- half of Apple's whole 32,768 B budget, capping k_td
+ * at ~2 threadgroups per core. A 1080 Ti has 96 KB per SM and fits six. See
+ * METAL_PORT_PLAN.md section 8q. */
+#ifndef TD_TILE
 #define TD_TILE 512
+#endif
 #define TD_MAXHIT 16      /* buffered small-prime hits; ~7 per survivor typical */
 /* Recorded factors per survivor, multiplicity included. 32 was not enough: a
  * 224-bit algebraic norm carrying a high power of a small prime records one

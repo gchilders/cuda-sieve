@@ -33,12 +33,24 @@ using namespace metal;
 
 /* Bounds the source keeps inside its own __CUDACC__ guard;
  * lifted here so every Metal translation unit shares one copy. */
+#ifndef TD_GROUP_W
 #define TD_GROUP_W 8
+#endif
+#ifndef TD_GROUP_X
 #define TD_GROUP_X (TD_GROUP_W * 32)
+#endif
+#ifndef TD_SCAN_BLK
 #define TD_SCAN_BLK 256
+#endif
+#ifndef TD_TILE
 #define TD_TILE 512
+#endif
+#ifndef TD_MAXHIT
 #define TD_MAXHIT 16      /* buffered small-prime hits; ~7 per survivor typical */
+#endif
+#ifndef TD_FMAX
 #define TD_FMAX  64
+#endif
 
 typedef struct {
     bn_t    c[BENCH_NCOEFF];
