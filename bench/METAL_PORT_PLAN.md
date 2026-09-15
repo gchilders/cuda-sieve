@@ -1920,6 +1920,96 @@ display.** That last clause stopped being a disclaimer here and became the
 hazard.
 
 
+### 8l. 8x24 validated over 288 special-q: not "comparable" -- identical
+
+8k recommended `--ecm-curves 8 --cof-rounds 24` but would not adopt it,
+because `cofac.cuh` warns the curve axis changes which sigmas run and equal
+relations had only been seen on one band. Validated against 48x4 over
+**288 special-q**, same B1 2000 / B2 60000, accepting in advance that a few
+relations might be gained or lost:
+
+| | 48c x 4r | 8c x 24r |
+|---|---|---|
+| relations | **13,485** | **13,485** |
+| shared (a,b) | 13,485 | 13,485 |
+| unique to this run | **0** | **0** |
+| records enqueued | 564,696 | 564,696 |
+| side 0 split / dead / stuck | 477,071 / 87,625 / 0 | 477,071 / 87,625 / 0 |
+| side 1 split / dead / stuck | 14,291 / 550,405 / 0 | 14,291 / 550,405 / 0 |
+| cofactor ms/q | 835.3 | **277.4** |
+| wall ms/q | 1555.8 | **981.8** |
+| longest launch | 3620 ms | 1207 ms |
+
+Not merely comparable yield -- **the identical relation set**, and identical
+split/dead/stuck on both sides. The sieve does not depend on ECM parameters,
+so both runs hand the cofactoriser the same 564,696 candidates; that number
+matching is what makes the rest a like-for-like comparison rather than two
+different experiments.
+
+**Why identical, when 160 of the 192 sigmas differ.** Sigma is
+`c0*1000 + cv + 6` with `c0 = round + 1`, so 48x4 tries {1006-1053, 2006-2053,
+3006-3053, 4006-4053} and 8x24 tries {1006-1013, ..., 24006-24013}; they share
+only 32. They agree because **the differing sigmas never split anything**:
+
+| at B1 2000 | relations | side 1 split |
+|---|---|---|
+| 8 curves x 1 round | 6,723 | 7,115 |
+| 8 curves x 4 rounds | 6,724 | 7,116 |
+| 8 curves x 24 rounds | 6,724 | 7,116 |
+
+Rounds beyond the first are worth **one relation**, and beyond the fourth,
+nothing. At these parameters ECM either splits a cofactor in the first few
+curves or does not split it at all, so a 192-curve budget is doing ~8 curves of
+useful work. (Later rounds are not idle -- `dead` rises from 246,104 to 274,947
+as records are proven unsplittable -- they just do not yield.)
+
+**This is a property of this job's parameters, not a theorem.** On a job where
+curves past the eighth do split things -- a larger B1, harder cofactors -- the
+differing sigmas would matter and the two configurations would diverge. The
+validation is c183 at B1 2000 / B2 60000 over 288 q.
+
+#### What the launch bound costs when it cannot be met
+
+8k set the bound at 750 ms. Over 288 q the two configurations diverge sharply,
+and the reason is worth stating plainly:
+
+- **8x24 meets it.** The chunker descends 15,360 -> 7,680 -> 3,840 and settles
+  with launches around 400 ms. 277.4 ms/q -- *faster* than the 465 ms/q this
+  configuration cost before the bound existed.
+- **48x4 cannot.** One curve is ~92 ms, so 48 of them is ~4.4 s no matter how
+  the records are sliced. The controller descends 15,360 -> 7,680 -> 3,840 ->
+  1,920, the no-progress guard fires and reverts it to 3,840, and it parks
+  there at **835.3 ms/q against 465 before**. The guard stops the bleeding; it
+  cannot make an unreachable bound reachable.
+
+So the bound is cheap when it can be met and expensive when it cannot, and
+which one you get is decided by `--ecm-curves`, not by the chunker. `cofq_init`
+now says so at startup rather than leaving it to be discovered:
+
+```
+cofactor queue: 48 curves/round is about 4434 ms in one launch, over this
+build's 750 ms bound. --cof-chunk splits RECORDS and cannot divide a chain,
+so the chunker will subdivide without reaching it and lose throughput doing so.
+Shorter launches, same B1/B2: --ecm-curves 7 --cof-rounds 24 (the cap) gives
+168 curves in launches of about 705 ms.
+```
+
+It advises and does not act: curves-per-round chooses which sigmas run, and
+this build does not change that behind the caller's back. The estimate is
+**0.0413 ms per (prime power + giant step)** -- the MARGINAL cost of a curve.
+The one-curve timings in 8k (110 / 370 / 1461 ms at B1 2000 / 8000 / 32000)
+include a fixed per-launch overhead and overstate it by ~9%; 8 curves at
+B1 2000 measured 740 ms, i.e. 92.5 ms each over 2,237 units. Calibrated so the
+advisory stays quiet on a configuration that does meet the bound.
+
+**Still not adopted as a default.** It is validated, identical and three times
+faster on this job, and it remains a mathematics parameter validated on one
+composite. Ship it as job settings.
+
+**Measured on a 10-core M3 in a fanless MacBook Air that also drives the
+display.**
+
+
 ## 9. Drift ledger — CUDA-side changes made for this port
 
 | date | CUDA file(s) | change | verified how |
