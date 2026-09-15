@@ -82,7 +82,14 @@ typedef struct {
  * regions in one slab, 4x the target, the exact shape finding 79 measured at
  * +68.3% fill. Deriving the trigger as `target * 2` fixes that and reproduces
  * the old 2^30 exactly at the default --region 14, so no default moves. */
+/* Overridable so a build whose hardware wants a different slab size can set
+ * it without forking this header. The DEFAULT IS UNCHANGED, so the CUDA build
+ * and slabtest's pinned expectations are unaffected; only a build that passes
+ * -DSLAB_PERF_REGIONS sees anything different. The Metal port sets 8192 --
+ * measured, see bench/METAL_PORT_PLAN.md section 8c. */
+#ifndef SLAB_PERF_REGIONS
 #define SLAB_PERF_REGIONS      32768u
+#endif
 
 static inline uint32_t slab_row_quantum(int logI)
 {
