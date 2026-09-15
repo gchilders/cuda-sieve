@@ -163,12 +163,14 @@ SIEVE_CPUOBJ := verify_cpu.o fbgen_lib.o fb_load.o fb_cado.o poly.o primes.o \
 $(BUILD)/bench.metallib: metal/bench_kernels.metal metal/bench_kernels_body.metal.inc \
                          metal/cuda_msl_compat.h metal/plattice_msl.h \
                          metal/fbgen_gpu.metal metal/fbgen_gpu_body.metal.inc \
+                         metal/cofac.metal metal/cofac_body.metal.inc \
                          metal/scan.metal | $(BUILD)
 	$(METAL) $(MSLFLAGS) -c metal/bench_kernels.metal -o $(BUILD)/bench_kernels.air
 	$(METAL) $(MSLFLAGS) -c metal/fbgen_gpu.metal     -o $(BUILD)/fbgen_gpu.air
+	$(METAL) $(MSLFLAGS) -c metal/cofac.metal         -o $(BUILD)/cofac.air
 	$(METAL) $(MSLFLAGS) -c metal/scan.metal          -o $(BUILD)/scan.air
 	$(METALLIB) $(BUILD)/bench_kernels.air $(BUILD)/fbgen_gpu.air \
-	            $(BUILD)/scan.air -o $@
+	            $(BUILD)/cofac.air $(BUILD)/scan.air -o $@
 
 $(BUILD)/phase5_test: metal/phase5_test.cpp metal/fbgen_gpu_metal.cpp \
                       metal/metal_rt.mm metal/metal_scan.cpp $(BUILD)/bench.metallib
@@ -198,3 +200,33 @@ $(BUILD)/argbuf_test: metal/argbuf_test.cpp metal/metal_rt.mm | $(BUILD)
 .PHONY: argbufcheck
 argbufcheck: $(BUILD)/argbuf_test $(BUILD)/argbuf.metallib
 	@cd $(BUILD) && ./argbuf_test argbuf.metallib
+
+# ---- Phase 6a gate: the cofactoriser, via run_cofac ---------------------
+#
+# run_cofac() is the tree's own standalone cofactorisation entry point, and
+# oracle/c183.q120000053.cofac_candidates.txt is the recorded CADO run's own
+# candidate list for the parity special-q. 37 is the count cofcheck.sh pins
+# and the count las itself finds at this q, so this reaches a real golden
+# number long before ./bench --pipeline exists.
+
+COFAC_CPUOBJ := verify_cpu.o fb_load.o fb_cado.o poly.o primes.o platform.o \
+                rfb.o watchdog.o runlog.o
+
+$(BUILD)/cofac_test: metal/cofac_test.cpp metal/cofac_metal.cpp metal/metal_rt.mm \
+                     $(BUILD)/bench.metallib
+	$(MAKE) $(COFAC_CPUOBJ)
+	$(CXX) $(HOSTFLAGS) metal/cofac_test.cpp metal/cofac_metal.cpp \
+	    metal/metal_rt.mm $(COFAC_CPUOBJ) \
+	    -framework Metal -framework Foundation -framework IOKit -lm -o $@
+
+.PHONY: cofaccheck
+cofaccheck: $(BUILD)/cofac_test
+	@rc=0; \
+	for L in 3 4; do \
+	  for M in --rho --ecm; do \
+	    printf '%-10s %-6s ' "limbs=$$L" "$$M"; \
+	    CUDA_SIEVE_METALLIB=$(CURDIR)/$(BUILD)/bench.metallib $(BUILD)/cofac_test \
+	      $$M --limbs $$L --in ../oracle/c183.q120000053.cofac_candidates.txt \
+	      --expect 37 2>/dev/null | grep -E 'GATE' || rc=1; \
+	  done; \
+	done; exit $$rc
