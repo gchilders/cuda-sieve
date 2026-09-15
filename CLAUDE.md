@@ -319,6 +319,16 @@ call site cannot do one and forget the other.
   286.9 to **160.1**, wall from 1005 to **860.7**, relations unchanged, six
   gates green including cofcheck's pinned counts.
 
+  **VALIDATED over 288 q (plan 8o): identical relation sets** — 13,485 each,
+  zero unique to either, from the identical 564,696 candidates, at **cofac/q
+  348.3 -> 153.5, wall 1068.6 -> 856.0, launch 1669 -> 467 ms**. Unlike 8l the
+  two configs share only 8 of their 48 sigmas, so this was not forced — and
+  side 1's split count is identical (14,291) while dead/stuck move by 31,
+  proving the sigmas really did differ and the same cofactors factored anyway.
+  **At B1 2000/B2 60000 the relation set is robust to WHICH sigmas are tried**
+  — only how many, and how cheaply. That is what makes the re-compaction win
+  free. At a B1 where the marginal curve decides relations they would diverge.
+
   An explicit `--ecm-curves` is never overruled (it gets the advisory instead),
   and the derivation is gated on both sides being ECM because `cofq_flush`
   passes one round count to both and raising it under rho hits the
