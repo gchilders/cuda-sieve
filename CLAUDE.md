@@ -141,9 +141,21 @@ disappointing GPU result. The HIP port's gfx1103 iGPU did comparable work in
   `cd bench && make -f Makefile.metal fbcheck` — `fbgpucheck.sh`, 19 cases,
   all byte-identical to the CPU generator. Also `make -f Makefile.metal
   scancheck` for the scan/select primitives alone.
-- Phases 5-9: not started. Next is Phase 5, the sieve kernels
-  (`k_transform`, `k_fill_*`, `k_apply`) and the `pipeline_metal.cpp`
-  orchestration, including the soft-fp64 norm fallback.
+- **Phase 5 (sieve kernels): device half DONE, gate NOT yet run.**
+  `metal/bench_kernels.metal` compiles clean — 19 kernels including
+  `k_transform`, `k_fill_atomic` and `k_apply`, with the fp64 norm fallback
+  on `softfp64.h`. Still to do: the host harness that runs
+  transform → fill → apply and compares against `verify_count_updates` and
+  `verify_apply_region` (the tree's own CPU ground truth, pure host C).
+  **Nothing about the sieve is verified yet** — it compiles, that is all.
+- Phases 6-9: not started.
+
+**Known gap, Phase 8:** `k_fill_l1`/`k_fill_l2` are absent. Both want
+33,792 B of static threadgroup memory against Apple's 32,768 B ceiling —
+over by exactly 1 KB. They are the two-level fill path; apply requires
+single-level 4-byte records, so production uses `k_fill_atomic` and never
+reaches them. The fix is retuning `L1_CAP`/`L2_CAP` 64 -> 62, which is a
+performance change and now permitted to be measured on this box.
 
 **The Phase 4 reference is the CPU generator, not CUDA.** `fbgen.c` builds and
 runs natively on macOS unchanged, so `fbgpucheck.sh` compares the Metal build
