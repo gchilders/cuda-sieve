@@ -2,7 +2,7 @@
 
 Porting the CUDA NFS lattice sieve in `bench/` to Metal Shading Language for
 Apple Silicon. The plan of record is **`bench/METAL_PORT_PLAN.md`** — read it
-first; this file carries the running ledger and the rules.
+first; it also carries the drift ledger. This file carries the rules.
 
 Branched from `main` at `3e15fec`. `hip-port` is a reference for method, not
 a base: it is 23 commits behind `main`.
@@ -308,6 +308,9 @@ adopt it" and "accept a divergent relation set". See the plan's Phase 7.
 
 ## Drift ledger — CUDA-side changes made for this port
 
-| date | CUDA file(s) | change | verified how |
-|---|---|---|---|
-| — | — | none yet | — |
+**The ledger lives in `bench/METAL_PORT_PLAN.md` section 9, and only there.**
+A copy of it used to sit here and had already drifted to "none yet" while the
+plan carried two rows — precisely the failure the ledger rule exists to catch,
+committed by the ledger itself. Three rows as of 2026-09-14: `cofcheck.sh`
+(`head -c -1`), `fbgpucheck.sh` (`sha256sum`), `slab.h` (`SLAB_PERF_REGIONS`
+made overridable, default unchanged). Add new rows there.
