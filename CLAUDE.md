@@ -164,10 +164,9 @@ disappointing GPU result. The HIP port's gfx1103 iGPU did comparable work in
   `pipeline.cuh` and `bench_main.cu` are ported, **`./bench` links, and a
   `--pipeline` band runs end to end on the M3** (`make -f Makefile.metal
   benchbin`). `--verify-only` passes through the real binary.
-  **`cofcheck.sh` DOES NOT PASS**: its refusal cases do, its relation-count
-  cases do not. A band produced 125 cofactorisation candidates where the
-  oracle has 1,851, and the production-geometry run is currently SIGKILLed
-  with no output flushed. The port is feature-complete and wrong.
+  **`cofcheck.sh` PASSES: 54 PASS, 0 FAIL, exit 0** —
+  `make -f Makefile.metal cofcheckgate`. That is the formal gate the HIP port
+  used. **Phase 6 is complete.**
 
 **THE METAL BUILD DEFAULTS `log_region` TO 13, not CUDA's 14.** Apple's
 threadgroup ceiling is a hard 32 KB with no opt-in tier, and at 14 `k_apply`
@@ -193,7 +192,20 @@ never reaches `k_cof_enqueue` or `k_rel_pack`; `cofcheck.sh` will be the first
 thing that runs them. Pass such a struct as `mtl_argbuf_t` — it binds the
 buffer and calls `mtlUseResource` on every pointer inside in one step, so a
 call site cannot do one and forget the other.
-- Phases 7-9: not started.
+- Phase 7 (relation comparison): **largely answered by Phase 6's gate.**
+  `cofcheck.sh` pins ~25 relation counts derived from the CUDA build and the
+  Metal build matches every one; the 37 relations at the parity special-q are
+  the identical (a,b) set as las's. The 3 ULP `log2` divergence has not moved
+  a relation. What remains is a full band rather than a single q.
+- Phases 8-9: not started (two-level fill retune, packaging).
+
+**Candidate counts do not compare across sievers; relation sets do.** Our 1,845
+cofactorisation candidates against the oracle's 1,851 is not a defect: the 7
+las has that we lack are exactly the relations that need no cofactorisation
+(las dumps every post-sieve survivor, we dump only what enters the
+cofactoriser), and the 1 we have that it lacks is a marginal survivor at
+`i = -16384` under a deliberately looser allowance. Plan section 5b has the
+derivation.
 
 **Residency is load-bearing and easy to get wrong.** Any pointer reached
 through a GPU address (i.e. inside an argument-buffer struct) must have
