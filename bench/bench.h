@@ -460,6 +460,13 @@ int  bench_boinc_is_managed(void);
 int  bench_boinc_gpu_device(void);
 int  bench_boinc_resolve_path(const char *option, const char *logical_name,
                               const char **resolved_name);
+/* Suspend/resume fraction-done reporting. The slab auto-calibration pass runs a
+ * throwaway single-q band through the same run_pipeline_impl that reports
+ * progress, and a one-q band reads as 100% complete -- which, because BOINC
+ * reports must be nondecreasing, pins the whole workunit at 99% seconds after
+ * it starts. Suspended reports are dropped WITHOUT advancing the monotonic
+ * high-water mark, so real progress still begins from zero. Non-BOINC: no-op. */
+void bench_boinc_progress_suspend(int on);
 void bench_boinc_fraction_done(double fraction_done);
 /* `status` is the process exit status; `outcome` is what the run actually did,
  * and it is the one that decides how BOINC is told. They are separate because

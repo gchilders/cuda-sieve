@@ -236,6 +236,26 @@ call site cannot do one and forget the other.
   lane mapping all ruled out. Threadgroup-size tuning, `--cof-chunk`
   and slab sizing are all measured and written up (plan 8a-8d).
 
+  **Slab size is now auto-calibrated at startup (plan 8g), ported from the
+  HIP port.** It times the run's real first special-q against 2^25/2^26/2^27
+  slabs and keeps the fastest, so the static constant below is a fallback
+  rather than the answer. It reproduces 8c's 2^26 from scratch here, and beats
+  the static default by 3.8% at `--region 12`, where the region-relative
+  target drifts but the hardware's preference does not. Skipped when
+  `--slab-j` is given or the geometry is below the trigger — which is also why
+  `cofcheck.sh` is undisturbed.
+
+  **THE BOINC HAZARD IS REAL AND IS GATED.** A calibration band is one q, which
+  reads as 1/1 = 100% done, clamps to 0.99, and — because BOINC reports must be
+  nondecreasing — becomes the floor for the whole workunit. The HIP port
+  shipped that; volunteers saw tasks pinned at 99% for hours.
+  `bench_boinc_progress_suspend()` drops those reports **before** the
+  high-water mark, and `make -f Makefile.metal boinccheck` proves it — with a
+  control that reproduces the bug, in its own process, because the mark is a
+  static with no reset. `HAVE_BOINC` defaults to 0, so that path is compiled
+  out of every ordinary build and NOTHING else in the tree can reach it. That
+  is exactly how it reached the field. Do not delete that gate.
+
   **Slab sizing was the one real win: 8 slabs instead of 2, -44% on the
   sieve.** `slab.h`'s target is in bucket *regions*, so this build's
   `--region 13` silently quartered CUDA's intent; `SLAB_PERF_REGIONS` is now
@@ -353,6 +373,9 @@ adopt it" and "accept a divergent relation set". See the plan's Phase 7.
 **The ledger lives in `bench/METAL_PORT_PLAN.md` section 9, and only there.**
 A copy of it used to sit here and had already drifted to "none yet" while the
 plan carried two rows — precisely the failure the ledger rule exists to catch,
-committed by the ledger itself. Three rows as of 2026-09-14: `cofcheck.sh`
+committed by the ledger itself. Five rows as of 2026-09-15: `cofcheck.sh`
 (`head -c -1`), `fbgpucheck.sh` (`sha256sum`), `slab.h` (`SLAB_PERF_REGIONS`
-made overridable, default unchanged). Add new rows there.
+made overridable, default unchanged), `runlog.c`/`.h` (`g_runlog_quiet`) and
+`boinc_support.cpp`/`bench.h` (`bench_boinc_progress_suspend`). The last two
+are ports from `hip-port` and are inert unless called, which only the Metal
+build does. Add new rows there.
