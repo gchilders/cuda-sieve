@@ -200,9 +200,25 @@ inline mtlError_t mtl_launch(const char *kernel, mtlStream_t s, unsigned grid,
     return mtl_launch_end();
 }
 
+/* Same, but the kernel name is an expression rather than a token. Needed
+ * where a launch sits inside a function templated on the very parameter that
+ * selects the instantiation -- cf_run_rounds<L> launching k_cofac<L,M,S> --
+ * so the name cannot be formed textually at all. */
+#define MTL_LAUNCH_NAMED(kname, grid, block, smem, stream, ...) \
+    mtl_launch((kname), (stream), (unsigned)(grid), (unsigned)(block), (size_t)(smem), __VA_ARGS__)
+
 /* k_foo<<<g, b, smem, stream>>>(a, b, c)  ->  MTL_LAUNCH(k_foo, g, b, smem, stream, a, b, c) */
 #define MTL_LAUNCH(kern, grid, block, smem, stream, ...) \
     mtl_launch(#kern, (stream), (unsigned)(grid), (unsigned)(block), (size_t)(smem), __VA_ARGS__)
+
+/* CUDA ships a templated cudaMalloc overload so callers can write
+ * cudaMalloc(&typed_ptr, n) without a cast, and the ported code relies on it.
+ * Mirror it rather than editing every call site. */
+template <class T>
+inline mtlError_t mtlMalloc(T **p, size_t n) { return mtlMalloc((void **)p, n); }
+template <class T>
+inline mtlError_t mtlHostAlloc(T **p, size_t n, unsigned f)
+{ return mtlHostAlloc((void **)p, n, f); }
 
 /* cudaEventRecord(e) defaults to the legacy default stream. */
 inline mtlError_t mtlEventRecord(mtlEvent_t e) { return mtlEventRecordOn(e, 0); }

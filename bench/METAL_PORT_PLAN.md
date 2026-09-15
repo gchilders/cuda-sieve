@@ -663,15 +663,56 @@ granted for a resource, persists within the process** — so the control now
 runs FIRST, before anything makes those buffers resident. A control that
 passes for the wrong reason is worse than none.
 
+**6b. The cofactoriser runs and hits the golden number.**
+`make -f Makefile.metal cofaccheck` — `run_cofac()` on the oracle's own
+candidate list for the parity special-q, **37 relations in all four
+configurations**: rho and ECM, at 3-limb and 4-limb cofactor width. 37 is the
+count `cofcheck.sh` pins and the count las itself finds at this q.
+
+`metal/cofac.metal` (11 kernels: six `k_cofac` instantiations, two compaction
+kernels, and the three-pass scan `cf_run_rounds` borrows from `td.cuh`) and
+`metal/cofac_metal.cpp` (the host driver). Four things had to change beyond
+renaming:
+
+- **`goto` is rejected by MSL outright.** `mz_rho`'s `goto found` became a
+  flag and two breaks — the same control flow, since the outer loop is
+  `for (;;)` and exits only by `return` or that jump.
+- **`__CUDACC__` hid the entire host driver**, exactly as the HIP port's
+  ledger warns. `cofac.cuh` wraps its GPU host half — `run_cofac` included —
+  in `#if defined(__CUDACC__)`; compiled as ordinary C++ that block vanishes,
+  so the file built with **zero errors** and then failed to link. The two
+  guards want opposite treatment: the `CF_FN`/`CF_HD` block needs the
+  *non*-CUDA branch (host wants `static inline`, not `__device__`), every
+  other guard needs enabling.
+- **A launch whose instantiation is a template parameter.** `cf_run_rounds<L>`
+  launches `k_cofac<L, METHOD, STAGE2>`, so the mangled name cannot be formed
+  textually at all — the naive rewrite produced `"k_cofac_L_0_0"`. Selected at
+  run time from `L` via `MTL_LAUNCH_NAMED`, which is what the CUDA compiler
+  was doing at compile time.
+- **By-value struct kernel parameters.** `mz<L> lim2` is the kernel's own copy
+  in CUDA but arrives as a `constant` reference in MSL, which the body then
+  cannot take the address of. The wrapper gives the body back a thread-local
+  copy under the original name.
+
+The oracle file is a candidate list (`a b cof0 cof1`) while `run_cofac` parses
+`mkcofbatch`'s batch format, so the harness converts, following the sign
+convention `mkcofbatch.c` documents (negative exactly when bits exceed that
+side's lpb). The factor lists are left **empty**, so every prime below `lim`
+has to come out of the split — a harder test than the pipeline's own path,
+not an easier one.
+
 **Still to do for this phase:**
-- `td.cuh` device code (14 kernels) including the soft-fp64 `cof_classify`,
-  and deleting the two helpers `bench_kernels.metal` currently duplicates
-  from it (`td_mod_magic`, `SS_KSHIFT` — noted there as a single source of
-  truth that must not stay duplicated).
-- `cofac.cuh` device code (9 kernels, the `mz<L>` Montgomery arithmetic, rho
-  and ECM), plus the `cofq_t` argument buffer now that the mechanism is proven.
-- The host halves, and then `pipeline.cuh` and `bench_main.cu`, which
-  `cofcheck.sh` needs because it drives `./bench --pipeline`.
+- `td.cuh` device code (14 kernels) including the soft-fp64 `cof_classify`.
+  **Three duplications are outstanding and will rot if left**:
+  `bench_kernels.metal`'s copies of `td_mod_magic` and `SS_KSHIFT`, and
+  `cofac_metal.cpp`'s copies of `TD_SCAN_BLK` and `TD_FMAX`. Forking `td.cuh`
+  properly deletes all four.
+- The inline-queue kernels the pipeline needs but `run_cofac` does not:
+  `k_cof_enqueue` (with the `cofq_t` argument buffer, mechanism proven in 6a),
+  `k_cof_gate`, `k_cof_status_hist`, `k_rel_flags`, `k_rel_gather`,
+  `k_rel_pack`. The generator already reports these as unported.
+- `pipeline.cuh` and `bench_main.cu`, which `cofcheck.sh` needs because it
+  drives `./bench --pipeline`.
 
 **An intermediate gate exists and should be used first:** `run_cofac()`
 (`cofac.cuh:2728`) is a standalone cofactorisation entry point that reads a
