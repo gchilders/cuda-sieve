@@ -28,6 +28,7 @@
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
 #import <IOKit/IOKitLib.h>
+#include <mach-o/dyld.h>
 
 #include "metal_rt.h"
 
@@ -77,6 +78,18 @@ unsigned                     g_bind_grid = 0, g_bind_block = 0;
 mtlError_t                   g_bind_error = mtlSuccess;
 
 inline mtlError_t fail(mtlError_t e) { g_last_error = e; return e; }
+
+/* Ported code calls mtlSetDevice / mtlMalloc exactly where the CUDA original
+ * called cudaSetDevice / cudaMalloc, and never calls an init function -- CUDA
+ * has none. So the shim initialises itself on first use, finding the shader
+ * library next to the executable (CUDA_SIEVE_METALLIB overrides). Keeping the
+ * ported call sequence identical to CUDA's is worth more than an explicit
+ * init, because every deviation is a place a port can silently drift. */
+mtlError_t ensure_init_locked(void);
+
+struct AutoInit {
+    AutoInit() { }
+};
 
 Stream *resolve(mtlStream_t s)
 { return s ? (Stream *)s : &g_default; }
@@ -223,16 +236,24 @@ id<MTLComputePipelineState> pso_for(const char *name)
 
 /* ------------------------------------------------------------ lifecycle -- */
 
-extern "C" mtlError_t mtlInit(const char *metallib_path)
+static mtlError_t init_locked(const char *metallib_path)
 {
-    std::lock_guard<std::mutex> lk(g_lock);
     if (g_dev) return mtlSuccess;
     g_dev = MTLCreateSystemDefaultDevice();
     if (!g_dev) return fail(mtlErrorInitialization);
 
     NSError *err = nil;
-    NSString *path = metallib_path ? [NSString stringWithUTF8String:metallib_path]
-                                   : @"bench.metallib";
+    NSString *path;
+    if (metallib_path) {
+        path = [NSString stringWithUTF8String:metallib_path];
+    } else if (const char *env = getenv("CUDA_SIEVE_METALLIB")) {
+        path = [NSString stringWithUTF8String:env];
+    } else {
+        char buf[4096]; uint32_t sz = sizeof buf;
+        if (_NSGetExecutablePath(buf, &sz) != 0) buf[0] = 0;
+        NSString *dir = [[NSString stringWithUTF8String:buf] stringByDeletingLastPathComponent];
+        path = [dir stringByAppendingPathComponent:@"bench.metallib"];
+    }
     g_lib = [g_dev newLibraryWithURL:[NSURL fileURLWithPath:path] error:&err];
     if (!g_lib) {
         fprintf(stderr, "metal_rt: cannot load shader library '%s': %s\n",
@@ -242,6 +263,20 @@ extern "C" mtlError_t mtlInit(const char *metallib_path)
     g_default.q = [g_dev newCommandQueue];
     g_core_count = query_core_count();
     return mtlSuccess;
+}
+
+extern "C" mtlError_t mtlInit(const char *metallib_path)
+{
+    std::lock_guard<std::mutex> lk(g_lock);
+    return init_locked(metallib_path);
+}
+
+namespace {
+mtlError_t ensure_init_locked(void)
+{
+    if (g_dev) return mtlSuccess;
+    return init_locked(nullptr);
+}
 }
 
 extern "C" void mtlShutdown(void)
@@ -262,6 +297,7 @@ extern "C" mtlError_t mtlGetDeviceCount(int *n) { if (n) *n = g_dev ? 1 : 0; ret
 
 extern "C" mtlError_t mtlGetDeviceProperties(mtlDeviceProp *p, int dev)
 {
+    { std::lock_guard<std::mutex> _lk(g_lock); mtlError_t _e = ensure_init_locked(); if (_e != mtlSuccess) return _e; }
     if (!p || dev != 0 || !g_dev) return fail(mtlErrorInvalidValue);
     memset(p, 0, sizeof *p);
     snprintf(p->name, sizeof p->name, "%s", g_dev.name.UTF8String);
@@ -280,6 +316,7 @@ extern "C" mtlError_t mtlGetDeviceProperties(mtlDeviceProp *p, int dev)
 
 extern "C" mtlError_t mtlMemGetInfo(size_t *freeB, size_t *totalB)
 {
+    { std::lock_guard<std::mutex> _lk(g_lock); mtlError_t _e = ensure_init_locked(); if (_e != mtlSuccess) return _e; }
     if (!g_dev) return fail(mtlErrorInitialization);
     size_t total = (size_t)g_dev.recommendedMaxWorkingSetSize;
     size_t used  = (size_t)g_dev.currentAllocatedSize;
@@ -291,7 +328,11 @@ extern "C" mtlError_t mtlMemGetInfo(size_t *freeB, size_t *totalB)
 /* --------------------------------------------------------------- memory -- */
 
 extern "C" mtlError_t mtlMalloc(void **p, size_t n)
-{ std::lock_guard<std::mutex> lk(g_lock); return alloc_shared(p, n); }
+{
+    std::lock_guard<std::mutex> lk(g_lock);
+    mtlError_t e = ensure_init_locked();
+    return e == mtlSuccess ? alloc_shared(p, n) : e;
+}
 
 extern "C" mtlError_t mtlFree(void *p)
 {
@@ -304,7 +345,11 @@ extern "C" mtlError_t mtlFree(void *p)
  * host allocations with buffers too means a staging pointer can be bound
  * directly if a kernel ever wants it, and keeps one free path. */
 extern "C" mtlError_t mtlHostAlloc(void **p, size_t n, unsigned)
-{ std::lock_guard<std::mutex> lk(g_lock); return alloc_shared(p, n); }
+{
+    std::lock_guard<std::mutex> lk(g_lock);
+    mtlError_t e = ensure_init_locked();
+    return e == mtlSuccess ? alloc_shared(p, n) : e;
+}
 
 extern "C" mtlError_t mtlFreeHost(void *p) { return mtlFree(p); }
 
@@ -363,6 +408,7 @@ extern "C" mtlError_t mtlMemcpyToSymbol(const char *name, const void *src,
 {
     if (!name || !src) return fail(mtlErrorInvalidValue);
     std::lock_guard<std::mutex> lk(g_lock);
+    { mtlError_t _e = ensure_init_locked(); if (_e != mtlSuccess) return _e; }
     auto it = g_symbols.find(name);
     void *dst = nullptr;
     if (it == g_symbols.end()) {
@@ -391,6 +437,7 @@ extern "C" void *mtlGetSymbol(const char *name)
 
 extern "C" mtlError_t mtlStreamCreate(mtlStream_t *s)
 {
+    { std::lock_guard<std::mutex> _lk(g_lock); mtlError_t _e = ensure_init_locked(); if (_e != mtlSuccess) return _e; }
     if (!s) return fail(mtlErrorInvalidValue);
     std::lock_guard<std::mutex> lk(g_lock);
     Stream *st = new Stream();
@@ -426,6 +473,7 @@ struct mtlEventOpaque {
 
 extern "C" mtlError_t mtlEventCreate(mtlEvent_t *e)
 {
+    { std::lock_guard<std::mutex> _lk(g_lock); mtlError_t _e = ensure_init_locked(); if (_e != mtlSuccess) return _e; }
     if (!e) return fail(mtlErrorInvalidValue);
     std::lock_guard<std::mutex> lk(g_lock);
     mtlEventOpaque *ev = new mtlEventOpaque();
@@ -555,6 +603,7 @@ extern "C" mtlError_t mtl_launch_begin(const char *kernel, mtlStream_t s,
                                        unsigned grid, unsigned block, size_t smem)
 {
     g_lock.lock();
+    if (ensure_init_locked() != mtlSuccess) { g_lock.unlock(); return fail(mtlErrorInitialization); }
     id<MTLComputePipelineState> pso = pso_for(kernel);
     if (!pso) {
         fprintf(stderr, "metal_rt: no kernel named '%s' in the shader library\n", kernel);
