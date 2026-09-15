@@ -26,6 +26,7 @@
 /* 1.0 as a binary64 bit pattern. */
 #define SF_ONE_D ((sf64)0x3ff0000000000000ul)
 #include "plattice_msl.h"
+#include "td_msl.h"
 
 #define BENCH_MAX_DEGREE 8
 #define BENCH_NCOEFF (BENCH_MAX_DEGREE + 1)
@@ -52,25 +53,9 @@ typedef struct {
     long    a0, a1, b0, b1;
 } norm_t;
 
-/* Two helpers the sieve path reaches into td.cuh for. Copied rather than
- * pulling in all of td.cuh, which is Phase 6's work and drags in bigint/prp:
- *
- *  - td_mod_magic (td.cuh:102) is the division-free modulo the small-prime
- *    line sieve runs ~3e9 times; the CUDA version branches on __CUDA_ARCH__
- *    to pick __umulhi, and mulhi is that same instruction here.
- *  - SS_KSHIFT (td.cuh:159) is described there as "the single source of truth
- *    for the bias shift", read by both ss_first on the device and
- *    ss_magic_build on the host. Duplicating a single source of truth is
- *    exactly the sort of thing that rots, so Phase 6 should include td.cuh
- *    properly and delete these two.
- */
-static inline uint32_t td_mod_magic(uint32_t w, uint32_t m,
-                                    uint32_t magic, uint32_t sh)
-{
-    uint32_t q = mulhi(w, magic) >> sh;
-    return w - q * m;
-}
-#define SS_KSHIFT(logI)  ((uint32_t)((logI) - 2))
+/* td_mod_magic and SS_KSHIFT now come from td.metal, which forks td.cuh
+ * properly. They used to be copied in here, which duplicated what td.cuh
+ * itself calls "the single source of truth for the bias shift". */
 
 /* norm_t crosses the host/device boundary BY VALUE, and MSL's `double`-free
  * substitution for its two fp64 members means the layout is reconstructed
