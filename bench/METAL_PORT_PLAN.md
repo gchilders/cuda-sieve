@@ -984,6 +984,62 @@ decides whether it is *necessary*, and how much moves if it is adopted.
 **Gate:** a recorded number — cells flipped, relations gained/lost — and a
 decision justified by it, not by this paragraph.
 
+## PHASE 7 IS DONE. The relations are BYTE-IDENTICAL to the CUDA build.
+
+Run against a real NVIDIA GPU, which this project has access to after all: a
+**GTX 1080 Ti (sm_61, driver 580.178.04)** in an NRP/Nautilus k8s pod on
+`nvidia/cuda:12.8.1-devel-ubuntu22.04`, nvcc 12.8.93, building `main` at
+`3e15fec` with `GPU_ARCH=61` -- the same environment and one of the same cards
+the HIP port used for its own differential checks.
+
+**The inputs are identical before anything is compared.** The pod generated
+`c183.fb1` from `c183.poly` with `fbgen --lim 134200000 --maxbits 15` and it
+hashes `b4534cb6a0bbfc218cd8d9e3fd9d9f8f9f8d11227788161fb90563192a3a4cf4` --
+the manifest's hash for the canonical file. Both builds sieve the same
+7,602,601-prime factor base.
+
+**288 special-q, two comparisons, both byte-identical:**
+
+| | CUDA, GTX 1080 Ti | Metal, M3 | relations |
+|---|---|---|---|
+| **A. matched settings** | region 13, 12c x 4r | region 13, 12c x 4r | **13,485, `cmp` clean** |
+| **B. each at its OWN defaults** | region **14**, 12c x 4r, 168 blocks | region **13**, derived **2c x 24r**, 512 blocks, 4 auto-calibrated slabs | **13,485, `cmp` clean** |
+
+B is the result that matters. The two builds disagree about the bucket region,
+the cofactor grid, the slab plan, the launch geometry and the curve schedule --
+every default this port changed, all at once -- and they emit the same
+13,485 relations in the same order, byte for byte. 564,696 records enqueued on
+both; side 0 split/dead/stuck 477,071 / 87,625 / 0 on both.
+
+One diagnostic differs and it is not platform: side 1 `dead`/`stuck` is
+550,145 / 260 on CUDA and 550,176 / 229 on Metal -- the same +31/-31 that 8o
+measured between 12x4 and 2x24 **on Metal alone**. It tracks the curve
+schedule, and neither number is a relation.
+
+### The log2 decision, settled by measurement
+
+Phase 2 flagged `metal::log2` as differing from host `log2f` on 50.03% of
+inputs by up to 3 ULP and framed a choice between adopting `pl_log2f` on both
+builds or accepting a divergent relation set. **Neither is needed.** The
+divergence does not reach a relation: 0 of 4,194,304 cells differed in Phase 5,
+and now 0 of 13,485 relations differ over 288 special-q against the real CUDA
+build. Option 1 (`-DNORM_PORTABLE_LOG2` on both) remains available as insurance
+against a future toolkit or vendor, and would cost a CUDA-side change and a
+re-pin of `cofcheck.sh`; on this evidence it is not a fix for anything
+currently broken. **Recommended: do nothing, and keep this measurement as the
+reason.**
+
+The same run retires the other two open worries by construction: the
+`log_region 13 vs 14` difference moves no relation (it is comparison B), and
+neither does soft-fp64 in `cof_classify`, nor any of the 84 kernels.
+
+**Caveat, stated because the gate is only as wide as what it ran.** One card
+(sm_61), one composite (c183), one band (288 q from 120000053), at
+B1 2000 / B2 60000 with `lpb 31/32`. The HIP port's experience is that sm_61,
+sm_75 and sm_86 agree with each other, so card-to-card risk is low, but this
+does not prove byte-identity at another geometry -- notably logI 16, which
+CLAUDE.md already flags as differentially untested on CUDA too.
+
 **Largely answered already, by Phase 6's gate.** `cofcheck.sh` pins ~25
 relation counts **derived from the CUDA build**, and the Metal build matches
 every one of them: 7, 37, 36, 59, 66, and the rest, across rho and ECM, both
