@@ -245,6 +245,16 @@ call site cannot do one and forget the other.
   broken. The same run retires the region-13-vs-14 worry (that IS comparison B)
   and soft-fp64 in `cof_classify`.
 
+  **SPEED, same band, same settings, same relations: 1080 Ti 204.1 s vs M3
+  328.0 s — the card 1.61x faster.** Per stage (ms/q, CUDA vs Metal):
+  transform 8.5/34.2, **fill 212.1/153.9 — METAL FASTER**, apply 102.5/372.7,
+  TD 17.9/125.6 (**7.03x, the weak spot**), algebraic queue 266.8/285.4,
+  **cofactor device 318.3/349.7 — 1.10x, essentially parity**. The cofactor
+  stage converging confirms 8h from the other side: it is latency-bound on one
+  ECM chain, so cores and bandwidth buy almost nothing. `fill` wins on UMA.
+  **TD is where the remaining Metal headroom is** — it was never tuned, and it
+  is 2.6% of CUDA's wall against 11.2% of Metal's.
+
   **Caveat:** one card, one composite, one band, at B1 2000/B2 60000 and
   lpb 31/32. Does not prove byte-identity at logI 16, which CLAUDE.md already
   flags as differentially untested on CUDA too.
