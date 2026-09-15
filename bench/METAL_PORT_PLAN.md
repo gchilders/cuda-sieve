@@ -1666,11 +1666,62 @@ hand-tune this". That sweep ran at `--nq 1`, where 1,852 records leave even a
 is worth 10.9% of wall. Flatness measured on a starved stage says nothing
 about the stage when fed.
 
-**Recommended, not yet applied:** size the Metal cofactor grid from the work
-rather than the core count -- `blocks * threads >= CQ_FLUSH` -- which at the
-default 256 threads means `blocks >= 512`. Left as a recommendation because it
-changes a default that interacts with watchdog safety, and that is the user's
-call rather than a tuning pass's.
+#### The rule is a threshold, not a slope
+
+`CQ_FLUSH` is the queue's **capacity**, so a flush never exceeds 131,072
+records -- `--nq 72`'s 140,363 is the band's cumulative total, one full flush
+plus a 9,291-record remainder. That makes the target exact: one record per
+thread for a full flush is `131072 / 256` = **512 blocks**. Measured at
+`--nq 72`, with every stage `--blocks` feeds:
+
+| `--blocks` | transform | TD | classify | algebraic | cofac/q | wall/q |
+|---|---|---|---|---|---|---|
+| 60 (default) | 74.1 | 114.7 | 34.7 | 449.6 | 495.0 | 1291.3 |
+| 288 | 50.5 | 132.9 | 24.8 | 335.8 | 369.8 | 1080.8 |
+| **512** | 60.7 | **131.7** | 19.7 | **322.2** | **357.0** | **1067.5** |
+| 576 | 53.2 | 133.4 | 18.1 | 321.8 | 356.5 | 1066.1 |
+
+3,385 relations at every point. **512 and 576 are indistinguishable** (321.8
+vs 322.2 ms), and 1152 was slightly *worse* in the previous table. So this is a
+threshold and not a curve: clear `CQ_FLUSH` and you are done, and threads
+beyond the record count buy nothing because there are no more records to give
+them. (These absolute numbers run slightly higher than the previous table's --
+same machine, later in a long session, fanless. Compare within a sweep, not
+across them.)
+
+**The trade-off it exposes, stated honestly:** `blocks` is a shared knob, and
+**TD gets ~15% worse** (114.7 -> 131.7 ms) because TD prefers a smaller grid.
+It is swamped -- the cofactor stage gives back 127 ms against TD's 17 -- so
+wall falls 17.3%. But it is a real regression in one stage, not a free win.
+
+#### Recommended, not yet applied
+
+A **per-core multiplier is the wrong shape for this**. Reaching 512 on a
+10-core M3 needs `x 51`; that same multiplier gives a 40-core M3 Max 2,048
+blocks and 524,288 threads, four times a full flush, past the point where 1152
+already measured slightly worse. The work is fixed at 131,072 records while
+Apple core counts vary by 8x, so no single multiplier fits the range.
+
+Size it from the work, keeping the core-count rule as a floor:
+
+```c
+auto_blocks = max(multiProcessorCount * 6,           /* the old rule */
+                  (CQ_FLUSH + threads - 1) / threads); /* one record/thread */
+```
+
+10-core M3 -> `max(60, 512)` = 512. 40-core M3 Max -> `max(240, 512)` = 512. A
+hypothetical 128-core part -> `max(768, 512)` = 768, where the core term takes
+over. Must use the live `threads`, not a literal 256, since `--threads` moves.
+
+**The caveat that makes this the user's call, not a tuning pass's.** Auto
+chunking clamps to `cof_chunk_floor()` = `blocks * threads` as a hard lower
+bound, so a grid at or above `CQ_FLUSH` means **subdivision can never engage
+again** -- by construction, on every Apple GPU. On this M3 that is measured to
+be right and is also the *shortest* possible launch. On an **M1**, which this
+port has never run on at all (5.1a), it removes a watchdog protection whose
+value there is unmeasured. Either decouple the chunk floor from the grid so
+`COF_CHUNK_TARGET_MS` can still subdivide, or accept that Apple parts take the
+"large device, one slice" path the CUDA design already grants a 4090.
 
 **Measured on a 10-core M3 in a fanless MacBook Air that also drives the
 display.**
