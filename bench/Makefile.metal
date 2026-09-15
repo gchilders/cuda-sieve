@@ -173,6 +173,26 @@ fbcheck: $(BUILD)/fbgen_gpu fbgen
 	@CUDA_SIEVE_METALLIB=$(CURDIR)/$(BUILD)/bench.metallib sh fbgpucheck.sh; \
 	  rc=$$?; rm -f ./fbgen_gpu; exit $$rc
 
+# ---- BOINC progress gate: the calibration pass must not pin the counter ---
+# HAVE_BOINC defaults to 0, so the fraction-done path is compiled OUT of every
+# ordinary build and no other test in the tree can reach it. This builds it
+# with -DHAVE_BOINC against a stub client API and drives it directly. The
+# CONTROL case runs first and must REPRODUCE the field bug -- a gate whose
+# control cannot fail proves nothing.
+BOINC_GATE_OBJ := $(BUILD)/boinc_progress_test
+
+boinccheck: | $(BUILD)
+	$(CXX) $(HOSTFLAGS) -DHAVE_BOINC -I metal/boinc_stub \
+	    metal/boinc_progress_test.cpp metal/boinc_stub/boinc_stub.cpp \
+	    boinc_support.cpp -o $(BOINC_GATE_OBJ)
+	@echo "== control: WITHOUT the suspend, does the bug still exist? =="
+	@$(BOINC_GATE_OBJ) control
+	@echo
+	@echo "== gate: WITH the suspend =="
+	@$(BOINC_GATE_OBJ) suspended
+	@echo
+	@echo "BOINC PROGRESS GATE: PASS"
+
 # ---- Phase 5 gate: the sieve against the tree's own CPU ground truth -----
 
 SIEVE_CPUOBJ := verify_cpu.o fbgen_lib.o fb_load.o fb_cado.o poly.o primes.o \

@@ -1428,6 +1428,112 @@ timing is not a measurement.**
 **Measured on a 10-core M3 in a fanless MacBook Air that also drives the
 display.**
 
+### 8g. Slab auto-calibration, ported from the HIP port
+
+8c set `SLAB_PERF_REGIONS` to 8192 from a sweep on **one** machine. The HIP
+port faced the same problem and solved it better than a constant: probe the
+hardware in front of you at startup. Ported here from `pipeline_hip.cuh`
+(commits `d3d9e7d`, `3483e17`, `eb72ede`, `3b7498a`).
+
+**What it does.** Before the real band, time the run's actual first special-q
+against three candidate slab sizes and keep the fastest. Costs one extra
+special-q at startup, negligible against a run measured in hours. Skipped
+when `--slab-j` is given (a regression knob auto-tuning must not override) or
+when the geometry is below the slabbing trigger -- **both confirmed, and they
+are why the existing gates are undisturbed: `cofcheck.sh`'s geometries sit
+below the trigger, so calibration never runs there.**
+
+**Candidates are one octave below the HIP port's.** It probes
+{2^27, 2^28, 2^29} because gfx1103 measured 2^27; this probes
+{2^25, 2^26, 2^27} because 8c measured 2^26 here. The measured winner is the
+*interior* point, which is what lets a three-point probe confirm or move it --
+the HIP list has its winner at the boundary.
+
+**It reproduces 8c's answer from scratch**, which is the validation that
+matters:
+
+| candidate | 2^25 (1024 rows) | **2^26 (2048)** | 2^27 (4096) |
+|---|---|---|---|
+| probe time | 961.6 ms | **800.8 ms** | 904.4 ms |
+
+Same bracketed interior minimum, same winner, arrived at independently of the
+static constant.
+
+**Where it earns its keep is where the static default is wrong.** The static
+target is region-relative (`SLAB_PERF_REGIONS << log_region`), so it drifts
+with `--region` while the hardware's preference does not:
+
+| `--region 12` | rows/slab | slabs | sieve, both sides |
+|---|---|---|---|
+| static default (`8192 << 12` = 2^25) | 1024 | 16 | 758.2 ms |
+| **auto-calibrated** | **2048** | **8** | **729.6 ms** |
+
+Calibration finds 2^26 again and is **3.8% faster** than the constant. 37
+relations both ways.
+
+**The absolute-vs-region-relative caveat is inherited and real.** Candidates
+are absolute position counts, measured at `--region 13` only; calibration does
+not re-derive them against a caller's own `--region`. The table above is that
+caveat working *for* us, but it is the same mechanism that would work against
+us on a geometry where the region-relative default happens to be right.
+Flagged, as the HIP port flagged it, rather than silently assumed correct.
+
+#### The BOINC counter, which is the part that bit the HIP port in the field
+
+Calibration runs throwaway bands through the **same** `run_pipeline_impl` that
+reports progress. With one q in and one q retired that reads as 1/1 -- clamped
+to 0.99 and, because BOINC reports must be nondecreasing, **0.99 becomes the
+floor for the entire workunit**. The field symptom was a task pinned at 99%
+within seconds of starting and staying there for hours.
+
+Three things now stand between this port and that:
+
+1. `bench_boinc_progress_suspend()` (ported into `boinc_support.cpp`). The
+   guard sits **before** the monotonic high-water mark, not after -- a
+   suspended report must be dropped without advancing the mark, and the
+   difference between those two placements is the whole bug.
+2. `g_runlog_quiet` (ported into `runlog.c`), so a throwaway pass cannot write
+   warnings a reader would attribute to the real run.
+3. **`make -f Makefile.metal boinccheck`**, a new gate.
+
+The gate matters more than it looks, because `HAVE_BOINC` defaults to 0: the
+entire fraction-done path is **compiled out of every ordinary build**, so
+nothing else in the tree can reach it, and this is precisely how the bug
+reached the field in the first place. The gate compiles `boinc_support.cpp`
+with `-DHAVE_BOINC` against a stub client API in `metal/boinc_stub/` and
+drives it directly.
+
+It runs the **control first, in its own process**, and the control must
+*reproduce* the bug:
+
+```
+== control: WITHOUT the suspend ==
+PASS   control: an unsuspended calibration band reports 0.99
+PASS   control: the real band's 0.4% is then swallowed by the 0.99 floor
+PASS   control: so is 50% -- the task is pinned until it truly passes 99%
+== gate: WITH the suspend ==
+PASS   suspended calibration reports never reach BOINC
+PASS   the real band's first report still starts from 0.4%, not 99%
+PASS   and progress keeps advancing normally afterwards
+PASS   monotonicity is preserved -- a backwards report is still dropped
+```
+
+Own process per case for the same reason `argbufcheck` isolates its residency
+control: the high-water mark is a static with no reset -- deliberately, it is
+a per-task invariant -- so a control sharing it with the case it controls
+would prove nothing.
+
+**The status line was also made to stop lying.** It reported the static target
+(`auto target 8192 bucket regions`) even when calibration had overridden it,
+naming a target that did not produce the plan being printed. It now says which
+decided. HIP's `BOINC: slab plan:` stderr line is ported too, gated on there
+having *been* a decision worth reporting, so the below-trigger majority does
+not dilute the fleet aggregate it exists to produce.
+
+**Measured on a 10-core M3 in a fanless MacBook Air that also drives the
+display.** The point of calibration is that this sentence stops mattering.
+
+
 ## 9. Drift ledger — CUDA-side changes made for this port
 
 | date | CUDA file(s) | change | verified how |
@@ -1435,3 +1541,5 @@ display.**
 | 2026-09-14 | `bench/cofcheck.sh` | `head -c -1` (all but the last byte) is a GNU coreutils extension that BSD `head` rejects outright; falls back to `dd` where it is unsupported | Ran on macOS: the case it guards ("unterminated candidate file") passes, and the 43 cases before it were already passing when it aborted the script. No behaviour change where GNU `head` exists — the fallback is only taken when `head -c -1 /dev/null` itself fails. **Not run on Linux**, so "no change there" is by inspection of the probe, not by execution. |
 | 2026-09-14 | `bench/fbgpucheck.sh` | `sha256sum` (coreutils) falls back to `shasum -a 256` where absent, so the same script is the gate on macOS instead of being forked | Ran on macOS: 19/19 cases pass including the publish-guard case that uses the hash. No behaviour change where `sha256sum` exists, which is every Linux box the CUDA build runs on — the fallback is only taken when the command is missing. **Not run on Linux**, so "no change there" is by inspection of a two-branch `command -v` test, not by execution. |
 | 2026-09-14 | `bench/slab.h` | wrapped `#define SLAB_PERF_REGIONS 32768u` in `#ifndef`/`#endif` so a build can override it. **The default is unchanged**: a build that passes no `-D` sees the identical token it saw before. Only the Metal build overrides it, to `8192u`, because its `--region` default of 13 makes CUDA's region *count* mean a quarter of CUDA's slab size in positions -- see section 8c. | `make slabcheck` passes against the edited header. That pass is evidence rather than a tautology because the gate is *sensitive* to this constant: the same `slabtest.cpp` recompiled with `-DSLAB_PERF_REGIONS=8192u` fails on the first pinned row (`plan 0 got jmax=2048 n=2 enabled=1; want 4096/1/0`). The pinned rows do exercise the policy, and they still see 32768. |
+| 2026-09-15 | `bench/runlog.c`, `bench/runlog.h` | added `int g_runlog_quiet` (default 0) and a `if (!g_runlog_quiet)` guard around `runlog_warn`'s **stderr half only**; the log-file half is untouched. Verbatim from `hip-port`. **No CUDA-side code sets it**, so the CUDA build sees an unconditional `0` and identical behaviour. | Compiles clean in the default build (`make runlog.o`, `-Wall -Wextra`). Behaviour unchanged by inspection of a one-line guard on a variable no CUDA translation unit writes; **not exercised on a CUDA build**, since there is no nvcc on this machine. |
+| 2026-09-15 | `bench/boinc_support.cpp`, `bench/bench.h` | added `bench_boinc_progress_suspend(int)` and a `if (progress_suspended) return;` early-out in `bench_boinc_fraction_done`, placed **before** the monotonic high-water mark. Verbatim from `hip-port`. Nothing in the CUDA build calls the setter, so `progress_suspended` is permanently 0 there and the early-out never fires. | `make -f Makefile.metal boinccheck`: compiles `boinc_support.cpp` with `-DHAVE_BOINC` against a stub client API and drives both cases in separate processes. The control, run first, reproduces the HIP port's field bug (task pinned at 99%); the gate shows the suspend prevents it while preserving monotonicity. Also compiles clean both with and without `HAVE_BOINC` (`-Wall -Wextra`). **The real BOINC SDK is not installed here**, so this is verified against a stub, not against a client. |
