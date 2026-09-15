@@ -222,7 +222,34 @@ never reaches `k_cof_enqueue` or `k_rel_pack`; `cofcheck.sh` will be the first
 thing that runs them. Pass such a struct as `mtl_argbuf_t` — it binds the
 buffer and calls `mtlUseResource` on every pointer inside in one step, so a
 call site cannot do one and forget the other.
-- Phase 7 (relation comparison): **largely answered by Phase 6's gate.**
+- **Phase 7 (relation comparison): DONE. The relations are BYTE-IDENTICAL to
+  the CUDA build over 288 special-q.** Run on a real **GTX 1080 Ti (sm_61)** in
+  an NRP/Nautilus k8s pod (`nvidia/cuda:12.8.1-devel-ubuntu22.04`, nvcc
+  12.8.93, `main` at 3e15fec, `GPU_ARCH=61`). The pod regenerated `c183.fb1`
+  to the manifest hash first, so both builds sieve identical input.
+
+  Two comparisons, both `cmp`-clean at 13,485 relations: **(A)** matched
+  settings, and **(B) each build at its OWN defaults** — CUDA region 14 /
+  12c x 4r / 168 blocks against Metal region 13 / derived 2c x 24r / 512
+  blocks / 4 auto-calibrated slabs. **B is the one that matters**: every
+  default this port changed, all at once, and the output is the same bytes in
+  the same order. 564,696 enqueued and side 0 477,071/87,625/0 on both. Side 1
+  dead/stuck differs 550,145/260 vs 550,176/229 — the same ±31 8o measured
+  between 12x4 and 2x24 on Metal ALONE, so it tracks the curve schedule, not
+  the platform, and neither number is a relation.
+
+  **THE log2 DECISION IS SETTLED: do nothing.** Phase 2's 3-ULP divergence
+  reaches no relation — 0 of 4.2M cells in Phase 5, now 0 of 13,485 relations
+  against real CUDA. `-DNORM_PORTABLE_LOG2` on both builds stays available as
+  insurance against a future toolkit or vendor; it fixes nothing currently
+  broken. The same run retires the region-13-vs-14 worry (that IS comparison B)
+  and soft-fp64 in `cof_classify`.
+
+  **Caveat:** one card, one composite, one band, at B1 2000/B2 60000 and
+  lpb 31/32. Does not prove byte-identity at logI 16, which CLAUDE.md already
+  flags as differentially untested on CUDA too.
+
+- Phase 7 background (superseded by the above): **largely answered by Phase 6's gate.**
   `cofcheck.sh` pins ~25 relation counts derived from the CUDA build and the
   Metal build matches every one; the 37 relations at the parity special-q are
   the identical (a,b) set as las's. The 3 ULP `log2` divergence has not moved
