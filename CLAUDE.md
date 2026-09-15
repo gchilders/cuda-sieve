@@ -51,6 +51,15 @@ design decisions:
    3 ULP**, and `precise::log2` is bit-identical to it — the `precise::`
    namespace is not a fix. Measured with `-fno-fast-math` already set.
 
+5. **Apple GPUs flush subnormals to zero.** fp32 `/` and `fma` are otherwise
+   correctly rounded and bit-exact against the host — over 2^20 samples each,
+   **zero** disagreements where neither side was subnormal, and every
+   disagreement that did occur was FTZ. This is what lets `portable_log2.h`
+   use `/` and `fma` directly. It is also a live hazard for `k_apply`'s fp32
+   Horner, whose `s = fabsf(acc)` is deliberately a cancelled quantity; the
+   existing `fmaxf(s, 1e-30f)` clamp and `NORM_CANCEL_TOL` guard look
+   sufficient, but Phase 5 must confirm that rather than inherit it.
+
 Everything else checked out clean: SIMD width 32, `simd_ballot` in ascending
 lane order (so `td.cuh:647` holds), `simd_shuffle_up` matching CUDA,
 `mulhi(ulong,ulong)` exact against `__int128`, templated kernels with
@@ -59,8 +68,20 @@ lane order (so `td.cuh:647` holds), `simd_shuffle_up` matching CUDA,
 
 ## Status
 - **Phase 0 (toolchain + probe): DONE.** Probe sources in `metal-probe/`.
-- Phase 1 (branch + ledger): this commit.
-- Phases 2-9: not started.
+- **Phase 1 (branch + ledger): DONE.**
+- **Phase 2 (portability primitives): DONE, gate green.**
+  `cd bench && make -f Makefile.metal metalcheck` — 6.6M results compared,
+  0 mismatches. `softfp64.h` (IEEE binary64 in integer ops),
+  `portable_log2.h`, `msl_compat.h`, `sf_sites.h`.
+- Phases 3-9: not started. Next is Phase 3, the `metal_rt` runtime shim —
+  the decision the rest of the port's effort hinges on (plan section 6).
+
+**Phase 2 changed a Phase 7 option.** "Portable log2 in the Metal build only"
+is not a real choice: `pl_log2f` differs from the host's `log2f` on 1.02% of
+inputs by up to 3 ULP, the same order as `metal::log2`. A portable log2 is not
+more accurate, it is only *shared* — so it buys nothing for byte-identity
+unless the CUDA build uses it too. Phase 7 now decides between "both builds
+adopt it" and "accept a divergent relation set". See the plan's Phase 7.
 
 ## Drift ledger — CUDA-side changes made for this port
 
