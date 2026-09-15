@@ -1226,7 +1226,16 @@ inside ~20 ms of wall is noise.
 | algebraic queue | 1504.9 | 1574.4 | 1502.9 | 1570.3 | 1519.9 | 1696.2 |
 | **wall** | 3018.7 | 2785.6 | 2559.9 | 2600.6 | **2530.3** | 2761.2 |
 
-**`--blocks`:** flat from 80 upward; the inherited 288 sits in the flat region.
+**`--blocks`:** flat from 80 upward.
+
+> **CORRECTION.** This section said the default was the inherited `48 * 6` =
+> 288. It is not: `bench_main_metal.cpp` sets `cfg.blocks` to
+> `multiProcessorCount * 6` before the pipeline ever sees it, which on a
+> 10-core M3 is **60**, and the `48 * 6` in `pipeline_host.inc` is a fallback
+> that never fires. 60 sits just below where the curve flattens -- the table
+> puts it between 2537 and 2526 ms against 2517 at 288 -- so the real default
+> is worth perhaps 10-20 ms, at the edge of the 0.77% noise band. The
+> conclusion "do not hand-tune this" survives; the stated default was wrong.
 
 | `--blocks` | 10 | 20 | 40 | 80 | 144 | 288 | 576 | 1152 |
 |---|---|---|---|---|---|---|---|---|
@@ -1248,9 +1257,16 @@ knob is not worth 0.75%, and TD, which dominates the three, is already at its
 best value.
 
 **Why the cofactor stage ignores all of this.** The algebraic queue is 1500 ms
-of a 2520 ms wall -- 59%, more than every other stage combined -- and it moves
-by under 2% across a 16x range of threadgroup sizes and a 115x range of
-threadgroup counts. It is not occupancy-bound, so no packing fixes it. 8b's
+of a 2520 ms wall here -- and it moves by under 2% across a 16x range of
+threadgroup sizes and a 115x range of threadgroup counts.
+
+> **CORRECTION (8h).** That 59% share is an artifact of this section's
+> single-q benchmark, not a property of the port. The cross-q queue is built
+> to flush 131,072 records and a one-q band hands it 1,852 -- 1.4% of a batch.
+> At a production band size the cofactor stage is ~39% of wall and slightly
+> *smaller* than the sieve. The geometry-immunity finding below is unaffected
+> and its explanation is the same one that explains the inflation: the stage
+> is starved of records, and launch geometry cannot invent any. See 8h. It is not occupancy-bound, so no packing fixes it. 8b's
 table already says why, read the other way round: dividing the *same* 1,852
 records into more launches costs a near-constant amount per launch.
 
@@ -1532,6 +1548,60 @@ not dilute the fleet aggregate it exists to produce.
 
 **Measured on a 10-core M3 in a fanless MacBook Air that also drives the
 display.** The point of calibration is that this sentence stops mattering.
+
+
+### 8h. The cofactor stage does not dominate. The single-q benchmark does.
+
+Every number in 8a-8g came from a one-special-q band, because that is the
+geometry the parity gate and `cofcheck.sh` pin. For the sieve that is
+harmless -- sieve/q is 527-546 ms whether the band is 1 q or 72. For the
+cofactoriser it is **not**, and it inflated that stage's apparent share by
+nearly 4x.
+
+`cofac.cuh` sets `CQ_FLUSH` to **131,072 candidates per flush, "~67
+special-q"**. The queue is explicitly cross-q: it exists so the cofactoriser
+runs on a batch assembled from many special-q rather than on one q's worth.
+A one-q band hands it **1,852 records -- 1.4% of one intended batch** -- and
+the kernel assigns *one thread per record*, so the grid runs at a few percent
+occupancy and the launch costs what its longest ECM chain costs.
+
+| band | records per flush | cofac/q | sieve/q | wall/q | cofac share |
+|---|---|---|---|---|---|
+| 1 q | 1,852 | 1753 ms | 546 | 2572 | **68%** |
+| 4 q | 7,671 | 535 | 537 | 1273 | 42% |
+| 8 q | 15,555 | 589 | 537 | 1304 | 45% |
+| 24 q | 46,893 | 463 | 527 | 1191 | 39% |
+| **72 q** | **140,363** | **464** | **537** | **1183** | **39%** |
+
+**In steady state the cofactor stage is ~39% of wall and slightly smaller
+than the sieve** (464 vs 537 ms/q). It flattens by about 24 q and does not
+improve further at 72, which is where a full `CQ_FLUSH` batch is reached
+(140,363 records is one in-loop flush plus the final one). Per-q wall is
+**1183 ms against the one-q band's 2572** -- the single-q figure overstates
+the real cost of a q by 2.2x, essentially all of it in this one stage.
+
+So the ordering to carry forward is sieve first, cofactoriser second, and the
+"more than every other stage combined" framing in 8d was measuring the
+benchmark rather than the port.
+
+**What this does not change: 8d's geometry-immunity result.** The stage is
+insensitive to `--threads` and `--blocks` because the number of *active*
+threads is the record count, which no launch geometry can alter. That is the
+same fact that makes a one-q band so slow, seen from the other side. It also
+means 8b's `--cof-chunk` penalty was measured in the regime where chunking is
+most obviously harmful -- chunking 1,852 records below a
+`blocks * threads` floor of 15,360 -- and should be re-measured at production
+batch size before its 2x figure is quoted as a general property.
+
+**Method note, which is the durable lesson.** A single-q band is the right
+gate for correctness and the wrong instrument for throughput, and nothing in
+the output says so: the per-q breakdown looks exactly as authoritative at
+`--nq 1` as at `--nq 72`. Any future tuning of a *queued* stage must state its
+band size alongside the machine, exactly as this port already states the
+machine alongside every number.
+
+**Measured on a 10-core M3 in a fanless MacBook Air that also drives the
+display.**
 
 
 ## 9. Drift ledger — CUDA-side changes made for this port
