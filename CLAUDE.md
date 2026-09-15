@@ -173,18 +173,29 @@ threadgroup ceiling is a hard 32 KB with no opt-in tier, and at 14 `k_apply`
 wants 32,896 B — 128 bytes over. `--region` still overrides; the CUDA build is
 untouched.
 
-**13 is a ceiling, not an optimum — bigger is better and we are 128 bytes
-short (plan 8e).** Regions below 13 are monotonically much worse: apply is
+**13 is the measured optimum, and region 14 is no longer refused (plan
+8e/8f).** The 128-byte slice-log copy is gone — `k_apply` reads the table from
+device memory — so region 14 needs exactly 32,768 B and runs. It is *slower*:
+apply ~393 ms against ~342 at region 13. At 14 a threadgroup asks for the
+entire 32 KB budget, so one fits per core, and that occupancy cliff costs more
+than the halved region count saves. `fill`, which has no region-sized
+threadgroup array, does improve at 14 exactly as predicted (136 vs 148 ms) —
+the two halves of the sieve want opposite things and apply is the bigger one.
+Dropping the copy was worth **-4.2% on apply** on its own (three runs each way,
+non-overlapping ranges), and the host-side length now has ONE definition,
+`mtl_apply_smem()` in `metal_rt.h`, because three copies of it existed and a
+threadgroup length that disagrees with the kernel is a wrong answer, not a
+compile error.
+
+**Below 13 everything is worse (plan 8e).** Regions below 13 are monotonically much worse: apply is
 349.6 ms at 13 and 1497.8 at 10, fitting `182.3 ms + 20.07 us per region`
 with residuals under 4 ms. Each bucket region costs ~20 us of fixed overhead,
 so halving the region doubles how often that is paid; freeing threadgroup
 memory buys nothing. **Do not lower `--region` looking for occupancy.** The
-same fit extrapolates region 14 at ~22% off the sieve stage. The 128 bytes
-blocking it are `nslice_pow2 * 2`, a read-only table copied into threadgroup
-memory (`bench_kernels_body.metal.inc:538`) from a `device const` pointer the
-kernel already has — an NVIDIA optimisation with no obvious Apple rationale.
-Dropping that copy would make region 14 need exactly 32,768 B, which fits.
-Not attempted; `sievecheck` would falsify it cheaply.
+same fit extrapolates region 14 at ~22% off the sieve stage. That extrapolation was
+tested and **refuted** — see above and plan 8f. The per-region cost is real,
+but the model was fitted entirely below the occupancy cliff and had no term
+for it.
 
 **Two traps this port fell into; do not repeat them.**
 1. `NULL` is `0L` in C++, NOT a pointer. Passed to a binding template it takes

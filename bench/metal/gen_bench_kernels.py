@@ -284,6 +284,33 @@ for c in COUNTERS64:
     body = re.sub(r'device ulong \*( ?)' + c + r'\b', r'device uint32_t *\1' + c, body)
     body = re.sub(r'\batomicAdd\(\s*' + c + r'\s*,', 'atomicAdd64(' + c + ',', body)
 
+# ---- k_apply's slice-log table: keep it in device memory -----------------
+# CUDA copies the 64-entry logp table into shared memory and reads it from
+# there. That is worth doing on NVIDIA, where shared memory is a distinct and
+# much faster pool than global. It is what puts k_apply 128 bytes -- exactly
+# nslice_pow2 * sizeof(uint16_t) -- over Apple's hard 32,768 B threadgroup
+# ceiling at log_region 14, which is the whole reason this build dropped to
+# 13. Plan 8e measured what that costs: each bucket region carries ~20 us of
+# fixed overhead, so halving the region doubles how often it is paid, and 13
+# is 349.6 ms of apply against a predicted ~265 at 14.
+#
+# The table is READ-ONLY after the copy and indexed divergently, so on a UMA
+# part with a unified cache there is no pool to promote it into: `device`
+# reads of 128 hot bytes come out of the same L1. (`constant` would be wrong
+# here -- it is tuned for uniform access, and this index varies per thread.)
+# Dropping the copy makes the requirement exactly 32,768 B at region 14, and
+# the host's check is `>`, so it fits.
+_lut_decl = '    uint16_t *lut = (uint16_t *)(sm + nword);\n'
+_lut_copy = '    for (uint32_t i = tid; i < nslice; i += nth) lut[i] = slice_logp[i];\n'
+assert _lut_decl in body and _lut_copy in body, 'k_apply lut shape changed'
+body = body.replace(_lut_decl, '', 1)
+body = body.replace(_lut_copy, '', 1)
+_n_lut = body.count('lut[')
+assert _n_lut == 1, 'expected exactly one lut read, found %d' % _n_lut
+body = body.replace('lut[', 'slice_logp[')
+print('k_apply: slice-log table left in device memory (-%d B of threadgroup)'
+      % (64 * 2))
+
 # ---- pointer casts inside bodies ----------------------------------------
 # `*(uint16_t *)(out + at)` needs an address space in MSL. `out` is a device
 # buffer everywhere this appears except the one lut cast off shared memory.
