@@ -582,9 +582,60 @@ has the ground truth — `verify_count_updates` (per-region fill counts) and
 `fbgen_gpu` can generate it), set up `qlat_t`/`norm_t`, run
 transform → fill → apply through `metal_rt`, and compare against both.
 
-**Gate (not yet run):** per-region fill counts equal to `verify_count_updates`
-exactly, and zero differing cells against `verify_apply_region` — which is
-also where the `pl_log2f`-vs-libm cell count gets measured for Phase 7.
+**Gate: PASSING — `make -f Makefile.metal sievecheck`.** At logI 13, J 4096,
+`lim` 1,000,000 on `oracle/c183.poly` with the oracle's own special-q
+(q = 120000053, rho = 112625526):
+
+| check | result |
+|---|---|
+| shared struct layout (`norm_t`, `plat_t`) host vs device | agree — 192/192 B, matching member offsets |
+| fill, per region | **all 4,096 regions match the CPU exactly**, 67,071,278 updates |
+| apply, per cell | **all 4,194,304 cells match the CPU exactly** over 512 regions |
+| cells over the survivor threshold | 623,098 on both sides |
+
+`norm_t` crosses the boundary by value and its two fp64 members are
+*reconstructed* on the device rather than shared, so the layout check runs
+first: a silent mismatch would corrupt every norm while still producing
+plausible output.
+
+**The fill reference had to be rewritten, and the reason is a CUDA-tree
+property worth knowing.** `verify_count_updates` walks with
+`pl_first`/`pl_next` — the **32-bit** walk, whose `pl_add32_sat` saturates to
+`UINT32_MAX` (ending the walk) whenever an increment's high word is nonzero.
+`k_fill_atomic` walks with `pl_first64`/`pl_next64`, where the same increment
+wraps and the walk continues. **They are different walks**, and on this factor
+base they disagree by 2.4%: 65,519,535 updates against 67,071,278, differing
+in 4,095 of 4,096 regions.
+
+This was confirmed **on the host, with no GPU involved** — a standalone
+comparison of the two walks over the same lattices differs on 646 moduli,
+321 of which disagree on the very first position. So it is not a Metal defect.
+The gate therefore compares against a 64-bit CPU walk, which the GPU
+reproduces exactly, and reports the 32-bit figure alongside. Whether the CUDA
+build's own `--verify` is affected is a question for the CUDA side and is
+recorded in §10.
+
+### 5a. The Phase 7 log2 question, measured early — and my earlier estimate corrected
+
+**Zero of 4,194,304 cells differ**, with the GPU running `pl_log2f` and the
+CPU reference running libm's `log2f`. Verified that the substitution really
+reaches the kernel (the preprocessed device source calls
+`pl_log2f(fmax(s, 1e-30f))`), so this is a real result and not a silent
+fallback.
+
+Phase 2's note that MSL's `log2` "disagrees on 50.03% of inputs" was correct
+about *the logarithm* and misleading about *the sieve*, and the arithmetic is
+worth writing down. A cell is an integer, `floor(scale * (log2M + log2(s) -
+bias) + 0.5)`. `pl_log2f` differs from libm on ~1% of inputs, and when it does
+the difference is 1-3 ULP of a result of magnitude ~100, i.e. ~1e-5 absolute;
+scaled by 1.925 that is ~3e-5, and it only matters if it straddles a rounding
+boundary. So the expected rate is roughly `0.01 x 3e-5` = **3e-7 per cell** —
+about one cell in three million, not the "tens of thousands per q" my Phase 2
+framing implied. Observing 0 in 4.2M is exactly consistent with that.
+
+This substantially de-risks Phase 7, but does not settle it: it is one
+geometry, the expectation is order-1 rather than 0, and the question that
+actually matters is CUDA-vs-Metal relations, not Metal-vs-libm cells.
 
 ### Phase 6 — Trial division and cofactorisation
 `td.cuh` and `cofac.cuh` device code, including the `cofq_t` argument
@@ -639,6 +690,26 @@ correctness vehicle.
 `Makefile.metal`, metallib embedding, arm64 BOINC.
 
 ---
+
+## 10. Open questions for the CUDA side
+
+Raised by this port, not caused by it. None are Metal bugs and none have been
+changed.
+
+1. **`verify_count_updates` walks in 32 bits; `k_fill_atomic` walks in 64.**
+   `pl_add32_sat` saturates and ends a walk where `pl_next64` wraps and
+   continues, so the two enumerate different position sets — by 2.4% on the
+   c183 factor base at logI 13, differing in 4,095 of 4,096 regions.
+   `bench_kernels.cu:2619`'s `--verify` gate compares exactly these two, and
+   `bench_kernels.cu:2617` says that gate exists because "every placement bug
+   this project has hit had exactly the right total". Either that gate is
+   failing on CUDA too, or it is only ever run at a geometry where the two
+   agree. Worth a look on a box with a card; demonstrated on the host with no
+   GPU at all (646 moduli differ, 321 of them at the first position).
+2. **`verify_apply_region` returns survivors at `cells[c] >= Cinit`** — that
+   is BOUND = 0 — so its return value is not comparable with a run at any
+   other bound. The Phase 5 harness derives both counts from the cell arrays
+   at the threshold actually used instead.
 
 ## 9. Drift ledger — CUDA-side changes made for this port
 
