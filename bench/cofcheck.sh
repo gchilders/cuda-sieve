@@ -28,6 +28,22 @@ fail=0
 # a re-baselined golden number stops catching the bugs it was written for.
 #
 # The policy itself is pinned separately, in its own case below.
+# Which build is this? Checked for EITHER marker and refused outright if
+# neither matches, exactly as the HIP port does and for the same reason: a
+# silent "assume CUDA" would re-enable the --ecm-b1 400000 case below on a
+# build where it takes the whole machine down.
+HELP_OUT=$(./bench --help 2>&1) || true
+if printf '%s' "$HELP_OUT" | grep -q 'select Metal device'; then
+    IS_METAL=1
+elif printf '%s' "$HELP_OUT" | grep -q 'select CUDA device'; then
+    IS_METAL=0
+else
+    echo "cofcheck: cannot tell which build this is from --help; refusing to" >&2
+    echo "  guess, because the --ecm-b1 400000 case is machine-crashing on" >&2
+    echo "  Metal and harmless on CUDA." >&2
+    exit 2
+fi
+
 PIN="--allowance 101.6 --allowance0 68.1"
 run() { ./bench --pipeline --cadofb $FB --poly $POLY --qrange 120000053:120000053 $PIN "$@" 2>&1; }
 
@@ -98,7 +114,24 @@ else
 fi
 # ...and a B1 near the top of its own documented range must not self-refuse by
 # deriving a B2 past the B2 ceiling. --ecm-b1 accepts up to 1000000.
-if run --cofactor --cof-ecm --ecm-b1 400000 --nq 1 --relations $TMP/b1hi.txt \
+#
+# ON METAL THIS IS INVERTED, and it is not a portability nicety. B1=400000
+# derives B2 to 10^7: 320,000 giant steps and 33,860 prime powers, about 15.9 s
+# of work in ONE ECM curve, which at this case's 12 curves/round is a single
+# kernel launch of roughly 190 s. --cof-chunk splits RECORDS and can never make
+# a launch shorter than one curve, so nothing in the port can bound it. On a
+# Mac the GPU also drives the display: this took WindowServer down TWICE, both
+# times ~1m47s into this script, on an otherwise idle machine. The HIP port
+# skips the case (a caught device failure there, not a system crash); this
+# build REFUSES it in cofq_init, so the case asserts the refusal instead.
+if [ "$IS_METAL" = "1" ]; then
+    if run --cofactor --cof-ecm --ecm-b1 400000 --nq 1 2>&1 \
+       | grep -q 'REFUSED -- one ECM curve'; then
+        printf 'PASS   %-34s refused, as Metal must\n' "large B1 with derived B2"
+    else
+        printf 'FAIL   %-34s NOT refused -- this crashes the Mac\n' "large B1 with derived B2"; fail=1
+    fi
+elif run --cofactor --cof-ecm --ecm-b1 400000 --nq 1 --relations $TMP/b1hi.txt \
    >/dev/null 2>&1; then
     printf 'PASS   %-34s accepted\n' "large B1 with derived B2"
 else

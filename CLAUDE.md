@@ -261,6 +261,33 @@ call site cannot do one and forget the other.
   `--region 13` silently quartered CUDA's intent; `SLAB_PERF_REGIONS` is now
   overridable (default unchanged) and set to 8192 here.
 
+  **A LAUNCH-DURATION BOUND IS NOW POLICY: 750 ms (plan 8k).** Set by the
+  user for UI responsiveness as much as watchdog safety.
+  `COF_CHUNK_TARGET_MS` is 750 here, compared against 8k's MEASURED launch
+  (CUDA's 250 is against a whole-side sum -- not comparable). Auto opens at one
+  core-derived grid and descends, with a **no-progress guard** that stops when
+  a halving stops paying, because a bound can be unreachable and chasing one is
+  how 8j's unconditional slowdown comes back.
+
+  **`--cof-chunk` CANNOT bound a launch below one ECM chain.** Measured: launch
+  time is flat at ~1495 ms below 1920 records while cofac/q rises 10x. The
+  lever is `--ecm-curves`, which is PER ROUND: **8 curves x 24 rounds holds
+  740 ms and is 24% FASTER than 48 x 4** (354.6 vs 467.2 ms/q), same 192-curve
+  budget, identical relations. Recommended as job settings, **not** adopted as
+  defaults — it changes which sigmas run (`sigma = c0*1000 + cv + 6`), which
+  `cofac.cuh` warns about explicitly.
+
+  **`--ecm-b1 400000` CRASHED THIS MACHINE TWICE.** WindowServer crash plus
+  userspace watchdog timeout, 1m47s and 1m48s into `cofcheckgate`, same case
+  both times, idle machine. B2 derives to 10^7: 320,000 giant steps, ~15.9 s in
+  ONE curve, ~190 s in one launch. `cofac.cuh`'s own warning block names this
+  configuration and says **cofcheck.sh skips it on HIP** — this port did not,
+  and on Apple silicon the GPU drives the display, so it is a dead session and
+  not a failed task. `cofq_init` now REFUSES above `COF_LAUNCH_REFUSE_MS`
+  (10 s/curve), and `cofcheck.sh` asserts that refusal on Metal. **Do not
+  remove either.** The threshold is a judgement: 3.6 s and 6.9 s launches run
+  fine here, 15.9 s kills the box, and nobody has measured the real line.
+
   **The cofactor grid is now sized from the work (plan 8j):**
   `max(multiProcessorCount * 6, ceil(CQ_FLUSH / threads))` = 512 blocks here,
   and `cof_chunk_floor()` is decoupled from it so subdivision stays reachable
@@ -404,9 +431,11 @@ adopt it" and "accept a divergent relation set". See the plan's Phase 7.
 **The ledger lives in `bench/METAL_PORT_PLAN.md` section 9, and only there.**
 A copy of it used to sit here and had already drifted to "none yet" while the
 plan carried two rows — precisely the failure the ledger rule exists to catch,
-committed by the ledger itself. Five rows as of 2026-09-15: `cofcheck.sh`
+committed by the ledger itself. Six rows as of 2026-09-15: `cofcheck.sh`
 (`head -c -1`), `fbgpucheck.sh` (`sha256sum`), `slab.h` (`SLAB_PERF_REGIONS`
-made overridable, default unchanged), `runlog.c`/`.h` (`g_runlog_quiet`) and
-`boinc_support.cpp`/`bench.h` (`bench_boinc_progress_suspend`). The last two
+made overridable, default unchanged), `runlog.c`/`.h` (`g_runlog_quiet`),
+`boinc_support.cpp`/`bench.h` (`bench_boinc_progress_suspend`), and
+`cofcheck.sh` again (build detection; the `--ecm-b1 400000` case asserts a
+refusal on Metal). The last two
 are ports from `hip-port` and are inert unless called, which only the Metal
 build does. Add new rows there.

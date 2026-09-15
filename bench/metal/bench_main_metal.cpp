@@ -279,7 +279,7 @@ static void usage(void)
 "  --device N       select CUDA device N, used only when the BOINC client did\n"
 "                   not assign one; its assignment wins  [CUDA's default]\n"
 #else
-"  --device N       select CUDA device N  [CUDA's default device]\n"
+"  --device N       select Metal device N  [the system default device]\n"
 #endif
 "  --threads N      threads per block, multiple of 32  [256]\n"
 "  --blocks N       0 = auto (6 per SM)        [0]\n"

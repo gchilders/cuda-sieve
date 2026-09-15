@@ -1807,6 +1807,119 @@ one flag today.
 display.**
 
 
+### 8k. A 750 ms launch bound, and the case that crashed the machine twice
+
+The user set the policy: **no kernel launch longer than about 750 ms**, for UI
+responsiveness as much as watchdog safety, and worth paying ~10% of a stage to
+hold. Finding out whether that was reachable found something worse first.
+
+#### The record axis cannot do it
+
+`--cof-chunk` splits the RECORD list, so the smallest launch it can make is
+one record per thread -- and a launch can never be shorter than **one record's
+own ECM chain**. Measured at `--nq 24`:
+
+| `--cof-chunk` | 15360 | 7680 | 3840 | 1920 | 960 | 480 |
+|---|---|---|---|---|---|---|
+| longest launch | 3567 | 1846 | 1641 | **1495** | 1499 | 1498 |
+| cofac/q | 465 | 592 | 884 | 1522 | 2777 | 4969 |
+
+Flat below ~1920 records: that is one chain at 48 curves. Subdividing past it
+buys nothing and costs everything -- cofac/q rises 10x.
+
+#### The curve axis can, and is free
+
+`--ecm-curves` is **per round**, and each round takes a disjoint sigma block
+(`sigma = c0*1000 + cv + 6`), so the same total curve budget can be spread over
+more, shorter rounds. At B1 2000 / B2 60000, 192 curves either way:
+
+| config | longest launch | cofac/q | relations |
+|---|---|---|---|
+| 48 curves x 4 rounds | 3613 ms | 467.2 | 1114 |
+| 24 x 8 | 1498 ms | 476.9 | 1114 |
+| 16 x 12 | 1164 ms | 392.1 | 1114 |
+| 12 x 16 | 969 ms | 361.2 | 1114 |
+| **8 x 24** | **740 ms** | **354.6** | **1114** |
+
+**The bound is met at 8 curves x 24 rounds, and it is not a 10% sacrifice --
+it is a 24% GAIN** (467.2 -> 354.6 ms/q). Shorter rounds re-compact the live
+list more often, so records that have already split stop occupying threads.
+`--cof-rounds` caps at 24, so at a 192-curve budget 8 x 24 is also the floor of
+this technique; going below ~740 ms would mean cutting the budget, which is a
+yield decision.
+
+**This is a mathematics change, not a tuning one.** `cofac.cuh` says so
+directly -- "a curve sub-range makes a later chunk restart the top composite
+with sigmas that cannot split it" -- so 48x4 and 8x24 try *different* 192-sigma
+sets. Relations were identical at every point above, but that is empirical on
+one band, not structural the way record chunking is. **Recommended as job
+settings, NOT adopted as defaults.**
+
+#### What the auto chunker now does
+
+`COF_CHUNK_TARGET_MS` is 750 on this build, compared against 8k's measured
+launch (not CUDA's 250 against a whole-side sum -- the two are not comparable).
+Auto opens at one core-derived grid of records and walks down. At `--nq 144`:
+
+- **bound reachable** (8 x 24): opens 15,360 -> measures 1194 ms -> 7,680 and
+  settles. cofac/q 265.0, wall 971.9, 6,724 relations.
+- **bound unreachable** (48 x 4): 15,360 -> 7,680 -> 3,840 -> 1,920, each step
+  still buying >10%, and a **no-progress guard** stops the descent when a
+  halving stops paying. Without it the controller subdivides to the floor
+  forever -- the same unconditional slowdown 8j removed, reached from the other
+  side.
+
+#### The crash
+
+**Two WindowServer crashes plus userspace watchdog timeouts, on an otherwise
+idle machine, 1m47s and 1m48s into `cofcheckgate` -- the same case both times.**
+Both gate logs are 14 lines and end identically. The case is:
+
+```
+--ecm-b1 400000        # B2 derives to 10^7
+```
+
+which is **320,000 giant steps and 33,860 prime powers: ~15.9 s of work in ONE
+curve**, and at that case's 12 curves/round a single kernel launch of about
+**190 seconds**. Nothing in the port can bound it -- chunking splits records,
+never the chain.
+
+`cofac.cuh` already knew. Its warning block names this exact configuration as
+"the one configuration observed to actually trip a device watchdog ... and is
+why cofcheck.sh skips that case on HIP". **This port did not skip it.** On
+gfx1103 it is a caught device failure; on Apple silicon the GPU also drives the
+display, so it is not a failed task, it is a dead session.
+
+Two changes, and the second is the one that matters:
+
+1. `cofq_init` now **REFUSES** when one curve's estimated work exceeds
+   `COF_LAUNCH_REFUSE_MS` (10 s), naming the numbers and the knobs. The
+   estimate is ~0.045 ms per (prime power + giant step), calibrated at one
+   curve on this M3: 110 / 370 / 1461 ms at B1 2000 / 8000 / 32000. It refuses
+   rather than silently lowering `--ecm-curves`, because curves-per-round
+   chooses which sigmas run.
+2. `cofcheck.sh` detects the build from `--help` (the Metal build now says
+   "select Metal device", mirroring HIP's marker) and **inverts that one case
+   on Metal**: it asserts the refusal instead of asserting acceptance. Refusing
+   to guess if neither marker matches, exactly as the HIP port does, because a
+   silent "assume CUDA" re-enables a machine-crashing case.
+
+`cofcheckgate` now runs to completion for the first time since the crashes:
+**54 PASS, 0 FAIL, exit 0**, including `large B1 with derived B2 -> refused, as
+Metal must`. All six gates green.
+
+**The 10 s refusal threshold is a judgement, not a measurement**, and is
+deliberately closer to what is known to work than to what is known to kill:
+launches of 3.6 s and 6.9 s have run here repeatedly without incident, and the
+case that took the machine down estimates at 15.9 s per curve. Nobody has
+measured where macOS actually draws the line, and finding out means crashing
+the machine on purpose.
+
+**Measured on a 10-core M3 in a fanless MacBook Air that also drives the
+display.** That last clause stopped being a disclaimer here and became the
+hazard.
+
+
 ## 9. Drift ledger — CUDA-side changes made for this port
 
 | date | CUDA file(s) | change | verified how |
@@ -1816,3 +1929,4 @@ display.**
 | 2026-09-14 | `bench/slab.h` | wrapped `#define SLAB_PERF_REGIONS 32768u` in `#ifndef`/`#endif` so a build can override it. **The default is unchanged**: a build that passes no `-D` sees the identical token it saw before. Only the Metal build overrides it, to `8192u`, because its `--region` default of 13 makes CUDA's region *count* mean a quarter of CUDA's slab size in positions -- see section 8c. | `make slabcheck` passes against the edited header. That pass is evidence rather than a tautology because the gate is *sensitive* to this constant: the same `slabtest.cpp` recompiled with `-DSLAB_PERF_REGIONS=8192u` fails on the first pinned row (`plan 0 got jmax=2048 n=2 enabled=1; want 4096/1/0`). The pinned rows do exercise the policy, and they still see 32768. |
 | 2026-09-15 | `bench/runlog.c`, `bench/runlog.h` | added `int g_runlog_quiet` (default 0) and a `if (!g_runlog_quiet)` guard around `runlog_warn`'s **stderr half only**; the log-file half is untouched. Verbatim from `hip-port`. **No CUDA-side code sets it**, so the CUDA build sees an unconditional `0` and identical behaviour. | Compiles clean in the default build (`make runlog.o`, `-Wall -Wextra`). Behaviour unchanged by inspection of a one-line guard on a variable no CUDA translation unit writes; **not exercised on a CUDA build**, since there is no nvcc on this machine. |
 | 2026-09-15 | `bench/boinc_support.cpp`, `bench/bench.h` | added `bench_boinc_progress_suspend(int)` and a `if (progress_suspended) return;` early-out in `bench_boinc_fraction_done`, placed **before** the monotonic high-water mark. Verbatim from `hip-port`. Nothing in the CUDA build calls the setter, so `progress_suspended` is permanently 0 there and the early-out never fires. | `make -f Makefile.metal boinccheck`: compiles `boinc_support.cpp` with `-DHAVE_BOINC` against a stub client API and drives both cases in separate processes. The control, run first, reproduces the HIP port's field bug (task pinned at 99%); the gate shows the suspend prevents it while preserving monotonicity. Also compiles clean both with and without `HAVE_BOINC` (`-Wall -Wextra`). **The real BOINC SDK is not installed here**, so this is verified against a stub, not against a client. |
+| 2026-09-15 | `bench/cofcheck.sh` | build detection from `--help` (`select Metal device` vs `select CUDA device`, refusing to guess if neither), and the `--ecm-b1 400000` case inverted on Metal to assert a refusal instead of an acceptance. **CUDA's path is unchanged**: `IS_METAL=0` takes the original branch verbatim. | Ran on Metal: 54 PASS / 0 FAIL / exit 0, with `large B1 with derived B2 -> refused, as Metal must`. The case it replaces crashed WindowServer twice on this machine. **Not run on a CUDA build** -- the CUDA branch is unchanged by inspection of a two-way `if`, not by execution. The HIP port skips this case for the same underlying reason (`cofac.cuh`'s own warning block says so). |
