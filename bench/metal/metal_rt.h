@@ -269,4 +269,22 @@ inline mtlError_t mtlEventRecord(mtlEvent_t e) { return mtlEventRecordOn(e, 0); 
 inline mtlError_t mtlEventRecord(mtlEvent_t e, mtlStream_t s) { return mtlEventRecordOn(e, s); }
 
 #endif  /* __cplusplus */
+
+/* Threadgroup bytes k_apply needs for one bucket region.
+ *
+ * CUDA's figure carries a second term, `nslice_pow2 * sizeof(uint16_t)`, for a
+ * copy of the slice-log table in shared memory. This build leaves that table
+ * in device memory (see metal/gen_bench_kernels.py for why), so the term is
+ * gone -- and with it the 128 bytes that put log_region 14 at 32,896 B against
+ * Apple's hard 32,768 B ceiling. At 14 the requirement is now exactly 32,768,
+ * and every check against the ceiling is `>`, so it fits.
+ *
+ * It lives here because three places need it -- the pipeline, the bench_kernels
+ * harness and the Phase 5 gate -- and a threadgroup length that disagrees with
+ * what the kernel indexes is not a compile error, it is a wrong answer. */
+static inline size_t mtl_apply_smem(uint32_t ncell, int cellbits)
+{
+    return (size_t)ncell * (size_t)cellbits / 8;
+}
+
 #endif  /* CUDA_SIEVE_METAL_RT_H */

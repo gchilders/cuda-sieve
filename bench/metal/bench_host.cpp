@@ -1482,7 +1482,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
         } else {
             const int CB = cfg->cell_bits;
             const uint32_t ncell = 1u << log_region;
-            const size_t smem = (size_t)ncell * CB / 8 + (size_t)nslice_pow2 * 2;
+            const size_t smem = mtl_apply_smem(ncell, CB);
             const uint32_t maxsurv = 1u << 22;
             /* gate 5: the one position whose pipeline-produced cell we read back */
             const uint32_t probe_x = (cfg->probe_j != 0xFFFFFFFFu)
