@@ -1016,6 +1016,53 @@ One diagnostic differs and it is not platform: side 1 `dead`/`stuck` is
 measured between 12x4 and 2x24 **on Metal alone**. It tracks the curve
 schedule, and neither number is a relation.
 
+### How fast is it, against the card that produced the reference?
+
+Same 288 special-q, same settings, same 13,485 relations, measured end to end
+on each platform. **GTX 1080 Ti: 204.1 s. M3: 328.0 s. The card is 1.61x
+faster overall** -- and the per-stage split is where it gets interesting:
+
+| stage, ms/q | GTX 1080 Ti | M3 | M3/CUDA |
+|---|---|---|---|
+| transform + plattice | 8.54 | 34.24 | 4.01x |
+| **fill** | **212.09** | **153.92** | **0.73x -- Metal FASTER** |
+| apply | 102.49 | 372.69 | 3.64x |
+| *sieve, both sides* | *323.12* | *560.85* | *1.74x* |
+| **norms + trial division** | **17.86** | **125.60** | **7.03x** |
+| rational queue | 51.04 | 64.16 | 1.26x |
+| algebraic queue | 266.81 | 285.43 | 1.07x |
+| *cofactor, device* | *318.28* | *349.71* | *1.10x* |
+| **wall per q** | **696.49** | **1124.79** | **1.61x** |
+
+Three things worth reading off it.
+
+**The cofactor stage is at parity -- 1.10x.** A 250 W discrete card with 28 SMs
+and dedicated GDDR5X is 10% faster than a fanless 10-core iGPU at the stage
+that is 46% of its own wall. That is 8h's finding confirmed from the other
+side: the stage is latency-bound on one long dependent ECM chain, so cores and
+bandwidth buy almost nothing, and the two platforms converge. The algebraic
+queue alone is 1.07x.
+
+**`fill` is FASTER on the M3, 153.9 against 212.1 ms.** The one stage where
+unified memory is an advantage rather than a caveat: fill is a scatter of 4-byte
+records through an atomic-heavy path, and it does not have to cross a PCIe bus
+to reach memory the host also owns.
+
+**Trial division is the weak spot: 7.03x, the worst ratio here**, and it turns
+a stage that is 2.6% of CUDA's wall into 11.2% of Metal's. `apply` at 3.64x is
+larger in absolute terms (219 ms/q against 108) but is at least the stage a
+discrete card should win. **If anyone wants more Metal performance, TD is where
+the headroom is** -- it was never tuned, and Phase 8 spent its effort on the
+sieve and the cofactoriser because that is where the one-q benchmark pointed.
+
+Context for the ratio: this is a 250 W discrete card against a fanless laptop
+iGPU sharing 16 GB of UMA with the OS and the display, and the gap is 1.61x.
+
+**Measured on a 10-core M3 in a fanless MacBook Air that also drives the
+display, against a GTX 1080 Ti in an NRP k8s pod.** Neither machine was
+otherwise loaded; the M3 figure carries this port's usual throttling caveat and
+the pod's does not.
+
 ### The log2 decision, settled by measurement
 
 Phase 2 flagged `metal::log2` as differing from host `log2f` on 50.03% of
