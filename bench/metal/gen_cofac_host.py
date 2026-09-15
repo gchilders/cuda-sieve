@@ -171,11 +171,15 @@ static int mtl_check_impl(mtlError_t err, const char *expr,
 #define CUDA_CHECKED(x) mtl_check_impl((x), #x, __FILE__, __LINE__)
 #define CK(x) do { if (CUDA_CHECKED(x)) return -1; } while (0)
 
-/* td.cuh puts these inside its own __CUDACC__ guard, so a host translation
+/* td.cuh puts these inside its own __CUDACC__ guard, so a HOST translation
  * unit does not see them. Values must track td.cuh (TD_SCAN_BLK at :365,
- * TD_FMAX at :589). DUPLICATED CONSTANTS ROT: Phase 6b forks td.cuh properly
- * and deletes this block, exactly as bench_kernels.metal must drop its own
- * copies of td_mod_magic and SS_KSHIFT. */
+ * TD_FMAX at :589).
+ *
+ * Forking td.cuh for the DEVICE side (metal/td_msl.h) did not remove this:
+ * that header is MSL. Removing it properly means either lifting these two
+ * defines above td.cuh's guard -- a CUDA-side change, and the cleanest fix --
+ * or giving the host a generated companion to td_msl.h. Left duplicated and
+ * flagged rather than quietly forgotten. */
 #ifndef TD_SCAN_BLK
 #define TD_SCAN_BLK 256
 #endif

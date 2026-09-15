@@ -155,8 +155,13 @@ disappointing GPU result. The HIP port's gfx1103 iGPU did comparable work in
   pins and what las finds at this q.
   `make -f Makefile.metal argbufcheck` — the `cofq_t` argument-buffer
   mechanism, proven with a negative control.
-  Still to do: `td.cuh` device code, the six inline-queue kernels the pipeline
-  needs (`k_cof_enqueue` and friends), then `pipeline.cuh` and `bench_main.cu`.
+  **The entire device side now compiles: 75 kernels in one metallib** across
+  `bench_kernels.metal` (19), `td.metal` (26), `fbgen_gpu.metal` (16),
+  `cofac.metal` (8) and `scan.metal` (6). MSL copies of the shared arithmetic
+  headers are generated from the untouched originals: `bigint_msl.h`,
+  `prp_msl.h`, `plattice_msl.h`, `slab_msl.h`, `td_msl.h`.
+  Still to do: the six inline-queue kernels the pipeline needs
+  (`k_cof_enqueue` and friends), then `pipeline.cuh` and `bench_main.cu`.
 - Phases 7-9: not started.
 
 **Residency is load-bearing and easy to get wrong.** Any pointer reached
@@ -175,12 +180,19 @@ that block vanishes, so the file built with ZERO errors and then failed to
 link. Note the two guards want opposite treatment: the `CF_FN`/`CF_HD` block
 needs the *non*-CUDA branch, everything else needs enabling.
 
-**Four duplicated constants are outstanding and will rot.**
-`bench_kernels.metal` copies `td_mod_magic` and `SS_KSHIFT` from `td.cuh`;
-`cofac_metal.cpp` copies `TD_SCAN_BLK` and `TD_FMAX`. `td.cuh` calls
-`SS_KSHIFT` "the single source of truth for the bias shift", which is exactly
-the kind of thing that must not be duplicated for long. Forking `td.cuh`
-properly deletes all four.
+**A regex over `#if` blocks silently deleted half a header — do not do that.**
+Reducing `#if defined(__CUDA_ARCH__)` with a regex assumed a bare `#else`;
+`bigint.cuh`'s block has an `#elif defined(_MSC_VER)`, so the regex orphaned
+it and turned the rest of the header into a dead branch. It still COMPILED,
+and the symbols simply ceased to exist, surfacing two translation units away
+as "unknown type name". `gen_msl_headers.py` now walks the conditionals
+properly and asserts they balance. Any future guard rewriting must do the
+same.
+
+**One duplication remains, host-side only:** `cofac_metal.cpp`'s copies of
+`TD_SCAN_BLK` and `TD_FMAX`. Forking `td.cuh` fixed the device side
+(`td_msl.h`) but that header is MSL. The clean fix lifts those two defines
+above `td.cuh`'s `__CUDACC__` guard — a CUDA-side change needing a ledger row.
 
 **Two CUDA-side observations this phase raised** (plan §10, nothing changed):
 `verify_count_updates` walks in 32 bits while `k_fill_atomic` walks in 64, and
