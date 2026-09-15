@@ -160,16 +160,21 @@ fbcheck: $(BUILD)/fbgen_gpu fbgen
 SIEVE_CPUOBJ := verify_cpu.o fbgen_lib.o fb_load.o fb_cado.o poly.o primes.o \
                 platform.o rfb.o
 
+MSL_HEADERS := metal/cuda_msl_compat.h metal/softfp64.h metal/portable_log2.h \
+               metal/sf_sites.h metal/bigint_msl.h metal/prp_msl.h \
+               metal/plattice_msl.h metal/slab_msl.h metal/td_msl.h
+
 $(BUILD)/bench.metallib: metal/bench_kernels.metal metal/bench_kernels_body.metal.inc \
-                         metal/cuda_msl_compat.h metal/plattice_msl.h \
+                         metal/td.metal metal/td_body.metal.inc \
                          metal/fbgen_gpu.metal metal/fbgen_gpu_body.metal.inc \
                          metal/cofac.metal metal/cofac_body.metal.inc \
-                         metal/scan.metal | $(BUILD)
+                         metal/scan.metal $(MSL_HEADERS) | $(BUILD)
 	$(METAL) $(MSLFLAGS) -c metal/bench_kernels.metal -o $(BUILD)/bench_kernels.air
+	$(METAL) $(MSLFLAGS) -c metal/td.metal            -o $(BUILD)/td.air
 	$(METAL) $(MSLFLAGS) -c metal/fbgen_gpu.metal     -o $(BUILD)/fbgen_gpu.air
 	$(METAL) $(MSLFLAGS) -c metal/cofac.metal         -o $(BUILD)/cofac.air
 	$(METAL) $(MSLFLAGS) -c metal/scan.metal          -o $(BUILD)/scan.air
-	$(METALLIB) $(BUILD)/bench_kernels.air $(BUILD)/fbgen_gpu.air \
+	$(METALLIB) $(BUILD)/bench_kernels.air $(BUILD)/td.air $(BUILD)/fbgen_gpu.air \
 	            $(BUILD)/cofac.air $(BUILD)/scan.air -o $@
 
 $(BUILD)/phase5_test: metal/phase5_test.cpp metal/fbgen_gpu_metal.cpp \

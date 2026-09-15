@@ -37,12 +37,11 @@ for pat in (r'^__global__ void k_cofac', r'^__global__ void k_cof_selflags',
     j = i - 1 if cof[i - 1].startswith('template') else i
     KERNELS.append('\n'.join(cof[j:upto_close(cof, i) + 1]))
 
-# 3. td.cuh's three-pass scan, which cf_run_rounds launches directly
+# 3. td.cuh's three-pass scan used to be copied in here. It now comes from
+#    td.metal, which forks td.cuh properly -- two definitions of the same
+#    kernel in one metallib is a duplicate symbol, and a copy of someone
+#    else's kernel is exactly the duplication this port keeps having to undo.
 scan = []
-for pat in (r'^__global__ void k_scan_pass1', r'^__global__ void k_scan_pass2',
-            r'^__global__ void k_scan_pass3'):
-    i = find(td, pat)
-    scan.append('\n'.join(td[i:upto_close(td, i) + 1]))
 
 body = arith + '\n\n' + '\n\n'.join(scan) + '\n\n' + '\n\n'.join(KERNELS)
 
@@ -119,9 +118,6 @@ K = {
              [(str(L), m, s) for L in (3, 4) for (m, s) in (('1','1'), ('1','0'), ('0','0'))]),
  'k_cof_selflags':   (None, None),
  'k_cof_selscatter': (None, None),
- 'k_scan_pass1':     (None, None),
- 'k_scan_pass2':     (None, None),
- 'k_scan_pass3':     (None, None),
 }
 
 def split_top(s):
