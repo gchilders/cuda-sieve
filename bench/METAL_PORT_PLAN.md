@@ -454,12 +454,72 @@ exactly one such kernel, `k_cof_enqueue` taking `cofq_t` by value
 (`cofac.cuh:1410`, ~27 pointers); it needs an argument buffer, which is
 Phase 6. `mtl_launch` rejects it loudly rather than binding garbage.
 
-### Phase 4 — `fbgen_gpu.metal` + scan/select
-Self-contained and independently gated, which is why it goes first — the HIP
-port found the same.
+### Phase 4 — `fbgen_gpu.metal` + scan/select — **DONE**
 
-**Gate:** a standalone `fbgen_gpu_metal` generates `oracle/c183.fb1` and it
-byte-compares equal against the CUDA build's.
+**The gate turned out to be stronger than planned, and it is worth saying why.**
+The plan assumed the reference had to be a CUDA-generated factor base, which
+this machine cannot produce. But `fbgen.c` — the CPU generator — builds and
+runs natively on macOS with no changes at all. So the reference is the
+*independent CPU implementation*, not another GPU build, and the tree already
+had the script that compares them: `fbgpucheck.sh`. The HIP port could not do
+this (its CPU `fbgen` segfaulted under MinGW) and fell back to generating with
+its own port and running `fbtest` over the result, which is a much weaker
+claim.
+
+**Gate: PASSING — `make -f Makefile.metal fbcheck`, 19 cases, all
+byte-identical to the CPU generator:** the `lim=2` and `lim=3` boundaries,
+every supported polynomial degree 1 through 8 (crossing the CAP=6/CAP=8
+dispatch boundary at 6 and 7), GNFS powers/ramification, prime-only, the
+octic, C147 degree-5, three in-memory `afb_build_gpu` production-consumer
+cases, and two negative controls (an oversized `--segment-odds` is refused; a
+failed `--compare-fb` neither publishes over the existing output nor leaves a
+`.part` behind).
+
+**4a — the CUB replacement.** `metal/scan.metal` + `metal/metal_scan.cpp`
+give an exclusive prefix sum and a stable flagged compaction with *CUB's
+calling convention* (NULL temp to query the size, allocate once, pass it
+thereafter), so each of the eight `cub::` call sites ported by changing the
+name alone. Shape follows `td.cuh:365-420`'s existing three-pass scan and the
+tree's existing scan-then-scatter compaction — including its reason
+(`td.cuh:455`): an ordered scan gives every selected element a deterministic
+slot, so output is byte-reproducible, which is exactly what makes the CPU
+diff meaningful. Separately gated by `make -f Makefile.metal scancheck` at
+every block/two-level boundary (255/256/257, 65535/65536/65537, 8M =
+`GPU_FB_DEFAULT_SEG_ODDS`), with uint32-wrapping values and 0%/50%/100%
+densities.
+
+**4b — the device half.** ~1,150 lines. Three things the transformation had
+to do, all forced by MSL:
+
+1. *Address spaces.* MSL rejects an unqualified pointer parameter outright, so
+   all 51 function heads are qualified. Almost all are `thread` — the original
+   builds polynomials in registers and passes their addresses, which maps
+   cleanly. Three take `constant` (`d_big_mod`, `d_big_mod_mont`,
+   `d_ctx_big`), because their only callers pass `&c_alg[i]`, `&c_y0`, `&c_y1`.
+2. *`__constant__` globals become kernel parameters*, bound after the kernel's
+   own so the "CUDA parameter i → `[[buffer(i)]]`" rule survives, and threaded
+   down into the two device functions that read them.
+3. *Kernel bodies are unchanged.* Rather than rewriting every
+   `blockIdx.x * blockDim.x + threadIdx.x`, the ids arrive as MSL attributes
+   and `FB_KERNEL_IDS` re-exposes them under CUDA's names; `atomicAdd` is a
+   one-line shim over `atomic_fetch_add_explicit`. A body textually identical
+   to the CUDA original cannot have acquired a transcription bug, which is
+   worth more here than elegance.
+
+Templated kernels become `static inline` bodies with thin concrete wrappers
+named by the port-wide rule, giving 10 explicit instantiations.
+
+**4c — the host half.** ~1,350 lines, and **this is the Phase 3 bet paying
+off**: 15 launches rewritten, every `cuda*` call renamed onto `metal_rt.h`,
+and nothing else. The shim also gained lazy initialisation, so the ported
+call sequence is identical to CUDA's — which has no init call — rather than
+acquiring a Metal-shaped prologue that would be one more place to drift.
+
+**Porting aids, not sources of truth:** `metal/gen_fbgen_metal.py` and
+`metal/gen_fbgen_host.py` produced the first drafts and are committed so a
+later CUDA-side change to this file can be re-diffed rather than re-ported
+from memory. They are deliberately **not** wired into the build; the generated
+files are committed and reviewed like any other source.
 
 ### Phase 5 — Sieve kernels
 `k_transform`, `k_fill_*`, `k_apply`, and the `pipeline_metal.cpp`
@@ -526,4 +586,4 @@ correctness vehicle.
 
 | date | CUDA file(s) | change | verified how |
 |---|---|---|---|
-| — | — | none yet | — |
+| 2026-09-14 | `bench/fbgpucheck.sh` | `sha256sum` (coreutils) falls back to `shasum -a 256` where absent, so the same script is the gate on macOS instead of being forked | Ran on macOS: 19/19 cases pass including the publish-guard case that uses the hash. No behaviour change where `sha256sum` exists, which is every Linux box the CUDA build runs on — the fallback is only taken when the command is missing. **Not run on Linux**, so "no change there" is by inspection of a two-branch `command -v` test, not by execution. |
