@@ -72,4 +72,18 @@ static inline uint32_t td_mod_magic(uint32_t w, uint32_t m,
 }
 #define SS_KSHIFT(logI)  ((uint32_t)((logI) - 2))
 
+/* norm_t crosses the host/device boundary BY VALUE, and MSL's `double`-free
+ * substitution for its two fp64 members means the layout is reconstructed
+ * rather than shared. A silent mismatch would corrupt every norm while still
+ * producing plausible-looking output, so the harness checks it explicitly. */
+kernel void k_layout_check(device uint32_t *o [[buffer(0)]])
+{
+    o[0] = (uint32_t)sizeof(norm_t);
+    o[1] = (uint32_t)sizeof(plat_t);
+    o[2] = (uint32_t)((device const uchar *)&((device const norm_t *)0)->dd
+                      - (device const uchar *)0);
+    o[3] = (uint32_t)((device const uchar *)&((device const norm_t *)0)->a0
+                      - (device const uchar *)0);
+}
+
 #include "bench_kernels_body.metal.inc"

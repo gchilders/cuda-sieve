@@ -124,12 +124,6 @@ rtcheck: $(BUILD)/rt_test $(BUILD)/rt_test.metallib
 METAL_OBJS   := $(BUILD)/metal_rt.o $(BUILD)/metal_scan.o
 FBGEN_CPUOBJ := fbgen_lib.o fb_load.o fb_cado.o poly.o primes.o platform.o
 
-$(BUILD)/bench.metallib: metal/fbgen_gpu.metal metal/fbgen_gpu_body.metal.inc \
-                         metal/scan.metal | $(BUILD)
-	$(METAL) $(MSLFLAGS) -c metal/fbgen_gpu.metal -o $(BUILD)/fbgen_gpu.air
-	$(METAL) $(MSLFLAGS) -c metal/scan.metal      -o $(BUILD)/scan.air
-	$(METALLIB) $(BUILD)/fbgen_gpu.air $(BUILD)/scan.air -o $@
-
 $(BUILD)/metal_rt.o: metal/metal_rt.mm metal/metal_rt.h | $(BUILD)
 	$(CXX) $(HOSTFLAGS) -c $< -o $@
 
@@ -160,3 +154,34 @@ fbcheck: $(BUILD)/fbgen_gpu fbgen
 	@cp $(BUILD)/fbgen_gpu ./fbgen_gpu
 	@CUDA_SIEVE_METALLIB=$(CURDIR)/$(BUILD)/bench.metallib sh fbgpucheck.sh; \
 	  rc=$$?; rm -f ./fbgen_gpu; exit $$rc
+
+# ---- Phase 5 gate: the sieve against the tree's own CPU ground truth -----
+
+SIEVE_CPUOBJ := verify_cpu.o fbgen_lib.o fb_load.o fb_cado.o poly.o primes.o \
+                platform.o rfb.o
+
+$(BUILD)/bench.metallib: metal/bench_kernels.metal metal/bench_kernels_body.metal.inc \
+                         metal/cuda_msl_compat.h metal/plattice_msl.h \
+                         metal/fbgen_gpu.metal metal/fbgen_gpu_body.metal.inc \
+                         metal/scan.metal | $(BUILD)
+	$(METAL) $(MSLFLAGS) -c metal/bench_kernels.metal -o $(BUILD)/bench_kernels.air
+	$(METAL) $(MSLFLAGS) -c metal/fbgen_gpu.metal     -o $(BUILD)/fbgen_gpu.air
+	$(METAL) $(MSLFLAGS) -c metal/scan.metal          -o $(BUILD)/scan.air
+	$(METALLIB) $(BUILD)/bench_kernels.air $(BUILD)/fbgen_gpu.air \
+	            $(BUILD)/scan.air -o $@
+
+$(BUILD)/phase5_test: metal/phase5_test.cpp metal/fbgen_gpu_metal.cpp \
+                      metal/metal_rt.mm metal/metal_scan.cpp $(BUILD)/bench.metallib
+	$(MAKE) $(SIEVE_CPUOBJ)
+	$(CXX) $(HOSTFLAGS) -DFBGEN_GPU_LIBRARY metal/phase5_test.cpp \
+	    metal/fbgen_gpu_metal.cpp metal/metal_rt.mm metal/metal_scan.cpp \
+	    $(SIEVE_CPUOBJ) -framework Metal -framework Foundation -framework IOKit \
+	    -lm -o $@
+
+# --bound 300 puts a real number of cells over the survivor threshold; a bound
+# that leaves none would pass while exercising nothing.
+.PHONY: sievecheck
+sievecheck: $(BUILD)/phase5_test
+	@CUDA_SIEVE_METALLIB=$(CURDIR)/$(BUILD)/bench.metallib $(BUILD)/phase5_test \
+	    --poly ../oracle/c183.poly --lim 1000000 --logI 13 --J 4096 \
+	    --bound 300 --ncheck 512

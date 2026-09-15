@@ -141,14 +141,26 @@ disappointing GPU result. The HIP port's gfx1103 iGPU did comparable work in
   `cd bench && make -f Makefile.metal fbcheck` — `fbgpucheck.sh`, 19 cases,
   all byte-identical to the CPU generator. Also `make -f Makefile.metal
   scancheck` for the scan/select primitives alone.
-- **Phase 5 (sieve kernels): device half DONE, gate NOT yet run.**
-  `metal/bench_kernels.metal` compiles clean — 19 kernels including
-  `k_transform`, `k_fill_atomic` and `k_apply`, with the fp64 norm fallback
-  on `softfp64.h`. Still to do: the host harness that runs
-  transform → fill → apply and compares against `verify_count_updates` and
-  `verify_apply_region` (the tree's own CPU ground truth, pure host C).
-  **Nothing about the sieve is verified yet** — it compiles, that is all.
-- Phases 6-9: not started.
+- **Phase 5 (sieve kernels): DONE, gate green.**
+  `cd bench && make -f Makefile.metal sievecheck`. At logI 13 / J 4096 /
+  lim 1e6 on c183 with the oracle's special-q: all 4,096 regions of fill and
+  all 4,194,304 cells of apply match the CPU reference exactly, with 623,098
+  cells over the survivor threshold on both sides. Shared struct layouts are
+  cross-checked first.
+- Phases 6-9: not started. Next is Phase 6, `td.cuh` + `cofac.cuh` and the
+  `cofq_t` argument buffer, gated on `cofcheck.sh`.
+
+**Two CUDA-side observations this phase raised** (plan §10, nothing changed):
+`verify_count_updates` walks in 32 bits while `k_fill_atomic` walks in 64, and
+`pl_add32_sat` saturating ends a walk where `pl_next64` wraps and continues —
+they differ by 2.4% on c183, demonstrated on the host with no GPU. And
+`verify_apply_region`'s survivor return value is fixed at BOUND = 0.
+
+**Phase 7 is much less risky than Phase 2 implied.** Zero of 4.2M cells differ
+between `pl_log2f` on the GPU and libm's `log2f` on the CPU. The expected rate
+is ~3e-7 per cell (~1% of log2 results differ at all, each by ~3e-5 after
+scaling, and only a boundary crossing changes the integer) — about one cell in
+three million, not the tens of thousands the Phase 2 note suggested.
 
 **Known gap, Phase 8:** `k_fill_l1`/`k_fill_l2` are absent. Both want
 33,792 B of static threadgroup memory against Apple's 32,768 B ceiling —
