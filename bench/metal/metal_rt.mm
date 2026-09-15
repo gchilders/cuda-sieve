@@ -672,6 +672,25 @@ extern "C" void mtl_bind_buffer(const void *ptr, int index)
     [g_bind_enc setBuffer:a->buf offset:((uintptr_t)ptr - a->base) atIndex:index];
 }
 
+extern "C" uint64_t mtlDeviceAddress(const void *p)
+{
+    if (!p) return 0;
+    std::lock_guard<std::mutex> lk(g_lock);
+    const Alloc *a = reg_find(p);
+    if (!a) { g_last_error = mtlErrorNotMapped; return 0; }
+    return (uint64_t)a->buf.gpuAddress + ((uintptr_t)p - a->base);
+}
+
+/* Must be called while a launch is being bound: the encoder is the scope
+ * residency applies to. */
+extern "C" void mtlUseResource(const void *p)
+{
+    if (!p || !g_bind_enc) return;
+    const Alloc *a = reg_find(p);
+    if (!a) { g_bind_error = mtlErrorNotMapped; g_last_error = mtlErrorNotMapped; return; }
+    [g_bind_enc useResource:a->buf usage:(MTLResourceUsageRead | MTLResourceUsageWrite)];
+}
+
 extern "C" void mtl_bind_bytes(const void *data, size_t sz, int index)
 { [g_bind_enc setBytes:data length:sz atIndex:index]; }
 

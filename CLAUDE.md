@@ -147,8 +147,27 @@ disappointing GPU result. The HIP port's gfx1103 iGPU did comparable work in
   all 4,194,304 cells of apply match the CPU reference exactly, with 623,098
   cells over the survivor threshold on both sides. Shared struct layouts are
   cross-checked first.
-- Phases 6-9: not started. Next is Phase 6, `td.cuh` + `cofac.cuh` and the
-  `cofq_t` argument buffer, gated on `cofcheck.sh`.
+- **Phase 6 (TD + cofactorisation): groundwork done.** The `cofq_t` argument
+  buffer — the one mechanism in this port with no CUDA-shaped equivalent — is
+  solved and gated: `make -f Makefile.metal argbufcheck`. `metal_rt` gained
+  `mtlDeviceAddress()` and `mtlUseResource()`. Still to do: `td.cuh` and
+  `cofac.cuh` device code, their host halves, then `pipeline.cuh` and
+  `bench_main.cu`.
+- Phases 7-9: not started.
+
+**Residency is load-bearing and easy to get wrong.** Any pointer reached
+through a GPU address (i.e. inside an argument-buffer struct) must have
+`mtlUseResource()` called for it between `mtl_launch_begin` and
+`mtl_launch_end`, or the kernel reads garbage rather than failing cleanly —
+4,095 of 4,096 wrong in the control. Note also that **residency persists once
+granted within a process**, which is why `argbufcheck` runs its negative
+control FIRST; a control placed after the positive case passes and proves
+nothing.
+
+**Use `run_cofac()` as the intermediate gate before `cofcheck.sh`.** It is a
+standalone cofactorisation entry point reading a batch file, and
+`oracle/c183.q120000053.cofac_candidates.txt` (1,852 candidates) is already in
+the tree — the same trick that made Phase 4 gateable without the full binary.
 
 **Two CUDA-side observations this phase raised** (plan §10, nothing changed):
 `verify_count_updates` walks in 32 bits while `k_fill_atomic` walks in 64, and
