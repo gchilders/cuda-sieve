@@ -273,6 +273,58 @@ src = (hdr
          ' * track the originals rather than drifting as hand copies. */\n'
        + '\n\n'.join(borrowed) + '\n\n'
        + src)
+# ---- decouple the chunk floor from the launch grid ------------------------
+# cof_chunk_floor() is blocks * threads, and the CUDA argument for it is sound:
+# a slice of one record per thread is fully loaded, so subdividing costs
+# nothing and small devices bound their launch duration for free.
+#
+# That argument breaks once the grid is sized from the work (see
+# gen_bench_main.py). With blocks * threads >= CQ_FLUSH the floor equals the
+# whole flush, so auto chunking could never subdivide again -- on ANY Apple
+# GPU, by construction. Subdivision is not pointless there: a launch's duration
+# is roughly (records / resident threads) x one ECM chain, and a 10-core part
+# cannot hold 131,072 threads resident, so it runs them in waves and a full
+# flush IS a long launch. Removing the ability to split it would silently
+# retire the watchdog protection on exactly the slow parts that need it -- and
+# this port has never run on an M1 at all (5.1a).
+#
+# So the floor keeps its own, core-derived notion of "fully loaded" instead of
+# inheriting whatever grid the caller happens to launch. Set once at init.
+_floor_old = (
+    "static uint32_t cof_chunk_floor(int blocks, int threads)" + chr(10) +
+    "{" + chr(10) +
+    "    const uint64_t f = (uint64_t)(blocks > 0 ? blocks : 1)" + chr(10) +
+    "                     * (uint64_t)(threads > 0 ? threads : 1);" + chr(10) +
+    "    return f > 0xffffffffull ? 0xffffffffu : (uint32_t)f;" + chr(10) +
+    "}")
+_floor_new = (
+    "/* Blocks' worth of records the DEVICE can keep loaded, independent of the" + chr(10) +
+    " * grid actually launched. Zero until mtl_set_cof_floor_blocks() runs, in" + chr(10) +
+    " * which case the floor falls back to the caller's grid -- the CUDA" + chr(10) +
+    " * behaviour, and the safe direction if initialisation order ever moves. */" + chr(10) +
+    "static int g_cof_floor_blocks;" + chr(10) +
+    chr(10) +
+    "void mtl_set_cof_floor_blocks(int b) { g_cof_floor_blocks = b > 0 ? b : 0; }" + chr(10) +
+    chr(10) +
+    "static uint32_t cof_chunk_floor(int blocks, int threads)" + chr(10) +
+    "{" + chr(10) +
+    "    const int fb = g_cof_floor_blocks ? g_cof_floor_blocks : blocks;" + chr(10) +
+    "    const uint64_t f = (uint64_t)(fb > 0 ? fb : 1)" + chr(10) +
+    "                     * (uint64_t)(threads > 0 ? threads : 1);" + chr(10) +
+    "    return f > 0xffffffffull ? 0xffffffffu : (uint32_t)f;" + chr(10) +
+    "}")
+assert _floor_old in src, 'cof_chunk_floor shape changed'
+src = src.replace(_floor_old, _floor_new, 1)
+print('  chunk floor decoupled from the launch grid')
+
+# The queue capacity, for bench_main's grid sizing. An ACCESSOR, not a second
+# #define: CQ_FLUSH has exactly one definition and the grid must track it.
+src = src.replace(
+    'static uint32_t cof_chunk_floor(int blocks, int threads)',
+    'uint32_t mtl_cof_flush_capacity(void) { return CQ_FLUSH; }' + chr(10) + chr(10) +
+    'static uint32_t cof_chunk_floor(int blocks, int threads)', 1)
+print('  CQ_FLUSH exposed for grid sizing')
+
 open(OUT, 'w').write(src)
 print('wrote %s: %d kernels removed, %d launches rewritten' % (OUT, nk, nl))
 if skipped:
