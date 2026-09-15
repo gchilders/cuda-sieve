@@ -3706,6 +3706,8 @@ done:
     return rc;
 }
 
+#include "slab_calib.inc"
+
 extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                             const fb_t *fb0, const fb_t *fbs0,
                             const qsel_t *qlist, uint32_t nq, sqgen_t *qgen,
@@ -3715,15 +3717,30 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     uint32_t pmax1 = fb_max_td_prime(fbs1);
     uint32_t pmax0 = fb_max_td_prime(fbs0);
     uint32_t pmax = pmax1 > pmax0 ? pmax1 : pmax0;
+    /* Auto-calibration returns 0 when it did not run or was inconclusive, in
+     * which case the caller's own --slab-j (itself usually 0, meaning the
+     * static default) is what the planner sees -- exactly as before. */
+    const uint32_t calibrated_j = calibrate_slab_rows(fb1, fbs1, fb0, fbs0,
+                                                      qlist, nq, POLY, cfg,
+                                                      pmax);
+    const uint32_t forced_j = calibrated_j ? calibrated_j : cfg->slab_j;
 
     if (slab_make_plan(cfg->logI, cfg->log_region, cfg->J, pmax,
-                       cfg->slab_j, &plan)) {
+                       forced_j, &plan)) {
         fprintf(stderr,
                 "  pipeline: cannot make a safe slab plan for logI=%d J=%u"
                 " (largest direct-test prime %u, requested --slab-j %u)\n",
                 cfg->logI, cfg->J, pmax, cfg->slab_j);
         return -1;
     }
+#ifdef HAVE_BOINC
+    if (cfg->slab_j ||
+        slab_perf_jmax(cfg->logI, cfg->log_region, cfg->J) != 0xffffffffu)
+        fprintf(stderr, "BOINC: slab plan: %u rows/slab, %u slab%s%s\n",
+                plan.jmax, plan.nslab, plan.nslab == 1 ? "" : "s",
+                calibrated_j ? " (auto-calibrated)"
+                : cfg->slab_j ? " (--slab-j forced)" : " (static default)");
+#endif
     /* The A/B record path leaves no other trace: the stage label is the same on
      * both branches and the checkpoint job text does not carry the flag, so a
      * sweep log that mixes the two kernels would have no tell. Finding 78's
@@ -3736,7 +3753,12 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     if (plan.enabled) {
         const uint32_t perf_jmax = slab_perf_jmax(cfg->logI, cfg->log_region,
                                                   cfg->J);
-        if (!cfg->slab_j && perf_jmax != 0xffffffffu)
+        if (calibrated_j)
+            printf("  j-slabbing: %u slab%s, up to %u rows/slab"
+                   " (auto-calibrated against this run's first special-q,"
+                   " not the static target)\n",
+                   plan.nslab, plan.nslab == 1 ? "" : "s", plan.jmax);
+        else if (!cfg->slab_j && perf_jmax != 0xffffffffu)
             printf("  j-slabbing: %u slab%s, up to %u rows/slab"
                    " (auto target %u bucket regions at --region %d;"
                    " safety bounds may reduce it further)\n",

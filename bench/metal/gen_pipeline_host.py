@@ -52,6 +52,78 @@ assert _smem_old in src, 'pipeline apply smem shape changed'
 src = src.replace(_smem_old, _smem_new, 1)
 print('  apply threadgroup length via mtl_apply_smem')
 
+# Slab auto-calibration, ported from the HIP port. The FUNCTION is hand-written
+# in metal/slab_calib.inc -- splicing a hundred lines of new logic in by regex
+# is how this port broke a header once already -- so the generator only has to
+# include it and rewrite the one call site.
+_inc_anchor = 'extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,'
+assert _inc_anchor in src, 'run_pipeline signature changed'
+src = src.replace(_inc_anchor,
+                  '#include "slab_calib.inc"\n\n' + _inc_anchor, 1)
+
+_call_old = """    uint32_t pmax = pmax1 > pmax0 ? pmax1 : pmax0;
+
+    if (slab_make_plan(cfg->logI, cfg->log_region, cfg->J, pmax,
+                       cfg->slab_j, &plan)) {"""
+_call_new = """    uint32_t pmax = pmax1 > pmax0 ? pmax1 : pmax0;
+    /* Auto-calibration returns 0 when it did not run or was inconclusive, in
+     * which case the caller's own --slab-j (itself usually 0, meaning the
+     * static default) is what the planner sees -- exactly as before. */
+    const uint32_t calibrated_j = calibrate_slab_rows(fb1, fbs1, fb0, fbs0,
+                                                      qlist, nq, POLY, cfg,
+                                                      pmax);
+    const uint32_t forced_j = calibrated_j ? calibrated_j : cfg->slab_j;
+
+    if (slab_make_plan(cfg->logI, cfg->log_region, cfg->J, pmax,
+                       forced_j, &plan)) {"""
+assert _call_old in src, 'run_pipeline slab_make_plan call shape changed'
+src = src.replace(_call_old, _call_new, 1)
+print('  slab auto-calibration spliced in')
+
+# The j-slabbing status line reports the STATIC target, which becomes a lie the
+# moment calibration overrides it -- the plan printed would not be the one the
+# named target implies. Say which decided.
+_msg_old = """        if (!cfg->slab_j && perf_jmax != 0xffffffffu)
+            printf("  j-slabbing: %u slab%s, up to %u rows/slab"
+                   " (auto target %u bucket regions at --region %d;"
+                   " safety bounds may reduce it further)\\n",
+                   plan.nslab, plan.nslab == 1 ? "" : "s", plan.jmax,
+                   (unsigned)SLAB_PERF_REGIONS, cfg->log_region);"""
+_msg_new = """        if (calibrated_j)
+            printf("  j-slabbing: %u slab%s, up to %u rows/slab"
+                   " (auto-calibrated against this run's first special-q,"
+                   " not the static target)\\n",
+                   plan.nslab, plan.nslab == 1 ? "" : "s", plan.jmax);
+        else if (!cfg->slab_j && perf_jmax != 0xffffffffu)
+            printf("  j-slabbing: %u slab%s, up to %u rows/slab"
+                   " (auto target %u bucket regions at --region %d;"
+                   " safety bounds may reduce it further)\\n",
+                   plan.nslab, plan.nslab == 1 ? "" : "s", plan.jmax,
+                   (unsigned)SLAB_PERF_REGIONS, cfg->log_region);"""
+assert _msg_old in src, 'j-slabbing status message shape changed'
+src = src.replace(_msg_old, _msg_new, 1)
+
+# HIP's fleet-aggregation line, ported. stderr, because stderr.txt is the only
+# per-task output a real BOINC client keeps -- the point is to learn, across
+# many volunteers' actual Apple GPUs, whether this 10-core M3's 2^26 optimum
+# generalises or whether an M3 Max picks something else, without having to
+# reproduce every machine by hand. Gated on there having BEEN a slab decision
+# worth reporting, so the below-trigger majority does not dilute the aggregate.
+_boinc_old = """    if (slab_make_plan(cfg->logI, cfg->log_region, cfg->J, pmax,
+                       forced_j, &plan)) {"""
+_boinc_marker = "    /* The A/B record path leaves no other trace"
+assert _boinc_marker in src, 'run_pipeline body shape changed'
+src = src.replace(_boinc_marker, """#ifdef HAVE_BOINC
+    if (cfg->slab_j ||
+        slab_perf_jmax(cfg->logI, cfg->log_region, cfg->J) != 0xffffffffu)
+        fprintf(stderr, "BOINC: slab plan: %u rows/slab, %u slab%s%s\\n",
+                plan.jmax, plan.nslab, plan.nslab == 1 ? "" : "s",
+                calibrated_j ? " (auto-calibrated)"
+                : cfg->slab_j ? " (--slab-j forced)" : " (static default)");
+#endif
+""" + _boinc_marker, 1)
+print('  status line reports who decided; BOINC slab-plan line added')
+
 open(OUT, 'w').write(src)
 print('wrote %s (%d lines, %d launches rewritten)' % (OUT, src.count('\n'), nl))
 left = sorted(set(re.findall(r'\bcuda[A-Z]\w*', src)))

@@ -226,13 +226,17 @@ void runlog_record(const char *fmt, ...)
     va_end(ap);
 }
 
+int g_runlog_quiet = 0;
+
 void runlog_warn(const char *fmt, ...)
 {
     va_list ap;
-    va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
-    va_end(ap);
-    fputc('\n', stderr);
+    if (!g_runlog_quiet) {
+        va_start(ap, fmt);
+        vfprintf(stderr, fmt, ap);
+        va_end(ap);
+        fputc('\n', stderr);
+    }
     if (L.f) {
         char pre[80], stamp[64];
         /* Leading newlines are terminal spacing -- they exist to break away
