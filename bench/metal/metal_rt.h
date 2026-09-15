@@ -237,6 +237,14 @@ template <class T>
 inline mtlError_t mtlHostAlloc(T **p, size_t n, unsigned f)
 { return mtlHostAlloc((void **)p, n, f); }
 
+/* CUDA's async calls default their stream argument to the legacy default
+ * stream, and the ported code relies on that. extern "C" cannot carry default
+ * arguments, so mirror them as C++ overloads. */
+inline mtlError_t mtlMemsetAsync(void *p, int v, size_t n)
+{ return mtlMemsetAsync(p, v, n, 0); }
+inline mtlError_t mtlMemcpyAsync(void *dst, const void *src, size_t n, int kind)
+{ return mtlMemcpyAsync(dst, src, n, kind, 0); }
+
 /* cudaEventRecord(e) defaults to the legacy default stream. */
 inline mtlError_t mtlEventRecord(mtlEvent_t e) { return mtlEventRecordOn(e, 0); }
 inline mtlError_t mtlEventRecord(mtlEvent_t e, mtlStream_t s) { return mtlEventRecordOn(e, s); }

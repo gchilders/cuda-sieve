@@ -757,19 +757,57 @@ unchanged.
 own `__CUDACC__` guard, lifted by name, so every Metal translation unit shares
 one statement of each.
 
+**6e. `pipeline.cuh` ported; the combined host TU compiles.**
+`metal/pipeline_host.inc` (3,743 lines, 26 launches) and
+`metal/bench_host.cpp` (2,056 lines, 38 launches) — the latter mirrors
+`bench_kernels.cu`'s role as the single host TU that also pulls in the
+cofactor and pipeline code. **Both compile with zero errors.**
+
+**This is the Phase 3 bet settling.** `pipeline.cuh` has no device code and no
+`__CUDACC__` guards at all; with `metal_rt.h` presenting CUDA's names and
+CUDA's blocking semantics, it ported by renaming plus one real transformation
+— every launch there sits inside a function templated on `bool SLABBED`, so
+the mangled kernel name cannot be formed textually and becomes a ternary over
+the two concrete names, which the compiler folds.
+
+Four host-side details that needed more than a rename:
+
+- `cudaFuncSetAttribute(..., MaxDynamicSharedMemorySize, n)` becomes
+  `mtlFuncSetMaxThreadgroupMemory`, which *validates* against the device
+  ceiling rather than raising it — the check that matters on Apple, where
+  32 KB is well under CUDA's opt-in tier.
+- `cudaDeviceGetAttribute(cudaDevAttrMaxGridDimX)` and
+  `cudaDevAttrMaxSharedMemoryPerBlockOptin` become small helpers over
+  `mtlGetDeviceProperties`.
+- `run_bench`'s `LAUNCH_APPLY` macro parameterises the template arguments, so
+  the kernel name is pasted by the preprocessor; all nine `k_apply`
+  instantiations (both cell widths x atomic x norm mode) are now built rather
+  than failing at run time with a missing-kernel error.
+- CUDA's async calls default their stream argument; `extern "C"` cannot carry
+  defaults, so `metal_rt.h` mirrors them as C++ overloads.
+
+**The last hand-copied constants are gone.** `metal/td_host.h` is generated
+from `td.cuh` and lifts the eight `TD_*`/`TDF_*` names it keeps inside its own
+`__CUDACC__` guard; `bench_host.cpp` lifts the six launch-shape constants that
+live in the device region it strips. Everything now tracks its original by
+name. `metal/portlib.py` holds the one copy of the launch rewriter and the
+rename table, because two copies of a transformation this fiddly would drift —
+and a drifting transformation produces a file that compiles and computes
+something else.
+
 **Still to do for this phase:**
 - **One duplication remains, on the HOST side only**: `cofac_metal.cpp`'s
   copies of `TD_SCAN_BLK` and `TD_FMAX`. Forking `td.cuh` fixed the device
   side but not this — `td_msl.h` is MSL. The clean fix is a CUDA-side change,
   lifting those two defines above `td.cuh`'s `__CUDACC__` guard, which would
   need a drift-ledger row.
-- `pipeline.cuh` (~4,000 lines of orchestration) and `bench_main.cu`
-  (~3,200 lines of CLI and band driving), which `cofcheck.sh` needs because it
-  drives `./bench --pipeline`. This is the last piece, and the one the Phase 3
-  shim was built for: the orchestration should port largely by renaming.
-- The argument-buffer path compiles but is **not yet exercised** — `run_cofac`
-  does not reach `k_cof_enqueue` or `k_rel_pack`. `cofcheck.sh` will be the
-  first thing that runs them.
+- `bench_main.cu` (~3,200 lines of CLI and band driving), then linking
+  `./bench` and running `cofcheck.sh`. That is all that stands between here
+  and Phase 6's real gate.
+- Nothing in `pipeline_host.inc` or `bench_host.cpp` has **run** yet — they
+  compile, and that is the whole claim. The argument-buffer path is in the
+  same position: `run_cofac` never reaches `k_cof_enqueue` or `k_rel_pack`,
+  so `cofcheck.sh` will be the first thing that exercises either.
 
 **An intermediate gate exists and should be used first:** `run_cofac()`
 (`cofac.cuh:2728`) is a standalone cofactorisation entry point that reads a
