@@ -78,7 +78,26 @@ unsigned                     g_bind_grid = 0, g_bind_block = 0;
  * failure that happened somewhere else entirely. */
 mtlError_t                   g_bind_error = mtlSuccess;
 
-inline mtlError_t fail(mtlError_t e) { g_last_error = e; return e; }
+/* CUDA_SIEVE_METAL_TRACE=1 reports every error at the point it is raised.
+ * Ported code threads failures back through CK/PIPE_CK macros that often
+ * `goto done` without printing, so a real fault can reach exit(255) with
+ * nothing on stderr -- which is exactly how the first pipeline run failed. */
+int g_trace = -1;
+inline bool tracing(void)
+{
+    if (g_trace < 0) { const char *e = getenv("CUDA_SIEVE_METAL_TRACE");
+                       g_trace = (e && *e && *e != '0') ? 1 : 0; }
+    return g_trace != 0;
+}
+
+const char *err_name(mtlError_t e);
+
+inline mtlError_t fail(mtlError_t e)
+{
+    g_last_error = e;
+    if (tracing()) fprintf(stderr, "metal_rt: [trace] error raised: %s\n", err_name(e));
+    return e;
+}
 
 /* Ported code calls mtlSetDevice / mtlMalloc exactly where the CUDA original
  * called cudaSetDevice / cudaMalloc, and never calls an init function -- CUDA
@@ -133,6 +152,9 @@ id<MTLCommandBuffer> commit(Stream *st)
 mtlError_t cb_status(id<MTLCommandBuffer> cb)
 {
     if (!cb || !cb.error) return mtlSuccess;
+    if (tracing())
+        fprintf(stderr, "metal_rt: [trace] command buffer failed: %s\n",
+                cb.error.localizedDescription.UTF8String);
     if (cb.error.code == MTLCommandBufferErrorTimeout) return mtlErrorLaunchTimeout;
     if (cb.error.code == MTLCommandBufferErrorOutOfMemory) return mtlErrorLaunchOutOfResources;
     return mtlErrorLaunchFailure;
@@ -314,9 +336,34 @@ extern "C" void mtlShutdown(void)
     g_lib = nil; g_dev = nil;
 }
 
-extern "C" mtlError_t mtlSetDevice(int dev)   { return dev == 0 ? mtlSuccess : fail(mtlErrorInvalidValue); }
-extern "C" mtlError_t mtlGetDevice(int *dev)  { if (dev) *dev = 0; return mtlSuccess; }
-extern "C" mtlError_t mtlGetDeviceCount(int *n) { if (n) *n = g_dev ? 1 : 0; return mtlSuccess; }
+/* These three are the first calls a ported main() makes, so they are where
+ * lazy initialisation actually has to happen. mtlGetDeviceCount in particular
+ * must NOT answer 0 merely because nothing has touched the GPU yet -- that
+ * reads to the caller as "this process sees no device" and aborts the run. */
+extern "C" mtlError_t mtlSetDevice(int dev)
+{
+    std::lock_guard<std::mutex> lk(g_lock);
+    mtlError_t e = ensure_init_locked();
+    if (e != mtlSuccess) return e;
+    return dev == 0 ? mtlSuccess : fail(mtlErrorInvalidValue);
+}
+
+extern "C" mtlError_t mtlGetDevice(int *dev)
+{
+    std::lock_guard<std::mutex> lk(g_lock);
+    mtlError_t e = ensure_init_locked();
+    if (e != mtlSuccess) return e;
+    if (dev) *dev = 0;
+    return mtlSuccess;
+}
+
+extern "C" mtlError_t mtlGetDeviceCount(int *n)
+{
+    std::lock_guard<std::mutex> lk(g_lock);
+    mtlError_t e = ensure_init_locked();
+    if (n) *n = (e == mtlSuccess && g_dev) ? 1 : 0;
+    return mtlSuccess;
+}
 
 extern "C" mtlError_t mtlGetDeviceProperties(mtlDeviceProp *p, int dev)
 {
@@ -589,6 +636,8 @@ extern "C" mtlError_t mtlGetLastError(void)
 
 extern "C" mtlError_t mtlPeekAtLastError(void) { return g_last_error; }
 
+namespace { const char *err_name(mtlError_t e) { return mtlGetErrorString(e); } }
+
 extern "C" const char *mtlGetErrorString(mtlError_t e)
 {
     switch (e) {
@@ -643,12 +692,18 @@ extern "C" mtlError_t mtl_launch_begin(const char *kernel, mtlStream_t s,
         g_lock.unlock();
         return fail(mtlErrorKernelNotFound);
     }
+    if (tracing() && block > pso.maxTotalThreadsPerThreadgroup)
+        fprintf(stderr, "metal_rt: [trace] %s: %u threads requested, pipeline"
+                " allows %lu\n", kernel, block,
+                (unsigned long)pso.maxTotalThreadsPerThreadgroup);
     if (block > pso.maxTotalThreadsPerThreadgroup) {
         fprintf(stderr, "metal_rt: %s launched with %u threads; max is %lu\n",
                 kernel, block, (unsigned long)pso.maxTotalThreadsPerThreadgroup);
         g_lock.unlock();
         return fail(mtlErrorLaunchOutOfResources);
     }
+    if (tracing()) fprintf(stderr, "metal_rt: [trace] launch %s grid=%u block=%u smem=%zu\n",
+                           kernel, grid, block, smem);
     Stream *st = resolve(s);
     id<MTLComputeCommandEncoder> enc = ensure_compute(st);
     [enc setComputePipelineState:pso];

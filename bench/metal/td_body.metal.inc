@@ -815,7 +815,6 @@ kernel void k_td_0_0_0_0(
     device uint32_t * faccnt [[buffer(18)]],
     constant uint32_t &fmax [[buffer(19)]],
     constant uint32_t &j_base [[buffer(20)]],
-    threadgroup tdsmall_t *tile [[threadgroup(0)]],
     uint _tid [[thread_position_in_grid]],
     uint _ntid [[threads_per_grid]],
     uint _bid [[threadgroup_position_in_grid]],
@@ -823,6 +822,7 @@ kernel void k_td_0_0_0_0(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
+    threadgroup tdsmall_t tile[TD_TILE];
     k_td_body<0, 0, 0, false>(A, B, X, sel, n, logI, P, sq, plist, pcnt, K, sm, nsm, cof, cofbits, flags, nhit, fac, faccnt, fmax, j_base, tile, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
@@ -848,7 +848,6 @@ kernel void k_td_1_0_0_0(
     device uint32_t * faccnt [[buffer(18)]],
     constant uint32_t &fmax [[buffer(19)]],
     constant uint32_t &j_base [[buffer(20)]],
-    threadgroup tdsmall_t *tile [[threadgroup(0)]],
     uint _tid [[thread_position_in_grid]],
     uint _ntid [[threads_per_grid]],
     uint _bid [[threadgroup_position_in_grid]],
@@ -856,6 +855,7 @@ kernel void k_td_1_0_0_0(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
+    threadgroup tdsmall_t tile[TD_TILE];
     k_td_body<1, 0, 0, false>(A, B, X, sel, n, logI, P, sq, plist, pcnt, K, sm, nsm, cof, cofbits, flags, nhit, fac, faccnt, fmax, j_base, tile, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
@@ -881,7 +881,6 @@ kernel void k_td_1_0_0_1(
     device uint32_t * faccnt [[buffer(18)]],
     constant uint32_t &fmax [[buffer(19)]],
     constant uint32_t &j_base [[buffer(20)]],
-    threadgroup tdsmall_t *tile [[threadgroup(0)]],
     uint _tid [[thread_position_in_grid]],
     uint _ntid [[threads_per_grid]],
     uint _bid [[threadgroup_position_in_grid]],
@@ -889,6 +888,7 @@ kernel void k_td_1_0_0_1(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
+    threadgroup tdsmall_t tile[TD_TILE];
     k_td_body<1, 0, 0, true>(A, B, X, sel, n, logI, P, sq, plist, pcnt, K, sm, nsm, cof, cofbits, flags, nhit, fac, faccnt, fmax, j_base, tile, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
@@ -914,7 +914,6 @@ kernel void k_td_1_1_0_0(
     device uint32_t * faccnt [[buffer(18)]],
     constant uint32_t &fmax [[buffer(19)]],
     constant uint32_t &j_base [[buffer(20)]],
-    threadgroup tdsmall_t *tile [[threadgroup(0)]],
     uint _tid [[thread_position_in_grid]],
     uint _ntid [[threads_per_grid]],
     uint _bid [[threadgroup_position_in_grid]],
@@ -922,6 +921,7 @@ kernel void k_td_1_1_0_0(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
+    threadgroup tdsmall_t tile[TD_TILE];
     k_td_body<1, 1, 0, false>(A, B, X, sel, n, logI, P, sq, plist, pcnt, K, sm, nsm, cof, cofbits, flags, nhit, fac, faccnt, fmax, j_base, tile, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
@@ -947,7 +947,6 @@ kernel void k_td_1_1_0_1(
     device uint32_t * faccnt [[buffer(18)]],
     constant uint32_t &fmax [[buffer(19)]],
     constant uint32_t &j_base [[buffer(20)]],
-    threadgroup tdsmall_t *tile [[threadgroup(0)]],
     uint _tid [[thread_position_in_grid]],
     uint _ntid [[threads_per_grid]],
     uint _bid [[threadgroup_position_in_grid]],
@@ -955,6 +954,7 @@ kernel void k_td_1_1_0_1(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
+    threadgroup tdsmall_t tile[TD_TILE];
     k_td_body<1, 1, 0, true>(A, B, X, sel, n, logI, P, sq, plist, pcnt, K, sm, nsm, cof, cofbits, flags, nhit, fac, faccnt, fmax, j_base, tile, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
@@ -980,7 +980,6 @@ kernel void k_td_1_1_1_0(
     device uint32_t * faccnt [[buffer(18)]],
     constant uint32_t &fmax [[buffer(19)]],
     constant uint32_t &j_base [[buffer(20)]],
-    threadgroup tdsmall_t *tile [[threadgroup(0)]],
     uint _tid [[thread_position_in_grid]],
     uint _ntid [[threads_per_grid]],
     uint _bid [[threadgroup_position_in_grid]],
@@ -988,6 +987,7 @@ kernel void k_td_1_1_1_0(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
+    threadgroup tdsmall_t tile[TD_TILE];
     k_td_body<1, 1, 1, false>(A, B, X, sel, n, logI, P, sq, plist, pcnt, K, sm, nsm, cof, cofbits, flags, nhit, fac, faccnt, fmax, j_base, tile, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
@@ -1013,7 +1013,6 @@ kernel void k_td_1_1_1_1(
     device uint32_t * faccnt [[buffer(18)]],
     constant uint32_t &fmax [[buffer(19)]],
     constant uint32_t &j_base [[buffer(20)]],
-    threadgroup tdsmall_t *tile [[threadgroup(0)]],
     uint _tid [[thread_position_in_grid]],
     uint _ntid [[threads_per_grid]],
     uint _bid [[threadgroup_position_in_grid]],
@@ -1021,6 +1020,7 @@ kernel void k_td_1_1_1_1(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
+    threadgroup tdsmall_t tile[TD_TILE];
     k_td_body<1, 1, 1, true>(A, B, X, sel, n, logI, P, sq, plist, pcnt, K, sm, nsm, cof, cofbits, flags, nhit, fac, faccnt, fmax, j_base, tile, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
@@ -1266,7 +1266,6 @@ kernel void k_td_record_warp_0(
     device uint32_t * faccnt [[buffer(17)]],
     constant uint32_t &fmax [[buffer(18)]],
     constant uint32_t &j_base [[buffer(19)]],
-    threadgroup tdsmall_t *tile [[threadgroup(0)]],
     uint _tid [[thread_position_in_grid]],
     uint _ntid [[threads_per_grid]],
     uint _bid [[threadgroup_position_in_grid]],
@@ -1274,6 +1273,7 @@ kernel void k_td_record_warp_0(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
+    threadgroup tdsmall_t tile[TD_TILE];
     k_td_record_warp_body<false>(A, B, X, sel, n, logI, P, sq, plist, pcnt, K, sm, nsm, cof, cofbits, flags, fac, faccnt, fmax, j_base, tile, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
@@ -1298,7 +1298,6 @@ kernel void k_td_record_warp_1(
     device uint32_t * faccnt [[buffer(17)]],
     constant uint32_t &fmax [[buffer(18)]],
     constant uint32_t &j_base [[buffer(19)]],
-    threadgroup tdsmall_t *tile [[threadgroup(0)]],
     uint _tid [[thread_position_in_grid]],
     uint _ntid [[threads_per_grid]],
     uint _bid [[threadgroup_position_in_grid]],
@@ -1306,6 +1305,7 @@ kernel void k_td_record_warp_1(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
+    threadgroup tdsmall_t tile[TD_TILE];
     k_td_record_warp_body<true>(A, B, X, sel, n, logI, P, sq, plist, pcnt, K, sm, nsm, cof, cofbits, flags, fac, faccnt, fmax, j_base, tile, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 

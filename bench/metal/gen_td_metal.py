@@ -108,8 +108,16 @@ for name, (tparams, insts) in K.items():
         for n_, (ty, nm, dim) in enumerate(tg_decls):
             inner = re.sub(r'^\s*threadgroup\s+' + ty + r'\s+' + nm + r'\[[^\]]+\];\s*$',
                            '', inner, flags=re.M)
+            # The array is DECLARED IN THE WRAPPER, which is kernel-qualified
+            # and may therefore hold threadgroup variables, and the body gets a
+            # pointer. The obvious alternative -- making it a
+            # [[threadgroup(n)]] PARAMETER -- silently gives a zero-length
+            # buffer unless the host sets its length, and these were static
+            # __shared__ arrays in CUDA with no host involvement at all. That
+            # mistake cost a band that ran to completion and produced 125
+            # cofactorisation candidates where the oracle has 1,851.
             tg_params.append('threadgroup %s *%s' % (ty, nm))
-            tg_bufs.append('threadgroup %s *%s [[threadgroup(%d)]]' % (ty, nm, n_))
+            tg_bufs.append('    threadgroup %s %s[%s];' % (ty, nm, dim))
             tg_args.append(nm)
 
     if tparams is None:
@@ -130,10 +138,11 @@ for name, (tparams, insts) in K.items():
                 for tn, tv in zip(tnames, inst):
                     q = re.sub(r'\b' + tn + r'\b', tv, q)
                 cps.append(q)
-            kps = [bufparam(pp, k) for k, pp in enumerate(cps)] + tg_bufs + IDS
+            kps = [bufparam(pp, k) for k, pp in enumerate(cps)] + IDS
             suffix = '_'.join('1' if a == 'true' else '0' if a == 'false' else a for a in inst)
-            wr.append('kernel void %s_%s(\n    %s)\n{\n    %s_body<%s>(%s);\n}\n'
-                      % (name, suffix, ',\n    '.join(kps), name,
+            decls = (chr(10).join(tg_bufs) + chr(10)) if tg_bufs else ''
+            wr.append('kernel void %s_%s(\n    %s)\n{\n%s    %s_body<%s>(%s);\n}\n'
+                      % (name, suffix, ',\n    '.join(kps), decls, name,
                          ', '.join(inst), ', '.join(args)))
         new = head + inner + '}\n\n' + '\n'.join(wr)
     body = body[:m.start()] + new + body[j + 1:]

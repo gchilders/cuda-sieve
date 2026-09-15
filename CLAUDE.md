@@ -161,10 +161,32 @@ disappointing GPU result. The HIP port's gfx1103 iGPU did comparable work in
   copies of the shared arithmetic headers are generated from the untouched
   originals: `bigint_msl.h`, `prp_msl.h`, `plattice_msl.h`, `slab_msl.h`,
   `td_msl.h`.
-  `pipeline.cuh` is ported too (`metal/pipeline_host.inc`) and the combined
-  host TU `metal/bench_host.cpp` compiles with zero errors — but **nothing in
-  either has run**; they compile, and that is the whole claim.
-  Still to do: `bench_main.cu`, then link `./bench` and run `cofcheck.sh`.
+  `pipeline.cuh` and `bench_main.cu` are ported, **`./bench` links, and a
+  `--pipeline` band runs end to end on the M3** (`make -f Makefile.metal
+  benchbin`). `--verify-only` passes through the real binary.
+  **`cofcheck.sh` DOES NOT PASS**: its refusal cases do, its relation-count
+  cases do not. A band produced 125 cofactorisation candidates where the
+  oracle has 1,851, and the production-geometry run is currently SIGKILLed
+  with no output flushed. The port is feature-complete and wrong.
+
+**THE METAL BUILD DEFAULTS `log_region` TO 13, not CUDA's 14.** Apple's
+threadgroup ceiling is a hard 32 KB with no opt-in tier, and at 14 `k_apply`
+wants 32,896 B — 128 bytes over. `--region` still overrides; the CUDA build is
+untouched.
+
+**Two traps this port fell into; do not repeat them.**
+1. `NULL` is `0L` in C++, NOT a pointer. Passed to a binding template it takes
+   the non-pointer branch and binds eight bytes of zeros as a constant buffer,
+   so the kernel's `if (p)` sees a good address and faults. Use `nullptr`,
+   which has its own overload in `metal_rt.h`.
+2. A `threadgroup` array that was a static `__shared__` array in CUDA must be
+   DECLARED IN THE WRAPPER KERNEL, not turned into a `[[threadgroup(n)]]`
+   parameter — a parameter is zero-length unless the host sets its length, and
+   CUDA's version needed no host involvement at all.
+
+**`cof_classify` is verified on device** (`classifycheck`): 0 of 65,536
+verdicts differ from `prp.cuh`'s own fp64. The soft-float path is ruled out of
+the remaining candidate-count problem.
 
 **The `cofq_t` argument buffer is wired but NOT yet exercised.** `run_cofac`
 never reaches `k_cof_enqueue` or `k_rel_pack`; `cofcheck.sh` will be the first
