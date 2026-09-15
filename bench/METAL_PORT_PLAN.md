@@ -615,6 +615,34 @@ reproduces exactly, and reports the 32-bit figure alongside. Whether the CUDA
 build's own `--verify` is affected is a question for the CUDA side and is
 recorded in §10.
 
+### 5b. Candidate counts do not compare across sievers — relations do
+
+Worth writing down, because the numbers invite a false alarm. On the parity
+special-q our pipeline emits **1,845 cofactorisation candidates** where
+`oracle/c183.q120000053.cofac_candidates.txt` has **1,851**. The difference
+decomposes exactly, and neither half is a defect:
+
+- **The 7 las has that we lack are precisely the 7 relations that need no
+  cofactorisation** — proven, not inferred: the set difference
+  `oracle − ours` is *identical* to the relation set of a trial-division-only
+  run. The two pipelines mean different things by "candidate". las's file comes
+  from `-batch-print-survivors`, which dumps every post-sieve survivor;
+  `--candidates` dumps only records that actually enter the cofactoriser, and
+  a survivor already within `lpb` on both sides is a finished relation. It is
+  the same 7 `cofcheck.sh`'s first case pins.
+- **The 1 we have that las lacks** decodes to `i = -16384, j = 12803` — the
+  leftmost column of the region, a legal interior point — and it does not
+  become a relation. The run used `cofcheck.sh`'s pinned allowance, which the
+  program's own stderr reports as **8.03 bits looser** than the derived
+  policy, against las's `lambda0 2.35 / lambda1 3.5`. A marginal survivor
+  landing on one side of a deliberately different bound is expected.
+
+**The invariant is the relation set, and it matches exactly**: our 37 relations
+are the *identical* `(a,b)` set as las's 37 — 37 in both, zero either way.
+That is why the tree pins relation counts and never candidate counts, and why
+`oracle/README.md` cautions from the other direction that containment "does
+not establish yield equivalence".
+
 ### 5a. The Phase 7 log2 question, measured early — and my earlier estimate corrected
 
 **Zero of 4,194,304 cells differ**, with the GPU running `pl_log2f` and the
@@ -854,15 +882,38 @@ production-geometry run is SIGKILLed with no output flushed, which is a
   Phase 5 harness to compare its cofactor output against a CPU replay, the way
   `verify_apply_region` does for apply.
 
+**6g. `cofcheck.sh` PASSES. Phase 6 is done.**
+
+`make -f Makefile.metal cofcheckgate` — **54 PASS, 0 FAIL, `cofactor golden
+test passed`, exit 0.** This is the formal gate the HIP port used, and it is
+the tree's own script, unmodified except for two BSD/GNU portability
+fallbacks recorded in the drift ledger.
+
+It covers trial-division-only, rho and ECM through the inline queue, ECM with
+and without stage 2, chunked launches, 3-limb against 4-limb cofactor width,
+`lpb 33` with factors above 2^32, the lpb/mfb boundary refusals, the standalone
+splitter against the inline queue, multi-q generated bands byte-identical to
+cached and streamed, and the negative controls for corruption and
+compositeness.
+
+**Two more bugs the gate found, both in the last stretch:**
+
+1. `k_td`'s threadgroup tile was a `[[threadgroup(n)]]` parameter, which is
+   zero-length unless the host sets it. The band ran to completion and
+   produced **125 cofactorisation candidates where it should produce 1,845** —
+   a wrong answer, not a crash. Fixed by declaring the array in the wrapper
+   kernel, where MSL allows it and CUDA's static `__shared__` needed no host
+   involvement at all.
+2. `head -c -1` in `cofcheck.sh` is a GNU extension BSD rejects, which aborted
+   the script after 43 passing cases. Portability, not a port defect; ledgered.
+
 **Still to do for this phase:**
 - **One duplication remains, on the HOST side only**: `cofac_metal.cpp`'s
   copies of `TD_SCAN_BLK` and `TD_FMAX`. Forking `td.cuh` fixed the device
   side but not this — `td_msl.h` is MSL. The clean fix is a CUDA-side change,
   lifting those two defines above `td.cuh`'s `__CUDACC__` guard, which would
   need a drift-ledger row.
-- Diagnose the SIGKILL, then the candidate shortfall, then re-run
-  `cofcheck.sh`. The port is feature-complete and wrong; that is a much better
-  place to be than incomplete, but it is not done.
+- Nothing. Phase 6 is complete.
 
 **An intermediate gate exists and should be used first:** `run_cofac()`
 (`cofac.cuh:2728`) is a standalone cofactorisation entry point that reads a
@@ -907,6 +958,21 @@ decides whether it is *necessary*, and how much moves if it is adopted.
 **Gate:** a recorded number — cells flipped, relations gained/lost — and a
 decision justified by it, not by this paragraph.
 
+**Largely answered already, by Phase 6's gate.** `cofcheck.sh` pins ~25
+relation counts **derived from the CUDA build**, and the Metal build matches
+every one of them: 7, 37, 36, 59, 66, and the rest, across rho and ECM, both
+cofactor widths, and the lpb/mfb boundary. Separately, the Metal build's 37
+relations at the parity special-q are the *identical* `(a,b)` set as las's 37.
+
+So the 3 ULP `log2` divergence Phase 2 flagged **has not moved a single
+relation** at this geometry — consistent with the ~3e-7 per-cell estimate in
+section 5a and with the 0-of-4.2M cell result Phase 5 measured. Option 2
+(accept a divergent relation set) is looking unnecessary and option 1
+(`-DNORM_PORTABLE_LOG2` on both builds) is looking like insurance rather than
+a fix. What remains is to run a *band* rather than a single q, and on a
+geometry that exercises the `log_region <= 13` difference, before calling it
+settled.
+
 ### Phase 8 — Constraints and tuning
 `log_region <= 13` default; threadgroup sizing measured from scratch —
 `bench.h`'s 32-thread `k_fill_atomic` result is an NVIDIA L2-bound finding
@@ -945,4 +1011,5 @@ changed.
 
 | date | CUDA file(s) | change | verified how |
 |---|---|---|---|
+| 2026-09-14 | `bench/cofcheck.sh` | `head -c -1` (all but the last byte) is a GNU coreutils extension that BSD `head` rejects outright; falls back to `dd` where it is unsupported | Ran on macOS: the case it guards ("unterminated candidate file") passes, and the 43 cases before it were already passing when it aborted the script. No behaviour change where GNU `head` exists — the fallback is only taken when `head -c -1 /dev/null` itself fails. **Not run on Linux**, so "no change there" is by inspection of the probe, not by execution. |
 | 2026-09-14 | `bench/fbgpucheck.sh` | `sha256sum` (coreutils) falls back to `shasum -a 256` where absent, so the same script is the gate on macOS instead of being forked | Ran on macOS: 19/19 cases pass including the publish-guard case that uses the hash. No behaviour change where `sha256sum` exists, which is every Linux box the CUDA build runs on — the fallback is only taken when the command is missing. **Not run on Linux**, so "no change there" is by inspection of a two-branch `command -v` test, not by execution. |

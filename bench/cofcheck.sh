@@ -391,7 +391,15 @@ fi
 # Standalone splitter: the candidate file must parse identically with and
 # without a trailing newline, and must agree with the inline queue.
 run --candidates $TMP/c.txt --relations $TMP/td.txt >/dev/null
-head -c -1 $TMP/c.txt > $TMP/c_nonl.txt
+# `head -c -1` (all but the last byte) is a GNU coreutils extension; BSD head
+# rejects a negative count outright. Same portability class as the sha256sum
+# fallback above, so the Metal port runs this gate rather than forking it.
+if head -c -1 /dev/null >/dev/null 2>&1; then
+    strip_last_byte() { head -c -1 "$1"; }
+else
+    strip_last_byte() { dd if="$1" bs=1 count=$(( $(wc -c < "$1") - 1 )) 2>/dev/null; }
+fi
+strip_last_byte $TMP/c.txt > $TMP/c_nonl.txt
 a=$(./bench --cofac $TMP/c.txt      --poly $POLY --relations $TMP/s1.txt --cof-rounds 2 --cof-budget 65536 2>&1 | grep 'RELATIONS' | awk '{print $2}')
 b=$(./bench --cofac $TMP/c_nonl.txt --poly $POLY --relations $TMP/s2.txt --cof-rounds 2 --cof-budget 65536 2>&1 | grep 'RELATIONS' | awk '{print $2}')
 if [ "$a" = "$b" ] && [ "$a" = "30" ]; then
