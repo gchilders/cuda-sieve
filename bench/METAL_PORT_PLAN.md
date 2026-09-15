@@ -2066,6 +2066,89 @@ Metal-side only, through the generator; `bench_main.cu` is untouched, so the
 CUDA build keeps 24 and this needs no drift-ledger row. Six gates green.
 
 
+### 8n. Curves-per-round is derived, not pinned -- and the optimum is 2
+
+8l recommended 8x24 and 8m lifted the round cap that constrained it. Swept
+properly, at constant 192-curve budget, `--nq 144`, B1 2000 / B2 60000:
+
+| curves x rounds | longest launch | cofac/q | wall/q | relations |
+|---|---|---|---|---|
+| 16 x 12 | 2031 ms | 353.5 | 1072.9 | 6,724 |
+| 8 x 24 | 1220 ms | 265.3 | 969.4 | 6,724 |
+| 6 x 32 | 961 ms | 252.3 | 967.9 | 6,724 |
+| 4 x 48 | 756 ms | 212.5 | 912.8 | 6,724 |
+| 3 x 64 | 646 ms | 192.8 | 911.6 | 6,724 |
+| **2 x 96** | **442 ms** | **180.0** | **881.4** | 6,724 |
+| 1 x 192 | 253 ms | 181.0 | 883.4 | 6,724 |
+
+**A bracketed interior minimum at two curves per round**, and 8x24 -- the
+configuration 8l validated and recommended -- is 47% worse than it. Identical
+relations at all seven points.
+
+The mechanism is 8l's, continued: every round re-compacts the live list, so
+splitting the budget finely drops records that have already split before the
+expensive later rounds run. At ONE curve the five per-round kernels
+(`selflags`, three scan passes, `selscatter`) finally cost more than that
+saves, which is what puts the minimum at two rather than at the boundary.
+
+#### The rule, and why it is not "the largest count that fits"
+
+The obvious derivation -- pick the biggest curve count whose launch fits the
+750 ms bound -- is **wrong**: at B1 2000 that is 8 curves, and 8 costs 265.3
+ms/q against 180.0. The bound is a ceiling, not an objective. So the rule aims
+at **2** and lets the bound lower it further, never raise it:
+
+```c
+uint32_t fit = 2u;
+while (fit > 1u && ms_one_curve * fit > COF_CHUNK_TARGET_MS) fit--;
+```
+
+Rounds rise to keep the caller's **total curve budget** unchanged, capped at
+8m's 1000. Measured across B1, with the default 48-curve budget:
+
+| | derived | launch estimate | curve budget |
+|---|---|---|---|
+| B1 2000 | 2 x 24 | ~185 ms | 48 vs 48 |
+| B1 8000 | 2 x 24 | ~722 ms | 48 vs 48 |
+| B1 32000 | **1** x 48 | ~1419 ms | 48 vs 48 |
+
+At B1 32000 two curves would be ~2.8 s, so it drops to one -- still over the
+bound, because one curve is the floor no chunking or round-splitting can go
+below (8k). The bound is honoured where it can be and approached where it
+cannot.
+
+#### What the default now does
+
+| default budget, 48 curves | launch | cofac/q | wall/q | relations |
+|---|---|---|---|---|
+| old default, 12 x 4 | 1687 ms | 286.9 | 1005.1 | 6,724 |
+| **derived, 2 x 24** | **458 ms** | **160.1** | **860.7** | 6,724 |
+
+Launch **-73%** and under the bound, cofactor stage **-44%**, wall **-14%**,
+identical relations.
+
+**It only fires when `--ecm-curves` was not given**, and only when both sides
+are ECM. An explicit curve count is the caller choosing which sigmas run and is
+never overruled -- that case still gets 8m's advisory instead. The both-ECM
+condition is not cosmetic: `cofq_flush` passes one round count to both sides,
+so raising it under rho would walk into the `budget << r` overflow that 8m
+showed is checked against the caller's rounds, not ours.
+
+All five `cofq_flush` call sites had to move to the derived round count. Four
+matched a single pattern and **the fifth wraps its argument onto another line**;
+a flush left on `cfg->cof_rounds` would have run the derived curve count
+against the caller's rounds and silently shrunk the budget to a twelfth of it.
+The generator now asserts that site separately.
+
+**Six gates green, including `cofcheck.sh`'s ~25 pinned relation counts** --
+which is the result that matters most here, because the default now runs an
+entirely different sigma set and those counts were derived from the CUDA build.
+
+**Measured on a 10-core M3 in a fanless MacBook Air that also drives the
+display.** The optimum at two is a re-compaction effect and should carry; the
+exact cost per curve is this machine's and is what the bound is applied to.
+
+
 ## 9. Drift ledger — CUDA-side changes made for this port
 
 | date | CUDA file(s) | change | verified how |

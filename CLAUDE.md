@@ -302,6 +302,28 @@ call site cannot do one and forget the other.
   remove either.** The threshold is a judgement: 3.6 s and 6.9 s launches run
   fine here, 15.9 s kills the box, and nobody has measured the real line.
 
+  **CURVES-PER-ROUND IS NOW DERIVED, NOT PINNED (plan 8n).** When
+  `--ecm-curves` is not given and both sides are ECM, the build aims at **2
+  curves per round** and raises rounds to keep the caller's total curve budget.
+  Swept at constant budget, cofac ms/q by curves/round: 16c 353.5, 8c 265.3,
+  6c 252.3, 4c 212.5, 3c 192.8, **2c 180.0**, 1c 181.0 — a bracketed interior
+  minimum at two, and 8l's recommended 8x24 is 47% worse than it. Every round
+  re-compacts the live list, so a fine split drops already-split records before
+  the expensive rounds; at one curve the five per-round kernels cost more than
+  that saves.
+
+  **The rule is NOT "the largest count that fits the bound"** — that picks 8 at
+  B1 2000 and costs 265 against 180. The bound is a ceiling, not an objective:
+  aim at 2, let the bound lower it (B1 32000 derives 1 x 48). At the default
+  48-curve budget this takes the launch from 1687 to **458 ms**, cofac/q from
+  286.9 to **160.1**, wall from 1005 to **860.7**, relations unchanged, six
+  gates green including cofcheck's pinned counts.
+
+  An explicit `--ecm-curves` is never overruled (it gets the advisory instead),
+  and the derivation is gated on both sides being ECM because `cofq_flush`
+  passes one round count to both and raising it under rho hits the
+  `budget << r` overflow.
+
   **`--cof-rounds` now allows 1000 for ECM (plan 8m); rho keeps 24.** The cap
   was rho's: `budget << r` appears only in the rho launch, while ECM passes
   `S->curves` unshifted and the round index only picks a 1000-wide sigma block.
