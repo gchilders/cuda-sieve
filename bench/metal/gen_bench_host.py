@@ -57,6 +57,16 @@ if 'static uint32_t build_slices_b' not in src:
                       build_slices + '\n\n/* device code: see metal/bench_kernels.metal and metal/td.metal */', 1)
 
 src, nl = rewrite_launches(src)
+# The apply threadgroup width.
+ATHR_NOTE = "/* 192, not CUDA's 512. MEASURED on this box, bracketed interior minimum,\n * three runs per point at logI 14 / J 8192 / region 13 on oracle/c183:\n *\n *   threads   64      128     192     256     512\n *   apply    83.9    56.2    54.6    57.8    77.4  ms\n *\n * Run-to-run spread is under 1%% at each point, so the 29.5%% gap between 192\n * and CUDA's 512 is far outside the noise. 192 is 6 SIMD groups and keeps\n * (athr & 31) == 0, which k_apply's warp-ballot path requires.\n *\n * THE BOX: a 10-core M3 in a fanless MacBook Air that also drives the\n * display. The shape of the curve should carry to other Apple GPUs; the\n * exact optimum may not, and an M3 Max has four times the cores. Re-measure\n * there rather than trusting this number. */\n"
+n_athr = src.count('cfg->apply_threads ? cfg->apply_threads : 512;')
+src = src.replace('cfg->apply_threads ? cfg->apply_threads : 512;',
+                  'cfg->apply_threads ? cfg->apply_threads : 192;')
+if n_athr:
+    src = src.replace('    const int athr =', ATHR_NOTE + '    const int athr =', 1)
+    src = src.replace('            int athr =', ATHR_NOTE + '            int athr =', 1)
+    print('  apply threads default 512 -> 192 (%d site)' % n_athr)
+
 src = apply_renames(src)
 
 # the CUDA TU's own includes become the ported ones
