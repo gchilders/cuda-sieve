@@ -203,14 +203,32 @@ call site cannot do one and forget the other.
   Metal build matches every one; the 37 relations at the parity special-q are
   the identical (a,b) set as las's. The 3 ULP `log2` divergence has not moved
   a relation. What remains is a full band rather than a single q.
-- **Phase 8 (tuning): partly done.** The two-level fill's threadgroup-ceiling
+- **Phase 8 (tuning): DONE except the two-level fill defect.** The two-level fill's threadgroup-ceiling
   problem is SOLVED — `L1_CAP`/`L2_CAP` retuned 64 -> 61, measured against the
   driver's own refusal at 33,796 B — but the path **misplaces records across
   regions** (right total, wrong distribution) and therefore **`--mode
   twolevel` refuses on Metal**. Not the production path; apply needs
   single-level 4 B records. Cause not found; cap sweep, vote emulation and
-  lane mapping all ruled out. Still to do: threadgroup-size tuning,
-  `--cof-chunk` against the display watchdog, slab sizing for UMA.
+  lane mapping all ruled out. Threadgroup-size tuning, `--cof-chunk`
+  and slab sizing are all measured and written up (plan 8a-8d).
+
+  **Slab sizing was the one real win: 8 slabs instead of 2, -44% on the
+  sieve.** `slab.h`'s target is in bucket *regions*, so this build's
+  `--region 13` silently quartered CUDA's intent; `SLAB_PERF_REGIONS` is now
+  overridable (default unchanged) and set to 8192 here.
+
+  **The other knobs are already right, which is itself the result.**
+  `--threads` 256 and `--blocks` 288 are at their optima on this box even
+  though 288 is a literal `48 * 6` NVIDIA SM assumption. Do not "fix" it
+  without measuring: from 80 to 1152 threadgroups the wall is flat inside a
+  0.77% noise band.
+
+  **The cofactor stage is 59% of wall and is immune to launch geometry** --
+  under 2% across a 16x range of threadgroup sizes and 115x of counts. It is
+  critical-path bound, not occupancy bound: halving the records in a launch
+  leaves the launch's cost unchanged (1508 -> 1540 ms). Grid shape cannot
+  shorten a dependent chain, so do not spend effort there; the levers are
+  `--ecm-curves`/`--ecm-b1`/`--cof-rounds`, which change the mathematics.
 - Phase 9: not started (packaging).
 
 **Candidate counts do not compare across sievers; relation sets do.** Our 1,845

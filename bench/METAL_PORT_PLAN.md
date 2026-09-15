@@ -1202,6 +1202,88 @@ bandwidth and more cores to hide launch latency behind, and should be
 re-measured rather than inheriting 8192. `--slab-j` still overrides.
 
 
+### 8d. Threadgroup-size tuning: the defaults are already right
+
+Two knobs were left after 8a, and both are NVIDIA-shaped: `--threads`
+(default 256, governing transform, TD, classify, intersect and both cofactor
+queues) and `--blocks`, whose auto value is the literal `48 * 6` -- six blocks
+per SM on an assumed 48-SM part -- giving 288 threadgroups on a 10-core GPU.
+
+**Noise band first.** Three repeats of the unchanged configuration: wall
+2509.06 / 2528.46 / 2519.27 ms, a spread of **0.77%**. Better still, `fill`
+and `apply` are driven by `--fill-threads` and `--apply-threads`, *not* by
+either knob under test, so they act as an internal control: across all 14
+sweep runs they stayed at 146-150 ms and 349-359 ms, i.e. +/-1.4%. Anything
+inside ~20 ms of wall is noise.
+
+**`--threads`:** 256 is already the optimum.
+
+| `--threads` | 32 | 64 | 128 | 192 | 256 | 512 |
+|---|---|---|---|---|---|---|
+| transform | 92.5 | 63.1 | 58.4 | 62.5 | 55.6 | **50.6** |
+| norms + trial division | 512.1 | 291.7 | 159.6 | 106.0 | **92.8** | 122.2 |
+| classify | 26.6 | 19.0 | **17.6** | 24.1 | 31.3 | 35.0 |
+| algebraic queue | 1504.9 | 1574.4 | 1502.9 | 1570.3 | 1519.9 | 1696.2 |
+| **wall** | 3018.7 | 2785.6 | 2559.9 | 2600.6 | **2530.3** | 2761.2 |
+
+**`--blocks`:** flat from 80 upward; the inherited 288 sits in the flat region.
+
+| `--blocks` | 10 | 20 | 40 | 80 | 144 | 288 | 576 | 1152 |
+|---|---|---|---|---|---|---|---|---|
+| algebraic queue | 1508 | 1523 | 1505 | 1508 | 1505 | 1509 | 1505 | 1509 |
+| **wall** | 2712 | 2582 | 2537 | 2526 | 2520 | **2517** | 2515 | 2519 |
+
+Everything from 80 to 1152 is inside the noise band of everything else, so
+288 is kept -- not because it was chosen for this hardware, but because on
+this hardware the choice does not matter. Only starving the grid (10 or 20
+threadgroups) is measurably bad. **No change to either default.**
+
+**One knob, three stages, three different optima.** TD wants 256, classify
+wants 128 (17.6 vs 31.3 ms, far outside the +/-1.6 ms repeat spread), and
+transform mildly wants 512. Splitting `--threads` per stage is therefore a
+real but *small* win: at each stage's own optimum the saving is about 5 ms on
+transform and 14 ms on classify, ~19 ms against a 2520 ms wall, or **0.75% --
+the same size as the noise band**. Measured, and declined: a third geometry
+knob is not worth 0.75%, and TD, which dominates the three, is already at its
+best value.
+
+**Why the cofactor stage ignores all of this.** The algebraic queue is 1500 ms
+of a 2520 ms wall -- 59%, more than every other stage combined -- and it moves
+by under 2% across a 16x range of threadgroup sizes and a 115x range of
+threadgroup counts. It is not occupancy-bound, so no packing fixes it. 8b's
+table already says why, read the other way round: dividing the *same* 1,852
+records into more launches costs a near-constant amount per launch.
+
+| records per launch | 1852 | 926 | 463 | 256 |
+|---|---|---|---|---|
+| total algebraic | 1508 | 3080 | 5044 | 7696 |
+| **per launch** | **1508** | **1540** | 1261 | 962 |
+
+Halving the records per launch leaves the per-launch cost **unchanged**
+(1508 -> 1540 ms, inside noise). A stage whose cost does not fall when you
+halve its work is running down a critical path, not a throughput limit: the
+ECM round structure is a long dependent chain per record, and the launch ends
+when the slowest record does. Grid shape cannot shorten a dependent chain.
+The lever for this stage is `--ecm-curves` / `--ecm-b1` / `--cof-rounds`,
+which change the mathematics rather than the schedule, and so are out of
+scope for tuning.
+
+**Measured on a 10-core M3 in a fanless MacBook Air that also drives the
+display.** Relations were 37 at all 20 configurations. As in 8a, the shape
+should carry to other Apple GPUs and the exact values may not -- but "the
+inherited NVIDIA geometry is already in the flat region" is the kind of
+result that carries further than a specific optimum would.
+
+**Three stale `--help` defaults, found while checking this.** `--help` on the
+Metal build still advertised CUDA's numbers for values this port had already
+changed: `--apply-threads [512]` when 8a shipped 192, `--region [14]` when
+this build defaults to 13, and a `--slab-j` paragraph still working its
+example from "the default --region 14" with a 2^29 cap -- arithmetic that
+8c had just invalidated twice over. The code was right and the documentation
+the user actually reads was wrong. Corrected, with the reason on each line.
+(`%` needs escaping as `%%` there; line 296 was already doing it.)
+
+
 ## 9. Drift ledger — CUDA-side changes made for this port
 
 | date | CUDA file(s) | change | verified how |
