@@ -2149,6 +2149,69 @@ display.** The optimum at two is a re-compaction effect and should carry; the
 exact cost per curve is this machine's and is what the bound is applied to.
 
 
+### 8o. The derived default validated over 288 q
+
+8n changed what the build does when `--ecm-curves` is not given, so the
+comparison that matters is the old default against the new one -- both at the
+same 48-curve budget, over the same 288 special-q band as 8l.
+
+| | old default 12c x 4r | derived 2c x 24r |
+|---|---|---|
+| relations | **13,485** | **13,485** |
+| shared (a,b) | 13,485 | 13,485 |
+| unique to this run | **0** | **0** |
+| records enqueued | 564,696 | 564,696 |
+| side 0 split / dead / stuck | 477,071 / 87,625 / 0 | 477,071 / 87,625 / 0 |
+| cofactor ms/q | 348.3 | **153.5** |
+| wall ms/q | 1068.6 | **856.0** |
+| longest launch | 1669 ms | **467 ms** |
+
+**Identical relation sets**, at 56% less cofactor time, 20% less wall, and a
+launch inside the 750 ms bound where the old default was more than twice over
+it.
+
+#### The interesting part is where they DIFFER
+
+8l's identical result had an easy explanation: both configurations shared the
+first 8 sigmas of every round, which is where essentially all splitting happens
+at B1 2000. That is **not** true here. Both cover 48 sigmas, but 12x4 takes
+`{1006-1017, 2006-2017, 3006-3017, 4006-4017}` and 2x24 takes
+`{1006-1007, 2006-2007, ..., 24006-24007}` -- **8 in common, 40 different**. A
+cofactor splitting on sigma 1010 is found by the old default and never tried by
+the new one. Identical output was not forced this time.
+
+And the side-1 classification shows the sigmas genuinely did differ:
+
+| side 1, 564,696 records | 12c x 4r | 2c x 24r | |
+|---|---|---|---|
+| split | 14,291 | 14,291 | **identical** |
+| dead | 550,145 | 550,176 | +31 |
+| stuck | 260 | 229 | -31 |
+
+**The split count is identical while dead/stuck move.** So the two runs tried
+genuinely different curves -- this is not a parameter being quietly ignored --
+and factored exactly the same cofactors anyway. The 31 records that moved are
+ones the old default left unresolved (budget exhausted, `stuck`) and the new
+one proved unsplittable (`dead`). Neither is a relation either way, so yield is
+untouched.
+
+The reading: **at B1 2000 / B2 60000 the relation set is robust to which
+sigmas are tried.** A cofactor with a factor small enough for these bounds is
+found by almost any curve; one without is found by none of 48. Which sigmas
+you spend the budget on does not matter -- only how many, and how cheaply you
+can spend them. That is what makes 8n's re-compaction win free.
+
+**The caveat from 8l stands unchanged and is now more clearly load-bearing:**
+this is a property of these parameters. At a B1 where the marginal curve
+really does decide relations, the two would diverge, and the argument above
+says exactly when -- when a cofactor's smallest factor sits near the edge of
+what B1 can reach, so that success depends on the curve rather than on the
+bound.
+
+**Measured on a 10-core M3 in a fanless MacBook Air that also drives the
+display.**
+
+
 ## 9. Drift ledger — CUDA-side changes made for this port
 
 | date | CUDA file(s) | change | verified how |
