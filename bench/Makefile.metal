@@ -26,7 +26,13 @@ CF_LMAX   ?= 4
 # -ffp-contract=off on the host side is equally load-bearing: the host must
 # not fuse a*b+c into an fma the device build does not, or the two builds of a
 # shared header stop agreeing and every bit-exactness gate here becomes a lie.
-MSLFLAGS  := -std=metal3.2 -fno-fast-math -I metal
+# -std=metal3.2 rather than metal4.0 for portability: metal4.0 compiles this
+# tree warning-free but needs macOS 26, while metal3.2 reaches macOS 15. The
+# only cost is a pedantic `if constexpr is a C++17 extension` warning, since
+# MSL 3.2 is nominally C++14; the construct itself works (clang treats it as
+# the same extension it always has), and Phase 4's byte-identical gate is the
+# proof that it does.
+MSLFLAGS  := -std=metal3.2 -fno-fast-math -Wno-c++17-extensions -I metal
 HOSTFLAGS := -std=c++17 -O2 -ffp-contract=off -I . -I metal \
              -DBN_LIMBS=$(BN_LIMBS) -DCF_LMAX=$(CF_LMAX)
 
@@ -61,7 +67,7 @@ $(BUILD)/sites_msl.air: metal/sf_sites.h metal/softfp64.h | $(BUILD)
 	$(METAL) $(MSLFLAGS) -c $(BUILD)/sites_msl.metal -o $@
 
 .PHONY: metalcheck
-metalcheck: rtcheck $(BUILD)/sf_test_host $(BUILD)/sf_test.metallib $(BUILD)/sf_test_device \
+metalcheck: rtcheck scancheck $(BUILD)/sf_test_host $(BUILD)/sf_test.metallib $(BUILD)/sf_test_device \
             $(BUILD)/sf_sites_test $(BUILD)/sites_msl.air
 	@echo "== softfp64 vs hardware fp64 (host) =="
 	@$(BUILD)/sf_test_host
@@ -88,3 +94,51 @@ $(BUILD)/rt_test: metal/rt_test.cpp metal/metal_rt.mm metal/metal_rt.h | $(BUILD
 .PHONY: rtcheck
 rtcheck: $(BUILD)/rt_test $(BUILD)/rt_test.metallib
 	@$(BUILD)/rt_test $(BUILD)/rt_test.metallib
+
+# ---- Phase 4 gate: fbgen_gpu on Metal vs the CPU generator ---------------
+#
+# Stronger than the HIP port managed for this phase, and for a reason worth
+# recording: fbgen.c builds and runs natively on macOS, so the reference is
+# the INDEPENDENT CPU implementation rather than another GPU build. That is
+# what fbgpucheck.sh was written to compare, so the gate is the tree's own
+# script, unmodified except for a sha256sum/shasum portability fix.
+
+METAL_OBJS   := $(BUILD)/metal_rt.o $(BUILD)/metal_scan.o
+FBGEN_CPUOBJ := fbgen_lib.o fb_load.o fb_cado.o poly.o primes.o platform.o
+
+$(BUILD)/bench.metallib: metal/fbgen_gpu.metal metal/fbgen_gpu_body.metal.inc \
+                         metal/scan.metal | $(BUILD)
+	$(METAL) $(MSLFLAGS) -c metal/fbgen_gpu.metal -o $(BUILD)/fbgen_gpu.air
+	$(METAL) $(MSLFLAGS) -c metal/scan.metal      -o $(BUILD)/scan.air
+	$(METALLIB) $(BUILD)/fbgen_gpu.air $(BUILD)/scan.air -o $@
+
+$(BUILD)/metal_rt.o: metal/metal_rt.mm metal/metal_rt.h | $(BUILD)
+	$(CXX) $(HOSTFLAGS) -c $< -o $@
+
+$(BUILD)/metal_scan.o: metal/metal_scan.cpp metal/metal_scan.h | $(BUILD)
+	$(CXX) $(HOSTFLAGS) -c $< -o $@
+
+$(BUILD)/fbgen_gpu: metal/fbgen_gpu_metal.cpp $(METAL_OBJS) $(BUILD)/bench.metallib
+	$(MAKE) $(FBGEN_CPUOBJ)
+	$(CXX) $(HOSTFLAGS) metal/fbgen_gpu_metal.cpp $(METAL_OBJS) $(FBGEN_CPUOBJ) \
+	    -framework Metal -framework Foundation -framework IOKit -lm -o $@
+
+.PHONY: scancheck
+scancheck: $(BUILD)/scan_test $(BUILD)/scan_test.metallib
+	@$(BUILD)/scan_test $(BUILD)/scan_test.metallib
+
+$(BUILD)/scan_test.metallib: metal/scan.metal | $(BUILD)
+	$(METAL) $(MSLFLAGS) -c $< -o $(BUILD)/scan_only.air
+	$(METALLIB) $(BUILD)/scan_only.air -o $@
+
+$(BUILD)/scan_test: metal/scan_test.cpp metal/metal_scan.cpp metal/metal_rt.mm | $(BUILD)
+	$(CXX) $(HOSTFLAGS) metal/scan_test.cpp metal/metal_scan.cpp metal/metal_rt.mm \
+	    -framework Metal -framework Foundation -framework IOKit -o $@
+
+# fbgpucheck.sh wants ./fbgen_gpu and ./fbgen next to it, as the CUDA build
+# leaves them. Stage the Metal build under those names for the run only.
+.PHONY: fbcheck
+fbcheck: $(BUILD)/fbgen_gpu fbgen
+	@cp $(BUILD)/fbgen_gpu ./fbgen_gpu
+	@CUDA_SIEVE_METALLIB=$(CURDIR)/$(BUILD)/bench.metallib sh fbgpucheck.sh; \
+	  rc=$$?; rm -f ./fbgen_gpu; exit $$rc

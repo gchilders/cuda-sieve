@@ -77,9 +77,26 @@ lane order (so `td.cuh:647` holds), `simd_shuffle_up` matching CUDA,
   `cd bench && make -f Makefile.metal rtcheck` — 17 checks.
   `metal/metal_rt.h` is plain C++; `metal/metal_rt.mm` is the only
   Objective-C++ in the port. Ported orchestration compiles as ordinary C++.
-- Phases 4-9: not started. Next is Phase 4, `fbgen_gpu.metal` plus the
-  hand-rolled scan/select that replaces CUB — self-contained and
-  independently gated against the CUDA build's `oracle/c183.fb1`.
+- **Phase 4 (fbgen_gpu + CUB replacement): DONE, gate green.**
+  `cd bench && make -f Makefile.metal fbcheck` — `fbgpucheck.sh`, 19 cases,
+  all byte-identical to the CPU generator. Also `make -f Makefile.metal
+  scancheck` for the scan/select primitives alone.
+- Phases 5-9: not started. Next is Phase 5, the sieve kernels
+  (`k_transform`, `k_fill_*`, `k_apply`) and the `pipeline_metal.cpp`
+  orchestration, including the soft-fp64 norm fallback.
+
+**The Phase 4 reference is the CPU generator, not CUDA.** `fbgen.c` builds and
+runs natively on macOS unchanged, so `fbgpucheck.sh` compares the Metal build
+against an *independent* implementation rather than another GPU build. The HIP
+port could not do this — its CPU `fbgen` segfaulted under MinGW — and settled
+for a weaker check. Prefer this reference wherever a later phase can use it.
+
+**Porting aids:** `metal/gen_fbgen_metal.py` and `metal/gen_fbgen_host.py`
+produced the first drafts of the Phase 4 sources and are committed so a later
+CUDA-side change can be re-diffed rather than re-ported from memory. They are
+NOT wired into the build. The generated files are committed and reviewed like
+any other source; edit the source, and update the generator only if you intend
+to regenerate.
 
 **Two conventions the rest of the port depends on** (plan Phase 3):
 - CUDA kernel parameter *i* becomes MSL `[[buffer(i)]]`, same order.

@@ -94,14 +94,22 @@ guard="$tmpdir/publish-guard.roots1"
 badref="$tmpdir/publish-badref.roots1"
 ./fbgen --poly ../oracle/c183.poly --lim 10000 --maxbits 15 --threads 2 --out "$guard"
 ./fbgen --poly ../oracle/c183.poly --lim 10000 --maxbits 1 --threads 2 --out "$badref"
-before=$(sha256sum "$guard" | cut -d' ' -f1)
+# sha256sum is coreutils; macOS ships shasum instead. The Metal port's gate is
+# this same script, so pick whichever exists rather than forking the file.
+if command -v sha256sum >/dev/null 2>&1; then
+    sha256() { sha256sum "$1" | cut -d' ' -f1; }
+else
+    sha256() { shasum -a 256 "$1" | cut -d' ' -f1; }
+fi
+
+before=$(sha256 "$guard")
 if ./fbgen_gpu --poly ../oracle/c183.poly --lim 10000 --maxbits 15 \
        --device "$device" --out "$guard" --compare-fb "$badref" \
        >/dev/null 2>&1; then
     echo 'FAIL   mismatched --compare-fb unexpectedly passed' >&2
     exit 1
 fi
-after=$(sha256sum "$guard" | cut -d' ' -f1)
+after=$(sha256 "$guard")
 [ "$before" = "$after" ] || {
     echo 'FAIL   failed --compare-fb replaced the existing output' >&2
     exit 1
