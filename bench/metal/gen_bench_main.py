@@ -179,6 +179,74 @@ assert _dev_old in src, '--device help line shape changed'
 src = src.replace(_dev_old, _dev_new, 1)
 print('  --help marks this as the Metal build')
 
+# ---- lift the 24-round cap for ECM ----------------------------------------
+# The cap's own message says why it exists: "budget << r overflows beyond
+# that". That is RHO's iteration budget. ECM never shifts it -- the ECM
+# launches pass S->curves unshifted, and the round index reaches the device
+# only as c0 = r+1, which selects a 1000-wide sigma block
+# (`sigma = c0*1000 + cv + 6`).
+#
+# The overflow it guards is also already guarded exactly, and only where it
+# applies: bench_main's own check tests `(uint64_t)budget << (rounds-1) >
+# 0xFFFFFFFF` against the ACTUAL budget, gated on a side actually using rho.
+# That is why `--cof-rho --cof-rounds 20` is refused at the default budget of
+# 65536 while `--cof-rounds 16` is accepted. The blanket 24 adds nothing for
+# rho and costs ECM the only axis that can hold 8k's launch bound: to keep a
+# curve budget while shortening launches you need MORE rounds of FEWER curves,
+# and at B1 8000 one curve is ~370 ms, so 750 ms means 2 curves/round and 192
+# curves would need 96 rounds.
+#
+# 1000 rounds, not unbounded: sigma must stay in uint32 (it would take ~4.3M
+# rounds to break that) and each round costs five small kernels plus its
+# launches, so a cap that is generous without being meaningless is the useful
+# shape. Rho keeps 24 and its exact budget check underneath.
+_r1_old = chr(10).join([
+    "    if (cof_rounds < 1 || cof_rounds > 24) {",
+    '        fprintf(stderr, "--cof-rounds %d: must be 1..24 (budget << r overflows"',
+    '                " beyond that, and < 1 splits nothing)\\n", cof_rounds);',
+    "        bad = 1;",
+    "    }",
+    "    if (cfg->cof_rounds < 1 || cfg->cof_rounds > 24) {",
+    '        fprintf(stderr, "pipeline cof-rounds %d: must be 1..24\\n", cfg->cof_rounds);',
+    "        bad = 1;",
+    "    }"])
+_r1_new = chr(10).join([
+    "    {",
+    "        /* 24 is rho's bound, not ECM's -- see metal/gen_cofac_host.py. The",
+    "         * exact `budget << (rounds-1)` test below still gates rho. */",
+    "        const int rho_in_use = (cfg->cof_meth0 == COF_METHOD_RHO ||",
+    "                                cfg->cof_meth1 == COF_METHOD_RHO);",
+    "        const int rmax = rho_in_use ? 24 : 1000;",
+    "        if (cof_rounds < 1 || cof_rounds > rmax) {",
+    '            fprintf(stderr, "--cof-rounds %d: must be 1..%d (%s)\\n",',
+    "                    cof_rounds, rmax, rho_in_use",
+    '                    ? "budget << r overflows beyond that for rho, and < 1'
+    ' splits nothing"',
+    '                    : "ECM does not shift the budget; this bound is the'
+    ' sigma-block space, and < 1 splits nothing");',
+    "            bad = 1;",
+    "        }",
+    "        if (cfg->cof_rounds < 1 || cfg->cof_rounds > rmax) {",
+    '            fprintf(stderr, "pipeline cof-rounds %d: must be 1..%d\\n",',
+    "                    cfg->cof_rounds, rmax);",
+    "            bad = 1;",
+    "        }",
+    "        /* Sigma blocks are 1000 wide and indexed by the round, so more than",
+    "         * 994 curves in a round runs into the NEXT round's sigmas and",
+    "         * repeats them. Harmless arithmetically, but it silently spends",
+    "         * curves that cannot find anything new -- and it matters more now",
+    "         * that many-rounds-of-few-curves is the recommended shape. */",
+    "        if (cfg->ecm_curves > 994) {",
+    '            fprintf(stderr, "--ecm-curves %u: must be <= 994, or a round\'s"',
+    '                    " sigmas (c0*1000 + cv + 6) run into the next round\'s"',
+    '                    " and repeat them\\n", cfg->ecm_curves);',
+    "            bad = 1;",
+    "        }",
+    "    }"])
+assert _r1_old in src, 'cof-rounds validation shape changed'
+src = src.replace(_r1_old, _r1_new, 1)
+print('  cof-rounds cap lifted to 1000 for ECM; rho keeps 24; curves bounded to 994')
+
 open(OUT, 'w').write(src)
 print('wrote %s (%d lines)' % (OUT, src.count('\n')))
 left = sorted(set(re.findall(r'\bcuda[A-Z]\w*|CUDART_VERSION', src)))
