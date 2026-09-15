@@ -613,7 +613,12 @@ _guard = chr(10).join([
     "    if (Q->meth[0] || Q->meth[1]) {",
     "        /* ~0.045 ms per prime power + giant step, 10-core M3. A slower or",
     "         * faster Apple GPU moves this; it is a guard rail, not a model. */",
-    "        const double ms_one_curve = 0.045 * (double)(Q->ns + Q->s2nv);",
+    "        /* MARGINAL cost of a curve: 0.0413 ms per prime power + giant",
+    "         * step. The one-curve points (110/370/1461 ms at B1 2000/8000/",
+    "         * 32000) include a fixed per-launch overhead and so overstate",
+    "         * it; 8 curves at B1 2000 measured 740 ms, i.e. 92.5 ms each",
+    "         * over 2,237 units. Calibrated on a 10-core M3. */",
+    "        const double ms_one_curve = 0.0413 * (double)(Q->ns + Q->s2nv);",
     "        if (ms_one_curve > COF_LAUNCH_REFUSE_MS) {",
     "            fprintf(stderr,",
     "                    \"  cofactor queue: REFUSED -- one ECM curve is about\"",
@@ -651,6 +656,42 @@ _c_new = chr(10).join([
 assert _c_old in src, 'watchdog warn constant missing'
 src = src.replace(_c_old, _c_new, 1)
 print('  refuses an ECM chain no chunk size can bound')
+
+# Advise when the configured curve budget cannot meet the launch bound.
+# Chasing an unreachable bound is expensive -- measured over 288 q, 48 curves
+# x 4 rounds pays 835 ms/q against 465 before the bound existed, because the
+# controller descends until the no-progress guard stops it. The equivalent
+# split meets the bound AND is faster (277 ms/q). That is worth saying at
+# startup rather than leaving in a plan document, and it changes nothing: the
+# caller's own curves and rounds are used exactly as given.
+_adv_old = "        if (ms_one_curve > COF_LAUNCH_REFUSE_MS) {"
+_adv_new = chr(10).join([
+    "        const double ms_round = ms_one_curve * (double)Q->ecm_curves;",
+    "        if (ms_one_curve <= COF_LAUNCH_REFUSE_MS",
+    "            && ms_round > COF_CHUNK_TARGET_MS && Q->ecm_curves > 1) {",
+    "            const uint32_t fit = (uint32_t)(COF_CHUNK_TARGET_MS / ms_one_curve);",
+    "            fprintf(stderr,",
+    "                    \"  cofactor queue: %u curves/round is about %.0f ms in one\"",
+    "                    \" launch, over this build's %.0f ms bound. --cof-chunk\"",
+    "                    \" splits RECORDS and cannot divide a chain, so the\"",
+    "                    \" chunker will subdivide without reaching it and lose\"",
+    "                    \" throughput doing so.\\n\",",
+    "                    Q->ecm_curves, ms_round, (double)COF_CHUNK_TARGET_MS);",
+    "            /* --cof-rounds caps at 24, so suggest filling it rather than",
+    "             * a round count the parser would reject. cofq_init is not told",
+    "             * the caller's rounds, so this quotes the curves/round that fit",
+    "             * and the maximum rounds, not a budget it cannot see. */",
+    "            if (fit >= 1)",
+    "                fprintf(stderr,",
+    "                        \"  Shorter launches, same B1/B2: --ecm-curves %u\"",
+    "                        \" --cof-rounds 24 (the cap) gives %u curves in\"",
+    "                        \" launches of about %.0f ms.\\n\",",
+    "                        fit, fit * 24u, ms_one_curve * (double)fit);",
+    "        }",
+    "        if (ms_one_curve > COF_LAUNCH_REFUSE_MS) {"])
+assert _adv_old in src, 'refusal guard shape changed'
+src = src.replace(_adv_old, _adv_new, 1)
+print('  advises the split that meets the launch bound')
 
 open(OUT, 'w').write(src)
 print('wrote %s: %d kernels removed, %d launches rewritten' % (OUT, nk, nl))
