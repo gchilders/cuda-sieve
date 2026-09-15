@@ -1284,6 +1284,83 @@ the user actually reads was wrong. Corrected, with the reason on each line.
 (`%` needs escaping as `%%` there; line 296 was already doing it.)
 
 
+### 8e. Regions below 2^13: measured, and they are all worse
+
+8d tuned the knobs but never asked whether `--region 13` is *good*. It had
+only ever been justified as **the largest value that fits** under Apple's
+32,768 B threadgroup ceiling (5.1), which is a constraint, not a measurement.
+There was a plausible story for going lower: `k_apply`'s threadgroup
+requirement is `2^log_region * 2 + nslice_pow2 * 2` bytes, so every step down
+halves it and should buy occupancy.
+
+It does not. Swept with **`--slab-j 2048` pinned**, which holds the slab at
+the 8c optimum of 2^26 positions regardless of region -- without that pin the
+sweep would be moving slab size at the same time, since the auto target is
+`SLAB_PERF_REGIONS << log_region`.
+
+| `--region` | 10 | 11 | 12 | **13** |
+|---|---|---|---|---|
+| threadgroup B | 2,176 | 4,224 | 8,320 | 16,512 |
+| regions/slab | 65,536 | 32,768 | 16,384 | 8,192 |
+| fill | 518.5 | 311.5 | 175.1 | **154.4** |
+| apply | 1497.8 | 841.2 | 507.1 | **349.6** |
+| sieve, both sides | 2063.6 | 1212.1 | 739.5 | **562.2** |
+| wall | 4036.0 | 3181.2 | 2704.2 | **2544.6** |
+
+Monotonic, large, and in the opposite direction to the occupancy story. 37
+relations at every point. **The region wants to be as big as it is allowed to
+be**; freeing threadgroup memory buys nothing because the cost is per *region*,
+not per byte.
+
+The numbers fit a straight line in the region count almost exactly:
+
+```
+apply  =  182.3 ms + 20.07 us per region     residuals +2.8 -4.1 +1.2 +0.1 ms
+fill   =   87.6 ms +  6.58 us per region
+```
+
+Three independent incremental estimates of the apply slope -- 19.2, 20.4 and
+20.0 us -- agree across a 4x range of region counts. So each bucket region
+costs about **20 us of fixed overhead** in apply and 6.6 us in fill, against a
+constant term that is the actual useful work. Halving the region size does not
+halve anything; it doubles the number of times that fixed cost is paid.
+
+**This makes Apple's 32 KB ceiling a measured performance cost, not just a
+constraint.** Extrapolating the same fit one step up, to CUDA's default
+`--region 14` and its 4,096 regions:
+
+| | region 13 (measured) | region 14 (predicted) |
+|---|---|---|
+| apply | 349.6 ms | ~265 ms |
+| fill | 154.4 ms | ~115 ms |
+| sieve | 562.2 ms | ~440 ms, about **-22%** |
+
+**And we miss it by 128 bytes.** At region 14 the requirement is
+`32,768 + 128 = 32,896` B against a 32,768 B ceiling -- the overflow this port
+documented in Phase 5 and worked around by dropping to 13. Those 128 bytes are
+`nslice_pow2 * 2` for 64 slices: a **read-only** lookup table that the kernel
+copies in from a `device const uint16_t *` it already has
+(`lut[i] = slice_logp[i]`, `bench_kernels_body.metal.inc:538`) and then only
+ever reads. It is in threadgroup memory for an NVIDIA reason -- shared memory
+beats global for repeated random access there -- that does not obviously apply
+to a 128-byte table on an Apple GPU, where it would sit in cache or could be
+declared `constant`.
+
+If that copy were dropped on the Metal side, `k_apply` would need exactly
+32,768 B at region 14: equal to the ceiling, and the check is `>`, so it fits.
+**Not attempted yet** -- it is device-code surgery rather than tuning, it makes
+`k_apply` diverge from CUDA's structure, and the ~22% is an extrapolation one
+step outside the measured range. It is cheap to falsify, though: `sievecheck`
+compares all 4,194,304 cells exactly, so a wrong answer cannot hide.
+
+Note also that at region 14 the slab target moves with it -- `8192 << 14` is
+2^27 -- so `SLAB_PERF_REGIONS` would want halving to 4096 to keep the 8c
+optimum of 2^26 positions per slab.
+
+**Measured on a 10-core M3 in a fanless MacBook Air that also drives the
+display.**
+
+
 ## 9. Drift ledger — CUDA-side changes made for this port
 
 | date | CUDA file(s) | change | verified how |
