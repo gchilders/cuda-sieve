@@ -1489,7 +1489,21 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                 ? (uint32_t)((cfg->probe_i + (1 << (cfg->logI - 1)))
                              + ((uint64_t)cfg->probe_j << cfg->logI))
                 : 0xFFFFFFFFu;
-            int athr = cfg->apply_threads ? cfg->apply_threads : 512;
+/* 192, not CUDA's 512. MEASURED on this box, bracketed interior minimum,
+ * three runs per point at logI 14 / J 8192 / region 13 on oracle/c183:
+ *
+ *   threads   64      128     192     256     512
+ *   apply    83.9    56.2    54.6    57.8    77.4  ms
+ *
+ * Run-to-run spread is under 1%% at each point, so the 29.5%% gap between 192
+ * and CUDA's 512 is far outside the noise. 192 is 6 SIMD groups and keeps
+ * (athr & 31) == 0, which k_apply's warp-ballot path requires.
+ *
+ * THE BOX: a 10-core M3 in a fanless MacBook Air that also drives the
+ * display. The shape of the curve should carry to other Apple GPUs; the
+ * exact optimum may not, and an M3 Max has four times the cores. Re-measure
+ * there rather than trusting this number. */
+            int athr = cfg->apply_threads ? cfg->apply_threads : 192;
             /* region 0 is the j=0 row and is legitimately almost empty --
              * gating on it would check nothing. Use a mid-range region. */
             const uint32_t dbgreg = nregion / 2;
