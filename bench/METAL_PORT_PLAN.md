@@ -2010,6 +2010,62 @@ composite. Ship it as job settings.
 display.**
 
 
+### 8m. The 24-round cap is rho's, and ECM was paying for it
+
+`--cof-rounds` refused anything above 24, and its own message said why:
+"budget << r overflows beyond that". That is **rho's** iteration budget, and
+the cap was the only thing stopping ECM from using the one axis that can hold
+8k's launch bound.
+
+**ECM never shifts the budget.** The rho launch passes `S->budget << r`; both
+ECM launches pass `S->curves`, unshifted. The round index reaches the device
+only as `c0 = r + 1`, which selects a 1000-wide sigma block
+(`sigma = c0*1000 + cv + 6`). Nothing about ECM overflows with more rounds.
+
+**And the overflow it names is already guarded exactly, where it applies.**
+`bench_main` tests `(uint64_t)budget << (rounds-1) > 0xFFFFFFFF` against the
+*actual* budget, gated on a side really using rho:
+
+```
+$ ./bench ... --cof-rho --cof-rounds 16   # accepted
+$ ./bench ... --cof-rho --cof-rounds 20
+pipeline cof-budget 65536 with 20 rounds overflows uint32 (or is zero)
+```
+
+So at the pipeline's default budget of 65536 the real limit is **16**, not 24 --
+the blanket check is simultaneously too loose for rho and irrelevant to ECM,
+and the precise check underneath is what actually protects the shift. (An
+earlier draft of this section claimed the loose bound let rho silently run
+zero-iteration rounds. It does not: the exact check refuses them first. The
+claim was wrong and the empirical run is what caught it.)
+
+**Lifted to 1000 rounds for ECM; rho keeps 24 and its exact check.** 1000
+because sigma stays in uint32 until ~4.3M rounds, while each round costs five
+small kernels plus its launches -- generous without being meaningless.
+
+**What it buys.** To shorten a launch while keeping a curve budget you need
+more rounds of fewer curves, and how few depends on B1. At B1 8000 one curve
+is ~370 ms, so 24 rounds could not get a 192-curve budget anywhere near the
+bound:
+
+| B1 8000, 192 curves | longest launch | cofac/q | relations |
+|---|---|---|---|
+| 8 curves x 24 rounds (the old ceiling) | 4155 ms | 764.8 | 1114 |
+| **2 curves x 96 rounds** | **1594 ms** | **596.2** | 1114 |
+
+Launch down 62%, cofactor stage down 22%, **identical relations** -- the same
+result 8l found at B1 2000, for the same reason.
+
+**Also bounded `--ecm-curves` at 994**, which nothing checked before. Sigma
+blocks are 1000 wide and indexed by round, so 1000+ curves in a round run into
+the *next* round's sigmas and repeat them: arithmetically harmless, silently
+wasteful, and easier to hit now that many-rounds-of-few-curves is the
+recommended shape.
+
+Metal-side only, through the generator; `bench_main.cu` is untouched, so the
+CUDA build keeps 24 and this needs no drift-ledger row. Six gates green.
+
+
 ## 9. Drift ledger — CUDA-side changes made for this port
 
 | date | CUDA file(s) | change | verified how |

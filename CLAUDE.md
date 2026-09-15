@@ -302,6 +302,17 @@ call site cannot do one and forget the other.
   remove either.** The threshold is a judgement: 3.6 s and 6.9 s launches run
   fine here, 15.9 s kills the box, and nobody has measured the real line.
 
+  **`--cof-rounds` now allows 1000 for ECM (plan 8m); rho keeps 24.** The cap
+  was rho's: `budget << r` appears only in the rho launch, while ECM passes
+  `S->curves` unshifted and the round index only picks a 1000-wide sigma block.
+  The overflow it named is already guarded exactly and only for rho, by
+  `bench_main`'s uint64 test on the ACTUAL budget — at the default 65536 the
+  real rho limit is **16**, not 24. Lifting it matters because holding 8k's
+  launch bound needs more rounds of fewer curves as B1 grows: at B1 8000,
+  2c x 96r against 8c x 24r is **launch 4155 -> 1594 ms, cofac/q 765 -> 596,
+  identical relations**. `--ecm-curves` is now bounded at 994 too — sigma
+  blocks are 1000 wide, so more repeats the next round's sigmas.
+
   **The cofactor grid is now sized from the work (plan 8j):**
   `max(multiProcessorCount * 6, ceil(CQ_FLUSH / threads))` = 512 blocks here,
   and `cof_chunk_floor()` is decoupled from it so subdivision stays reachable
