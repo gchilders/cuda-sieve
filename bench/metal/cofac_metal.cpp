@@ -1718,7 +1718,34 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
     if (Q->meth[0] || Q->meth[1]) {
         /* ~0.045 ms per prime power + giant step, 10-core M3. A slower or
          * faster Apple GPU moves this; it is a guard rail, not a model. */
-        const double ms_one_curve = 0.045 * (double)(Q->ns + Q->s2nv);
+        /* MARGINAL cost of a curve: 0.0413 ms per prime power + giant
+         * step. The one-curve points (110/370/1461 ms at B1 2000/8000/
+         * 32000) include a fixed per-launch overhead and so overstate
+         * it; 8 curves at B1 2000 measured 740 ms, i.e. 92.5 ms each
+         * over 2,237 units. Calibrated on a 10-core M3. */
+        const double ms_one_curve = 0.0413 * (double)(Q->ns + Q->s2nv);
+        const double ms_round = ms_one_curve * (double)Q->ecm_curves;
+        if (ms_one_curve <= COF_LAUNCH_REFUSE_MS
+            && ms_round > COF_CHUNK_TARGET_MS && Q->ecm_curves > 1) {
+            const uint32_t fit = (uint32_t)(COF_CHUNK_TARGET_MS / ms_one_curve);
+            fprintf(stderr,
+                    "  cofactor queue: %u curves/round is about %.0f ms in one"
+                    " launch, over this build's %.0f ms bound. --cof-chunk"
+                    " splits RECORDS and cannot divide a chain, so the"
+                    " chunker will subdivide without reaching it and lose"
+                    " throughput doing so.\n",
+                    Q->ecm_curves, ms_round, (double)COF_CHUNK_TARGET_MS);
+            /* --cof-rounds caps at 24, so suggest filling it rather than
+             * a round count the parser would reject. cofq_init is not told
+             * the caller's rounds, so this quotes the curves/round that fit
+             * and the maximum rounds, not a budget it cannot see. */
+            if (fit >= 1)
+                fprintf(stderr,
+                        "  Shorter launches, same B1/B2: --ecm-curves %u"
+                        " --cof-rounds 24 (the cap) gives %u curves in"
+                        " launches of about %.0f ms.\n",
+                        fit, fit * 24u, ms_one_curve * (double)fit);
+        }
         if (ms_one_curve > COF_LAUNCH_REFUSE_MS) {
             fprintf(stderr,
                     "  cofactor queue: REFUSED -- one ECM curve is about"

@@ -273,9 +273,23 @@ call site cannot do one and forget the other.
   time is flat at ~1495 ms below 1920 records while cofac/q rises 10x. The
   lever is `--ecm-curves`, which is PER ROUND: **8 curves x 24 rounds holds
   740 ms and is 24% FASTER than 48 x 4** (354.6 vs 467.2 ms/q), same 192-curve
-  budget, identical relations. Recommended as job settings, **not** adopted as
-  defaults — it changes which sigmas run (`sigma = c0*1000 + cv + 6`), which
-  `cofac.cuh` warns about explicitly.
+  budget, identical relations. **VALIDATED over 288 special-q (plan 8l): the
+  relation sets are IDENTICAL** — 13,485 each, zero unique to either, identical
+  split/dead/stuck, from the identical 564,696 candidates. 160 of the 192
+  sigmas differ and it changes nothing, because at B1 2000 the differing sigmas
+  never split anything: 8 curves x 1 round already gives 6,723 of the 6,724
+  relations that 24 rounds do, so a 192-curve budget does ~8 curves of useful
+  work here. **A property of this job's parameters, not a theorem** — at a
+  larger B1 the two would diverge. Recommended as job settings, **still not** a
+  default, since it changes which sigmas run (`sigma = c0*1000 + cv + 6`).
+
+  **The bound is cheap to meet and expensive to miss.** Over 288 q, 8x24
+  settles at 3,840 records/launch and costs 277.4 ms/q — faster than the 465 it
+  cost before the bound existed. 48x4 cannot meet it (one curve is ~92 ms, so
+  48 is ~4.4 s however the records are sliced), descends, the no-progress guard
+  parks it at 3,840, and it pays **835.3 ms/q against 465**. `cofq_init` now
+  warns at startup and names the split that would fit; it advises, it does not
+  act.
 
   **`--ecm-b1 400000` CRASHED THIS MACHINE TWICE.** WindowServer crash plus
   userspace watchdog timeout, 1m47s and 1m48s into `cofcheckgate`, same case
