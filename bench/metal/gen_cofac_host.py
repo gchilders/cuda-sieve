@@ -325,6 +325,123 @@ src = src.replace(
     'static uint32_t cof_chunk_floor(int blocks, int threads)', 1)
 print('  CQ_FLUSH exposed for grid sizing')
 
+# ---- (b) measure a real per-launch duration, not a whole-side sum ---------
+# The auto chunker halves whenever `stage > COF_CHUNK_TARGET_MS`, where stage
+# is a SIDE's device time summed over every round and every slice. That is not
+# the quantity the target names. A watchdog kills ONE LAUNCH, and on this
+# hardware stage runs 39-45x the 250 ms target at every chunk size a 10-core
+# part can produce -- so the test is true always, the loop parks at the floor
+# forever, and an always-true test is not a controller (plan 8j).
+#
+# Measure the thing instead. Round 0, slice 0 is the longest launch in a flush:
+# every record is still CF_INCOMPLETE, so it carries the most live work of any
+# launch in the side. Bracket exactly that one, per side, and steer on the
+# larger of the two. The events are read after cofq_flush's EXISTING
+# mtlDeviceSynchronize(), so this adds no synchronisation -- only two event
+# records on one launch per side per flush.
+_peak_decl = (
+    "/* Bracket for the longest launch in a flush: round 0, slice 0, where every" + chr(10) +
+    " * record is still live. cf_run_rounds records it; cofq_flush reads it after" + chr(10) +
+    " * the device sync it already performs, so no extra stall is introduced." + chr(10) +
+    " * A file-scope pointer rather than another parameter on the template and its" + chr(10) +
+    " * dispatcher, both of which are threaded through by width. */" + chr(10) +
+    "typedef struct { mtlEvent_t a, b; int armed, fired; } cof_peak_t;" + chr(10) +
+    "static cof_peak_t *g_cof_peak;" + chr(10) + chr(10) +
+    "template <int L>" + chr(10) +
+    "static void cf_run_rounds(")
+assert src.count("template <int L>" + chr(10) + "static void cf_run_rounds(") == 1, 'cf_run_rounds shape changed'
+src = src.replace("template <int L>" + chr(10) + "static void cf_run_rounds(", _peak_decl, 1)
+
+_lines = src.split(chr(10))
+_open = "            const uint32_t e = (n - b > step) ? b + step : n;"
+_i = [k for k, l in enumerate(_lines) if l == _open]
+assert len(_i) == 1, 'slice-loop head not unique'
+_lines.insert(_i[0] + 1,
+    "            /* The flush's worst-case launch; see g_cof_peak. */" + chr(10) +
+    "            const int _peak = (r == 0 && b == 0 && g_cof_peak" + chr(10) +
+    "                               && g_cof_peak->armed);" + chr(10) +
+    "            if (_peak) mtlEventRecord(g_cof_peak->a);")
+
+_j = [k for k, l in enumerate(_lines) if 'cf_kname(L, 0, 0)' in l]
+assert len(_j) == 1, 'rho launch not unique'
+assert _lines[_j[0] + 1].strip() == '}', 'slice-loop else-branch shape changed'
+_lines.insert(_j[0] + 2,
+    "            if (_peak) {" + chr(10) +
+    "                mtlEventRecord(g_cof_peak->b);" + chr(10) +
+    "                g_cof_peak->armed = 0; g_cof_peak->fired = 1;" + chr(10) +
+    "            }")
+src = chr(10).join(_lines)
+print('  per-launch bracket added to cf_run_rounds')
+
+# cofq_flush: own the peak events, arm one per side, steer on the larger.
+_d_old = "    mtlEvent_t e0 = NULL, e1 = NULL, e2 = NULL;" + chr(10) + "    float t0 = 0, t1 = 0;"
+_d_new = ("    mtlEvent_t e0 = NULL, e1 = NULL, e2 = NULL;" + chr(10) +
+          "    cof_peak_t pk0 = {NULL, NULL, 0, 0}, pk1 = {NULL, NULL, 0, 0};" + chr(10) +
+          "    float t0 = 0, t1 = 0, launch_ms = 0;")
+assert _d_old in src, 'cofq_flush declarations changed'
+src = src.replace(_d_old, _d_new, 1)
+
+_c_old = ("    COF_FLUSH_CK(mtlEventCreate(&e0));" + chr(10) +
+          "    COF_FLUSH_CK(mtlEventCreate(&e1));" + chr(10) +
+          "    COF_FLUSH_CK(mtlEventCreate(&e2));" + chr(10) +
+          "    COF_FLUSH_CK(mtlEventRecord(e0));")
+_c_new = ("    COF_FLUSH_CK(mtlEventCreate(&e0));" + chr(10) +
+          "    COF_FLUSH_CK(mtlEventCreate(&e1));" + chr(10) +
+          "    COF_FLUSH_CK(mtlEventCreate(&e2));" + chr(10) +
+          "    COF_FLUSH_CK(mtlEventCreate(&pk0.a)); COF_FLUSH_CK(mtlEventCreate(&pk0.b));" + chr(10) +
+          "    COF_FLUSH_CK(mtlEventCreate(&pk1.a)); COF_FLUSH_CK(mtlEventCreate(&pk1.b));" + chr(10) +
+          "    COF_FLUSH_CK(mtlEventRecord(e0));" + chr(10) +
+          "    pk0.armed = 1; g_cof_peak = &pk0;")
+assert _c_old in src, 'cofq_flush event creation changed'
+src = src.replace(_c_old, _c_new, 1)
+
+_a_old = "    MTL_LAUNCH(k_cof_gate, blocks, threads, 0, 0, n, Q->d_st0, Q->d_st1);"
+_a_new = ("    g_cof_peak = NULL;" + chr(10) + _a_old + chr(10) +
+          "    pk1.armed = 1; g_cof_peak = &pk1;")
+assert src.count(_a_old) == 1, 'k_cof_gate launch not unique'
+src = src.replace(_a_old, _a_new, 1)
+
+_r_old = ("    COF_FLUSH_CK(mtlEventElapsedTime(&t0, e0, e1));" + chr(10) +
+          "    COF_FLUSH_CK(mtlEventElapsedTime(&t1, e1, e2));")
+_r_new = (_r_old + chr(10) +
+          "    g_cof_peak = NULL;" + chr(10) +
+          "    /* The longest single launch this flush actually ran, which is what" + chr(10) +
+          "     * COF_CHUNK_TARGET_MS is about. A side with no live records never" + chr(10) +
+          "     * fires, and contributes nothing. */" + chr(10) +
+          "    {" + chr(10) +
+          "        float p = 0;" + chr(10) +
+          "        if (pk0.fired && !mtlEventElapsedTime(&p, pk0.a, pk0.b)" + chr(10) +
+          "            && p > launch_ms) launch_ms = p;" + chr(10) +
+          "        if (pk1.fired && !mtlEventElapsedTime(&p, pk1.a, pk1.b)" + chr(10) +
+          "            && p > launch_ms) launch_ms = p;" + chr(10) +
+          "    }")
+assert _r_old in src, 'elapsed-time reads changed'
+src = src.replace(_r_old, _r_new, 1)
+
+_s_old = "        const float stage = t0 + t1;"
+_s_new = ("        /* The MEASURED longest launch, not t0+t1. The sum over every round" + chr(10) +
+          "         * and slice of a side is not what a watchdog kills and, on a" + chr(10) +
+          "         * 10-core Apple GPU, exceeds the target at every reachable chunk" + chr(10) +
+          "         * size -- which made this loop park at its floor unconditionally." + chr(10) +
+          "         * Falls back to the old sum if no launch was timed, so a flush" + chr(10) +
+          "         * that never fired steers exactly as it used to. */" + chr(10) +
+          "        const float stage = launch_ms > 0.0f ? launch_ms : (t0 + t1);")
+assert _s_old in src, 'steering input changed'
+src = src.replace(_s_old, _s_new, 1)
+
+# cofq_flush's OWN cleanup label -- the first "done:" in the file belongs to a
+# different function, and destroying pk0/pk1 there does not compile.
+_k = src.index("const float stage = launch_ms > 0.0f")
+_d = src.index(chr(10) + "done:", _k)
+src = (src[:_d] + chr(10) + "done:" + chr(10) +
+       "    g_cof_peak = NULL;" + chr(10) +
+       "    if (pk0.a) mtlEventDestroy(pk0.a);" + chr(10) +
+       "    if (pk0.b) mtlEventDestroy(pk0.b);" + chr(10) +
+       "    if (pk1.a) mtlEventDestroy(pk1.a);" + chr(10) +
+       "    if (pk1.b) mtlEventDestroy(pk1.b);" +
+       src[_d + len(chr(10) + "done:"):])
+print('  auto chunker now steers on a measured launch duration')
+
 open(OUT, 'w').write(src)
 print('wrote %s: %d kernels removed, %d launches rewritten' % (OUT, nk, nl))
 if skipped:

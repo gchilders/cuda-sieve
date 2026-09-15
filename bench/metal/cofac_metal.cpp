@@ -1149,6 +1149,14 @@ typedef struct {
  * remain CF_INCOMPLETE are requeued into the next round with a different rho
  * constant (or a fresh band of ECM sigmas) and, for rho, twice the budget --
  * so an exhausted budget is never turned into a proof of anything. */
+/* Bracket for the longest launch in a flush: round 0, slice 0, where every
+ * record is still live. cf_run_rounds records it; cofq_flush reads it after
+ * the device sync it already performs, so no extra stall is introduced.
+ * A file-scope pointer rather than another parameter on the template and its
+ * dispatcher, both of which are threaded through by width. */
+typedef struct { mtlEvent_t a, b; int armed, fired; } cof_peak_t;
+static cof_peak_t *g_cof_peak;
+
 template <int L>
 static void cf_run_rounds(const mz<L> *d_n, mz<L> lim2, uint32_t lpb, uint32_t n,
                           uint8_t *d_status, uint64_t *d_fac, uint8_t *d_nfac,
@@ -1176,6 +1184,10 @@ static void cf_run_rounds(const mz<L> *d_n, mz<L> lim2, uint32_t lpb, uint32_t n
         if (!step) step = n;   /* b += 0 would never terminate */
         for (uint32_t b = 0; b < n; b += step) {
             const uint32_t e = (n - b > step) ? b + step : n;
+            /* The flush's worst-case launch; see g_cof_peak. */
+            const int _peak = (r == 0 && b == 0 && g_cof_peak
+                               && g_cof_peak->armed);
+            if (_peak) mtlEventRecord(g_cof_peak->a);
             if (S->method) {
                 if (S->s2nv)
                     MTL_LAUNCH_NAMED(cf_kname(L, 1, 1), blocks, threads, 0, 0, d_n, lim2, lpb, (uint32_t)(r + 1), S->curves, W->d_sel, W->d_nsel, d_status, d_fac, d_nfac, d_iters, S->d_s, S->ns, S->d_s2mask, S->s2vmin, S->s2nv, b, e);
@@ -1183,6 +1195,10 @@ static void cf_run_rounds(const mz<L> *d_n, mz<L> lim2, uint32_t lpb, uint32_t n
                     MTL_LAUNCH_NAMED(cf_kname(L, 1, 0), blocks, threads, 0, 0, d_n, lim2, lpb, (uint32_t)(r + 1), S->curves, W->d_sel, W->d_nsel, d_status, d_fac, d_nfac, d_iters, S->d_s, S->ns, NULL, 0, 0, b, e);
             } else {
                 MTL_LAUNCH_NAMED(cf_kname(L, 0, 0), blocks, threads, 0, 0, d_n, lim2, lpb, (uint32_t)(r + 1), S->budget << r, W->d_sel, W->d_nsel, d_status, d_fac, d_nfac, d_iters, NULL, 0, NULL, 0, 0, b, e);
+            }
+            if (_peak) {
+                mtlEventRecord(g_cof_peak->b);
+                g_cof_peak->armed = 0; g_cof_peak->fired = 1;
             }
         }
     }
@@ -1796,7 +1812,8 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     const uint32_t nb = (n + TD_SCAN_BLK - 1) / TD_SCAN_BLK;
     uint32_t nr = 0, novf = 0;
     mtlEvent_t e0 = NULL, e1 = NULL, e2 = NULL;
-    float t0 = 0, t1 = 0;
+    cof_peak_t pk0 = {NULL, NULL, 0, 0}, pk1 = {NULL, NULL, 0, 0};
+    float t0 = 0, t1 = 0, launch_ms = 0;
     double h0;
     int rc = -1;
     if (!n) return 0;
@@ -1852,13 +1869,18 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     COF_FLUSH_CK(mtlEventCreate(&e0));
     COF_FLUSH_CK(mtlEventCreate(&e1));
     COF_FLUSH_CK(mtlEventCreate(&e2));
+    COF_FLUSH_CK(mtlEventCreate(&pk0.a)); COF_FLUSH_CK(mtlEventCreate(&pk0.b));
+    COF_FLUSH_CK(mtlEventCreate(&pk1.a)); COF_FLUSH_CK(mtlEventCreate(&pk1.b));
     COF_FLUSH_CK(mtlEventRecord(e0));
+    pk0.armed = 1; g_cof_peak = &pk0;
     if (cf_run_rounds_dyn(Q->L0, Q->d_c0, lim0, lpb0, n, Q->d_st0,
                           Q->d_sp0, Q->d_nsp0, &S, &W, NULL, blocks, threads))
         goto done;
     /* The class-aware gate: a record whose rational side did not split is dead
      * whatever the algebraic side does, so its side-1 job is never started. */
+    g_cof_peak = NULL;
     MTL_LAUNCH(k_cof_gate, blocks, threads, 0, 0, n, Q->d_st0, Q->d_st1);
+    pk1.armed = 1; g_cof_peak = &pk1;
     COF_FLUSH_CK(mtlEventRecord(e1));
     if (cf_run_rounds_dyn(Q->L1, Q->d_c1, lim1, lpb1, n, Q->d_st1,
                           Q->d_sp1, Q->d_nsp1, &S1, &W, NULL, blocks, threads))
@@ -1877,6 +1899,17 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     COF_FLUSH_CK(mtlDeviceSynchronize()); COF_FLUSH_CK(mtlGetLastError());
     COF_FLUSH_CK(mtlEventElapsedTime(&t0, e0, e1));
     COF_FLUSH_CK(mtlEventElapsedTime(&t1, e1, e2));
+    g_cof_peak = NULL;
+    /* The longest single launch this flush actually ran, which is what
+     * COF_CHUNK_TARGET_MS is about. A side with no live records never
+     * fires, and contributes nothing. */
+    {
+        float p = 0;
+        if (pk0.fired && !mtlEventElapsedTime(&p, pk0.a, pk0.b)
+            && p > launch_ms) launch_ms = p;
+        if (pk1.fired && !mtlEventElapsedTime(&p, pk1.a, pk1.b)
+            && p > launch_ms) launch_ms = p;
+    }
     Q->ms_rat += t0; Q->ms_alg += t1;
 
     /* Steer the NEXT flush. Only in auto mode, and only ever between flushes,
@@ -1890,7 +1923,13 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     if (!chunk) {
         const uint32_t floor_ch = cof_chunk_floor(blocks, threads);
         const uint32_t was = Q->chunk_cur;
-        const float stage = t0 + t1;
+        /* The MEASURED longest launch, not t0+t1. The sum over every round
+         * and slice of a side is not what a watchdog kills and, on a
+         * 10-core Apple GPU, exceeds the target at every reachable chunk
+         * size -- which made this loop park at its floor unconditionally.
+         * Falls back to the old sum if no launch was timed, so a flush
+         * that never fired steers exactly as it used to. */
+        const float stage = launch_ms > 0.0f ? launch_ms : (t0 + t1);
         if (stage > COF_CHUNK_TARGET_MS) {
             const uint32_t half = Q->chunk_cur / 2;
             Q->chunk_cur = (half > floor_ch) ? half : floor_ch;
@@ -1979,6 +2018,11 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     rc = 0;
 
 done:
+    g_cof_peak = NULL;
+    if (pk0.a) mtlEventDestroy(pk0.a);
+    if (pk0.b) mtlEventDestroy(pk0.b);
+    if (pk1.a) mtlEventDestroy(pk1.a);
+    if (pk1.b) mtlEventDestroy(pk1.b);
     if (e0 && CUDA_CHECKED(mtlEventDestroy(e0)) && rc == 0) rc = -1;
     if (e1 && CUDA_CHECKED(mtlEventDestroy(e1)) && rc == 0) rc = -1;
     if (e2 && CUDA_CHECKED(mtlEventDestroy(e2)) && rc == 0) rc = -1;
