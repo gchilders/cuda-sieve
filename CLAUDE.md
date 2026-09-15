@@ -161,8 +161,10 @@ disappointing GPU result. The HIP port's gfx1103 iGPU did comparable work in
   copies of the shared arithmetic headers are generated from the untouched
   originals: `bigint_msl.h`, `prp_msl.h`, `plattice_msl.h`, `slab_msl.h`,
   `td_msl.h`.
-  Still to do: `pipeline.cuh` and `bench_main.cu` — the last piece, and the
-  one the Phase 3 shim was built for.
+  `pipeline.cuh` is ported too (`metal/pipeline_host.inc`) and the combined
+  host TU `metal/bench_host.cpp` compiles with zero errors — but **nothing in
+  either has run**; they compile, and that is the whole claim.
+  Still to do: `bench_main.cu`, then link `./bench` and run `cofcheck.sh`.
 
 **The `cofq_t` argument buffer is wired but NOT yet exercised.** `run_cofac`
 never reaches `k_cof_enqueue` or `k_rel_pack`; `cofcheck.sh` will be the first
@@ -196,10 +198,15 @@ as "unknown type name". `gen_msl_headers.py` now walks the conditionals
 properly and asserts they balance. Any future guard rewriting must do the
 same.
 
-**One duplication remains, host-side only:** `cofac_metal.cpp`'s copies of
-`TD_SCAN_BLK` and `TD_FMAX`. Forking `td.cuh` fixed the device side
-(`td_msl.h`) but that header is MSL. The clean fix lifts those two defines
-above `td.cuh`'s `__CUDACC__` guard — a CUDA-side change needing a ledger row.
+**No hand-copied constants remain.** `metal/td_host.h` and `td_msl.h` are both
+generated from `td.cuh` and lift its guarded `TD_*`/`TDF_*` names; the
+launch-shape constants `bench_host.cpp` needs are lifted from
+`bench_kernels.cu`. Keep it that way — lift by name, never retype.
+
+**`metal/portlib.py` holds the ONE copy of the launch rewriter and the
+cuda*->mtl* table.** Two copies of that transformation would drift, and a
+drifting transformation produces a file that compiles and computes something
+else. Add to portlib, do not fork it.
 
 **Two CUDA-side observations this phase raised** (plan §10, nothing changed):
 `verify_count_updates` walks in 32 bits while `k_fill_atomic` walks in 64, and
