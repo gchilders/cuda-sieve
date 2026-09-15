@@ -329,12 +329,19 @@ call site cannot do one and forget the other.
   — only how many, and how cheaply. That is what makes the re-compaction win
   free. At a B1 where the marginal curve decides relations they would diverge.
 
-  **ECM ON c183 SATURATES AT B1 ~ 500 (plan 8p).** Relations are 6,724 at
+  **ECM ON c183 SATURATES AT B1 ~ 500 (plan 8p, §10).** Relations are 6,724 at
   B1 500, 1000, 2000 AND 32000, and 6,719 at 200 — production B1 2000 is 4x
   past the point where effort buys anything, at 2.3x the cofactor cost; B1
   32000 is 64x past it at 20x the cost. **That is why every sigma comparison
-  came back identical**: ECM was running far beyond its binding constraint. A
-  job-parameter observation tied to this job's lpb/mfb, not a port change.
+  came back identical**: ECM was running far beyond its binding constraint.
+
+  **B1 IS DELIBERATELY NOT CHANGED.** It comes from `cof_auto_b1`, shared by
+  every port, so moving it is a CUDA+HIP+Metal decision about the mathematics,
+  not a Metal tuning change. Recorded in plan §10 as evidence for that
+  decision; this build's B1/B2 handling is byte-identical to `bench_main.cu`.
+  **The line: a port may reshape the SCHEDULE to fit its hardware (8n's derived
+  curves-per-round — same budget, same B1, identical relation set over 288 q)
+  but may not retune the SCIENCE.**
 
   **Curves matter BELOW saturation, not above** — raising B1 makes the sigma
   choice matter *less*, not more. At B1 200 the derived default loses 24 of
