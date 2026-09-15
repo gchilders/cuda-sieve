@@ -442,6 +442,216 @@ src = (src[:_d] + chr(10) + "done:" + chr(10) +
        src[_d + len(chr(10) + "done:"):])
 print('  auto chunker now steers on a measured launch duration')
 
+# Report the measured launch duration: what the chunker now steers on, what a
+# watchdog and a stalled compositor both care about, and until now invisible.
+# stderr, like the chunk line -- a BOINC client keeps stderr.txt and discards
+# stdout with the slot directory. Only on a new maximum, so a long band does
+# not emit one line per flush.
+_rep_old = "    Q->ms_rat += t0; Q->ms_alg += t1;"
+_rep_new = _rep_old + chr(10) + chr(10).join([
+    "    if (launch_ms > 0.0f && launch_ms > Q->ms_launch_max) {",
+    "        Q->ms_launch_max = launch_ms;",
+    "        fprintf(stderr,",
+    "                \"  cofactor: longest kernel launch %.0f ms (%u records/launch,\"",
+    "                \" %u in flush)\\n\",",
+    "                (double)launch_ms,",
+    "                Q->chunk_cur < n ? Q->chunk_cur : n, n);",
+    "    }"])
+assert _rep_old in src, 'ms accumulation shape changed'
+src = src.replace(_rep_old, _rep_new, 1)
+
+# The high-water field itself.
+_fld_old = "    double ms_rat, ms_alg;"
+if _fld_old not in src:
+    import re as _re
+    _m = _re.search(r"\n(\s*)double ms_rat[^;]*;", src)
+    assert _m, 'cofq_t timing fields not found'
+    _fld_old = _m.group(0).lstrip(chr(10))
+src = src.replace(_fld_old, _fld_old + chr(10) + "    float  ms_launch_max;   /* longest single launch seen, ms */", 1)
+print('  longest-launch reporting added')
+
+# ---- (a), done properly: defend a launch-duration bound -------------------
+# The target is a UI-responsiveness and watchdog bound on ONE kernel launch:
+# 750 ms, chosen by the user, worth paying throughput for. With (b) the
+# controller finally measures that quantity, so it can now defend it.
+#
+# Two things had to change for the bound to be reachable at all.
+#
+# 1. THE FLOOR. cof_chunk_floor() is a core-derived 15,360 records here, and
+#    the control law clamps to it, so auto could never descend to the ~7,680
+#    that a 750 ms launch needs. The floor's job is to stop the controller
+#    subdividing into uselessly small launches; that job is done better by
+#    measuring whether subdividing still helps (below), so the floor drops to
+#    one full grid of records and the measurement takes over.
+#
+# 2. A NO-PROGRESS GUARD, because a bound can be UNREACHABLE. Measured here:
+#    launch time falls with chunk size only until one record's ECM chain is
+#    the whole launch, then it plateaus -- 3567, 1846, 1641, 1495, 1499, 1498
+#    ms at chunks 15360 down to 480, flat below ~1920, while cofac/q explodes
+#    from 465 to 4969. Against a target the chain cannot meet, an unguarded
+#    controller halves forever and lands exactly there: the same unconditional
+#    slowdown 8j removed, arrived at from the other direction. So a halving
+#    that does not buy at least 10% is undone and the descent stops.
+_g_old = "        if (stage > COF_CHUNK_TARGET_MS) {"
+_g_new = chr(10).join([
+    "        if (Q->chunk_parked) {",
+    "            /* Descent already proved useless at this size; see below. */",
+    "        } else if (stage > COF_CHUNK_TARGET_MS) {",
+    "            /* Did the LAST halving actually shorten the launch? If not,",
+    "             * the bound is below one ECM chain and no chunk can meet it.",
+    "             * Undo that halving and stop, rather than subdividing down to",
+    "             * the floor for nothing. */",
+    "            if (Q->ms_launch_prev > 0.0f && Q->chunk_prev > Q->chunk_cur",
+    "                && stage > Q->ms_launch_prev * 0.90f) {",
+    "                cof_report_chunk(Q->chunk_prev, n, 0);",
+    "                Q->chunk_cur = Q->chunk_prev;",
+    "                Q->chunk_parked = 1;",
+    "            } else {"])
+assert _g_old in src, 'steering halve branch shape changed'
+src = src.replace(_g_old, _g_new, 1)
+
+_h_old = chr(10).join([
+    "            const uint32_t half = Q->chunk_cur / 2;",
+    "            Q->chunk_cur = (half > floor_ch) ? half : floor_ch;",
+    "        } else if"])
+_h_new = chr(10).join([
+    "                const uint32_t half = Q->chunk_cur / 2;",
+    "                Q->ms_launch_prev = stage; Q->chunk_prev = Q->chunk_cur;",
+    "                Q->chunk_cur = (half > floor_ch) ? half : floor_ch;",
+    "            }",
+    "        } else if"])
+assert _h_old in src, 'halve body shape changed'
+src = src.replace(_h_old, _h_new, 1)
+
+_f_old = "    float  ms_launch_max;   /* longest single launch seen, ms */"
+_f_new = chr(10).join([
+    _f_old,
+    "    float  ms_launch_prev;  /* launch time before the last halving      */",
+    "    uint32_t chunk_prev;    /* the chunk that produced it               */",
+    "    int    chunk_parked;    /* halving stopped paying; descend no more  */"])
+assert _f_old in src, 'cofq_t launch field missing'
+src = src.replace(_f_old, _f_new, 1)
+
+_t_old = "#define COF_CHUNK_TARGET_MS   250.0f"
+assert _t_old in src, 'target shape changed'
+src = src.replace(_t_old, chr(10).join([
+    "/* 750 ms on ONE launch: a UI-responsiveness bound as much as a watchdog",
+    " * one, and explicitly worth throughput to hold. CUDA keeps 250 ms against",
+    " * a whole-side sum; this is 750 against a measured launch, so the two",
+    " * numbers are not comparable. See gen_cofac_host.py. */",
+    "#define COF_CHUNK_TARGET_MS   750.0f"]), 1)
+
+# The floor stops being the policy and becomes a sanity bound: one grid's
+# worth of records, so a slice never has fewer records than the grid can hold
+# in a single wave.
+# The opening value must NOT be the floor any more. It was the same number
+# when the floor was a full grid; now that the floor is a wave, opening there
+# would start every band at a slice far too small to be efficient and, with
+# one flush, never adapt at all -- measured at 722 ms/q against 355 for the
+# right slice. Open at ONE GRID of records, which is what the floor used to
+# be, and let the measurement walk it down toward the bound.
+_op_old = "                            : (Q->chunk_cur ? Q->chunk_cur : floor_ch);"
+_op_new = "                            : (Q->chunk_cur ? Q->chunk_cur : cof_chunk_open(blocks, threads));"
+assert _op_old in src, 'auto opening value shape changed'
+src = src.replace(_op_old, _op_new, 1)
+
+_od_old = "static uint32_t cof_chunk_floor(int blocks, int threads)"
+_od_new = chr(10).join([
+    "/* Where auto STARTS: one core-derived grid of records, one per thread.",
+    " * The floor below is where it may descend TO, which is a different and",
+    " * now much smaller number. */",
+    "static uint32_t cof_chunk_open(int blocks, int threads)",
+    "{",
+    "    const int ob = g_cof_floor_blocks ? g_cof_floor_blocks : blocks;",
+    "    const uint64_t f = (uint64_t)(ob > 0 ? ob : 1)",
+    "                     * (uint64_t)(threads > 0 ? threads : 1);",
+    "    return f > 0xffffffffull ? 0xffffffffu : (uint32_t)f;",
+    "}",
+    "",
+    _od_old])
+assert _od_old in src, 'cof_chunk_floor declaration missing'
+src = src.replace(_od_old, _od_new, 1)
+print('  auto opens at one grid, descends toward the bound by measurement')
+
+_fl_old = "    const int fb = g_cof_floor_blocks ? g_cof_floor_blocks : blocks;"
+_fl_new = chr(10).join([
+    "    /* One WAVE, not one grid: the measurement decides how far to descend",
+    "     * (see the no-progress guard), and this only stops the controller",
+    "     * asking for fewer records than the device can run at once. */",
+    "    const int fbb = g_cof_floor_blocks ? g_cof_floor_blocks : blocks;",
+    "    const int fb = fbb > 8 ? fbb / 8 : 1;"])
+assert _fl_old in src, 'chunk floor shape changed'
+src = src.replace(_fl_old, _fl_new, 1)
+print('  target 750 ms on a measured launch; floor lowered; no-progress guard added')
+
+# ---- refuse a launch this port cannot bound -------------------------------
+# The block above warns when stage 2 grows past what --cof-chunk can divide,
+# and says outright that the one configuration known to trip a watchdog is
+# --ecm-b1 400000, and that cofcheck.sh skips that case on HIP. This port did
+# not skip it, and it took the machine down TWICE -- a WindowServer crash and
+# userspace watchdog timeout, both ~1m47s into cofcheckgate, at exactly that
+# case, on an otherwise idle Mac. On Apple silicon the GPU also drives the
+# display, so a launch that a discrete card merely fails is one the compositor
+# does not survive. A warning is not enough here.
+#
+# The cost of one curve is very close to linear in the work it does. Measured
+# on a 10-core M3 at one curve, one round, B2 = 30*B1:
+#
+#     B1     2000     8000    32000
+#     ms      110      370     1461
+#
+# which is ~0.045 ms per (prime power + giant step) -- Q->ns + Q->s2nv -- and
+# predicts ~19 s per curve at B1 400000, so ~5 MINUTES for that case's default
+# 16 curves in a single launch. That is what the two crashes were.
+#
+# REFUSE rather than silently reducing --ecm-curves: curves-per-round chooses
+# which sigmas run (`sigma = c0*1000 + cv + 6`, see the record-axis comment
+# above), so quietly changing it would change which numbers factor. Tell the
+# caller instead, and name the knobs.
+_guard_anchor = "    {\n        static const char *nm[2] = { \"rho\", \"ECM\" };"
+_guard = chr(10).join([
+    "    if (Q->meth[0] || Q->meth[1]) {",
+    "        /* ~0.045 ms per prime power + giant step, 10-core M3. A slower or",
+    "         * faster Apple GPU moves this; it is a guard rail, not a model. */",
+    "        const double ms_one_curve = 0.045 * (double)(Q->ns + Q->s2nv);",
+    "        if (ms_one_curve > COF_LAUNCH_REFUSE_MS) {",
+    "            fprintf(stderr,",
+    "                    \"  cofactor queue: REFUSED -- one ECM curve is about\"",
+    "                    \" %.0f ms of work (%u prime powers + %u giant steps),\"",
+    "                    \" and a launch cannot be made shorter than one curve:\"",
+    "                    \" --cof-chunk splits RECORDS, never the chain. At\"",
+    "                    \" %u curves/round that is one kernel launch of roughly\"",
+    "                    \" %.0f s.\\n\",",
+    "                    ms_one_curve, Q->ns, Q->s2nv, Q->ecm_curves,",
+    "                    ms_one_curve * (double)Q->ecm_curves / 1000.0);",
+    "            fprintf(stderr,",
+    "                    \"  On Apple silicon the GPU also drives the display,\"",
+    "                    \" so this does not merely fail the task -- it hangs\"",
+    "                    \" WindowServer and takes the session down. Observed\"",
+    "                    \" twice at --ecm-b1 400000. Lower --ecm-b1/--ecm-b2,\"",
+    "                    \" or cut --ecm-curves and raise --cof-rounds to keep\"",
+    "                    \" the same curve budget in shorter launches.\\n\");",
+    "            goto done;",
+    "        }",
+    "    }",
+    ""])
+assert _guard_anchor in src, 'cofactor method banner shape changed'
+src = src.replace(_guard_anchor, _guard + _guard_anchor, 1)
+
+_c_old = "#define COF_S2NV_WATCHDOG_WARN  20000u"
+_c_new = chr(10).join([
+    _c_old,
+    "",
+    "/* Refuse above this much estimated work in ONE curve, because no chunking",
+    " * can divide a chain. 10 s: launches of 3.6 s and 6.9 s have both run",
+    " * here without incident, and the case that crashed the machine twice",
+    " * estimates at ~19 s per curve. Between those, closer to what is known to",
+    " * work than to what is known to kill it. */",
+    "#define COF_LAUNCH_REFUSE_MS  10000.0"])
+assert _c_old in src, 'watchdog warn constant missing'
+src = src.replace(_c_old, _c_new, 1)
+print('  refuses an ECM chain no chunk size can bound')
+
 open(OUT, 'w').write(src)
 print('wrote %s: %d kernels removed, %d launches rewritten' % (OUT, nk, nl))
 if skipped:
