@@ -533,12 +533,58 @@ later CUDA-side change to this file can be re-diffed rather than re-ported
 from memory. They are deliberately **not** wired into the build; the generated
 files are committed and reviewed like any other source.
 
-### Phase 5 — Sieve kernels
-`k_transform`, `k_fill_*`, `k_apply`, and the `pipeline_metal.cpp`
-orchestration behind them. Includes the soft-fp64 norm fallback.
+### Phase 5 — Sieve kernels — **device half DONE, gate not yet run**
 
-**Gate:** `--verify-only` passes both lattice-walk cases, and the in-tree
-"factors x cofactor == norm" self-check passes 100% on both sides.
+**Done: `metal/bench_kernels.metal` compiles clean**, 19 kernel entry points
+including `k_transform`, `k_fill_atomic`, `k_apply` (4 instantiations),
+`k_resieve_rewalk`, `k_purge`, `k_purge_prime`, `k_intersect_compact`,
+`k_build_summary*`, `k_snapshot_bounds`, `k_fill_segmented`. Supporting:
+`metal/cuda_msl_compat.h` (CUDA's device vocabulary in MSL) and
+`metal/plattice_msl.h` (plattice.cuh's arithmetic, verbatim, with address
+spaces added — `plattice.cuh` itself is untouched and still shared by the
+CUDA and CPU builds).
+
+**The fp64 norm fallback is ported and is the reason Phase 2 exists.**
+`bench_kernels.cu:525`'s eight-line `double` block is rewritten onto
+`softfp64.h` — the same computation with the same rounding, not an
+approximation, since Phase 2 proved those primitives bit-exact against
+hardware fp64.
+
+**`log2f` maps to `pl_log2f`, not `metal::log2`.** Phase 0 measured MSL's
+builtin disagreeing with the host on 50.03% of inputs by up to 3 ULP, which
+moves sieve cells. This makes the Phase 7 question concrete rather than
+hypothetical: the CPU reference (`verify_cpu.c`) still uses libm's `log2f`,
+so the parity gate below will *measure* the disagreement directly.
+
+**Two kernels are deliberately absent, and this is a real gap.** `k_fill_l1`
+and `k_fill_l2` each declare `128*64` uint32 plus two 128-word counters —
+**33,792 B against Apple's hard 32,768 B threadgroup ceiling, over by exactly
+1 KB**. MSL additionally forbids threadgroup declarations inside the non-kernel
+helper the templated form needs. They are the *two-level* fill path, and apply
+requires single-level 4-byte records (`bench_kernels.cu:2660`), so the
+production sieve runs `k_fill_atomic` and never reaches them. Closing the gap
+means retuning `L1_CAP`/`L2_CAP` from 64 to 62 — a performance change, so it
+belongs in Phase 8, measured rather than guessed.
+
+**Also ported:** the five 64-bit diagnostic counters (`nlost`, `nprobe`,
+`npass1`, `nread`, `npre`, `nqb`) become pairs of uint32 words with the carry
+folded across them, since Metal has no 64-bit atomics at all. Two
+little-endian uint32 words at one address *are* a little-endian uint64, so the
+host's existing 8-byte readback of each is unchanged — no host edit at all.
+Sound only because they are diagnostics: the pair is eventually consistent
+rather than atomic as a unit, and nothing computes from them.
+
+**Remaining for this phase: the host harness and the gate.** The tree already
+has the ground truth — `verify_count_updates` (per-region fill counts) and
+`verify_apply_region` (replays a region's records on the CPU and compares
+*every cell*, including the norm init and threshold). Both are pure host C in
+`verify_cpu.c`. The harness needs to build a factor base (our own
+`fbgen_gpu` can generate it), set up `qlat_t`/`norm_t`, run
+transform → fill → apply through `metal_rt`, and compare against both.
+
+**Gate (not yet run):** per-region fill counts equal to `verify_count_updates`
+exactly, and zero differing cells against `verify_apply_region` — which is
+also where the `pl_log2f`-vs-libm cell count gets measured for Phase 7.
 
 ### Phase 6 — Trial division and cofactorisation
 `td.cuh` and `cofac.cuh` device code, including the `cofq_t` argument
