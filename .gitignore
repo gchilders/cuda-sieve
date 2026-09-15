@@ -102,3 +102,6 @@ bench/fbgen
 bench/fbtest
 bench/*.o
 bench/*.d
+bench/.metal-build/
+bench/bench
+oracle/*.fb1

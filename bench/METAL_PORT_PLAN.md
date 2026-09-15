@@ -795,19 +795,74 @@ rename table, because two copies of a transformation this fiddly would drift —
 and a drifting transformation produces a file that compiles and computes
 something else.
 
+**6f. `bench_main.cu` ported; `./bench` links and the pipeline RUNS.**
+`metal/bench_main_metal.cpp` — no device code and no launches at all, only
+device selection and version reporting. CUDA's `cudaInitDevice` /
+`cudaSetDeviceFlags` dance exists to attach `cudaDeviceScheduleBlockingSync`
+across a `CUDART_VERSION` split; Metal has no scheduling-flags concept at all,
+because a command buffer's `waitUntilCompleted` already blocks the calling
+thread. There is nothing to configure and nothing to verify.
+
+`--verify-only` passes through the real binary: 12 Franke-Kleinjung walk cases
+and 7 forced/native slab walk cases, exit 0. A full `--pipeline` band ran end
+to end on the M3 at a reduced geometry and exited 0.
+
+**The predicted threadgroup constraint bit exactly as documented.** At CUDA's
+default `log_region = 14`, `k_apply` wants 32,896 B — 128 bytes over Apple's
+hard 32,768 B ceiling — and the run fails closed with `pipeline.cuh`'s own
+message. Failing closed on the *default* geometry is not a usable default, so
+the Metal build now defaults `log_region` to **13**, the largest value that
+fits, exactly as section 5.1 planned. `--region` still overrides and the CUDA
+build is untouched.
+
+**Two real bugs found by running it, both worth recording:**
+
+1. **`NULL` is `0L` in C++, not a pointer.** CUDA code passes `NULL` for
+   optional buffers (`k_apply`'s `dump`, `dbg_cells`, `probe_out`). The
+   binding template took its non-pointer branch and bound **eight bytes of
+   zeros as a constant buffer**, so the kernel's `if (dump)` saw a perfectly
+   good non-nil address and dereferenced it — a GPU page fault with no clue
+   which argument caused it. `metal_rt.h` now has a `std::nullptr_t` overload
+   and the generators rewrite a bare `NULL` argument to `nullptr`.
+2. **A threadgroup array must be declared in the wrapper, not made a
+   parameter.** `k_td`'s `threadgroup tdsmall_t tile[TD_TILE]` was hoisted to
+   a `[[threadgroup(0)]]` parameter, which silently has **zero length** unless
+   the host sets it — and these were static `__shared__` arrays in CUDA, with
+   no host involvement at all. The wrapper kernel declares them now.
+
+**`cof_classify` is verified on the device**: 0 of 65,536 verdicts differ from
+`prp.cuh`'s own fp64, with `prp.cuh` compiled unmodified
+(`make -f Makefile.metal classifycheck`). Phase 2 had tested the soft-float
+primitives device-vs-host and the call sites host-vs-fp64, but never
+`cof_classify` as `prp_msl.h` assembles it on the device. That gap is closed,
+and it rules the soft-float path out of the remaining problem.
+
+**`cofcheck.sh` DOES NOT PASS.** Its negative controls and refusal cases pass;
+every relation-count case does not. Before the threadgroup fix a band ran to
+completion and produced **125 cofactorisation candidates where the oracle has
+1,851**, and 0 relations against an expected 7 or 37. After the fix the
+production-geometry run is SIGKILLed with no output flushed, which is a
+*different* failure and has not been diagnosed.
+
+**Next diagnostic, in order:**
+- The SIGKILL. Run under `log stream` or with output unbuffered to see how far
+  it gets; check whether it is memory pressure or a GPU fault loop.
+- Then the candidate shortfall. Fill and apply are cell-exact (Phase 5) and
+  `cof_classify` is verdict-exact, so the untested device stages are `k_td`,
+  `k_resieve_scatter`, `k_emit_ranked` and `k_intersect_compact`. `k_td` is
+  the largest and the one whose threadgroup handling just changed — extend the
+  Phase 5 harness to compare its cofactor output against a CPU replay, the way
+  `verify_apply_region` does for apply.
+
 **Still to do for this phase:**
 - **One duplication remains, on the HOST side only**: `cofac_metal.cpp`'s
   copies of `TD_SCAN_BLK` and `TD_FMAX`. Forking `td.cuh` fixed the device
   side but not this — `td_msl.h` is MSL. The clean fix is a CUDA-side change,
   lifting those two defines above `td.cuh`'s `__CUDACC__` guard, which would
   need a drift-ledger row.
-- `bench_main.cu` (~3,200 lines of CLI and band driving), then linking
-  `./bench` and running `cofcheck.sh`. That is all that stands between here
-  and Phase 6's real gate.
-- Nothing in `pipeline_host.inc` or `bench_host.cpp` has **run** yet — they
-  compile, and that is the whole claim. The argument-buffer path is in the
-  same position: `run_cofac` never reaches `k_cof_enqueue` or `k_rel_pack`,
-  so `cofcheck.sh` will be the first thing that exercises either.
+- Diagnose the SIGKILL, then the candidate shortfall, then re-run
+  `cofcheck.sh`. The port is feature-complete and wrong; that is a much better
+  place to be than incomplete, but it is not done.
 
 **An intermediate gate exists and should be used first:** `run_cofac()`
 (`cofac.cuh:2728`) is a standalone cofactorisation entry point that reads a

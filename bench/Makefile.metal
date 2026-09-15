@@ -85,7 +85,7 @@ $(BUILD)/sites_msl.air: metal/sf_sites.h metal/softfp64.h | $(BUILD)
 	$(METAL) $(MSLFLAGS) -c $(BUILD)/sites_msl.metal -o $@
 
 .PHONY: metalcheck
-metalcheck: rtcheck scancheck argbufcheck $(BUILD)/sf_test_host $(BUILD)/sf_test.metallib $(BUILD)/sf_test_device \
+metalcheck: rtcheck scancheck argbufcheck classifycheck $(BUILD)/sf_test_host $(BUILD)/sf_test.metallib $(BUILD)/sf_test_device \
             $(BUILD)/sf_sites_test $(BUILD)/sites_msl.air
 	@echo "== softfp64 vs hardware fp64 (host) =="
 	@$(BUILD)/sf_test_host
@@ -235,3 +235,54 @@ cofaccheck: $(BUILD)/cofac_test
 	      --expect 37 2>/dev/null | grep -E 'GATE' || rc=1; \
 	  done; \
 	done; exit $$rc
+
+# ---- the full binary ----------------------------------------------------
+#
+# Mirrors the CUDA Makefile's `bench` target: the same host C objects, with
+# bench_main_metal.cpp and bench_host.cpp in place of the two .cu files and
+# the metal_rt shim in place of the CUDA runtime.
+
+BENCH_CPUOBJ := fb_load.o verify_cpu.o poly.o primes.o rfb.o fb_cado.o \
+                platform.o boinc_support.o runlog.o watchdog.o fbgen_lib.o
+
+METAL_TU := $(BUILD)/bench_main.o $(BUILD)/bench_host.o $(BUILD)/metal_rt.o \
+            $(BUILD)/metal_scan.o $(BUILD)/fbgen_gpu_lib.o
+
+$(BUILD)/bench_main.o: metal/bench_main_metal.cpp | $(BUILD)
+	$(CXX) $(HOSTFLAGS) -DPIPE_K=16 -c $< -o $@
+
+$(BUILD)/bench_host.o: metal/bench_host.cpp metal/pipeline_host.inc \
+                       metal/cofac_host.inc metal/td_host.h | $(BUILD)
+	$(CXX) $(HOSTFLAGS) -DPIPE_K=16 -c $< -o $@
+
+$(BUILD)/fbgen_gpu_lib.o: metal/fbgen_gpu_metal.cpp | $(BUILD)
+	$(CXX) $(HOSTFLAGS) -DFBGEN_GPU_LIBRARY -c $< -o $@
+
+$(BUILD)/bench: $(METAL_TU) $(BUILD)/bench.metallib
+	$(MAKE) $(BENCH_CPUOBJ)
+	$(CXX) $(HOSTFLAGS) $(METAL_TU) $(BENCH_CPUOBJ) \
+	    -framework Metal -framework Foundation -framework IOKit \
+	    -lm -ldl -lpthread -o $@
+
+.PHONY: benchbin
+benchbin: $(BUILD)/bench
+	@echo "built $(BUILD)/bench"
+
+# ---- cof_classify on the device, against prp.cuh's own fp64 --------------
+#
+# Phase 2 tested the softfp64 PRIMITIVES device-vs-host, and the assembled
+# call sites host-vs-fp64 -- but not cof_classify as prp_msl.h assembles it,
+# ON the device. This closes that gap: it is the only soft-fp64 consumer in
+# the pipeline, so it is the first thing to rule out when a band's candidate
+# count looks wrong.
+$(BUILD)/classify_test.metallib: metal/classify_test.metal $(MSL_HEADERS) | $(BUILD)
+	$(METAL) $(MSLFLAGS) -c $< -o $(BUILD)/classify_test.air
+	$(METALLIB) $(BUILD)/classify_test.air -o $@
+
+$(BUILD)/classify_test: metal/classify_test.cpp metal/metal_rt.mm | $(BUILD)
+	$(CXX) $(HOSTFLAGS) metal/classify_test.cpp metal/metal_rt.mm \
+	    -framework Metal -framework Foundation -framework IOKit -o $@
+
+.PHONY: classifycheck
+classifycheck: $(BUILD)/classify_test $(BUILD)/classify_test.metallib
+	@$(BUILD)/classify_test $(BUILD)/classify_test.metallib

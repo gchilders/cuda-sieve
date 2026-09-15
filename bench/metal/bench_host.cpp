@@ -519,10 +519,10 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                 CK(mtlMemset(d_ovf, 0, 8));
                 mtlEventRecord(t0);
                 switch (U) {
-                case 1: MTL_LAUNCH(k_resieve_scatter_1_0, blocks, threads, 0, 0, d_plat, d_primes, NULL, fb->n, xmax, cfg->logI, d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, log_gran, NULL); break;
-                case 2: MTL_LAUNCH(k_resieve_scatter_2_0, blocks, threads, 0, 0, d_plat, d_primes, NULL, fb->n, xmax, cfg->logI, d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, log_gran, NULL); break;
-                case 4: MTL_LAUNCH(k_resieve_scatter_4_0, blocks, threads, 0, 0, d_plat, d_primes, NULL, fb->n, xmax, cfg->logI, d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, log_gran, NULL); break;
-                default: MTL_LAUNCH(k_resieve_scatter_8_0, blocks, threads, 0, 0, d_plat, d_primes, NULL, fb->n, xmax, cfg->logI, d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, log_gran, NULL); break;
+                case 1: MTL_LAUNCH(k_resieve_scatter_1_0, blocks, threads, 0, 0, d_plat, d_primes, nullptr, fb->n, xmax, cfg->logI, d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, log_gran, nullptr); break;
+                case 2: MTL_LAUNCH(k_resieve_scatter_2_0, blocks, threads, 0, 0, d_plat, d_primes, nullptr, fb->n, xmax, cfg->logI, d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, log_gran, nullptr); break;
+                case 4: MTL_LAUNCH(k_resieve_scatter_4_0, blocks, threads, 0, 0, d_plat, d_primes, nullptr, fb->n, xmax, cfg->logI, d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, log_gran, nullptr); break;
+                default: MTL_LAUNCH(k_resieve_scatter_8_0, blocks, threads, 0, 0, d_plat, d_primes, nullptr, fb->n, xmax, cfg->logI, d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, log_gran, nullptr); break;
                 }
                 mtlEventRecord(t1);
                 CK(mtlEventSynchronize(t1)); CK(mtlGetLastError());
@@ -573,7 +573,7 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
         MTL_LAUNCH(k_build_summary_g, blocks, threads, 0, 0, d_two, nbitword, 2u, d_sum);
         CK(mtlMemset(d_pcnt, 0, (size_t)n * 4));
         CK(mtlMemset(d_ovf, 0, 8));
-        MTL_LAUNCH(k_resieve_scatter_4_0, blocks, threads, 0, 0, d_plat, d_primes, NULL, fb->n, xmax, cfg->logI, d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, 6, NULL);
+        MTL_LAUNCH(k_resieve_scatter_4_0, blocks, threads, 0, 0, d_plat, d_primes, nullptr, fb->n, xmax, cfg->logI, d_sum, d_two, d_gbase, d_plist, d_pcnt, K, d_ovf, 6, nullptr);
         CK(mtlDeviceSynchronize()); CK(mtlGetLastError());
         CK(mtlMemcpy(&hovf, d_ovf, 8, mtlMemcpyDeviceToHost));
     }
@@ -597,7 +597,7 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
      * full pass overwrites its output. */
     for (int rep = 0; rep < 3; rep++) {
         mtlEventRecord(t0);
-        MTL_LAUNCH(k_td_1_0_0_0, blocks, threads, 0, 0, d_a, d_b, d_x, NULL, n, cfg->logI, d_poly, cfg->side == 1 ? (uint32_t)L->q : 0u, d_plist, d_pcnt, K, d_sm, 0u, d_cof, d_cofbits, d_flags, NULL, NULL, NULL, 0, 0u);
+        MTL_LAUNCH(k_td_1_0_0_0, blocks, threads, 0, 0, d_a, d_b, d_x, nullptr, n, cfg->logI, d_poly, cfg->side == 1 ? (uint32_t)L->q : 0u, d_plist, d_pcnt, K, d_sm, 0u, d_cof, d_cofbits, d_flags, nullptr, nullptr, nullptr, 0, 0u);
         mtlEventRecord(t1);
         CK(mtlEventSynchronize(t1)); CK(mtlGetLastError());
         { float t = time_kernel(t0, t1); if (t < ms_td_nosm) ms_td_nosm = t; }
@@ -608,7 +608,7 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     CK(mtlMemset(d_ovf, 0, 8));
     for (int rep = 0; rep < 3; rep++) {
         mtlEventRecord(t0);
-        MTL_LAUNCH(k_td_0_0_0_0, blocks, threads, 0, 0, d_a, d_b, d_x, NULL, n, cfg->logI, d_poly, cfg->side == 1 ? (uint32_t)L->q : 0u, d_plist, d_pcnt, K, d_sm, nsm, d_cof, d_cofbits, d_flags, d_ovf, NULL, NULL, 0, 0u);
+        MTL_LAUNCH(k_td_0_0_0_0, blocks, threads, 0, 0, d_a, d_b, d_x, nullptr, n, cfg->logI, d_poly, cfg->side == 1 ? (uint32_t)L->q : 0u, d_plist, d_pcnt, K, d_sm, nsm, d_cof, d_cofbits, d_flags, d_ovf, nullptr, nullptr, 0, 0u);
         mtlEventRecord(t1);
         CK(mtlEventSynchronize(t1)); CK(mtlGetLastError());
         { float t = time_kernel(t0, t1); if (t < ms_td_nodiv) ms_td_nodiv = t; }
@@ -619,7 +619,7 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     for (int rep = 0; rep < 3; rep++) {
         CK(mtlMemset(d_flags, 0, 4));
         mtlEventRecord(t0);
-        MTL_LAUNCH(k_td_1_0_0_0, blocks, threads, 0, 0, d_a, d_b, d_x, NULL, n, cfg->logI, d_poly, cfg->side == 1 ? (uint32_t)L->q : 0u, d_plist, d_pcnt, K, d_sm, nsm, d_cof, d_cofbits, d_flags, NULL, NULL, NULL, 0, 0u);
+        MTL_LAUNCH(k_td_1_0_0_0, blocks, threads, 0, 0, d_a, d_b, d_x, nullptr, n, cfg->logI, d_poly, cfg->side == 1 ? (uint32_t)L->q : 0u, d_plist, d_pcnt, K, d_sm, nsm, d_cof, d_cofbits, d_flags, nullptr, nullptr, nullptr, 0, 0u);
         mtlEventRecord(t1);
         CK(mtlEventSynchronize(t1)); CK(mtlGetLastError());
         { float t = time_kernel(t0, t1); if (t < ms_td) ms_td = t; }
@@ -659,7 +659,7 @@ static int run_td_stage(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     if (cfg->emit_cof) {
         CK(mtlMalloc(&d_fac, (size_t)n * TD_FMAX * 4));
         CK(mtlMalloc(&d_faccnt, (size_t)n * 4));
-        MTL_LAUNCH(k_td_1_1_0_0, blocks, threads, 0, 0, d_a, d_b, d_x, NULL, n, cfg->logI, d_poly, cfg->side == 1 ? (uint32_t)L->q : 0u, d_plist, d_pcnt, K, d_sm, nsm, d_cof, d_cofbits, d_flags, NULL, d_fac, d_faccnt, TD_FMAX, 0u);
+        MTL_LAUNCH(k_td_1_1_0_0, blocks, threads, 0, 0, d_a, d_b, d_x, nullptr, n, cfg->logI, d_poly, cfg->side == 1 ? (uint32_t)L->q : 0u, d_plist, d_pcnt, K, d_sm, nsm, d_cof, d_cofbits, d_flags, nullptr, d_fac, d_faccnt, TD_FMAX, 0u);
         CK(mtlDeviceSynchronize()); CK(mtlGetLastError());
     }
 
@@ -1129,13 +1129,13 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
      * different people compared that number across GPUs before anyone noticed
      * it was measuring startup. The memsets follow the warm-up because nproj
      * and nlost are accumulators divided by reps. */
-    MTL_LAUNCH(k_transform_0, blocks, cfg->threads, 0, 0, D.primes, D.roots, D.plat, fb->n, cfg->logI, cfg->J, L->a0, L->a1, L->b0, L->b1, D.nproj, D.nlost, NULL);
+    MTL_LAUNCH(k_transform_0, blocks, cfg->threads, 0, 0, D.primes, D.roots, D.plat, fb->n, cfg->logI, cfg->J, L->a0, L->a1, L->b0, L->b1, D.nproj, D.nlost, nullptr);
     CK(mtlDeviceSynchronize());
     CK(mtlMemset(D.nproj, 0, 4));
     CK(mtlMemset(D.nlost, 0, 8));
     mtlEventRecord(e0);
     for (int rep = 0; rep < cfg->reps; rep++)
-        MTL_LAUNCH(k_transform_0, blocks, cfg->threads, 0, 0, D.primes, D.roots, D.plat, fb->n, cfg->logI, cfg->J, L->a0, L->a1, L->b0, L->b1, D.nproj, D.nlost, NULL);
+        MTL_LAUNCH(k_transform_0, blocks, cfg->threads, 0, 0, D.primes, D.roots, D.plat, fb->n, cfg->logI, cfg->J, L->a0, L->a1, L->b0, L->b1, D.nproj, D.nlost, nullptr);
     mtlEventRecord(e1);
     CK(mtlEventSynchronize(e1));
     CK(mtlGetLastError());
@@ -1175,11 +1175,11 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
 #define FILL_ONE(GRID, STREAM, PLAT, CUR, OUT, OVF)                          \
     do {                                                                     \
         if (cfg->record_bytes == 2)                                          \
-            MTL_LAUNCH(k_fill_atomic_2_0, (GRID), fthreads, 0, (STREAM), (PLAT), D.slice, fb->n, xmax, cfg->logI, log_region, (CUR), (OUT), cap, (OVF), NULL, NULL);                       \
+            MTL_LAUNCH(k_fill_atomic_2_0, (GRID), fthreads, 0, (STREAM), (PLAT), D.slice, fb->n, xmax, cfg->logI, log_region, (CUR), (OUT), cap, (OVF), nullptr, nullptr);                       \
         else if (cfg->record_bytes == 4)                                     \
-            MTL_LAUNCH(k_fill_atomic_4_0, (GRID), fthreads, 0, (STREAM), (PLAT), D.slice, fb->n, xmax, cfg->logI, log_region, (CUR), (OUT), cap, (OVF), NULL, NULL);                       \
+            MTL_LAUNCH(k_fill_atomic_4_0, (GRID), fthreads, 0, (STREAM), (PLAT), D.slice, fb->n, xmax, cfg->logI, log_region, (CUR), (OUT), cap, (OVF), nullptr, nullptr);                       \
         else                                                                 \
-            MTL_LAUNCH(k_fill_atomic_8_0, (GRID), fthreads, 0, (STREAM), (PLAT), D.slice, fb->n, xmax, cfg->logI, log_region, (CUR), (OUT), cap, (OVF), NULL, NULL);                       \
+            MTL_LAUNCH(k_fill_atomic_8_0, (GRID), fthreads, 0, (STREAM), (PLAT), D.slice, fb->n, xmax, cfg->logI, log_region, (CUR), (OUT), cap, (OVF), nullptr, nullptr);                       \
     } while (0)
 
         mtlEventRecord(e2);

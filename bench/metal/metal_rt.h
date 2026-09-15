@@ -36,6 +36,7 @@
 
 #ifdef __cplusplus
 #include <type_traits>
+#include <cstddef>
 #endif
 
 typedef int mtlError_t;
@@ -77,6 +78,10 @@ typedef struct {
     int    maxThreadsPerBlock;
     int    warpSize;              /* threadExecutionWidth: 32               */
     int    unifiedMemory;
+    /* Metal publishes no cache size. Reported as 0 so the startup line that
+     * prints it stays honest rather than inventing a number; CUDA's value is
+     * used for reporting only, never for a sizing decision. */
+    size_t l2CacheSize;
 } mtlDeviceProp;
 
 #ifdef __cplusplus
@@ -185,6 +190,20 @@ inline void mtl_bind_one(mtl_argbuf_t a, int i)
     mtl_bind_buffer(a.buf, i);
     for (int k = 0; k < a.nrefs; k++) mtlUseResource(a.refs[k]);
 }
+
+/* A null kernel argument.
+ *
+ * THIS OVERLOAD IS LOAD-BEARING, and the bug it prevents is vicious. CUDA
+ * code passes NULL for optional buffers (k_apply's `dump`, `dbg_cells`,
+ * `probe_out`), and in C++ NULL is 0L -- an INTEGER, not a pointer. Without
+ * this, the template below takes its non-pointer branch and binds eight bytes
+ * of zeros as a small constant buffer, so the kernel's `if (dump)` sees a
+ * perfectly good non-nil address and dereferences it. The result is a GPU
+ * page fault with no clue as to which argument caused it.
+ *
+ * The generators rewrite a bare NULL argument to nullptr so that it lands
+ * here; this overload is what makes that rewrite mean something. */
+inline void mtl_bind_one(std::nullptr_t, int i) { mtl_bind_buffer(nullptr, i); }
 
 template <class T>
 inline void mtl_bind_one(T a, int i)

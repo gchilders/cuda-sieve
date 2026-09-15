@@ -738,7 +738,7 @@ static int pipe_side_sieve_issue(const fb_t *fb, const bench_cfg_t *cfg,
      * ever shows up in a profile. */
     SLAB_CK(mtlMemsetAsync(S->survbits, 0, (size_t)nbitword * 4, st));
     wd_phase(side ? "slab.apply.side1" : "slab.apply.side0");
-    MTL_LAUNCH_NAMED((SLABBED ? "k_apply_16_1_1_1" : "k_apply_16_1_1_0"), nregion, athr, S->apply_smem, st, (const uint32_t *)bk->bucket, bk->cursor, bk->cap, cfg->logI, log_region, S->slice_logp, S->nslice_pow2, S->N, S->CINIT, S->CINIT - S->BOUND, S->tconst, NULL, S->d_nsurv, NULL, 0xFFFFFFFFu, S->sp, S->srt, S->sg, S->slp, S->smag, S->nsmall, S->nblk, S->nwrp, 0xFFFFFFFFu, NULL, S->survbits, cfg->not_both_even, j_base);
+    MTL_LAUNCH_NAMED((SLABBED ? "k_apply_16_1_1_1" : "k_apply_16_1_1_0"), nregion, athr, S->apply_smem, st, (const uint32_t *)bk->bucket, bk->cursor, bk->cap, cfg->logI, log_region, S->slice_logp, S->nslice_pow2, S->N, S->CINIT, S->CINIT - S->BOUND, S->tconst, nullptr, S->d_nsurv, nullptr, 0xFFFFFFFFu, S->sp, S->srt, S->sg, S->slp, S->smag, S->nsmall, S->nblk, S->nwrp, 0xFFFFFFFFu, nullptr, S->survbits, cfg->not_both_even, j_base);
     SLAB_CK(mtlEventRecord(S->ev[3], st));
     rc = 0;
 done:
@@ -1120,7 +1120,7 @@ static int pipe_td_verify(pipe_td_t *C, int side, uint32_t n, int logI,
 #define VERIFY_CK(x) do { if (CUDA_CHECKED(x)) { rc = -1; goto out; } } while (0)
     VERIFY_CK(mtlMalloc(&d_fac, (size_t)n * TD_FMAX * 4));
     VERIFY_CK(mtlMalloc(&d_faccnt, (size_t)n * 4));
-    MTL_LAUNCH_NAMED((SLABBED ? "k_td_1_1_0_1" : "k_td_1_1_0_0"), blocks, threads, 0, 0, C->d_a, C->d_b, C->d_x, NULL, n, logI, C->d_poly[side], sq, C->d_plist[side], C->d_pcnt[side], PIPE_K, C->d_sm[side], C->nsm[side], C->d_cof[side], C->d_cofbits[side], C->d_flags, NULL, d_fac, d_faccnt, TD_FMAX, j_base);
+    MTL_LAUNCH_NAMED((SLABBED ? "k_td_1_1_0_1" : "k_td_1_1_0_0"), blocks, threads, 0, 0, C->d_a, C->d_b, C->d_x, nullptr, n, logI, C->d_poly[side], sq, C->d_plist[side], C->d_pcnt[side], PIPE_K, C->d_sm[side], C->nsm[side], C->d_cof[side], C->d_cofbits[side], C->d_flags, nullptr, d_fac, d_faccnt, TD_FMAX, j_base);
     if (CUDA_CHECKED(mtlDeviceSynchronize()) ||
         CUDA_CHECKED(mtlGetLastError())) {
         fprintf(stderr, "  verify: recording pass failed\n");
@@ -1259,9 +1259,9 @@ static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
         const int side = si ? 0 : 1;          /* side 1 first, as before */
         const int e = si ? 7 : 4;
         CK(mtlMemsetAsync(C->d_pcnt[side], 0, (size_t)n * 4));
-        MTL_LAUNCH_NAMED((SLABBED ? "k_resieve_scatter_4_1" : "k_resieve_scatter_4_0"), blocks, threads, 0, 0, S[side]->plat, S[side]->primes, NULL, S[side]->nfb, xmax, cfg->logI, C->d_sum, d_two, C->d_gbase, C->d_plist[side], C->d_pcnt[side], PIPE_K, C->d_ovf, 6, S[side]->walk_cur);
+        MTL_LAUNCH_NAMED((SLABBED ? "k_resieve_scatter_4_1" : "k_resieve_scatter_4_0"), blocks, threads, 0, 0, S[side]->plat, S[side]->primes, nullptr, S[side]->nfb, xmax, cfg->logI, C->d_sum, d_two, C->d_gbase, C->d_plist[side], C->d_pcnt[side], PIPE_K, C->d_ovf, 6, S[side]->walk_cur);
         CK(mtlEventRecord(E[e + 1]));
-        MTL_LAUNCH_NAMED((SLABBED ? "k_td_1_0_0_1" : "k_td_1_0_0_0"), blocks, threads, 0, 0, C->d_a, C->d_b, C->d_x, NULL, n, cfg->logI, C->d_poly[side], side == cfg->sq_side ? (uint32_t)L->q : 0u, C->d_plist[side], C->d_pcnt[side], PIPE_K, C->d_sm[side], C->nsm[side], C->d_cof[side], C->d_cofbits[side], C->d_flags, NULL, NULL, NULL, 0, j_base);
+        MTL_LAUNCH_NAMED((SLABBED ? "k_td_1_0_0_1" : "k_td_1_0_0_0"), blocks, threads, 0, 0, C->d_a, C->d_b, C->d_x, nullptr, n, cfg->logI, C->d_poly[side], side == cfg->sq_side ? (uint32_t)L->q : 0u, C->d_plist[side], C->d_pcnt[side], PIPE_K, C->d_sm[side], C->nsm[side], C->d_cof[side], C->d_cofbits[side], C->d_flags, nullptr, nullptr, nullptr, 0, j_base);
         CK(mtlEventRecord(E[e + 2]));
         MTL_LAUNCH(k_classify, blocks, threads, 0, 0, C->d_cof[side], C->d_cofbits[side], C->d_b, n, lpb[side], mfb[side], (double)lim[side], C->d_status[side]);
         CK(mtlEventRecord(E[e + 3]));
@@ -1402,7 +1402,7 @@ static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
     for (int si = 0; si < 2; si++) {
         const int side = si ? 0 : 1;
         if (cfg->td_record_scalar)
-            MTL_LAUNCH_NAMED((SLABBED ? "k_td_1_1_1_1" : "k_td_1_1_1_0"), blocks, threads, 0, 0, C->d_a, C->d_b, C->d_x, C->d_sel, nacc, cfg->logI, C->d_poly[side], side == cfg->sq_side ? (uint32_t)L->q : 0u, C->d_plist[side], C->d_pcnt[side], PIPE_K, C->d_sm[side], C->nsm[side], C->d_ccof[side], C->d_cbits[side], C->d_flags, NULL, C->d_cfac[side], C->d_cfn[side], TD_FMAX, j_base);
+            MTL_LAUNCH_NAMED((SLABBED ? "k_td_1_1_1_1" : "k_td_1_1_1_0"), blocks, threads, 0, 0, C->d_a, C->d_b, C->d_x, C->d_sel, nacc, cfg->logI, C->d_poly[side], side == cfg->sq_side ? (uint32_t)L->q : 0u, C->d_plist[side], C->d_pcnt[side], PIPE_K, C->d_sm[side], C->nsm[side], C->d_ccof[side], C->d_cbits[side], C->d_flags, nullptr, C->d_cfac[side], C->d_cfn[side], TD_FMAX, j_base);
         else
             MTL_LAUNCH_NAMED((SLABBED ? "k_td_record_warp_1" : "k_td_record_warp_0"), rblocks, rthreads, 0, 0, C->d_a, C->d_b, C->d_x, C->d_sel, nacc, cfg->logI, C->d_poly[side], side == cfg->sq_side ? (uint32_t)L->q : 0u, C->d_plist[side], C->d_pcnt[side], PIPE_K, C->d_sm[side], C->nsm[side], C->d_ccof[side], C->d_cbits[side], C->d_flags, C->d_cfac[side], C->d_cfn[side], TD_FMAX, j_base);
     }
@@ -2512,7 +2512,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             PIPE_CK(mtlMemset(d_pre, 0, 8));
             PIPE_CK(mtlMemset(d_two, 0, (size_t)nbitword * 4));
             PIPE_CK(mtlEventRecord(ea));
-            MTL_LAUNCH_NAMED((SLABBED ? "k_intersect_compact_1_1" : "k_intersect_compact_1_0"), blocks, cfg->threads, 0, 0, S1.survbits, S0.survbits, nbitword, cfg->logI, Lq.a0, Lq.a1, Lq.b0, Lq.b1, (int64_t)Lq.q, NULL, NULL, NULL, 0u, d_n, d_pre, d_two, NULL, j_base);
+            MTL_LAUNCH_NAMED((SLABBED ? "k_intersect_compact_1_1" : "k_intersect_compact_1_0"), blocks, cfg->threads, 0, 0, S1.survbits, S0.survbits, nbitword, cfg->logI, Lq.a0, Lq.a1, Lq.b0, Lq.b1, (int64_t)Lq.q, nullptr, nullptr, nullptr, 0u, d_n, d_pre, d_two, nullptr, j_base);
             PIPE_CK(mtlEventRecord(eb));
             PIPE_CK(mtlEventSynchronize(eb));
             PIPE_CK(mtlGetLastError());
