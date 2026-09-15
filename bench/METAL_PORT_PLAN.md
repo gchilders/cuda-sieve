@@ -2212,6 +2212,81 @@ bound.
 display.**
 
 
+### 8p. Where curves matter is BELOW B1, not above -- and c183 saturates at 500
+
+8o said the two configurations would diverge "at a B1 where a cofactor's
+smallest factor sits near the edge of what B1 can reach". Directionally right,
+**and I looked for it in the wrong direction.** Raising B1 moves *further past*
+that edge, so every findable factor becomes findable by every curve and the
+sigma choice matters *less*. The edge is below.
+
+**B1 32000, sixteen times production, 144 q:** relation sets identical again,
+and this time even `dead`/`stuck` match exactly (7,116 / 274,947 / 0 on both),
+where at B1 2000 they differed by 31. Sharing only 4 of 48 sigmas changed
+nothing whatsoever.
+
+**Because ECM on c183 saturates at B1 ~ 500:**
+
+| B1 | relations | side 1 split | cofac ms/q |
+|---|---|---|---|
+| 200 | 6,719 | 7,111 | 53.5 |
+| **500** | **6,724** | **7,116** | **75.5** |
+| 1,000 | 6,724 | 7,116 | 108.0 |
+| 2,000 (production) | 6,724 | 7,116 | 170.9 |
+| 32,000 | 6,724 | 7,116 | 1,568.3 |
+
+Everything findable is found by B1 500. Production sits 4x past that for 2.3x
+the cofactor cost and zero extra relations; B1 32000 is 64x past it for 20x the
+cost. **That single fact explains every robustness result in 8l, 8n and 8o** --
+ECM was operating so far beyond its binding constraint that which curves ran
+could not possibly matter.
+
+A job-parameter observation, not a port change, and it belongs to this job's
+`lpb`/`mfb`: another composite saturates somewhere else. The transferable part
+is the method -- sweep B1 and find where relations stop moving.
+
+#### Below saturation the sigmas DO matter, asymmetrically
+
+At **B1 200**, the one regime on this job where the marginal curve decides
+relations, 288 q:
+
+| | old 12c x 4r | derived 2c x 24r |
+|---|---|---|
+| relations | 13,485 | 13,461 |
+| shared (a,b) | 13,461 | 13,461 |
+| **unique to this run** | **24** | **0** |
+| side 1 split | 14,291 | 14,267 |
+| side 1 stuck | 115,995 | 116,307 |
+| cofac ms/q | 74.0 | **57.7** |
+
+The derived default loses 24 relations (0.18%) and gains none -- a systematic
+loss, matching its 24 fewer splits exactly, not a symmetric trade.
+
+**This is the mechanism `cofac.cuh` warned about, measured.** Its record-axis
+comment says a curve sub-range "makes a later chunk restart the top composite
+with sigmas that cannot split it", because `mz_split` restarts its factor stack
+from the original cofactor on every call. A cofactor needing two factors peeled
+can be split by 12 curves in one round and not by 2 curves in each of six
+rounds: the second round does not resume, it starts over. The warning was
+right, and this is where it bites.
+
+**It is still the better default, on the measure that matters:**
+
+| B1 200 | relations/second of cofactor time |
+|---|---|
+| old 12c x 4r | 182.3 |
+| derived | **233.3 (+28%)** |
+
+0.18% fewer relations for 22% less time is more relations per hour, and at or
+above saturation there is no loss at all. Production runs at B1 2000, well
+above. **Anyone running deliberately below saturation should pass
+`--ecm-curves` explicitly**, which suppresses the derivation and gets 8m's
+advisory instead.
+
+**Measured on a 10-core M3 in a fanless MacBook Air that also drives the
+display.**
+
+
 ## 9. Drift ledger — CUDA-side changes made for this port
 
 | date | CUDA file(s) | change | verified how |

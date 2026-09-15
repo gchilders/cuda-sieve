@@ -329,6 +329,23 @@ call site cannot do one and forget the other.
   — only how many, and how cheaply. That is what makes the re-compaction win
   free. At a B1 where the marginal curve decides relations they would diverge.
 
+  **ECM ON c183 SATURATES AT B1 ~ 500 (plan 8p).** Relations are 6,724 at
+  B1 500, 1000, 2000 AND 32000, and 6,719 at 200 — production B1 2000 is 4x
+  past the point where effort buys anything, at 2.3x the cofactor cost; B1
+  32000 is 64x past it at 20x the cost. **That is why every sigma comparison
+  came back identical**: ECM was running far beyond its binding constraint. A
+  job-parameter observation tied to this job's lpb/mfb, not a port change.
+
+  **Curves matter BELOW saturation, not above** — raising B1 makes the sigma
+  choice matter *less*, not more. At B1 200 the derived default loses 24 of
+  13,485 relations (0.18%) and gains none, because `mz_split` restarts its
+  factor stack every round, so a cofactor needing two factors peeled can be
+  split by 12 curves in one round and not by 2 in each of six — exactly the
+  hazard `cofac.cuh`'s record-axis comment warns about. It is still the better
+  default there (**+28% relations per second of cofactor time**) and loses
+  nothing at or above saturation. **Below saturation, pass `--ecm-curves`
+  explicitly** to suppress the derivation.
+
   An explicit `--ecm-curves` is never overruled (it gets the advisory instead),
   and the derivation is gated on both sides being ECM because `cofq_flush`
   passes one round count to both and raising it under rho hits the
