@@ -30,6 +30,16 @@ using namespace metal;
 #define BENCH_NCOEFF (BENCH_MAX_DEGREE + 1)
 #endif
 
+
+/* Bounds the source keeps inside its own __CUDACC__ guard;
+ * lifted here so every Metal translation unit shares one copy. */
+#define TD_GROUP_W 8
+#define TD_GROUP_X (TD_GROUP_W * 32)
+#define TD_SCAN_BLK 256
+#define TD_TILE 512
+#define TD_MAXHIT 16      /* buffered small-prime hits; ~7 per survivor typical */
+#define TD_FMAX  64
+
 typedef struct {
     bn_t    c[BENCH_NCOEFF];
     int32_t sign[BENCH_NCOEFF];

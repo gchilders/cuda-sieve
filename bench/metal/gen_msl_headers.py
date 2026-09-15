@@ -38,7 +38,8 @@ OLD_GAP = '        double nd = bn_to_double(n);\n        double kB = lim * lim;\
 NEW_GAP = '        /* The gap test, on softfp64: same operations, same order, same\n         * rounding. sf_cof_gap_test returns 1 where the original returns\n         * COF_REJECT_GAP. */\n        if (sf_cof_gap_test(sf_bn_to_double(n->v, BN_LIMBS), bits, lpb, lim))\n            return COF_REJECT_GAP;'
 
 def convert(src_path, out_path, guard, fn_macros, first_marker, extra_head='',
-            drop_host=True, device_params=(), drop_fns=(), end_marker=None):
+            drop_host=True, device_params=(), drop_fns=(), end_marker=None,
+            extra_defines_from=None):
     src = open(src_path).read()
     end = src.index(end_marker) if end_marker else src.rindex('#endif')
     body = src[src.index(first_marker):end]
@@ -167,6 +168,23 @@ def convert(src_path, out_path, guard, fn_macros, first_marker, extra_head='',
            '#ifndef UINT64_MAX\n#define UINT64_MAX 0xfffffffffffffffful\n#endif\n'
            '#ifndef INT64_MAX\n#define INT64_MAX  0x7fffffffffffffffl\n#endif\n%s\n'
            % (src_path.split('/')[-1], src_path.split('/')[-1], guard, guard, extra_head))
+    # Some #defines sit INSIDE the source's own __CUDACC__ guard (td.cuh's
+    # TD_FMAX and friends), so the extracted section misses them -- yet other
+    # Metal translation units need them. Pull them across by name so there is
+    # still exactly one statement of each per build.
+    if extra_defines_from:
+        path, names = extra_defines_from
+        src2 = open(path).read()
+        picked = []
+        for nm in names:
+            m = re.search(r'^#define\s+' + nm + r'\b[^\n]*$', src2, re.M)
+            if m: picked.append(m.group(0))
+        if picked:
+            body = ('\n/* Bounds the source keeps inside its own __CUDACC__ guard;\n'
+                    ' * lifted here so every Metal translation unit shares one copy. */\n'
+                    + '\n'.join(picked) + '\n\n' + body)
+            print('  lifted %d #define(s) from inside the guard' % len(picked))
+
     open(out_path, 'w').write(hdr + body + '\n#endif  /* %s */\n' % guard)
     print('  wrote %s (%d heads qualified)' % (out_path, n))
 
@@ -193,7 +211,10 @@ convert('bench/td.cuh', 'bench/metal/td_msl.h', 'CUDA_SIEVE_TD_MSL_H',
         extra_head='\n#include "bigint_msl.h"\n'
                    '#ifndef BENCH_MAX_DEGREE\n#define BENCH_MAX_DEGREE 8\n#endif\n'
                    '#ifndef BENCH_NCOEFF\n#define BENCH_NCOEFF (BENCH_MAX_DEGREE + 1)\n#endif\n',
-        end_marker='#if defined(__CUDACC__)')
+        end_marker='#if defined(__CUDACC__)',
+        extra_defines_from=('bench/td.cuh',
+                            ('TD_GROUP_W', 'TD_GROUP_X', 'TD_SCAN_BLK',
+                             'TD_TILE', 'TD_MAXHIT', 'TD_FMAX')))
 print('plattice.cuh:')
 convert('bench/plattice.cuh', 'bench/metal/plattice_msl.h', 'CUDA_SIEVE_PLATTICE_MSL_H',
         ['PL_FN'], 'typedef struct')

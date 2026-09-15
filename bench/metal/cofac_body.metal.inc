@@ -1041,3 +1041,351 @@ kernel void k_cof_selscatter(
     }
 }
 
+
+kernel void k_cof_gate(
+    constant uint32_t &n [[buffer(0)]],
+    device uint8_t * st0 [[buffer(1)]],
+    device uint8_t * st1 [[buffer(2)]],
+    uint _tid [[thread_position_in_grid]],
+    uint _ntid [[threads_per_grid]],
+    uint _bid [[threadgroup_position_in_grid]],
+    uint _lid [[thread_position_in_threadgroup]],
+    uint _bdim [[threads_per_threadgroup]],
+    uint _gdim [[threadgroups_per_grid]])
+{
+    CUDA_KERNEL_IDS
+
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t tt = bench_grid_thread_x(); tt < n; tt += stride) {
+        const uint32_t t = (uint32_t)tt;
+        if (st0[t] != CF_OK && st1[t] == CF_INCOMPLETE) st1[t] = CF_DEAD;
+    }
+}
+
+
+kernel void k_cof_status_hist(
+    constant uint32_t &n [[buffer(0)]],
+    device const uint8_t * st0 [[buffer(1)]],
+    device const uint8_t * st1 [[buffer(2)]],
+    device uint32_t * out [[buffer(3)]],
+    uint _tid [[thread_position_in_grid]],
+    uint _ntid [[threads_per_grid]],
+    uint _bid [[threadgroup_position_in_grid]],
+    uint _lid [[thread_position_in_threadgroup]],
+    uint _bdim [[threads_per_threadgroup]],
+    uint _gdim [[threadgroups_per_grid]])
+{
+    CUDA_KERNEL_IDS
+
+    /* Relies on blockDim.x >= 8 for both the zeroing and the flush below.
+     * Guaranteed: --threads is refused outside [32, 1024] and must be a
+     * multiple of 32. Stated because nothing else in this file needs a block
+     * floor, so a future launch geometry could break it silently -- bins 4..7
+     * are side 1, and they would read uninitialised shared memory and never
+     * be flushed, i.e. the instrumentation would lie rather than fail. */
+    threadgroup unsigned int bin[8];
+    if (threadIdx.x < 8) bin[threadIdx.x] = 0u;
+    __syncthreads();
+    {
+        const uint64_t stride = bench_grid_stride_x();
+        for (uint64_t tt = bench_grid_thread_x(); tt < n; tt += stride) {
+            const uint32_t t = (uint32_t)tt;
+            uint32_t a = st0[t], b = st1[t];
+            atomicAdd(&bin[(a < 4u ? a : 3u)], 1u);
+            atomicAdd(&bin[4u + (b < 4u ? b : 3u)], 1u);
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < 8 && bin[threadIdx.x])
+        atomicAdd64(&out[2 * threadIdx.x], (ulong)bin[threadIdx.x]);
+}
+
+
+kernel void k_rel_flags(
+    constant uint32_t &n [[buffer(0)]],
+    device const uint8_t * st0 [[buffer(1)]],
+    device const uint8_t * st1 [[buffer(2)]],
+    device uint32_t * flag [[buffer(3)]],
+    uint _tid [[thread_position_in_grid]],
+    uint _ntid [[threads_per_grid]],
+    uint _bid [[threadgroup_position_in_grid]],
+    uint _lid [[thread_position_in_threadgroup]],
+    uint _bdim [[threads_per_threadgroup]],
+    uint _gdim [[threadgroups_per_grid]])
+{
+    CUDA_KERNEL_IDS
+
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t tt = bench_grid_thread_x(); tt < n; tt += stride) {
+        const uint32_t t = (uint32_t)tt;
+        flag[t] = (st0[t] == CF_OK && st1[t] == CF_OK) ? 1u : 0u;
+    }
+}
+
+
+kernel void k_rel_gather(
+    constant uint32_t &n [[buffer(0)]],
+    device const uint32_t * flag [[buffer(1)]],
+    device const uint32_t * off [[buffer(2)]],
+    constant uint32_t &cap [[buffer(3)]],
+    device uint32_t * idx [[buffer(4)]],
+    device uint32_t * nrel [[buffer(5)]],
+    uint _tid [[thread_position_in_grid]],
+    uint _ntid [[threads_per_grid]],
+    uint _bid [[threadgroup_position_in_grid]],
+    uint _lid [[thread_position_in_threadgroup]],
+    uint _bdim [[threads_per_threadgroup]],
+    uint _gdim [[threadgroups_per_grid]])
+{
+    CUDA_KERNEL_IDS
+
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t tt = bench_grid_thread_x(); tt < n; tt += stride) {
+        const uint32_t t = (uint32_t)tt;
+        if (flag[t] && off[t] < cap) idx[off[t]] = t;
+        if (t == n - 1) *nrel = off[t] + flag[t];
+    }
+}
+
+
+kernel void k_rel_pack(
+    constant uint32_t &nr [[buffer(0)]],
+    device const uint32_t * idx [[buffer(1)]],
+    constant cofq_dev_t &Q [[buffer(2)]],
+    device int64_t * oa [[buffer(3)]],
+    device int64_t * ob [[buffer(4)]],
+    device uint32_t * of0 [[buffer(5)]],
+    device uint8_t * ofn0 [[buffer(6)]],
+    device uint32_t * of1 [[buffer(7)]],
+    device uint8_t * ofn1 [[buffer(8)]],
+    device uint64_t * osp0 [[buffer(9)]],
+    device uint8_t * onsp0 [[buffer(10)]],
+    device uint64_t * osp1 [[buffer(11)]],
+    device uint8_t * onsp1 [[buffer(12)]],
+    uint _tid [[thread_position_in_grid]],
+    uint _ntid [[threads_per_grid]],
+    uint _bid [[threadgroup_position_in_grid]],
+    uint _lid [[thread_position_in_threadgroup]],
+    uint _bdim [[threads_per_threadgroup]],
+    uint _gdim [[threadgroups_per_grid]])
+{
+    CUDA_KERNEL_IDS
+
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t tt = bench_grid_thread_x(); tt < nr; tt += stride) {
+        const uint32_t t = (uint32_t)tt;
+        const uint32_t r = idx[t];
+        oa[t] = Q.d_a[r]; ob[t] = Q.d_b[r];
+        ofn0[t] = Q.d_fn0[r]; ofn1[t] = Q.d_fn1[r];
+        for (uint32_t z = 0; z < Q.d_fn0[r]; z++)
+            of0[(size_t)t * TD_FMAX + z] = Q.d_f0[(size_t)r * TD_FMAX + z];
+        for (uint32_t z = 0; z < Q.d_fn1[r]; z++)
+            of1[(size_t)t * TD_FMAX + z] = Q.d_f1[(size_t)r * TD_FMAX + z];
+        /* the split primes, plus the residual of a side that needed no split */
+        {
+            uint32_t k = Q.d_nsp0[r];
+            for (uint32_t z = 0; z < k; z++)
+                osp0[(size_t)t * CF_MAXFAC + z] = Q.d_sp0[(size_t)r * CF_MAXFAC + z];
+            if (!k && Q.d_sm0[r]) { osp0[(size_t)t * CF_MAXFAC] = Q.d_sm0[r]; k = 1; }
+            onsp0[t] = (uint8_t)k;
+            k = Q.d_nsp1[r];
+            for (uint32_t z = 0; z < k; z++)
+                osp1[(size_t)t * CF_MAXFAC + z] = Q.d_sp1[(size_t)r * CF_MAXFAC + z];
+            if (!k && Q.d_sm1[r]) { osp1[(size_t)t * CF_MAXFAC] = Q.d_sm1[r]; k = 1; }
+            onsp1[t] = (uint8_t)k;
+        }
+    }
+}
+
+
+template <int L0, int L1>
+static inline void k_cof_enqueue_body(
+    device const bn_t * cof0,
+    device const uint8_t * bits0,
+    device const bn_t * cof1,
+    device const uint8_t * bits1,
+    device const int64_t * a,
+    device const int64_t * b,
+    device const uint32_t * f0,
+    device const uint32_t * fn0,
+    device const uint32_t * f1,
+    device const uint32_t * fn1,
+    constant uint32_t &n,
+    constant uint32_t &base,
+    constant uint32_t &lpb0,
+    constant uint32_t &lpb1,
+    constant cofq_dev_t &Q,
+    uint _tid,
+    uint _ntid,
+    uint _bid,
+    uint _lid,
+    uint _bdim,
+    uint _gdim)
+{
+    CUDA_KERNEL_IDS
+
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t tt = bench_grid_thread_x(); tt < n; tt += stride) {
+        const uint32_t t = (uint32_t)tt;
+        const uint32_t d = base + t;
+        Q.d_a[d] = a[t]; Q.d_b[d] = b[t];
+        Q.d_nsp0[d] = 0; Q.d_nsp1[d] = 0;
+        {
+            uint32_t c = fn0[t]; if (c > TD_FMAX) c = TD_FMAX;
+            Q.d_fn0[d] = (uint8_t)c;
+            for (uint32_t z = 0; z < c; z++)
+                Q.d_f0[(size_t)d * TD_FMAX + z] = f0[(size_t)t * TD_FMAX + z];
+            c = fn1[t]; if (c > TD_FMAX) c = TD_FMAX;
+            Q.d_fn1[d] = (uint8_t)c;
+            for (uint32_t z = 0; z < c; z++)
+                Q.d_f1[(size_t)d * TD_FMAX + z] = f1[(size_t)t * TD_FMAX + z];
+        }
+        /* A side within lpb needs no splitting, but its residual is still a
+         * prime of the relation whenever it is not 1. */
+        {
+            /* bn_fits_u64, not a hand-rolled two-limb pack: this branch is
+             * taken when the residual is already within lpb, and at lpb > 32
+             * that residual is a prime needing 64 bits. The helper also
+             * REJECTS a value with limbs above the low two set, so a future
+             * change to lpb or the bits accounting cannot silently reinstate
+             * the truncation this whole path exists to remove. A 0 here is a
+             * residual that did not fit, which cannot happen while
+             * bits <= lpb <= 64 and is emitted as "no residual" if it ever
+             * does -- visible as a failed reconstruction, not a wrong one. */
+            uint64_t sm = 0;
+            bn_t v = cof0[t];
+            if ((uint32_t)bits0[t] > lpb0) {
+                uint32_t hi = 0;
+                #pragma unroll
+                for (int i = 0; i < L0; i++) Q.d_c0[(size_t)d * L0 + i] = v.v[i];
+                #pragma unroll
+                for (int i = L0; i < BN_LIMBS; i++) hi |= v.v[i];
+                Q.d_sm0[d] = 0;
+                if (hi) { Q.d_st0[d] = CF_OVERFLOW; atomicAdd(Q.d_ovf, 1u); }
+                else      Q.d_st0[d] = CF_INCOMPLETE;
+            } else {
+                Q.d_sm0[d] = (bits0[t] > 1 && bn_fits_u64(&v, &sm)) ? sm : 0ull;
+                Q.d_st0[d] = CF_OK;
+            }
+            v = cof1[t];
+            if ((uint32_t)bits1[t] > lpb1) {
+                uint32_t hi = 0;
+                #pragma unroll
+                for (int i = 0; i < L1; i++) Q.d_c1[(size_t)d * L1 + i] = v.v[i];
+                #pragma unroll
+                for (int i = L1; i < BN_LIMBS; i++) hi |= v.v[i];
+                Q.d_sm1[d] = 0;
+                if (hi) { Q.d_st1[d] = CF_OVERFLOW; atomicAdd(Q.d_ovf, 1u); }
+                else      Q.d_st1[d] = CF_INCOMPLETE;
+            } else {
+                Q.d_sm1[d] = (bits1[t] > 1 && bn_fits_u64(&v, &sm)) ? sm : 0ull;
+                Q.d_st1[d] = CF_OK;
+            }
+        }
+    }
+}
+
+kernel void k_cof_enqueue_3_3(
+    device const bn_t * cof0 [[buffer(0)]],
+    device const uint8_t * bits0 [[buffer(1)]],
+    device const bn_t * cof1 [[buffer(2)]],
+    device const uint8_t * bits1 [[buffer(3)]],
+    device const int64_t * a [[buffer(4)]],
+    device const int64_t * b [[buffer(5)]],
+    device const uint32_t * f0 [[buffer(6)]],
+    device const uint32_t * fn0 [[buffer(7)]],
+    device const uint32_t * f1 [[buffer(8)]],
+    device const uint32_t * fn1 [[buffer(9)]],
+    constant uint32_t &n [[buffer(10)]],
+    constant uint32_t &base [[buffer(11)]],
+    constant uint32_t &lpb0 [[buffer(12)]],
+    constant uint32_t &lpb1 [[buffer(13)]],
+    constant cofq_dev_t &Q [[buffer(14)]],
+    uint _tid [[thread_position_in_grid]],
+    uint _ntid [[threads_per_grid]],
+    uint _bid [[threadgroup_position_in_grid]],
+    uint _lid [[thread_position_in_threadgroup]],
+    uint _bdim [[threads_per_threadgroup]],
+    uint _gdim [[threadgroups_per_grid]])
+{
+    k_cof_enqueue_body<3, 3>(cof0, bits0, cof1, bits1, a, b, f0, fn0, f1, fn1, n, base, lpb0, lpb1, Q, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+}
+
+kernel void k_cof_enqueue_3_4(
+    device const bn_t * cof0 [[buffer(0)]],
+    device const uint8_t * bits0 [[buffer(1)]],
+    device const bn_t * cof1 [[buffer(2)]],
+    device const uint8_t * bits1 [[buffer(3)]],
+    device const int64_t * a [[buffer(4)]],
+    device const int64_t * b [[buffer(5)]],
+    device const uint32_t * f0 [[buffer(6)]],
+    device const uint32_t * fn0 [[buffer(7)]],
+    device const uint32_t * f1 [[buffer(8)]],
+    device const uint32_t * fn1 [[buffer(9)]],
+    constant uint32_t &n [[buffer(10)]],
+    constant uint32_t &base [[buffer(11)]],
+    constant uint32_t &lpb0 [[buffer(12)]],
+    constant uint32_t &lpb1 [[buffer(13)]],
+    constant cofq_dev_t &Q [[buffer(14)]],
+    uint _tid [[thread_position_in_grid]],
+    uint _ntid [[threads_per_grid]],
+    uint _bid [[threadgroup_position_in_grid]],
+    uint _lid [[thread_position_in_threadgroup]],
+    uint _bdim [[threads_per_threadgroup]],
+    uint _gdim [[threadgroups_per_grid]])
+{
+    k_cof_enqueue_body<3, 4>(cof0, bits0, cof1, bits1, a, b, f0, fn0, f1, fn1, n, base, lpb0, lpb1, Q, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+}
+
+kernel void k_cof_enqueue_4_3(
+    device const bn_t * cof0 [[buffer(0)]],
+    device const uint8_t * bits0 [[buffer(1)]],
+    device const bn_t * cof1 [[buffer(2)]],
+    device const uint8_t * bits1 [[buffer(3)]],
+    device const int64_t * a [[buffer(4)]],
+    device const int64_t * b [[buffer(5)]],
+    device const uint32_t * f0 [[buffer(6)]],
+    device const uint32_t * fn0 [[buffer(7)]],
+    device const uint32_t * f1 [[buffer(8)]],
+    device const uint32_t * fn1 [[buffer(9)]],
+    constant uint32_t &n [[buffer(10)]],
+    constant uint32_t &base [[buffer(11)]],
+    constant uint32_t &lpb0 [[buffer(12)]],
+    constant uint32_t &lpb1 [[buffer(13)]],
+    constant cofq_dev_t &Q [[buffer(14)]],
+    uint _tid [[thread_position_in_grid]],
+    uint _ntid [[threads_per_grid]],
+    uint _bid [[threadgroup_position_in_grid]],
+    uint _lid [[thread_position_in_threadgroup]],
+    uint _bdim [[threads_per_threadgroup]],
+    uint _gdim [[threadgroups_per_grid]])
+{
+    k_cof_enqueue_body<4, 3>(cof0, bits0, cof1, bits1, a, b, f0, fn0, f1, fn1, n, base, lpb0, lpb1, Q, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+}
+
+kernel void k_cof_enqueue_4_4(
+    device const bn_t * cof0 [[buffer(0)]],
+    device const uint8_t * bits0 [[buffer(1)]],
+    device const bn_t * cof1 [[buffer(2)]],
+    device const uint8_t * bits1 [[buffer(3)]],
+    device const int64_t * a [[buffer(4)]],
+    device const int64_t * b [[buffer(5)]],
+    device const uint32_t * f0 [[buffer(6)]],
+    device const uint32_t * fn0 [[buffer(7)]],
+    device const uint32_t * f1 [[buffer(8)]],
+    device const uint32_t * fn1 [[buffer(9)]],
+    constant uint32_t &n [[buffer(10)]],
+    constant uint32_t &base [[buffer(11)]],
+    constant uint32_t &lpb0 [[buffer(12)]],
+    constant uint32_t &lpb1 [[buffer(13)]],
+    constant cofq_dev_t &Q [[buffer(14)]],
+    uint _tid [[thread_position_in_grid]],
+    uint _ntid [[threads_per_grid]],
+    uint _bid [[threadgroup_position_in_grid]],
+    uint _lid [[thread_position_in_threadgroup]],
+    uint _bdim [[threads_per_threadgroup]],
+    uint _gdim [[threadgroups_per_grid]])
+{
+    k_cof_enqueue_body<4, 4>(cof0, bits0, cof1, bits1, a, b, f0, fn0, f1, fn1, n, base, lpb0, lpb1, Q, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+}
+

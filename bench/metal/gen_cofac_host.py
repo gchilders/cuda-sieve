@@ -223,7 +223,58 @@ HELPER = (
 for suffix, meth, st2 in (('1_1', '1', '1'), ('1_0', '1', '0'), ('0_0', '0', '0')):
     src = src.replace('MTL_LAUNCH(k_cofac_L_' + suffix + ',',
                       'MTL_LAUNCH_NAMED(cf_kname(L, ' + meth + ', ' + st2 + '),')
+ARGBUF = (
+"/* ---- cofq_t as an argument buffer --------------------------------------" + chr(10) +
+" *" + chr(10) +
+" * CUDA passes cofq_t to k_cof_enqueue and k_rel_pack BY VALUE. A host pointer" + chr(10) +
+" * means nothing to a shader, so the device gets a struct of GPU ADDRESSES" + chr(10) +
+" * instead -- cofq_dev_t in metal/cofac.metal, whose member order and types" + chr(10) +
+" * this mirror must match exactly." + chr(10) +
+" *" + chr(10) +
+" * Residency is not optional: a buffer reached through a raw address is" + chr(10) +
+" * invisible to Metal's own tracking, and omitting mtlUseResource gives" + chr(10) +
+" * garbage rather than an error (metal/argbuf_test.cpp shows 4095 of 4096" + chr(10) +
+" * values wrong in its negative control). Passing the struct as mtl_argbuf_t" + chr(10) +
+" * makes mtl_launch do the binding and the residency together, so a call site" + chr(10) +
+" * cannot do one and forget the other." + chr(10) +
+" */" + chr(10) +
+"struct cofq_dev_t {" + chr(10) +
+"    uint64_t d_c0, d_c1, d_st0, d_st1, d_sm0, d_sm1, d_a, d_b," + chr(10) +
+"             d_f0, d_f1, d_fn0, d_fn1, d_sp0, d_sp1, d_nsp0, d_nsp1, d_ovf;" + chr(10) +
+"};" + chr(10) + chr(10) +
+"static cofq_dev_t *g_cofq_dev = NULL;" + chr(10) +
+"static const void *g_cofq_refs[17];" + chr(10) + chr(10) +
+"static mtl_argbuf_t cofq_argbuf(const cofq_t *Q)" + chr(10) +
+"{" + chr(10) +
+"    if (!g_cofq_dev && mtlMalloc((void **)&g_cofq_dev, sizeof *g_cofq_dev) != mtlSuccess) {" + chr(10) +
+"        fprintf(stderr, \"cofq_argbuf: out of memory\\n\");" + chr(10) +
+"        mtl_argbuf_t z = { NULL, NULL, 0 }; return z;" + chr(10) +
+"    }" + chr(10) +
+"    const void *p[17] = { Q->d_c0, Q->d_c1, Q->d_st0, Q->d_st1, Q->d_sm0," + chr(10) +
+"                          Q->d_sm1, Q->d_a, Q->d_b, Q->d_f0, Q->d_f1," + chr(10) +
+"                          Q->d_fn0, Q->d_fn1, Q->d_sp0, Q->d_sp1," + chr(10) +
+"                          Q->d_nsp0, Q->d_nsp1, Q->d_ovf };" + chr(10) +
+"    uint64_t *a = (uint64_t *)g_cofq_dev;" + chr(10) +
+"    for (int i = 0; i < 17; i++) { a[i] = mtlDeviceAddress(p[i]); g_cofq_refs[i] = p[i]; }" + chr(10) +
+"    mtl_argbuf_t r = { g_cofq_dev, g_cofq_refs, 17 };" + chr(10) +
+"    return r;" + chr(10) +
+"}" + chr(10))
+# ARGBUF references cofq_t, so it has to sit AFTER that struct's definition
+# rather than at the top of the file.
+anchor = '} cofq_t;'
+assert anchor in src, 'cofq_t definition not found'
+src = src.replace(anchor, anchor + chr(10) + chr(10) + ARGBUF, 1)
 src = HELPER + chr(10) + src
+
+# The two by-value cofq_t launches take the argument buffer instead.
+src = src.replace(", lpb0, lpb1, *Q);", ", lpb0, lpb1, cofq_argbuf(Q));")
+src = src.replace("MTL_LAUNCH(k_rel_pack, blocks, threads, 0, 0, nr, Q->d_idx, *Q,",
+                  "MTL_LAUNCH(k_rel_pack, blocks, threads, 0, 0, nr, Q->d_idx, cofq_argbuf(Q),")
+
+# CF_ENQ(A, B) parameterises the template arguments, so the mangled kernel
+# name has to be pasted by the preprocessor rather than formed here.
+src = src.replace("MTL_LAUNCH(k_cof_enqueue_A_B,",
+                  "MTL_LAUNCH(k_cof_enqueue_##A##_##B,")
 
 src = (hdr
        + '/* ---- borrowed verbatim from bench_kernels.cu, which defines these\n'
