@@ -1348,18 +1348,85 @@ declared `constant`.
 
 If that copy were dropped on the Metal side, `k_apply` would need exactly
 32,768 B at region 14: equal to the ceiling, and the check is `>`, so it fits.
-**Not attempted yet** -- it is device-code surgery rather than tuning, it makes
-`k_apply` diverge from CUDA's structure, and the ~22% is an extrapolation one
-step outside the measured range. It is cheap to falsify, though: `sievecheck`
-compares all 4,194,304 cells exactly, so a wrong answer cannot hide.
+**Attempted, and the extrapolation was wrong -- see 8f.** Region 14 does now
+fit and run correctly, and it is *slower*. The per-region model above is
+sound but incomplete: it has no term for what happens when a threadgroup asks
+for the entire 32 KB budget.
 
 Note also that at region 14 the slab target moves with it -- `8192 << 14` is
 2^27 -- so `SLAB_PERF_REGIONS` would want halving to 4096 to keep the 8c
-optimum of 2^26 positions per slab.
+optimum of 2^26 positions per slab. (The 8e sweeps and 8f's all pin
+`--slab-j 2048` instead, which fixes 2^26 positions directly.)
 
 **Measured on a 10-core M3 in a fanless MacBook Air that also drives the
 display.**
 
+
+### 8f. The 128 bytes are gone; region 14 fits, runs, and is still slower
+
+8e predicted region 14 at about -22% on the sieve if `k_apply`'s 128-byte
+slice-log copy were dropped. The copy is gone, region 14 fits, every answer is
+bit-exact -- **and the prediction was wrong**.
+
+The change is three lines of device code: `k_apply` no longer copies
+`slice_logp` into threadgroup memory, it indexes the `device const uint16_t *`
+it was already being passed. The table is read-only after the copy and indexed
+divergently (`(r >> 16) & (nslice - 1)`), so there is no uniform-access case to
+make `constant` the right space, and on a UMA part with a unified cache there
+is no faster pool to promote 128 hot bytes into. The host side must agree, or
+it reserves bytes the kernel never indexes; that figure had been written out
+three times -- the pipeline, the `bench_kernels` harness, and the Phase 5 gate
+-- so it is now `mtl_apply_smem()` in `metal_rt.h`, named once. A threadgroup
+length that disagrees with what the kernel indexes is not a compile error, it
+is a wrong answer.
+
+**Region 14 now runs.** It had been failing closed since Phase 5. At 4,096
+regions it needs exactly 32,768 B, the checks are all `>`, and it produces 37
+relations. It is also slower than 13:
+
+| `--region`, `--slab-j 2048` | 12 | **13** | 14 |
+|---|---|---|---|
+| fill | 176.1 | 147.9 / 147.6 / 148.3 | **135.3 / 136.0 / 136.5** |
+| apply | 508.8 | **340.0 / 342.0 / 345.4** | 389.8 / 394.4 / 395.1 |
+| sieve, both sides | 738.7 | **542.0 - 548.8** | 579.9 - 588.9 |
+
+The decomposition is the interesting part, and it rescues the 8e model rather
+than discarding it. **`fill` behaves exactly as predicted** -- 8e's fit said
+~115 ms at region 14 against 154 at 13, and it measures 136, the right
+direction and the right order. Fill carries no region-sized threadgroup array.
+**`apply` does the opposite**: predicted ~265 ms, measured ~393. The per-region
+overhead is real and still ~20 us, but at region 14 `k_apply` asks for the
+entire 32,768 B threadgroup budget, so a core can hold **one** threadgroup and
+nothing else. That occupancy cliff costs more than the halved region count
+saves. 8e's model was fitted entirely below the cliff and had no term for it.
+
+So `--region 13` stays the default, now on a measurement rather than on a
+constraint. Region 14 is no longer refused, which matters for hardware with a
+larger ceiling, where the region-count saving would arrive without the cliff.
+
+**What the change is actually worth, measured back to back.** The 8e numbers
+were taken across a long session on a fanless chassis, so the before/after was
+re-run against a rebuild of the old code rather than against them:
+
+| region 13, `--slab-j 2048` | before | after | |
+|---|---|---|---|
+| apply | 357.4 ms [352.3-364.3] | **342.4 ms** [340.0-345.4] | **-4.2%** |
+| sieve, both sides | 560.3 ms [557.3-562.6] | **546.2 ms** [542.0-548.8] | **-2.5%** |
+
+Three runs each, and the two apply ranges **do not overlap** -- every run after
+is faster than every run before. Small, but real, and it costs nothing: the
+threadgroup copy plus its barrier traffic bought nothing on a unified cache.
+All five gates green; `sievecheck` compares all 4,194,304 cells exactly.
+
+**One measurement discarded, recorded here because it nearly misled the whole
+conclusion.** The first region-14 run reported apply at 905.6 ms, which would
+have made the ceiling look catastrophic rather than merely unhelpful. Three
+repeats gave 389.8 / 394.4 / 395.1. The outlier was a cold first run on a
+fanless machine that had just finished a gate sweep. **On this box a single
+timing is not a measurement.**
+
+**Measured on a 10-core M3 in a fanless MacBook Air that also drives the
+display.**
 
 ## 9. Drift ledger — CUDA-side changes made for this port
 

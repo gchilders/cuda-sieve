@@ -160,6 +160,13 @@ for a, b in (('LAUNCH_APPLY(16, 1, NORM_CONST)', 'LAUNCH_APPLY(16, 1, 0)'),
 
 src = src.replace('cuda_optin_smem_limit', 'mtl_optin_smem_limit')
 
+# Same as the pipeline's: the harness binds the same kernel, so it must agree.
+_smem_old = "            const size_t smem = (size_t)ncell * CB / 8 + (size_t)nslice_pow2 * 2;"
+_smem_new = "            const size_t smem = mtl_apply_smem(ncell, CB);"
+assert _smem_old in src, 'harness apply smem shape changed'
+src = src.replace(_smem_old, _smem_new, 1)
+print('  apply threadgroup length via mtl_apply_smem')
+
 open(OUT, 'w').write(src)
 print('wrote %s (%d lines, %d launches rewritten)' % (OUT, src.count('\n'), nl))
 left = sorted(set(re.findall(r'\bcuda[A-Z]\w*', src)))

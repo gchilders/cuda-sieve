@@ -528,14 +528,12 @@ static inline void k_apply_body(
     const uint32_t nword  = ncell / (32 / CELLBITS);
     const uint32_t CPW    = 32 / CELLBITS;          /* cells per 32-bit word */
     threadgroup uint32_t *S   = sm;
-    threadgroup uint16_t *lut = (threadgroup uint16_t *)(sm + nword);
 
     const uint32_t b = blockIdx.x, tid = threadIdx.x, nth = blockDim.x;
     const uint32_t Imask = (1u << logI) - 1;
     const int32_t  Ihalf = 1 << (logI - 1);
     const uint32_t xbase = b << log_region;
 
-    for (uint32_t i = tid; i < nslice; i += nth) lut[i] = slice_logp[i];
 
     /* ---- init: log-norm bound, computed in shared memory ---- */
     for (uint32_t w = tid; w < nword; w += nth) {
@@ -655,7 +653,7 @@ report spurious cell mismatches. Pricing builds only, never for relations."
     for (uint32_t i = tid; i < n; i += nth) {
         const uint32_t r = buckets[(size_t)b * cap + i];
         const uint32_t off = r & (ncell - 1);
-        const uint32_t lp  = lut[(r >> 16) & (nslice - 1)];
+        const uint32_t lp  = slice_logp[(r >> 16) & (nslice - 1)];
         const uint32_t w   = off / CPW;
         const uint32_t sh  = (off % CPW) * CELLBITS;
         if (ATOMIC) atomicAdd(&S[w], lp << sh);
