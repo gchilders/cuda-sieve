@@ -1420,6 +1420,45 @@ typedef struct {
     unsigned long long *d_nst;            /* 8 counters, device side       */
 } cofq_t;
 
+/* ---- cofq_t as an argument buffer --------------------------------------
+ *
+ * CUDA passes cofq_t to k_cof_enqueue and k_rel_pack BY VALUE. A host pointer
+ * means nothing to a shader, so the device gets a struct of GPU ADDRESSES
+ * instead -- cofq_dev_t in metal/cofac.metal, whose member order and types
+ * this mirror must match exactly.
+ *
+ * Residency is not optional: a buffer reached through a raw address is
+ * invisible to Metal's own tracking, and omitting mtlUseResource gives
+ * garbage rather than an error (metal/argbuf_test.cpp shows 4095 of 4096
+ * values wrong in its negative control). Passing the struct as mtl_argbuf_t
+ * makes mtl_launch do the binding and the residency together, so a call site
+ * cannot do one and forget the other.
+ */
+struct cofq_dev_t {
+    uint64_t d_c0, d_c1, d_st0, d_st1, d_sm0, d_sm1, d_a, d_b,
+             d_f0, d_f1, d_fn0, d_fn1, d_sp0, d_sp1, d_nsp0, d_nsp1, d_ovf;
+};
+
+static cofq_dev_t *g_cofq_dev = NULL;
+static const void *g_cofq_refs[17];
+
+static mtl_argbuf_t cofq_argbuf(const cofq_t *Q)
+{
+    if (!g_cofq_dev && mtlMalloc((void **)&g_cofq_dev, sizeof *g_cofq_dev) != mtlSuccess) {
+        fprintf(stderr, "cofq_argbuf: out of memory\n");
+        mtl_argbuf_t z = { NULL, NULL, 0 }; return z;
+    }
+    const void *p[17] = { Q->d_c0, Q->d_c1, Q->d_st0, Q->d_st1, Q->d_sm0,
+                          Q->d_sm1, Q->d_a, Q->d_b, Q->d_f0, Q->d_f1,
+                          Q->d_fn0, Q->d_fn1, Q->d_sp0, Q->d_sp1,
+                          Q->d_nsp0, Q->d_nsp1, Q->d_ovf };
+    uint64_t *a = (uint64_t *)g_cofq_dev;
+    for (int i = 0; i < 17; i++) { a[i] = mtlDeviceAddress(p[i]); g_cofq_refs[i] = p[i]; }
+    mtl_argbuf_t r = { g_cofq_dev, g_cofq_refs, 17 };
+    return r;
+}
+
+
 /* Append one special-q's joint candidates. Everything the relation will need
  * is copied in, because the per-q arrays are overwritten by the next q. */
 /* Templated on BOTH sides' widths because one launch writes both arrays and
@@ -1443,7 +1482,7 @@ static int cof_enqueue(int blocks, int threads,
                        const cofq_t *Q)
 {
 #define CF_ENQ(A, B) do {                                                     \
-        MTL_LAUNCH(k_cof_enqueue_A_B, blocks, threads, 0, 0, cof0, bits0, cof1, bits1, a, b, f0, fn0, f1, fn1, n, base, lpb0, lpb1, *Q);    \
+        MTL_LAUNCH(k_cof_enqueue_##A##_##B, blocks, threads, 0, 0, cof0, bits0, cof1, bits1, a, b, f0, fn0, f1, fn1, n, base, lpb0, lpb1, cofq_argbuf(Q));    \
         return 0;                                                             \
     } while (0)
     switch (Q->L0 * 8 + Q->L1) {
@@ -1910,7 +1949,7 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     }
     if (!nr) { Q->n = 0; rc = 0; goto done; }
 
-    MTL_LAUNCH(k_rel_pack, blocks, threads, 0, 0, nr, Q->d_idx, *Q, O->d_a, O->d_b, O->d_f0, O->d_fn0, O->d_f1, O->d_fn1, O->d_sp0, O->d_nsp0, O->d_sp1, O->d_nsp1);
+    MTL_LAUNCH(k_rel_pack, blocks, threads, 0, 0, nr, Q->d_idx, cofq_argbuf(Q), O->d_a, O->d_b, O->d_f0, O->d_fn0, O->d_f1, O->d_fn1, O->d_sp0, O->d_nsp0, O->d_sp1, O->d_nsp1);
     COF_FLUSH_CK(mtlDeviceSynchronize()); COF_FLUSH_CK(mtlGetLastError());
     h0 = host_ms();
     COF_FLUSH_CK(mtlMemcpy(O->a, O->d_a, (size_t)nr * 8, mtlMemcpyDeviceToHost));

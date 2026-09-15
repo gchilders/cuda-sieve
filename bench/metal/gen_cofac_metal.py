@@ -32,7 +32,10 @@ arith = '\n'.join(cof[a:b + 1])
 # 2. the kernels run_cofac reaches
 KERNELS = []
 for pat in (r'^__global__ void k_cofac', r'^__global__ void k_cof_selflags',
-            r'^__global__ void k_cof_selscatter'):
+            r'^__global__ void k_cof_selscatter',
+            r'^__global__ void k_cof_gate', r'^__global__ void k_cof_status_hist',
+            r'^__global__ void k_rel_flags', r'^__global__ void k_rel_gather',
+            r'^__global__ void k_rel_pack', r'^__global__ void k_cof_enqueue'):
     i = find(cof, pat)
     j = i - 1 if cof[i - 1].startswith('template') else i
     KERNELS.append('\n'.join(cof[j:upto_close(cof, i) + 1]))
@@ -56,6 +59,7 @@ body = body.replace('__device__ ', 'static inline ')
 body = body.replace('__restrict', '')
 body = body.replace('unsigned long long', 'ulong').replace('long long', 'long')
 body = body.replace('__umulhi(', 'mulhi(')
+
 
 # ---- drop the host-only helpers that share this line range ---------------
 # cofac.cuh's arithmetic block also holds the ECM plan builders and their
@@ -118,6 +122,13 @@ K = {
              [(str(L), m, s) for L in (3, 4) for (m, s) in (('1','1'), ('1','0'), ('0','0'))]),
  'k_cof_selflags':   (None, None),
  'k_cof_selscatter': (None, None),
+ 'k_cof_gate':       (None, None),
+ 'k_cof_status_hist':(None, None),
+ 'k_rel_flags':      (None, None),
+ 'k_rel_gather':     (None, None),
+ 'k_rel_pack':       (None, None),
+ 'k_cof_enqueue':    (['int L0', 'int L1'],
+                      [('3','3'), ('3','4'), ('4','3'), ('4','4')]),
 }
 
 def split_top(s):
@@ -131,10 +142,18 @@ def split_top(s):
 
 def bufparam(p, i):
     p = p.strip()
+    # cofq_t is passed BY VALUE in CUDA and carries ~27 device pointers, which
+    # a host pointer value cannot express on a GPU. It becomes an argument
+    # buffer: a struct of GPU addresses, bound as one buffer, with every
+    # pointer inside made resident by mtlUseResource (see metal/argbuf_test).
+    if p.startswith('cofq_t '):
+        return 'constant cofq_dev_t &%s [[buffer(%d)]]' % (p.split()[-1], i)
     if '*' in p: return 'device %s [[buffer(%d)]]' % (p, i)
     return 'constant %s [[buffer(%d)]]' % (re.sub(r'(\w+)$', r'&\1', p), i)
 def plainparam(p):
     p = p.strip()
+    if p.startswith('cofq_t '):
+        return 'constant cofq_dev_t &' + p.split()[-1]
     return ('device ' + p) if '*' in p else ('constant ' + re.sub(r'(\w+)$', r'&\1', p))
 def argname(p):
     return re.sub(r'.*?(\w+)\s*$', r'\1', p.strip().replace('*', ' '))
@@ -202,6 +221,15 @@ for name, (tparams, insts) in K.items():
                 head = re.sub(r'(constant [^,\n]*&)' + nm + r'\b', r'\g<1>' + nm + '_v', head)
         newtext = head + inner + '}\n\n' + '\n'.join(wr)
     body = body[:m.start()] + newtext + body[j + 1:]
+
+# k_cof_status_hist accumulates eight 64-bit status counters. Metal has no
+# 64-bit atomics at all, so each becomes a PAIR of uint32 words -- which is
+# byte-identical to a little-endian uint64, so the host's readback of eight
+# 8-byte counters is unchanged.
+body = body.replace('device ulong * out [[buffer(3)]]', 'device uint32_t * out [[buffer(3)]]')
+body = body.replace('device ulong * out', 'device uint32_t * out')
+body = body.replace('atomicAdd(&out[threadIdx.x], (ulong)bin[threadIdx.x]);',
+                    'atomicAdd64(&out[2 * threadIdx.x], (ulong)bin[threadIdx.x]);')
 
 # address spaces: every pointer here is a thread-local working value except a
 # kernel's own buffers, which the parameter builders already qualified.
