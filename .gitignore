@@ -97,3 +97,8 @@ metal-probe/*.metallib
 metal-probe/probe
 *.metallib
 bench/.metal-build/
+bench/fbgen_gpu
+bench/fbgen
+bench/fbtest
+bench/*.o
+bench/*.d
