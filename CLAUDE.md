@@ -261,11 +261,21 @@ call site cannot do one and forget the other.
   `--region 13` silently quartered CUDA's intent; `SLAB_PERF_REGIONS` is now
   overridable (default unchanged) and set to 8192 here.
 
-  **The other knobs are already right, which is itself the result.**
-  `--threads` 256 and `--blocks` 288 are at their optima on this box even
-  though 288 is a literal `48 * 6` NVIDIA SM assumption. Do not "fix" it
-  without measuring: from 80 to 1152 threadgroups the wall is flat inside a
-  0.77% noise band.
+  **`--threads` 256 is right. `--blocks` IS NOT (plan 8i).** Its default is
+  `multiProcessorCount * 6` = **60** on a 10-core M3 = 15,360 threads, against
+  a `CQ_FLUSH` batch of 131,072 records — a grid 8.5x smaller than the work.
+  CUDA's formula works only because NVIDIA SM counts are large (a 4090 gets
+  196,608 threads from it). Consequence: `--cof-chunk` auto picks its floor,
+  `blocks * threads`, and splits every round into 9 launches — **the worst
+  point measured**. `--blocks 576` clears CQ_FLUSH, stops the chunking, and is
+  worth **-25.5% on the cofactor stage and -10.9% on wall** at `--nq 72`, with
+  identical relations. It is also a SHORTER launch, not a longer one, so the
+  watchdog margin improves. Recommended fix: size the grid from the work
+  (`blocks * threads >= CQ_FLUSH`), not the core count. NOT yet applied.
+
+  8d's "--blocks is flat, do not hand-tune" was measured at `--nq 1`, where
+  1,852 records leave even a 60-block grid oversubscribed. **Flatness measured
+  on a starved stage says nothing about the stage when fed.**
 
   **The cofactor stage is ~39% of wall at a production band size, and is
   SMALLER than the sieve (464 vs 537 ms/q).** The 59% figure below came from a
