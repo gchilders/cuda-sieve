@@ -1129,6 +1129,41 @@ correctness vehicle.
 
 ## 10. Open questions for the CUDA side
 
+### ECM saturates far below the derived B1 on c183 (measured, not acted on)
+
+`cof_auto_b1` derives B1 from `lpb`, in code every port shares. On
+`oracle/c183` at the production geometry, 144 special-q, relations against B1:
+
+| B1 | relations | side 1 split | cofactor ms/q |
+|---|---|---|---|
+| 200 | 6,719 | 7,111 | 53.5 |
+| **500** | **6,724** | **7,116** | **75.5** |
+| 1,000 | 6,724 | 7,116 | 108.0 |
+| 2,000 | 6,724 | 7,116 | 170.9 |
+| 32,000 | 6,724 | 7,116 | 1,568.3 |
+
+Every relation this job can reach is reached by B1 500. Beyond it the cofactor
+stage grows linearly and the relation set does not move at all -- 4x the cost
+at 2,000, 20x at 32,000, for nothing. Below it, B1 200 loses 5 relations, so
+the knee is real and sits between 200 and 500.
+
+**Deliberately not acted on.** B1 is shared tuning, and a Metal-only change to
+it would diverge the three ports on the mathematics rather than on the
+schedule. Raised here as evidence for a decision that belongs to CUDA, HIP and
+Metal together.
+
+Two caveats before anyone acts on it. The knee is a property of THIS job's
+`lpb`/`mfb` -- another composite saturates elsewhere, and the method (sweep B1,
+find where relations stop moving) is what transfers, not the number 500. And
+it was measured on one band of one composite on one machine; the relation
+counts are machine-independent, but only the counts have been checked.
+
+Also worth noting for whoever picks this up: it explains why the Metal port's
+sigma-set comparisons (8l, 8n, 8o) all came back identical. ECM at B1 2000 is
+running so far past its binding constraint that which curves are tried cannot
+change the outcome. That robustness is a symptom of the same over-provisioning.
+
+
 Raised by this port, not caused by it. None are Metal bugs and none have been
 changed.
 
@@ -2241,9 +2276,31 @@ cost. **That single fact explains every robustness result in 8l, 8n and 8o** --
 ECM was operating so far beyond its binding constraint that which curves ran
 could not possibly matter.
 
-A job-parameter observation, not a port change, and it belongs to this job's
-`lpb`/`mfb`: another composite saturates somewhere else. The transferable part
-is the method -- sweep B1 and find where relations stop moving.
+**B1 IS NOT BEING CHANGED, and should not be.** It is derived from `lpb` by
+`cof_auto_b1` in code shared by every port, so moving it is a tuning decision
+for CUDA, HIP and Metal together -- not something a Metal port gets to do on
+its own, and not something to discover as a silent divergence later. The
+observation is recorded in section 10 for the CUDA side to weigh; this build's
+B1/B2 handling is byte-identical to `bench_main.cu`.
+
+**The line this draws is worth stating, because this port already ships one
+cofactor default that CUDA does not** (8n's derived curves-per-round). The
+difference is what the change can move:
+
+- **Curves-per-round is a SCHEDULE.** The same curve budget, the same B1, the
+  same work, in a different launch shape -- and 8n/8o measured the relation set
+  identical over 288 q at production parameters, twice. It buys a launch bound
+  this hardware needs and CUDA does not.
+- **B1 is the SCIENCE.** It decides which cofactors are reachable at all, so
+  moving it changes yield, cost and the relation set on every platform.
+
+A port may reshape the schedule to fit its hardware. It may not quietly retune
+the mathematics. The saturation measurement is evidence for a decision that
+belongs to all three ports at once.
+
+The transferable part is the method -- sweep B1 and find where relations stop
+moving -- and the caveat that saturation is tied to this job's `lpb`/`mfb`, so
+another composite sits elsewhere.
 
 #### Below saturation the sigmas DO matter, asymmetrically
 
@@ -2279,9 +2336,9 @@ right, and this is where it bites.
 
 0.18% fewer relations for 22% less time is more relations per hour, and at or
 above saturation there is no loss at all. Production runs at B1 2000, well
-above. **Anyone running deliberately below saturation should pass
-`--ecm-curves` explicitly**, which suppresses the derivation and gets 8m's
-advisory instead.
+above, so the shipped configuration takes the no-loss case. **Anyone running
+deliberately below saturation should pass `--ecm-curves` explicitly**, which
+suppresses the derivation and gets 8m's advisory instead.
 
 **Measured on a 10-core M3 in a fanless MacBook Air that also drives the
 display.**
