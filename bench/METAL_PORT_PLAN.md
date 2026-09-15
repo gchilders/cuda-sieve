@@ -15,10 +15,11 @@ Branched from `main` at `3e15fec`. Note that `hip-port` is 23 commits behind
   drift ledger (section 9) saying what changed and how far it was verified.
   The HIP port's experience is that an unrecorded CUDA-side edit is the
   failure this rule exists to prevent.
-- **This machine is a correctness vehicle only.** An M3 MacBook Air (10-core
-  GPU, 16 GB unified, shared with the display and the OS) is not a platform to
-  draw performance conclusions from. Record numbers as observations, never as
-  shipped defaults, without saying so explicitly.
+- **Performance tuning on this box is allowed** (changed 2026-09-14). A full
+  M3 is a real Apple GPU, so measurements here are real. State the machine
+  with the number — a fanless 10-core M3 that also drives the display is the
+  small end of the range and throttles under sustained load — and say which
+  box produced any value that becomes a shipped default.
 - Acceptance gate: `cofcheck.sh` green, plus relation comparison against the
   CUDA build on the oracle jobs. Whether that comparison can be *byte*
   identical is an open question — see section 5.1.
@@ -177,6 +178,17 @@ fit. The Metal build must default to 13 and the existing
 `cuda_optin_smem_limit` check (`pipeline.cuh:287-292`) must be retargeted at
 `MTLDevice.maxThreadgroupMemoryLength`, which already fails closed with a
 clear message.
+
+### 5.1a Support floor: M1 (Apple7) on macOS 13
+
+`-std=metal3.0`, `METAL_MIN_MACOS = 13.0`. MSL 3.0 is the toolchain's floor,
+not a choice: Xcode 26.5's Metal compiler advertises `metal2.0`-`metal2.4` in
+its `-std` help and rejects all of them. No hardware coverage is lost — every
+Apple silicon Mac runs macOS 13+ — only an M1 held back on Big Sur or
+Monterey. `metal_rt` fails closed below `MTLGPUFamilyApple7` and cross-checks
+`threadExecutionWidth == 32`, because Metal also runs on Intel Macs whose AMD
+(64-lane) or Intel (8-lane) GPUs would silently compute a different answer
+rather than crash.
 
 ### 5.2 Memory and the display watchdog
 
