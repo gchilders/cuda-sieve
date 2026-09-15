@@ -701,12 +701,44 @@ side's lpb). The factor lists are left **empty**, so every prime below `lim`
 has to come out of the split — a harder test than the pipeline's own path,
 not an easier one.
 
+**6c. `td.cuh` forked; the whole device side now compiles.**
+`metal/td.metal` — 26 kernels: `k_td` (7 instantiations), `k_td_record_warp`,
+`k_resieve_scatter` (5), `k_emit_ranked` (2), `k_classify`, `k_cand_stats`,
+`k_group_counts`, the three-pass scan, `k_tdsmall_advance`, `k_accept_flags`,
+`k_scatter_sel`, `k_gather_ab`. With `bench_kernels.metal` (19),
+`cofac.metal` (8), `fbgen_gpu.metal` (16) and `scan.metal` (6) that is
+**75 kernels in one metallib**, and every device translation unit compiles
+with zero errors.
+
+`k_classify` is where Phase 2 pays off a second time: it calls `cof_classify`,
+whose CADO gap test is written against doubles this GPU does not have.
+`prp_msl.h` routes it through `softfp64`, and `k_classify`'s `double lim`
+parameter is now carried as its 64-bit pattern — **the host passes the same
+eight bytes it always did**, so there is no host-side change.
+
+Also generated as MSL, from headers that stay untouched and shared:
+`bigint_msl.h`, `prp_msl.h`, `plattice_msl.h`, `slab_msl.h`, and `td_msl.h`
+(td.cuh's pre-guard section — the types, the `TD_*` bounds, `td_mod_magic`
+and `SS_KSHIFT`). `bench_kernels.metal` now includes `td_msl.h` instead of
+carrying its own copies, so the device build states `SS_KSHIFT` exactly once.
+
+**The generator bug worth recording.** Reducing `#if defined(__CUDA_ARCH__)`
+blocks with a regex assumed a bare `#else`. `bigint.cuh`'s block is
+`#if / #elif defined(_MSC_VER) / #else / #endif`, so the regex ate the `#if`
+and `#else` and left the `#elif` **orphaned** — which turned the entire rest
+of the header into a dead branch. The file still compiled; every symbol after
+that point simply ceased to exist, and the failure surfaced two translation
+units away as "unknown type name 'bns_t'". That is a *missing-code* bug, not
+a wrong-branch one, exactly the class the HIP port's ledger calls out. Fixed
+with a real preprocessor walk, plus an assertion that refuses to emit a header
+whose conditionals are unbalanced or whose `#else`/`#elif` is orphaned.
+
 **Still to do for this phase:**
-- `td.cuh` device code (14 kernels) including the soft-fp64 `cof_classify`.
-  **Three duplications are outstanding and will rot if left**:
-  `bench_kernels.metal`'s copies of `td_mod_magic` and `SS_KSHIFT`, and
-  `cofac_metal.cpp`'s copies of `TD_SCAN_BLK` and `TD_FMAX`. Forking `td.cuh`
-  properly deletes all four.
+- **One duplication remains, on the HOST side only**: `cofac_metal.cpp`'s
+  copies of `TD_SCAN_BLK` and `TD_FMAX`. Forking `td.cuh` fixed the device
+  side but not this — `td_msl.h` is MSL. The clean fix is a CUDA-side change,
+  lifting those two defines above `td.cuh`'s `__CUDACC__` guard, which would
+  need a drift-ledger row.
 - The inline-queue kernels the pipeline needs but `run_cofac` does not:
   `k_cof_enqueue` (with the `cofq_t` argument buffer, mechanism proven in 6a),
   `k_cof_gate`, `k_cof_status_hist`, `k_rel_flags`, `k_rel_gather`,
