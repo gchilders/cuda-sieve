@@ -23,6 +23,11 @@ CXX       ?= clang++
 # CUDA build and slabtest's pinned expectations are untouched.
 SLAB_PERF_REGIONS ?= 8192u
 
+# k_td stages small primes through a threadgroup tile of TD_TILE * 32 B. The
+# CUDA default 512 is 16 KB -- half of Apple's whole 32,768 B budget. See
+# METAL_PORT_PLAN.md 8q.
+TD_TILE   ?= 512
+
 BN_LIMBS  ?= 12
 CF_LMAX   ?= 4
 
@@ -63,13 +68,19 @@ METAL_MIN_MACOS ?= 13.0
 # every object depends on, so switching between builds rebuilds them; we do not
 # have to remember to.
 CPUOBJ_TUNE := -mcpu=apple-m1 -mmacosx-version-min=$(METAL_MIN_MACOS)
+# BN_LIMBS is used by BOTH sides -- bigint_msl.h declares bn_t with it and the
+# host declares the same struct -- but only HOSTFLAGS was passing it, so the
+# device silently kept bigint_msl.h's #ifndef default of 12 while the host took
+# the Makefile's value. Identical today at 12; a desynced bn_t the moment
+# anyone changed it, which is a wrong answer and not a compile error.
 MSLFLAGS  := -std=metal3.0 -mmacos-version-min=$(METAL_MIN_MACOS) \
              -DSLAB_PERF_REGIONS=$(SLAB_PERF_REGIONS) \
+             -DBN_LIMBS=$(BN_LIMBS) -DTD_TILE=$(TD_TILE) \
              -fno-fast-math -Wno-c++17-extensions -I metal
 
 HOSTFLAGS := -std=c++17 -O2 -ffp-contract=off -I . -I metal \
              -mmacosx-version-min=$(METAL_MIN_MACOS) \
-             -DBN_LIMBS=$(BN_LIMBS) -DCF_LMAX=$(CF_LMAX) \
+             -DBN_LIMBS=$(BN_LIMBS) -DCF_LMAX=$(CF_LMAX) -DTD_TILE=$(TD_TILE) \
              -DSLAB_PERF_REGIONS=$(SLAB_PERF_REGIONS)
 
 BUILD := .metal-build

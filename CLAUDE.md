@@ -449,6 +449,38 @@ call site cannot do one and forget the other.
   leaves the launch's cost unchanged (1508 -> 1540 ms). Grid shape cannot
   shorten a dependent chain, so do not spend effort there; the levers are
   `--ecm-curves`/`--ecm-b1`/`--cof-rounds`, which change the mathematics.
+- **TD tuning (plan 8q): the cause is found, and no knob helps.** TD is the
+  port's worst stage at 7.03x CUDA. Three theories measured and REFUTED:
+  `BN_LIMBS` 12/8/7 (128.1/130.0/129.0 ms — no effect), `TD_TILE`
+  512/256/128/64 (132.0/130.5/131.5/138.0 — no effect), and a TD-specific
+  threadgroup width (TD -15% but **classify +106%**, net wall 1.8% WORSE).
+
+  **That third one matters beyond TD.** Classify does not read that knob — the
+  stages are coupled through the DATA: `k_td`'s grid-stride mapping decides
+  which thread writes which cofactor, and `k_classify` reads those arrays, so
+  halving TD's width scatters the writes classify then pays for. **8d's "one
+  knob, three stages, three optima" assumed the stages are independent. They
+  are not.** No knob shipped; a knob defaulting to the value it already had
+  earns nothing.
+
+  **The real cause: 64-bit integer multiply is 4.77x slower than 32-bit on
+  this GPU** (probe: 401.54 ms vs 84.12 for the same loop). `bn_divmod_u32_pre`
+  runs a `mulhi(ulong,ulong)` plus a 64-bit multiply PER LIMB, and Apple's
+  32-bit ALUs emulate both, against a card where `__umul64hi` is an
+  instruction. **The fix, not attempted:** `d` is uint32 and `rem < d`, so
+  quotient and remainder both fit in 32 bits — only `cur` is 64-bit. The
+  standard 2-word-by-1-word division needs only 32x32→64 products, would live
+  in `bigint_msl.h` (Metal-only, no CUDA change), and the gates to verify it
+  already exist: `sievecheck`'s 4.2M cells, `cofcheck.sh`, and Phase 7's
+  byte-identity against real CUDA.
+
+  **Two latent bugs fixed on the way.** `MSLFLAGS` was not passing
+  `-DBN_LIMBS`, so the device kept `bigint_msl.h`'s default of 12 while the
+  host took the Makefile value — identical today, a desynced `bn_t` the moment
+  anyone changed it. And the define-lifters emitted `TD_TILE`/`TD_FMAX` BARE,
+  so a lifted copy would override a `-D` of the same name; both now wrap every
+  lifted define in `#ifndef`.
+
 - Phase 9: not started (packaging).
 
 **Candidate counts do not compare across sievers; relation sets do.** Our 1,845
@@ -549,11 +581,12 @@ adopt it" and "accept a divergent relation set". See the plan's Phase 7.
 **The ledger lives in `bench/METAL_PORT_PLAN.md` section 9, and only there.**
 A copy of it used to sit here and had already drifted to "none yet" while the
 plan carried two rows — precisely the failure the ledger rule exists to catch,
-committed by the ledger itself. Six rows as of 2026-09-15: `cofcheck.sh`
+committed by the ledger itself. Seven rows as of 2026-09-15: `cofcheck.sh`
 (`head -c -1`), `fbgpucheck.sh` (`sha256sum`), `slab.h` (`SLAB_PERF_REGIONS`
 made overridable, default unchanged), `runlog.c`/`.h` (`g_runlog_quiet`),
 `boinc_support.cpp`/`bench.h` (`bench_boinc_progress_suspend`), and
 `cofcheck.sh` again (build detection; the `--ecm-b1 400000` case asserts a
-refusal on Metal). The last two
+refusal on Metal), and `td.cuh`
+(`TD_TILE` made overridable, default unchanged). Two of those
 are ports from `hip-port` and are inert unless called, which only the Metal
 build does. Add new rows there.

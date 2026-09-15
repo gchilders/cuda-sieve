@@ -2447,6 +2447,91 @@ suppresses the derivation and gets 8m's advisory instead.
 display.**
 
 
+### 8q. Tuning TD: three theories refuted, one cause found, no knob shipped
+
+Phase 7 made TD the port's worst stage -- **7.03x CUDA**, 17.9 ms/q on a
+1080 Ti against 125.6 on the M3, turning 2.6% of CUDA's wall into 11.2% of
+Metal's. Tuned it. **Nothing shipped, and that is the honest result.**
+
+#### What it is not
+
+| theory | test | result |
+|---|---|---|
+| `BN_LIMBS` 12 is 384 bits for a 196-bit norm; the loops are 12 long | rebuild at 12 / 8 / 7 | **128.1 / 130.0 / 129.0 ms -- no effect** |
+| `TD_TILE` 512 x 32 B = 16 KB of threadgroup memory, half Apple's budget, so ~2 threadgroups per core against a 1080 Ti's six | rebuild at 512 / 256 / 128 / 64 | **132.0 / 130.5 / 131.5 / 138.0 ms -- no effect** |
+| TD wants a different threadgroup width from the rest of the pipeline | give `k_td` its own, clean-build A/B | **TD -15%, classify +106%, wall 1.8% WORSE** |
+
+The third is the interesting failure. Swept at band size, TD's own optimum is
+**128** threads and classify's is **256**, so 8d's global 256 looked like a
+compromise worth splitting. Giving `k_td` its own width does exactly what the
+sweep predicted for TD -- 128.9 -> 109.3 ms, -15% -- and **doubles classify**,
+18.1 -> 37.3 ms, for a net 1.8% loss. Two clean builds each way, two runs each,
+entirely consistent.
+
+Classify does not read that knob. The two stages are **coupled through the
+data**: `k_td`'s grid-stride mapping decides which thread writes which
+candidate's cofactor, and `k_classify` then reads those arrays. Halving TD's
+width doubles each thread's stride and scatters the writes, and classify pays
+for it. **8d's "one knob, three stages, three optima" framing assumed the
+stages were independent. They are not.** Reverted; no knob is shipped, because
+a knob whose default is the value it already had is machinery that earns
+nothing.
+
+#### What it is
+
+`bn_divmod_u32_pre` -- the trial-division inner loop -- runs, per limb:
+
+```c
+uint64_t cur = (rem << 32) | x->v[i];
+uint64_t q   = BN_MULHI64(cur, M);   /* 64x64 -> high 64 */
+uint64_t r   = cur - q * d;          /* 64-bit multiply  */
+```
+
+That is the only genuinely 64-bit-heavy arithmetic in TD, and **Apple GPUs are
+32-bit ALUs that emulate it.** Measured directly with a probe
+(`metal-probe`-style, two kernels identical but for width, 65,536 threads x
+200,000 iterations, best of 3):
+
+| | ms | vs 32-bit |
+|---|---|---|
+| 32-bit `mulhi` + multiply | 84.12 | 1.00x |
+| **64-bit `mulhi` + multiply** | **401.54** | **4.77x** |
+
+A 4.77x penalty on the operation TD spends its time in, against a card where
+`__umul64hi` is an instruction. That is the structural cause, and it is why no
+amount of tile sizing or thread counting moved it.
+
+**The fix, not attempted here:** `d` is a `uint32_t`, `rem < d`, and therefore
+both the quotient and the remainder fit in 32 bits -- only `cur` is 64-bit.
+This is the standard 2-word-by-1-word division (`udiv_qrnnd` with a 32-bit
+inverse), which needs only 32x32->64 products. Done in `bigint_msl.h` it would
+be Metal-only and need no CUDA-side change. It is exact arithmetic feeding
+relations, so it wants its own care -- but the gates to check it already exist
+and are strong: `sievecheck` compares 4,194,304 cells, `cofcheck.sh` pins ~25
+relation counts, and Phase 7 can re-run byte-identity against real CUDA.
+
+#### Two latent bugs found while doing this, both fixed
+
+1. **`MSLFLAGS` was not passing `-DBN_LIMBS`.** `bigint_msl.h` declares `bn_t`
+   with it and so does the host, but only `HOSTFLAGS` carried it -- so the
+   device silently kept the header's `#ifndef` default of 12 while the host
+   took the Makefile's value. Identical today at 12; a desynced `bn_t` the
+   moment anyone changed it, which is a wrong answer and not a compile error.
+2. **Lifted `#define`s were emitted bare.** `gen_msl_headers.py` and
+   `gen_td_host.py` copy `TD_TILE`, `TD_FMAX` and friends across from
+   `td.cuh` by name, unguarded -- so a bare copy would override a `-D` of the
+   same name and desync host from device. Both lifters now wrap every lifted
+   define in its own `#ifndef`.
+
+`TD_TILE` is now `#ifndef`-guarded in `td.cuh` with its default unchanged, and
+plumbed through both compiles, so the sweep above is reproducible even though
+its answer was "no effect".
+
+**Measured on a 10-core M3 in a fanless MacBook Air that also drives the
+display.** Six gates green, plus the CUDA-side `slabcheck`, since `td.cuh` was
+touched.
+
+
 ## 9. Drift ledger — CUDA-side changes made for this port
 
 | date | CUDA file(s) | change | verified how |
@@ -2457,3 +2542,4 @@ display.**
 | 2026-09-15 | `bench/runlog.c`, `bench/runlog.h` | added `int g_runlog_quiet` (default 0) and a `if (!g_runlog_quiet)` guard around `runlog_warn`'s **stderr half only**; the log-file half is untouched. Verbatim from `hip-port`. **No CUDA-side code sets it**, so the CUDA build sees an unconditional `0` and identical behaviour. | Compiles clean in the default build (`make runlog.o`, `-Wall -Wextra`). Behaviour unchanged by inspection of a one-line guard on a variable no CUDA translation unit writes; **not exercised on a CUDA build**, since there is no nvcc on this machine. |
 | 2026-09-15 | `bench/boinc_support.cpp`, `bench/bench.h` | added `bench_boinc_progress_suspend(int)` and a `if (progress_suspended) return;` early-out in `bench_boinc_fraction_done`, placed **before** the monotonic high-water mark. Verbatim from `hip-port`. Nothing in the CUDA build calls the setter, so `progress_suspended` is permanently 0 there and the early-out never fires. | `make -f Makefile.metal boinccheck`: compiles `boinc_support.cpp` with `-DHAVE_BOINC` against a stub client API and drives both cases in separate processes. The control, run first, reproduces the HIP port's field bug (task pinned at 99%); the gate shows the suspend prevents it while preserving monotonicity. Also compiles clean both with and without `HAVE_BOINC` (`-Wall -Wextra`). **The real BOINC SDK is not installed here**, so this is verified against a stub, not against a client. |
 | 2026-09-15 | `bench/cofcheck.sh` | build detection from `--help` (`select Metal device` vs `select CUDA device`, refusing to guess if neither), and the `--ecm-b1 400000` case inverted on Metal to assert a refusal instead of an acceptance. **CUDA's path is unchanged**: `IS_METAL=0` takes the original branch verbatim. | Ran on Metal: 54 PASS / 0 FAIL / exit 0, with `large B1 with derived B2 -> refused, as Metal must`. The case it replaces crashed WindowServer twice on this machine. **Not run on a CUDA build** -- the CUDA branch is unchanged by inspection of a two-way `if`, not by execution. The HIP port skips this case for the same underlying reason (`cofac.cuh`'s own warning block says so). |
+| 2026-09-15 | `bench/td.cuh` | wrapped `#define TD_TILE 512` in `#ifndef`/`#endif`. **Default unchanged**, so a build passing no `-D` sees the identical token; only the Metal build overrides it, and 8q measured that override to be worth nothing, so it does not. | `make slabcheck` passes; six Metal gates green including `sievecheck` (4,194,304 cells) and `cofcheck.sh` (54 cases). Behaviour change is nil by inspection of an `#ifndef` around an unchanged value. **Not compiled by nvcc** — no CUDA build was run against this edit. |
