@@ -1305,6 +1305,7 @@ typedef struct {
     uint8_t  *d_s2mask; uint32_t s2vmin, s2nv;/* ECM stage-2 schedule      */
     double ms_rat, ms_alg, ms_host;
     float  ms_launch_max;   /* longest single launch seen, ms */
+    uint32_t ecm_rounds;    /* rounds to actually run; derived or the caller's */
     float  ms_launch_prev;  /* launch time before the last halving      */
     uint32_t chunk_prev;    /* the chunk that produced it               */
     int    chunk_parked;    /* halving stopped paying; descend no more  */
@@ -1485,7 +1486,8 @@ static void cofq_free(cofq_t *Q, cofq_out_t *O)
  * only the standalone one could run ECM at all. */
 static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
                      int meth0, int meth1, uint32_t ecm_b1, uint32_t ecm_b2,
-                     uint32_t ecm_curves, int limbs0, int limbs1)
+                     uint32_t ecm_curves, int limbs0, int limbs1,
+                     int curves_set, uint32_t rounds_in)
 {
     const uint32_t nb = (cap + TD_SCAN_BLK - 1) / TD_SCAN_BLK;
     uint32_t *h_s = NULL;
@@ -1496,6 +1498,7 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
     memset(Q, 0, sizeof(*Q)); memset(O, 0, sizeof(*O));
     Q->cap = cap;
     Q->meth[0] = meth0; Q->meth[1] = meth1; Q->ecm_curves = ecm_curves;
+    Q->ecm_rounds = rounds_in ? rounds_in : 1u;
     Q->L0 = limbs0; Q->L1 = limbs1;
     /* Refused here rather than clamped: every caller derives these from mfb,
      * so a width outside the build is a configuration the run cannot honour,
@@ -1581,26 +1584,49 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
          * over 2,237 units. Calibrated on a 10-core M3. */
         const double ms_one_curve = 0.0413 * (double)(Q->ns + Q->s2nv);
         const double ms_round = ms_one_curve * (double)Q->ecm_curves;
-        if (ms_one_curve <= COF_LAUNCH_REFUSE_MS
-            && ms_round > COF_CHUNK_TARGET_MS && Q->ecm_curves > 1) {
-            const uint32_t fit = (uint32_t)(COF_CHUNK_TARGET_MS / ms_one_curve);
-            fprintf(stderr,
-                    "  cofactor queue: %u curves/round is about %.0f ms in one"
-                    " launch, over this build's %.0f ms bound. --cof-chunk"
-                    " splits RECORDS and cannot divide a chain, so the"
-                    " chunker will subdivide without reaching it and lose"
-                    " throughput doing so.\n",
-                    Q->ecm_curves, ms_round, (double)COF_CHUNK_TARGET_MS);
-            /* --cof-rounds caps at 24, so suggest filling it rather than
-             * a round count the parser would reject. cofq_init is not told
-             * the caller's rounds, so this quotes the curves/round that fit
-             * and the maximum rounds, not a budget it cannot see. */
-            if (fit >= 1)
+        const int both_ecm = Q->meth[0] && Q->meth[1];
+        if (ms_one_curve <= COF_LAUNCH_REFUSE_MS && Q->ecm_curves > 2u) {
+            /* NOT the largest count that fits the bound -- that is 8 at
+             * B1 2000 and costs 265 ms/q against 180. Measured at --nq 144,
+             * 192 curves, B1 2000/B2 60000, cofac ms/q by curves/round:
+             *   16c 353.5  8c 265.3  6c 252.3  4c 212.5  3c 192.8
+             *   2c 180.0   1c 181.0
+             * A bracketed interior minimum at TWO. Every round re-compacts
+             * the live list, so splitting the budget finely drops records
+             * that have already split before the expensive rounds run; at
+             * one curve the five per-round kernels finally cost more than
+             * that saves. So aim at 2 and let the bound lower it further. */
+            uint32_t fit = 2u;
+            while (fit > 1u && ms_one_curve * (double)fit > COF_CHUNK_TARGET_MS)
+                fit--;
+            if (fit > Q->ecm_curves) fit = Q->ecm_curves;
+            if (!curves_set && both_ecm) {
+                /* Same total curves, shorter launches. */
+                const uint64_t budget = (uint64_t)Q->ecm_curves * rounds_in;
+                uint64_t r = (budget + fit - 1u) / fit;
+                if (r > 1000u) r = 1000u;
+                if (r < 1u) r = 1u;
+                printf("  cofactor queue: %u curves/round is ~%.0f ms in one"
+                       " launch, over the %.0f ms bound; using %u x %u"
+                       " instead (~%.0f ms, %llu curves vs %llu)\n",
+                       Q->ecm_curves, ms_round, (double)COF_CHUNK_TARGET_MS,
+                       fit, (unsigned)r, ms_one_curve * (double)fit,
+                       (unsigned long long)((uint64_t)fit * r),
+                       (unsigned long long)budget);
+                Q->ecm_curves = fit;
+                Q->ecm_rounds = (uint32_t)r;
+            } else {
+                fprintf(stderr,
+                        "  cofactor queue: %u curves/round is about %.0f ms in"
+                        " one launch, over this build's %.0f ms bound."
+                        " --cof-chunk splits RECORDS and cannot divide a"
+                        " chain, so the chunker will subdivide without"
+                        " reaching it and lose throughput doing so.\n",
+                        Q->ecm_curves, ms_round, (double)COF_CHUNK_TARGET_MS);
                 fprintf(stderr,
                         "  Shorter launches, same B1/B2: --ecm-curves %u"
-                        " --cof-rounds 24 (the cap) gives %u curves in"
-                        " launches of about %.0f ms.\n",
-                        fit, fit * 24u, ms_one_curve * (double)fit);
+                        " with more --cof-rounds (ECM allows 1000).\n", fit);
+            }
         }
         if (ms_one_curve > COF_LAUNCH_REFUSE_MS) {
             fprintf(stderr,

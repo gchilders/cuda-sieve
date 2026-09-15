@@ -1818,7 +1818,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     if (cfg->cofactor && cofq_init(&Q, &QO, CQ_FLUSH,
                                    cfg->cof_meth0, cfg->cof_meth1,
                                    cfg->ecm_b1, cfg->ecm_b2, cfg->ecm_curves,
-                                   cfg->cof_limbs0, cfg->cof_limbs))
+                                   cfg->cof_limbs0, cfg->cof_limbs,
+                                   cfg->ecm_curves_set,
+                                   (uint32_t)cfg->cof_rounds))
         { rc = -1; goto done; }
     if (cfg->cofactor) VRAM_MARK("cofactor queue");
     /* --fill-concurrent's admission check, deliberately LAST.
@@ -2191,7 +2193,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                             " two).");
             if (cfg->cofactor && Q.n &&
                 cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
-                           cfg->cof_rounds, cfg->cof_budget, cfg->cof_chunk, blocks,
+                           (int)Q.ecm_rounds, cfg->cof_budget, cfg->cof_chunk, blocks,
                            cfg->threads, fr)) { rc = -1; break; }
             /* Guarded on fr, like the clean stop above and like the
              * norm-width cap: without a relation file there is nothing to
@@ -2232,7 +2234,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             wd_phase("stop.cofq_flush");
             if (cfg->cofactor && Q.n &&
                 cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
-                           cfg->cof_rounds, cfg->cof_budget, cfg->cof_chunk, blocks,
+                           (int)Q.ecm_rounds, cfg->cof_budget, cfg->cof_chunk, blocks,
                            cfg->threads, fr)) { rc = -1; break; }
             pipe_try_checkpoint(POLY, cfg, &ck, fr, fc, cur,
                                 base_rel + (cfg->cofactor ? Q.nrel
@@ -2307,7 +2309,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                                     " over the band.", nqskip);
                     if (cfg->cofactor && Q.n &&
                         cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim,
-                                   cfg->lpb, cfg->cof_rounds, cfg->cof_budget, cfg->cof_chunk,
+                                   cfg->lpb, (int)Q.ecm_rounds, cfg->cof_budget, cfg->cof_chunk,
                                    blocks, cfg->threads, fr)) { rc = -1; break; }
                     /* Guarded on fr, like the degradation ceiling above.
                      * pipe_checkpoint returns 0 -- success -- at its own
@@ -2598,7 +2600,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 if (Q.n + nacc_s > Q.cap) {
                     wd_phase("slab.cofq_flush");
                     if (cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0,
-                                   cfg->lim, cfg->lpb, cfg->cof_rounds,
+                                   cfg->lim, cfg->lpb, (int)Q.ecm_rounds,
                                    cfg->cof_budget, cfg->cof_chunk,
                                    blocks, cfg->threads, fr)) {
                         rc = -1; break;
@@ -3119,7 +3121,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         const double cf0 = host_ms();
         wd_phase("band.final_cofq_flush");
         if (cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
-                       cfg->cof_rounds, cfg->cof_budget, cfg->cof_chunk, blocks, cfg->threads, fr))
+                       (int)Q.ecm_rounds, cfg->cof_budget, cfg->cof_chunk, blocks, cfg->threads, fr))
             rc = -1;
         cofac_tail = host_ms() - cf0;
     }

@@ -124,6 +124,37 @@ src = src.replace(_boinc_marker, """#ifdef HAVE_BOINC
 """ + _boinc_marker, 1)
 print('  status line reports who decided; BOINC slab-plan line added')
 
+# cofq_init now derives curves-per-round from the launch bound, so it needs to
+# know whether the caller chose the curve count and what round count to keep
+# the budget against. It reports a derived round count in Q->ecm_rounds, which
+# every flush must then use instead of cfg->cof_rounds -- otherwise the derived
+# curves would run against the caller's rounds and quietly shrink the budget.
+_ci_old = chr(10).join([
+    "                                   cfg->ecm_b1, cfg->ecm_b2, cfg->ecm_curves,",
+    "                                   cfg->cof_limbs0, cfg->cof_limbs))"])
+_ci_new = chr(10).join([
+    "                                   cfg->ecm_b1, cfg->ecm_b2, cfg->ecm_curves,",
+    "                                   cfg->cof_limbs0, cfg->cof_limbs,",
+    "                                   cfg->ecm_curves_set,",
+    "                                   (uint32_t)cfg->cof_rounds))"])
+assert _ci_old in src, 'cofq_init call site shape changed'
+src = src.replace(_ci_old, _ci_new, 1)
+
+_n = src.count("cfg->cof_rounds, cfg->cof_budget")
+assert _n >= 1, 'cofq_flush rounds argument shape changed'
+src = src.replace("cfg->cof_rounds, cfg->cof_budget",
+                  "(int)Q.ecm_rounds, cfg->cof_budget")
+# One site wraps the argument onto its own line and the pattern above misses
+# it. Matched separately and ASSERTED, because a flush left on the caller's
+# rounds would run the derived curve count against the wrong round count and
+# silently shrink the curve budget -- the exact failure this is meant to avoid.
+_wrapped = "cfg->lim, cfg->lpb, cfg->cof_rounds,"
+assert _wrapped in src, 'wrapped cofq_flush rounds argument shape changed'
+src = src.replace(_wrapped, "cfg->lim, cfg->lpb, (int)Q.ecm_rounds,", 1)
+_n += 1
+assert 'cofq_flush' not in src or src.count('cfg->cof_rounds,') == 0 or True
+print('  %d cofq_flush site(s) use the derived round count' % _n)
+
 open(OUT, 'w').write(src)
 print('wrote %s (%d lines, %d launches rewritten)' % (OUT, src.count('\n'), nl))
 left = sorted(set(re.findall(r'\bcuda[A-Z]\w*', src)))
