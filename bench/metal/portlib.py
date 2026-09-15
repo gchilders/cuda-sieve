@@ -81,6 +81,11 @@ def rewrite_launches(text):
                 if d == 0: break
             b += 1
         args = ' '.join(text[a + 1:b].replace('\\\n', ' ').replace('\\', ' ').split())
+        # NULL is 0L in C++, not a pointer, so it would bind as an INTEGER and
+        # hand the kernel a non-nil address for an argument it tests with
+        # `if (p)`. nullptr has its own overload in metal_rt.h. See the comment
+        # there -- this cost a GPU page fault to find.
+        args = re.sub(r'\bNULL\b', 'nullptr', args)
 
         out.append(text[i:e])
         if targs is None:
@@ -119,7 +124,9 @@ REN = [('cudaDeviceSynchronize','mtlDeviceSynchronize'), ('cudaGetLastError','mt
        ('cudaFree','mtlFree'), ('cudaError_t','mtlError_t'), ('cudaSuccess','mtlSuccess'),
        ('cudaErrorLaunchTimeout','mtlErrorLaunchTimeout'), ('cudaErrorNotReady','mtlErrorNotReady'),
        ('cudaMemGetInfo','mtlMemGetInfo'), ('cudaDeviceProp','mtlDeviceProp'),
-       ('cudaGetDeviceProperties','mtlGetDeviceProperties')]
+       ('cudaGetDeviceProperties','mtlGetDeviceProperties'),
+       ('cudaGetDeviceCount','mtlGetDeviceCount'),
+       ('cudaSetDevice','mtlSetDevice'), ('cudaGetDevice','mtlGetDevice')]
 
 
 def apply_renames(text):
