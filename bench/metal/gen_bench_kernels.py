@@ -23,13 +23,48 @@ def span(first_marker, last_marker):
 
 b1, e1 = span('template <bool SLABBED>', 'void k_fill_l2(')          # sieve core
 b2, e2 = span('uint32_t bgcd(', '__global__ void k_intersect_compact')
-body = '\n'.join(lines[b1:e1 + 1]) + '\n\n' + '\n'.join(lines[b2:e2 + 1])
+# The reciprocal gate's device half. bench_kernels.cu:1992's own comment says
+# it exists so "a CUDA-codegen/device-only regression cannot hide behind the"
+# CPU check -- which is exactly the class of thing a port should keep.
+k3 = next(i for i, l in enumerate(lines)
+          if l.startswith('__global__ void k_verify_td_mod_cases'))
+_d, _seen, e3 = 0, False, k3
+for _i in range(k3, len(lines)):
+    _d += lines[_i].count('{') - lines[_i].count('}')
+    if '{' in lines[_i]: _seen = True
+    if _seen and _d == 0: e3 = _i; break
+b3 = k3
+while not lines[b3].startswith('typedef struct'): b3 -= 1   # carry td_mod_case_t
+body = ('\n'.join(lines[b1:e1 + 1]) + '\n\n' + '\n'.join(lines[b2:e2 + 1])
+        + '\n\n' + '\n'.join(lines[b3:e3 + 1]))
 
 body = body.replace('__device__ __forceinline__ ', 'static inline ')
 body = body.replace('__device__ ', 'static inline ')
 body = body.replace('__restrict', '')
 # MSL has no `long long`; its `long` is already 64-bit.
 body = body.replace('unsigned long long', 'ulong').replace('long long', 'long')
+
+# ---- the two-level fill buffer depth ------------------------------------
+# k_fill_l1 and k_fill_l2 declare L1_NBUF*L1_CAP uint32 plus two NBUF-word
+# counters, and on Metal one more word for the __syncthreads_or vote:
+#
+#     128 * CAP * 4  +  128*4  +  128*4  +  4
+#
+# At CUDA's CAP = 64 that is 33,796 B against Apple's HARD 32,768 B ceiling,
+# which has no opt-in tier to raise the way CUDA's ~100 KB does. 61 is the
+# largest value that fits (32,260 B, 508 B spare) -- MEASURED against the
+# driver's own refusal, not estimated. The cap is a pure buffering depth:
+# L1_FLUSH is derived from it and every store is bounds-checked against it,
+# so this changes how often a buffer flushes and nothing about what the
+# kernel produces.
+#
+# Rewritten HERE rather than #defined in the wrapper, because the extracted
+# region carries CUDA's own #define and would override anything set earlier.
+for _nm in ('L1_CAP', 'L2_CAP'):
+    body, _n = re.subn(r'#define ' + _nm + r'(\s+)64\b',
+                       '#define ' + _nm + r'\g<1>61', body)
+    if _n: print('retuned %s 64 -> 61 for the 32 KB threadgroup ceiling' % _nm)
+
 # __launch_bounds__(N, M): the second argument is CUDA's
 # minBlocksPerMultiprocessor and has no Metal analogue; the first becomes
 # MSL's own attribute, which the shim applies at the kernel head instead.
@@ -49,6 +84,8 @@ K = {
  # Production uses <16,1,NORM_HORNER,SLABBED>; the rest are run_bench's own
  # A/B pricing arms, which cost nothing to instantiate and would otherwise
  # fail at run time with a missing-kernel error.
+ 'k_fill_l1':          (None, None, False),
+ 'k_fill_l2':          (['int RECBYTES'], [('2',), ('4',)], False),
  'k_apply':            (['int CELLBITS','int ATOMIC','int NORMMODE','bool SLABBED'],
                         [(c, a, n, 'false') for c in ('16', '8')
                          for a in ('0', '1') for n in ('0', '1')]
@@ -61,6 +98,7 @@ K = {
  'k_snapshot_bounds':  (None, None, False),
  'k_purge_prime':      (None, None, False),
  'k_intersect_compact':(['int AGG','bool SLABBED'], [('1','false'),('1','true')], False),
+ 'k_verify_td_mod_cases': (None, None, False),
 }
 
 def split_top(s):
@@ -92,7 +130,10 @@ for name, (tparams, insts, dynsmem) in K.items():
     # (k_apply has a long one), so the optional prefix has to skip comments.
     COMMENT = r'(?:/\*.*?\*/\s*|//[^\n]*\n\s*)*'
     pre = (r'(?:template\s*<[^>]*>\s*' + COMMENT + r')?') if tparams else ''
-    m = re.search(pre + r'__global__\s+(?:void\s+)?' + name + r'\s*\(', body, re.S)
+    # A comment can sit between __global__ and void (k_fill_l1 carries the
+    # occupancy note there), so skip comments on both sides.
+    m = re.search(pre + r'__global__\s*' + COMMENT + r'\s*(?:void\s*)?'
+                  + COMMENT + name + r'\s*\(', body, re.S)
     if not m:
         print('MISS', name); continue
     a = body.index('(', m.end() - 1)
@@ -128,6 +169,30 @@ for name, (tparams, insts, dynsmem) in K.items():
     # static __shared__ arrays are ordinary threadgroup declarations in MSL
     inner = re.sub(r'\b__shared__\s+', 'threadgroup ', inner)
 
+    # A kernel that votes with __syncthreads_or needs the scratch word the
+    # compat macro names. Declared as a one-element array so a plain kernel
+    # and a templated one spell the call site identically.
+    if '__syncthreads_or' in inner:
+        inner = '    threadgroup uint _sync_or_flag[1];\n' + inner
+
+    # MSL forbids a threadgroup declaration inside a non-kernel function, so a
+    # templated kernel's static shared arrays move to the WRAPPER, which is
+    # kernel-qualified, and the body takes pointers. Making them
+    # [[threadgroup(n)]] PARAMETERS instead is the trap: a parameter is
+    # zero-length unless the host sets its length, and these were static
+    # __shared__ arrays in CUDA with no host involvement at all. That mistake
+    # cost a band that ran to completion and produced a wrong answer.
+    tg_decls = re.findall(r'^\s*threadgroup\s+([\w<>]+)\s+(\w+)\[([^\]]+)\];\s*$',
+                          inner, re.M)
+    tg_params, tg_args, tg_decl_lines = [], [], []
+    if tparams is not None and tg_decls:
+        for ty, nm, dim in tg_decls:
+            inner = re.sub(r'^\s*threadgroup\s+' + ty + r'\s+' + nm + r'\[[^\]]+\];\s*$',
+                           '', inner, flags=re.M)
+            tg_params.append('threadgroup %s *%s' % (ty, nm))
+            tg_decl_lines.append('    threadgroup %s %s[%s];' % (ty, nm, dim))
+            tg_args.append(nm)
+
     if tparams is None:
         head = 'kernel void %s(\n    %s)\n{\n    CUDA_KERNEL_IDS\n' % (
             name, ',\n    '.join([bufparam(p, k) for k, p in enumerate(params)]
@@ -136,13 +201,15 @@ for name, (tparams, insts, dynsmem) in K.items():
     else:
         head = ('template <%s>\nstatic inline void %s_body(\n    %s)\n{\n    CUDA_KERNEL_IDS\n'
                 % (', '.join(tparams), name,
-                   ',\n    '.join([plainparam(p) for p in params] + smem_plain + IDS_PLAIN)))
+                   ',\n    '.join([plainparam(p) for p in params] + smem_plain
+                                    + tg_params + IDS_PLAIN)))
         wrappers = []
-        args = [argname(p) for p in params] + smem_args + IDS_ARGS
+        args = [argname(p) for p in params] + smem_args + tg_args + IDS_ARGS
         kps = [bufparam(p, k) for k, p in enumerate(params)] + smem_param + IDS
+        decls = ('\n'.join(tg_decl_lines) + '\n') if tg_decl_lines else ''
         for inst in insts:
-            wrappers.append('kernel void %s_%s(\n    %s)\n{\n    %s_body<%s>(%s);\n}\n'
-                            % (name, suffix_of(inst), ',\n    '.join(kps), name,
+            wrappers.append('kernel void %s_%s(\n    %s)\n{\n%s    %s_body<%s>(%s);\n}\n'
+                            % (name, suffix_of(inst), ',\n    '.join(kps), decls, name,
                                ', '.join(inst), ', '.join(args)))
         newtext = head + inner + '}\n\n' + '\n'.join(wrappers)
     body = body[:m.start()] + newtext + body[end:]
@@ -163,40 +230,12 @@ if m:
     body = body[:m.start()] + '/* build_slices_b: host-side, see bench_kernels.cu */\n' + body[j + 1:]
     print('dropped host helper build_slices_b')
 
-# ---- k_fill_l1 / k_fill_l2: over Apple's threadgroup-memory ceiling ------
-# Both declare 128*64 uint32 of static shared memory plus two 128-word
-# counters: 33,792 B against Apple's hard 32,768 B limit, over by exactly
-# 1 KB. They are the TWO-LEVEL fill path, and apply requires single-level
-# 4-byte records (bench_kernels.cu:2660), so the production sieve uses
-# k_fill_atomic and never reaches them. Excised rather than silently emitted:
-# a kernel whose pipeline cannot be created is worse than one that is absent
-# and documented. Re-tuning L1_CAP from 64 to 62 would fit exactly, but that
-# is a performance change and belongs in Phase 8, measured, not guessed here.
-for _l1 in ('k_fill_l1', 'k_fill_l2'):
-  m = re.search(r'(?:template\s*<[^>]*>\s*)?__global__\s+(?:[^\n]*\n\s*)?void\s+' + _l1 + r'\s*\(', body)
-  if m:
-    d = 0; j = body.index('{', m.end())
-    k = j
-    while k < len(body):
-        if body[k] == '{': d += 1
-        elif body[k] == '}':
-            d -= 1
-            if d == 0: break
-        k += 1
-    body = (body[:m.start()]
-            + '/* ' + _l1 + ' OMITTED. Both two-level fill kernels declare\n'
-              ' * 128*64 uint32 plus two 128-word counters: 33,792 B against\n'
-              " * Apple's hard 32,768 B threadgroup ceiling, over by exactly 1 KB.\n"
-              ' * MSL additionally forbids threadgroup declarations inside the\n'
-              ' * non-kernel helper the templated form would need.\n'
-              ' *\n'
-              ' * Not a blocker: apply requires single-level 4-byte records\n'
-              ' * (bench_kernels.cu:2660), so the production sieve runs\n'
-              ' * k_fill_atomic and never reaches these. Closing the gap means\n'
-              ' * retuning L1_CAP/L2_CAP from 64 to 62, which is a performance\n'
-              ' * change and belongs in Phase 8, measured rather than guessed. */\n'
-            + body[k + 1:])
-    print('excised ' + _l1 + ' (over threadgroup ceiling)')
+# k_fill_l1 / k_fill_l2 are BACK. They wanted 33,792 B of static threadgroup
+# memory against Apple's 32,768 B ceiling; metal/bench_kernels.metal now
+# overrides L1_CAP/L2_CAP from 64 to 62, which brings the footprint to exactly
+# 32,768 B. The cap is a pure buffering depth -- L1_FLUSH is derived from it
+# and every store is bounds-checked against it -- so the change is
+# functionally neutral, not an approximation.
 
 # ---- address spaces ------------------------------------------------------
 head_re = re.compile(r'(static inline[^;{()]*?\b(\w+)\s*\()([^{;]*?)(\)\s*\n?\s*\{)', re.S)

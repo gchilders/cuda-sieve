@@ -183,6 +183,12 @@ untouched.
    parameter — a parameter is zero-length unless the host sets its length, and
    CUDA's version needed no host involvement at all.
 
+**The thread-to-SIMD-lane mapping is verified** (`metal-probe/lanemap.metal`):
+`thread_index_in_simdgroup == tid & 31` and
+`simdgroup_index_in_threadgroup == tid >> 5`, so CUDA's `lane`/`warp`
+arithmetic and `__syncwarp` scope are valid as written. Phase 0 checked ballot
+ordering and shuffle semantics but not this.
+
 **`cof_classify` is verified on device** (`classifycheck`): 0 of 65,536
 verdicts differ from `prp.cuh`'s own fp64. The soft-float path is ruled out of
 the remaining candidate-count problem.
@@ -197,7 +203,15 @@ call site cannot do one and forget the other.
   Metal build matches every one; the 37 relations at the parity special-q are
   the identical (a,b) set as las's. The 3 ULP `log2` divergence has not moved
   a relation. What remains is a full band rather than a single q.
-- Phases 8-9: not started (two-level fill retune, packaging).
+- **Phase 8 (tuning): partly done.** The two-level fill's threadgroup-ceiling
+  problem is SOLVED — `L1_CAP`/`L2_CAP` retuned 64 -> 61, measured against the
+  driver's own refusal at 33,796 B — but the path **misplaces records across
+  regions** (right total, wrong distribution) and therefore **`--mode
+  twolevel` refuses on Metal**. Not the production path; apply needs
+  single-level 4 B records. Cause not found; cap sweep, vote emulation and
+  lane mapping all ruled out. Still to do: threadgroup-size tuning,
+  `--cof-chunk` against the display watchdog, slab sizing for UMA.
+- Phase 9: not started (packaging).
 
 **Candidate counts do not compare across sievers; relation sets do.** Our 1,845
 cofactorisation candidates against the oracle's 1,851 is not a defect: the 7

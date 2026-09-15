@@ -36,6 +36,13 @@ struct cu_dim { uint x; };
     const cu_dim gridDim   = { _gdim };                     \
     (void)blockIdx; (void)threadIdx; (void)blockDim; (void)gridDim;
 
+/* bench.h:895. CUDA keeps the cast before the multiply so a large grid cannot
+ * wrap; k_fill_l1 calls it directly rather than through the stride helpers. */
+static inline ulong bench_grid_product_u64(uint a, uint b)
+{
+    return (ulong)a * (ulong)b;
+}
+
 /* bench.h's grid-stride helpers. CUDA keeps the cast before the multiply so a
  * large grid cannot wrap; MSL's builtins are already the flattened values. */
 #define bench_grid_thread_x()  ((ulong)_tid)
@@ -46,6 +53,35 @@ struct cu_dim { uint x; };
 #define __syncthreads() threadgroup_barrier(mem_flags::mem_threadgroup)
 /* CUDA's __syncwarp() also fences shared memory for the warp. */
 #define __syncwarp(...)  simdgroup_barrier(mem_flags::mem_threadgroup)
+
+/* CUDA's __syncthreads_or(pred): a barrier AND a block-wide "is pred true for
+ * any thread?" vote. MSL has no block-wide vote, so it is built from
+ * threadgroup memory. The write of 1 is idempotent, so the race between
+ * voters is benign, and the two barriers reproduce the barrier half of the
+ * CUDA semantics exactly.
+ *
+ * The scratch word is named `_sync_or_flag` and is declared by whichever
+ * kernel needs it -- directly for a plain kernel, and by the wrapper for a
+ * templated one, since MSL forbids threadgroup declarations inside a
+ * non-kernel function. Declaring it as a one-element ARRAY means both spell
+ * the call site identically. */
+static inline int cu_syncthreads_or(threadgroup uint *flag, bool pred, uint lid)
+{
+    if (lid == 0) *flag = 0u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (pred) *flag = 1u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const int r = (int)*flag;
+    /* Third barrier: without it, a thread that races round the loop could
+     * reset the flag for the next vote while a slower one is still reading
+     * this one. Every caller does have a barrier further down its loop body,
+     * so this is belt-and-braces -- but a vote that is subtly wrong shows up
+     * as misplaced records with a correct total, which is the worst failure
+     * mode to debug. */
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return r;
+}
+#define __syncthreads_or(p) cu_syncthreads_or(_sync_or_flag, (p), _lid)
 
 /* ---- warp intrinsics --------------------------------------------------- */
 

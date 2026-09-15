@@ -1132,7 +1132,7 @@ kernel void k_apply_16_1_1_1(
  * bounded by how many buffers fit in shared memory, and each flush is one
  * atomic and one full-cache-line store, not one atomic per record. */
 #define L1_NBUF   128
-#define L1_CAP     64        /* uint32 slots = 256 B; 128*64*4 = 32 KB static smem */
+#define L1_CAP     61        /* uint32 slots = 256 B; 128*64*4 = 32 KB static smem */
 #define L1_RUNMAX   8        /* max positions aggregated per reservation   */
 #define L1_FLUSH  (L1_CAP - L1_RUNMAX)
 
@@ -1143,35 +1143,272 @@ kernel void k_apply_16_1_1_1(
  * shared atomic, which also cuts the number of block barriers by the same
  * factor. The barrier-per-record version this replaces spent 30% of its
  * issue slots stalled on barriers at 7.5% of DRAM peak. */
-/* k_fill_l1 OMITTED. Both two-level fill kernels declare
- * 128*64 uint32 plus two 128-word counters: 33,792 B against
- * Apple's hard 32,768 B threadgroup ceiling, over by exactly 1 KB.
- * MSL additionally forbids threadgroup declarations inside the
- * non-kernel helper the templated form would need.
- *
- * Not a blocker: apply requires single-level 4-byte records
- * (bench_kernels.cu:2660), so the production sieve runs
- * k_fill_atomic and never reaches these. Closing the gap means
- * retuning L1_CAP/L2_CAP from 64 to 62, which is a performance
- * change and belongs in Phase 8, measured rather than guessed. */
+kernel void k_fill_l1(
+    device const plat_t * plat [[buffer(0)]],
+    constant uint32_t &n [[buffer(1)]],
+    constant uint32_t &xmax [[buffer(2)]],
+    constant int &logI [[buffer(3)]],
+    constant int &log_super [[buffer(4)]],
+    device uint32_t * cursor [[buffer(5)]],
+    device uint32_t * out [[buffer(6)]],
+    constant uint32_t &cap [[buffer(7)]],
+    device uint32_t * overflow [[buffer(8)]],
+    uint _tid [[thread_position_in_grid]],
+    uint _ntid [[threads_per_grid]],
+    uint _bid [[threadgroup_position_in_grid]],
+    uint _lid [[thread_position_in_threadgroup]],
+    uint _bdim [[threads_per_threadgroup]],
+    uint _gdim [[threadgroups_per_grid]])
+{
+    CUDA_KERNEL_IDS
+    threadgroup uint _sync_or_flag[1];
+
+    threadgroup uint32_t buf[L1_NBUF * L1_CAP];
+    threadgroup uint32_t cnt[L1_NBUF];
+    threadgroup uint32_t base[L1_NBUF];
+
+    const uint32_t Imask = (1u << logI) - 1;
+    const uint32_t tid = threadIdx.x, nth = blockDim.x;
+
+    for (uint32_t i = tid; i < L1_NBUF; i += nth) cnt[i] = 0;
+    __syncthreads();
+
+    const uint64_t stride = bench_grid_product_u64(gridDim.x, nth);
+    uint64_t k = bench_grid_product_u64(blockIdx.x, nth) + tid;
+    plat_t P; P.inc_warp = PL_INVALID;
+    /* This walk stays 32-bit, unlike k_fill_atomic's. Converting it to
+     * pl_next64 was tried on 2026-08-24 and REVERTED: __launch_bounds__(512, 3)
+     * above caps this kernel at 40 registers, HEAD fits in exactly 40 with no
+     * spill, and the two extra 64-bit live values push it over -- ptxas honours
+     * the bound by spilling rather than by dropping to 2 blocks/SM.
+     *
+     *     HEAD:      40 regs, 0 stack,  0 spill st,  0 spill ld
+     *     converted: 40 regs, 8 stack, 12 spill st,  8 spill ld
+     *
+     * The conversion existed only to keep the fill-strategy A/B honest, and
+     * buying that with local-memory traffic in one strategy defeats its own
+     * purpose. If this kernel is ever revisited, raise or drop the launch bound
+     * first and re-measure; do not widen the walk underneath it. */
+    uint32_t x = 0;
+    int active = 0;
+
+    for (;;) {
+        if (!active) {                       /* pick up the next prime */
+            while (k < n) {
+                P = plat[(uint32_t)k];
+                if (P.inc_warp != PL_INVALID) { x = pl_first(&P, logI); active = (x < xmax); }
+                k += stride;
+                if (active) break;
+            }
+        }
+        if (!__syncthreads_or(active)) break;
+
+        if (active) {
+            /* gather a run of consecutive positions in one super-bucket */
+            uint32_t run[L1_RUNMAX];
+            const uint32_t b = x >> log_super;
+            uint32_t nrun = 0, xn = x;
+            do {
+                run[nrun++] = xn;
+                xn = pl_next(xn, &P, Imask);
+            } while (nrun < L1_RUNMAX && xn < xmax && (xn >> log_super) == b);
+
+            uint32_t slot = atomicAdd(&cnt[b], nrun);
+            if (slot + nrun <= L1_CAP) {
+                for (uint32_t t = 0; t < nrun; t++) buf[b * L1_CAP + slot + t] = run[t];
+                x = xn;
+                active = (x < xmax);
+            } else {
+                atomicSub(&cnt[b], nrun);    /* keep cnt exact; retry after flush */
+            }
+        }
+        __syncthreads();
+
+        /* flush buffers at/over the high-water mark. One warp per buffer. */
+        const uint32_t warp = tid >> 5, lane = tid & 31, nwarp = nth >> 5;
+        for (uint32_t b = warp; b < L1_NBUF; b += nwarp) {
+            uint32_t c = cnt[b];
+            if (c < L1_FLUSH) continue;
+            if (lane == 0) base[b] = atomicAdd(&cursor[b], c);
+            __syncwarp();
+            uint32_t dst = base[b];
+            if (dst + c <= cap) {
+                for (uint32_t t = lane; t < c; t += 32)
+                    out[(size_t)b * cap + dst + t] = buf[b * L1_CAP + t];
+            } else if (lane == 0) atomicAdd(overflow, c);
+            __syncwarp();
+            if (lane == 0) cnt[b] = 0;
+        }
+        __syncthreads();
+    }
+
+    /* drain partial buffers */
+    {
+        const uint32_t warp = tid >> 5, lane = tid & 31, nwarp = nth >> 5;
+        for (uint32_t b = warp; b < L1_NBUF; b += nwarp) {
+            uint32_t c = cnt[b];
+            if (c == 0) continue;
+            if (lane == 0) base[b] = atomicAdd(&cursor[b], c);
+            __syncwarp();
+            uint32_t dst = base[b];
+            if (dst + c <= cap) {
+                for (uint32_t t = lane; t < c; t += 32)
+                    out[(size_t)b * cap + dst + t] = buf[b * L1_CAP + t];
+            } else if (lane == 0) atomicAdd(overflow, c);
+            __syncwarp();
+            if (lane == 0) cnt[b] = 0;
+        }
+    }
+}
 
 
 /* ---- stage (c) level 2: split one super-bucket into regions ----------- */
 
 #define L2_NBUF 128
-#define L2_CAP   64
+#define L2_CAP   61
 
-/* k_fill_l2 OMITTED. Both two-level fill kernels declare
- * 128*64 uint32 plus two 128-word counters: 33,792 B against
- * Apple's hard 32,768 B threadgroup ceiling, over by exactly 1 KB.
- * MSL additionally forbids threadgroup declarations inside the
- * non-kernel helper the templated form would need.
- *
- * Not a blocker: apply requires single-level 4-byte records
- * (bench_kernels.cu:2660), so the production sieve runs
- * k_fill_atomic and never reaches these. Closing the gap means
- * retuning L1_CAP/L2_CAP from 64 to 62, which is a performance
- * change and belongs in Phase 8, measured rather than guessed. */
+template <int RECBYTES>
+static inline void k_fill_l2_body(
+    device const uint32_t * in,
+    device const uint32_t * incnt,
+    constant uint32_t &in_cap,
+    constant int &log_region,
+    constant int &log_super,
+    device uint32_t * cursor,
+    device uint8_t * out,
+    constant uint32_t &cap,
+    device uint32_t * overflow,
+    threadgroup uint *_sync_or_flag,
+    threadgroup uint32_t *buf,
+    threadgroup uint32_t *cnt,
+    threadgroup uint32_t *base,
+    uint _tid,
+    uint _ntid,
+    uint _bid,
+    uint _lid,
+    uint _bdim,
+    uint _gdim)
+{
+    CUDA_KERNEL_IDS
+
+    const uint32_t sb = blockIdx.x;              /* one block per super-bucket */
+    uint32_t nrec = incnt[sb];
+    if (nrec > in_cap) nrec = in_cap;   /* L1 cursor may overrun on overflow */
+    const uint32_t offmask = (1u << log_region) - 1;
+    const uint32_t regions_per_super = 1u << (log_super - log_region);
+    const uint32_t tid = threadIdx.x, nth = blockDim.x;
+
+    for (uint32_t i = tid; i < L2_NBUF; i += nth) cnt[i] = 0;
+    __syncthreads();
+
+    uint32_t idx = tid;
+    uint32_t pending = 0, prec = 0;
+    for (;;) {
+        int have = 0;
+        if (pending) { have = 1; }
+        else if (idx < nrec) { prec = in[(size_t)sb * in_cap + idx]; have = 1; }
+        if (!__syncthreads_or(have)) break;
+
+        if (have) {
+            uint32_t b = (prec >> log_region) & (regions_per_super - 1);
+            uint32_t slot = atomicAdd(&cnt[b], 1u);
+            if (slot < L2_CAP) {
+                buf[b * L2_CAP + slot] = prec;
+                pending = 0; idx += nth;
+            } else pending = 1;
+        }
+        __syncthreads();
+
+        const uint32_t warp = tid >> 5, lane = tid & 31, nwarp = nth >> 5;
+        for (uint32_t b = warp; b < regions_per_super; b += nwarp) {
+            uint32_t c = cnt[b];
+            if (c < L2_CAP) continue;
+            uint32_t gb = sb * regions_per_super + b;
+            if (lane == 0) base[b] = atomicAdd(&cursor[gb], L2_CAP);
+            __syncwarp();
+            uint32_t dst = base[b];
+            if (dst + L2_CAP <= cap) {
+                for (uint32_t t = lane; t < L2_CAP; t += 32) {
+                    uint32_t v = buf[b * L2_CAP + t];
+                    size_t at = ((size_t)gb * cap + dst + t) * RECBYTES;
+                    if (RECBYTES == 2) *(device uint16_t *)(out + at) = (uint16_t)(v & offmask);
+                    else               *(device uint32_t *)(out + at) = (v & offmask);
+                }
+            } else if (lane == 0) atomicAdd(overflow, L2_CAP);
+            __syncwarp();
+            if (lane == 0) cnt[b] = 0;
+        }
+        __syncthreads();
+    }
+
+    const uint32_t warp = tid >> 5, lane = tid & 31, nwarp = nth >> 5;
+    for (uint32_t b = warp; b < regions_per_super; b += nwarp) {
+        uint32_t c = cnt[b];
+        if (c == 0) continue;
+        if (c > L2_CAP) c = L2_CAP;
+        uint32_t gb = sb * regions_per_super + b;
+        if (lane == 0) base[b] = atomicAdd(&cursor[gb], c);
+        __syncwarp();
+        uint32_t dst = base[b];
+        if (dst + c <= cap) {
+            for (uint32_t t = lane; t < c; t += 32) {
+                uint32_t v = buf[b * L2_CAP + t];
+                size_t at = ((size_t)gb * cap + dst + t) * RECBYTES;
+                if (RECBYTES == 2) *(device uint16_t *)(out + at) = (uint16_t)(v & offmask);
+                else               *(device uint32_t *)(out + at) = (v & offmask);
+            }
+        } else if (lane == 0) atomicAdd(overflow, c);
+        __syncwarp();
+    }
+}
+
+kernel void k_fill_l2_2(
+    device const uint32_t * in [[buffer(0)]],
+    device const uint32_t * incnt [[buffer(1)]],
+    constant uint32_t &in_cap [[buffer(2)]],
+    constant int &log_region [[buffer(3)]],
+    constant int &log_super [[buffer(4)]],
+    device uint32_t * cursor [[buffer(5)]],
+    device uint8_t * out [[buffer(6)]],
+    constant uint32_t &cap [[buffer(7)]],
+    device uint32_t * overflow [[buffer(8)]],
+    uint _tid [[thread_position_in_grid]],
+    uint _ntid [[threads_per_grid]],
+    uint _bid [[threadgroup_position_in_grid]],
+    uint _lid [[thread_position_in_threadgroup]],
+    uint _bdim [[threads_per_threadgroup]],
+    uint _gdim [[threadgroups_per_grid]])
+{
+    threadgroup uint _sync_or_flag[1];
+    threadgroup uint32_t buf[L2_NBUF * L2_CAP];
+    threadgroup uint32_t cnt[L2_NBUF];
+    threadgroup uint32_t base[L2_NBUF];
+    k_fill_l2_body<2>(in, incnt, in_cap, log_region, log_super, cursor, out, cap, overflow, _sync_or_flag, buf, cnt, base, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+}
+
+kernel void k_fill_l2_4(
+    device const uint32_t * in [[buffer(0)]],
+    device const uint32_t * incnt [[buffer(1)]],
+    constant uint32_t &in_cap [[buffer(2)]],
+    constant int &log_region [[buffer(3)]],
+    constant int &log_super [[buffer(4)]],
+    device uint32_t * cursor [[buffer(5)]],
+    device uint8_t * out [[buffer(6)]],
+    constant uint32_t &cap [[buffer(7)]],
+    device uint32_t * overflow [[buffer(8)]],
+    uint _tid [[thread_position_in_grid]],
+    uint _ntid [[threads_per_grid]],
+    uint _bid [[threadgroup_position_in_grid]],
+    uint _lid [[thread_position_in_threadgroup]],
+    uint _bdim [[threads_per_threadgroup]],
+    uint _gdim [[threadgroups_per_grid]])
+{
+    threadgroup uint _sync_or_flag[1];
+    threadgroup uint32_t buf[L2_NBUF * L2_CAP];
+    threadgroup uint32_t cnt[L2_NBUF];
+    threadgroup uint32_t base[L2_NBUF];
+    k_fill_l2_body<4>(in, incnt, in_cap, log_region, log_super, cursor, out, cap, overflow, _sync_or_flag, buf, cnt, base, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+}
 
 
 static inline uint32_t bgcd(uint32_t u, uint32_t v)
@@ -1669,5 +1906,32 @@ kernel void k_intersect_compact_1_1(
     uint _gdim [[threadgroups_per_grid]])
 {
     k_intersect_compact_body<1, true>(A, B, nword, logI, a0, a1, b0, b1, q, out_x, out_a, out_b, cap, nout, npre, twosided, nqb, j_base, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+}
+
+
+typedef struct {
+    uint32_t w, m, magic, sh, ref;
+} td_mod_case_t;
+
+kernel void k_verify_td_mod_cases(
+    device const td_mod_case_t * v [[buffer(0)]],
+    constant uint32_t &n [[buffer(1)]],
+    device uint32_t * first_bad [[buffer(2)]],
+    uint _tid [[thread_position_in_grid]],
+    uint _ntid [[threads_per_grid]],
+    uint _bid [[threadgroup_position_in_grid]],
+    uint _lid [[thread_position_in_threadgroup]],
+    uint _bdim [[threads_per_threadgroup]],
+    uint _gdim [[threadgroups_per_grid]])
+{
+    CUDA_KERNEL_IDS
+
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t kk = bench_grid_thread_x(); kk < n; kk += stride) {
+        const uint32_t k = (uint32_t)kk;
+        const td_mod_case_t c = v[k];
+        if (td_mod_magic(c.w, c.m, c.magic, c.sh) != c.ref)
+            atomicMin(first_bad, k);
+    }
 }
 

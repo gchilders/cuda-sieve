@@ -72,6 +72,34 @@ new = ('cfg.logI = 15; cfg.J = 16384; cfg.slab_j = 0; cfg.log_region = 13;'
 assert old in src, 'bench_main.cu default geometry line changed'
 src = src.replace(old, new)
 
+# --mode twolevel FAILS CLOSED on Metal.
+#
+# The two-level fill kernels now compile and fit -- L1_CAP/L2_CAP retuned from
+# 64 to 61 for Apple's 32 KB threadgroup ceiling -- but they MISPLACE RECORDS
+# ACROSS REGIONS: the per-region gate reports ~350-500 of 2048 regions off by
+# about one, with the grand total exactly right. That is precisely the failure
+# bench_kernels.cu:2617 warns about ("every placement bug this project has hit
+# had exactly the right total"), and the cause is not yet found.
+#
+# It is not the production path -- apply requires single-level 4-byte records
+# (bench_kernels.cu:2660), so --pipeline never reaches it -- so refusing costs
+# nothing today. Refusing rather than warning is the tree's own convention for
+# a path known to compute the wrong thing.
+old_mode = """            if (!strcmp(m, "atomic")) cfg.fill_mode = FILL_ATOMIC;
+            else if (!strcmp(m, "twolevel")) cfg.fill_mode = FILL_TWOLEVEL;"""
+new_mode = (
+    '            if (!strcmp(m, "atomic")) cfg.fill_mode = FILL_ATOMIC;' + chr(10) +
+    '            else if (!strcmp(m, "twolevel")) {' + chr(10) +
+    '                fprintf(stderr, "--mode twolevel is refused on Metal: '
+    'the two-level fill kernels compile and fit, but they misplace records '
+    'across regions (right total, wrong distribution -- run with --verify to '
+    'see it). Not the production path; apply needs single-level 4 B records. '
+    'See METAL_PORT_PLAN.md section 8.\\n");' + chr(10) +
+    '                return 1;' + chr(10) +
+    '            }')
+assert old_mode in src, 'bench_main.cu --mode parsing changed'
+src = src.replace(old_mode, new_mode)
+
 src = apply_renames(src)
 
 # names with no Metal analogue
