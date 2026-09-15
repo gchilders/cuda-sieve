@@ -190,6 +190,32 @@ Monterey. `metal_rt` fails closed below `MTLGPUFamilyApple7` and cross-checks
 (64-lane) or Intel (8-lane) GPUs would silently compute a different answer
 rather than crash.
 
+**The flag only covers the TUs this Makefile compiles, which was not all of
+them.** The CPU-side objects (`verify_cpu.o`, `fbgen_lib.o`, `platform.o`,
+`watchdog.o`, ...) are built by delegating to the default `Makefile` rather
+than duplicating its rules, and its `HOST_TUNE` defaults to `-march=native`.
+So those objects were compiled with neither `-mmacosx-version-min` nor a
+pinned CPU: `otool -l platform.o` recorded `minos 26.0` inside a binary whose
+own load command says `minos 13.0`. The linker says so out loud -- "built for
+newer 'macOS' version (26.0) than being linked (13.0)" -- and the warning had
+been scrolling past since the first link.
+
+`Makefile.metal` now passes `HOST_TUNE='-mcpu=apple-m1
+-mmacosx-version-min=$(METAL_MIN_MACOS)'` to each of the four delegated
+builds. Every object in the link is `minos 13.0` and the warnings are gone.
+The default `Makefile` folds `HOST_TUNE` into a stamp that every object
+depends on, so alternating between a native build and a Metal build rebuilds
+them rather than silently reusing the wrong ones -- verified by switching
+`HOST_TUNE` back and watching `platform.o` rebuild unprompted.
+
+On *this* machine the ISA half was moot: Apple clang's `-march=native`
+resolves to `apple-m1` even on an M3, so no post-M1 instruction was reachable.
+That is a fact about this toolchain, not a guarantee, and `-mcpu=apple-m1`
+makes it one. All five gates were re-run after the change -- `verify_cpu.o` is
+the CPU *reference* the Phase 5 parity gate compares against, so changing its
+codegen flags could have moved the thing being compared to, and 4,194,304
+cells still match exactly.
+
 ### 5.2 Memory and the display watchdog
 
 16 GB unified, shared with the OS and the display the GPU is also driving.

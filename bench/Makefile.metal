@@ -53,6 +53,16 @@ CF_LMAX   ?= 4
 # as an extension. The construct works (clang has always accepted it), and
 # Phase 4's byte-identical gate is the proof.
 METAL_MIN_MACOS ?= 13.0
+
+# The CPU-side objects are built by the DEFAULT Makefile, which we invoke for
+# them rather than duplicating its rules. Its HOST_TUNE defaults to
+# -march=native, which records the build machine's OS as the minimum and, on a
+# machine where "native" resolves above apple-m1, its ISA too. Either one
+# quietly breaks the back-to-M1 promise from inside objects this Makefile does
+# not compile. Pin both. The default Makefile folds HOST_TUNE into a stamp that
+# every object depends on, so switching between builds rebuilds them; we do not
+# have to remember to.
+CPUOBJ_TUNE := -mcpu=apple-m1 -mmacosx-version-min=$(METAL_MIN_MACOS)
 MSLFLAGS  := -std=metal3.0 -mmacos-version-min=$(METAL_MIN_MACOS) \
              -DSLAB_PERF_REGIONS=$(SLAB_PERF_REGIONS) \
              -fno-fast-math -Wno-c++17-extensions -I metal
@@ -139,7 +149,7 @@ $(BUILD)/metal_scan.o: metal/metal_scan.cpp metal/metal_scan.h | $(BUILD)
 	$(CXX) $(HOSTFLAGS) -c $< -o $@
 
 $(BUILD)/fbgen_gpu: metal/fbgen_gpu_metal.cpp $(METAL_OBJS) $(BUILD)/bench.metallib
-	$(MAKE) $(FBGEN_CPUOBJ)
+	$(MAKE) HOST_TUNE='$(CPUOBJ_TUNE)' $(FBGEN_CPUOBJ)
 	$(CXX) $(HOSTFLAGS) metal/fbgen_gpu_metal.cpp $(METAL_OBJS) $(FBGEN_CPUOBJ) \
 	    -framework Metal -framework Foundation -framework IOKit -lm -o $@
 
@@ -187,7 +197,7 @@ $(BUILD)/bench.metallib: metal/bench_kernels.metal metal/bench_kernels_body.meta
 
 $(BUILD)/phase5_test: metal/phase5_test.cpp metal/fbgen_gpu_metal.cpp \
                       metal/metal_rt.mm metal/metal_scan.cpp $(BUILD)/bench.metallib
-	$(MAKE) $(SIEVE_CPUOBJ)
+	$(MAKE) HOST_TUNE='$(CPUOBJ_TUNE)' $(SIEVE_CPUOBJ)
 	$(CXX) $(HOSTFLAGS) -DFBGEN_GPU_LIBRARY metal/phase5_test.cpp \
 	    metal/fbgen_gpu_metal.cpp metal/metal_rt.mm metal/metal_scan.cpp \
 	    $(SIEVE_CPUOBJ) -framework Metal -framework Foundation -framework IOKit \
@@ -227,7 +237,7 @@ COFAC_CPUOBJ := verify_cpu.o fb_load.o fb_cado.o poly.o primes.o platform.o \
 
 $(BUILD)/cofac_test: metal/cofac_test.cpp metal/cofac_metal.cpp metal/metal_rt.mm \
                      $(BUILD)/bench.metallib
-	$(MAKE) $(COFAC_CPUOBJ)
+	$(MAKE) HOST_TUNE='$(CPUOBJ_TUNE)' $(COFAC_CPUOBJ)
 	$(CXX) $(HOSTFLAGS) metal/cofac_test.cpp metal/cofac_metal.cpp \
 	    metal/metal_rt.mm $(COFAC_CPUOBJ) \
 	    -framework Metal -framework Foundation -framework IOKit -lm -o $@
@@ -267,7 +277,7 @@ $(BUILD)/fbgen_gpu_lib.o: metal/fbgen_gpu_metal.cpp | $(BUILD)
 	$(CXX) $(HOSTFLAGS) -DFBGEN_GPU_LIBRARY -c $< -o $@
 
 $(BUILD)/bench: $(METAL_TU) $(BUILD)/bench.metallib
-	$(MAKE) $(BENCH_CPUOBJ)
+	$(MAKE) HOST_TUNE='$(CPUOBJ_TUNE)' $(BENCH_CPUOBJ)
 	$(CXX) $(HOSTFLAGS) $(METAL_TU) $(BENCH_CPUOBJ) \
 	    -framework Metal -framework Foundation -framework IOKit \
 	    -lm -ldl -lpthread -o $@
