@@ -1147,13 +1147,24 @@ static int cf_run_rounds_dyn(int L, const uint32_t *d_n, uint64_t lim,
  * deliberately conservative, and free to be, because over-chunking costs
  * nothing on the devices that ever reach this path (see the floor below).
  */
-#define COF_CHUNK_TARGET_MS   250.0f
+/* 750 ms on ONE launch: a UI-responsiveness bound as much as a watchdog
+ * one, and explicitly worth throughput to hold. CUDA keeps 250 ms against
+ * a whole-side sum; this is 750 against a measured launch, so the two
+ * numbers are not comparable. See gen_cofac_host.py. */
+#define COF_CHUNK_TARGET_MS   750.0f
 
 /* Giant steps per curve above which cofq_init warns that record chunking can
  * no longer bound a launch. ~40x the derived default's ~500 and ~16x below the
  * ~320,000 of the one configuration known to trip a watchdog; see the warning
  * site in cofq_init for why this is a judgement rather than a measurement. */
 #define COF_S2NV_WATCHDOG_WARN  20000u
+
+/* Refuse above this much estimated work in ONE curve, because no chunking
+ * can divide a chain. 10 s: launches of 3.6 s and 6.9 s have both run
+ * here without incident, and the case that crashed the machine twice
+ * estimates at ~19 s per curve. Between those, closer to what is known to
+ * work than to what is known to kill it. */
+#define COF_LAUNCH_REFUSE_MS  10000.0
 
 /* The floor is `blocks * threads`: one record per thread, and never less.
  *
@@ -1186,9 +1197,24 @@ void mtl_set_cof_floor_blocks(int b) { g_cof_floor_blocks = b > 0 ? b : 0; }
 
 uint32_t mtl_cof_flush_capacity(void) { return CQ_FLUSH; }
 
+/* Where auto STARTS: one core-derived grid of records, one per thread.
+ * The floor below is where it may descend TO, which is a different and
+ * now much smaller number. */
+static uint32_t cof_chunk_open(int blocks, int threads)
+{
+    const int ob = g_cof_floor_blocks ? g_cof_floor_blocks : blocks;
+    const uint64_t f = (uint64_t)(ob > 0 ? ob : 1)
+                     * (uint64_t)(threads > 0 ? threads : 1);
+    return f > 0xffffffffull ? 0xffffffffu : (uint32_t)f;
+}
+
 static uint32_t cof_chunk_floor(int blocks, int threads)
 {
-    const int fb = g_cof_floor_blocks ? g_cof_floor_blocks : blocks;
+    /* One WAVE, not one grid: the measurement decides how far to descend
+     * (see the no-progress guard), and this only stops the controller
+     * asking for fewer records than the device can run at once. */
+    const int fbb = g_cof_floor_blocks ? g_cof_floor_blocks : blocks;
+    const int fb = fbb > 8 ? fbb / 8 : 1;
     const uint64_t f = (uint64_t)(fb > 0 ? fb : 1)
                      * (uint64_t)(threads > 0 ? threads : 1);
     return f > 0xffffffffull ? 0xffffffffu : (uint32_t)f;
@@ -1278,6 +1304,10 @@ typedef struct {
     int meth[2];
     uint8_t  *d_s2mask; uint32_t s2vmin, s2nv;/* ECM stage-2 schedule      */
     double ms_rat, ms_alg, ms_host;
+    float  ms_launch_max;   /* longest single launch seen, ms */
+    float  ms_launch_prev;  /* launch time before the last halving      */
+    uint32_t chunk_prev;    /* the chunk that produced it               */
+    int    chunk_parked;    /* halving stopped paying; descend no more  */
     unsigned long long nseen, nrel;
     /* Per side, per CF_* status, accumulated over flushes. `ndead`/`nstuck`
      * used to be two scalars here that NOTHING ever wrote -- which is the
@@ -1541,6 +1571,30 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
                     " failure\" on AMD). Lower --ecm-b2 if tasks fail that"
                     " way.\n", Q->s2nv, ecm_curves);
     }
+    if (Q->meth[0] || Q->meth[1]) {
+        /* ~0.045 ms per prime power + giant step, 10-core M3. A slower or
+         * faster Apple GPU moves this; it is a guard rail, not a model. */
+        const double ms_one_curve = 0.045 * (double)(Q->ns + Q->s2nv);
+        if (ms_one_curve > COF_LAUNCH_REFUSE_MS) {
+            fprintf(stderr,
+                    "  cofactor queue: REFUSED -- one ECM curve is about"
+                    " %.0f ms of work (%u prime powers + %u giant steps),"
+                    " and a launch cannot be made shorter than one curve:"
+                    " --cof-chunk splits RECORDS, never the chain. At"
+                    " %u curves/round that is one kernel launch of roughly"
+                    " %.0f s.\n",
+                    ms_one_curve, Q->ns, Q->s2nv, Q->ecm_curves,
+                    ms_one_curve * (double)Q->ecm_curves / 1000.0);
+            fprintf(stderr,
+                    "  On Apple silicon the GPU also drives the display,"
+                    " so this does not merely fail the task -- it hangs"
+                    " WindowServer and takes the session down. Observed"
+                    " twice at --ecm-b1 400000. Lower --ecm-b1/--ecm-b2,"
+                    " or cut --ecm-curves and raise --cof-rounds to keep"
+                    " the same curve budget in shorter launches.\n");
+            goto done;
+        }
+    }
     {
         static const char *nm[2] = { "rho", "ECM" };
         printf("  cofactor method: side 0 %s, side 1 %s\n",
@@ -1713,7 +1767,7 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
          * the single-slice case. */
         const uint32_t floor_ch = cof_chunk_floor(blocks, threads);
         const uint32_t want = chunk ? chunk
-                            : (Q->chunk_cur ? Q->chunk_cur : floor_ch);
+                            : (Q->chunk_cur ? Q->chunk_cur : cof_chunk_open(blocks, threads));
         if (Q->chunk_cur != want) {
             Q->chunk_cur = want;
             cof_report_chunk(Q->chunk_cur, n, chunk != 0);
@@ -1767,6 +1821,14 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
             && p > launch_ms) launch_ms = p;
     }
     Q->ms_rat += t0; Q->ms_alg += t1;
+    if (launch_ms > 0.0f && launch_ms > Q->ms_launch_max) {
+        Q->ms_launch_max = launch_ms;
+        fprintf(stderr,
+                "  cofactor: longest kernel launch %.0f ms (%u records/launch,"
+                " %u in flush)\n",
+                (double)launch_ms,
+                Q->chunk_cur < n ? Q->chunk_cur : n, n);
+    }
 
     /* Steer the NEXT flush. Only in auto mode, and only ever between flushes,
      * so the slice is fixed for the whole of the one just measured.
@@ -1786,9 +1848,23 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
          * Falls back to the old sum if no launch was timed, so a flush
          * that never fired steers exactly as it used to. */
         const float stage = launch_ms > 0.0f ? launch_ms : (t0 + t1);
-        if (stage > COF_CHUNK_TARGET_MS) {
-            const uint32_t half = Q->chunk_cur / 2;
-            Q->chunk_cur = (half > floor_ch) ? half : floor_ch;
+        if (Q->chunk_parked) {
+            /* Descent already proved useless at this size; see below. */
+        } else if (stage > COF_CHUNK_TARGET_MS) {
+            /* Did the LAST halving actually shorten the launch? If not,
+             * the bound is below one ECM chain and no chunk can meet it.
+             * Undo that halving and stop, rather than subdividing down to
+             * the floor for nothing. */
+            if (Q->ms_launch_prev > 0.0f && Q->chunk_prev > Q->chunk_cur
+                && stage > Q->ms_launch_prev * 0.90f) {
+                cof_report_chunk(Q->chunk_prev, n, 0);
+                Q->chunk_cur = Q->chunk_prev;
+                Q->chunk_parked = 1;
+            } else {
+                const uint32_t half = Q->chunk_cur / 2;
+                Q->ms_launch_prev = stage; Q->chunk_prev = Q->chunk_cur;
+                Q->chunk_cur = (half > floor_ch) ? half : floor_ch;
+            }
         } else if (stage < COF_CHUNK_TARGET_MS / 4.0f && Q->chunk_cur < Q->cap) {
             /* Capped at the QUEUE CAPACITY, not at this flush's n. Several of
              * pipeline.cuh's cofq_flush call sites are checkpoint- or

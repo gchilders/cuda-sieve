@@ -170,6 +170,15 @@ src = src.replace(
     "uint32_t mtl_cof_flush_capacity(void);", 1)
 print('  chunk floor given its core-derived blocks at init')
 
+# A build marker in --help, mirroring the HIP port's "select HIP device".
+# cofcheck.sh needs to tell the builds apart to handle the one case that is
+# refused here, and grepping for anything less deliberate would be fragile.
+_dev_old = '"  --device N       select CUDA device N  [CUDA\'s default device]\\n"'
+_dev_new = '"  --device N       select Metal device N  [the system default device]\\n"'
+assert _dev_old in src, '--device help line shape changed'
+src = src.replace(_dev_old, _dev_new, 1)
+print('  --help marks this as the Metal build')
+
 open(OUT, 'w').write(src)
 print('wrote %s (%d lines)' % (OUT, src.count('\n')))
 left = sorted(set(re.findall(r'\bcuda[A-Z]\w*|CUDART_VERSION', src)))
