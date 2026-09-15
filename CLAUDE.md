@@ -173,6 +173,19 @@ threadgroup ceiling is a hard 32 KB with no opt-in tier, and at 14 `k_apply`
 wants 32,896 B — 128 bytes over. `--region` still overrides; the CUDA build is
 untouched.
 
+**13 is a ceiling, not an optimum — bigger is better and we are 128 bytes
+short (plan 8e).** Regions below 13 are monotonically much worse: apply is
+349.6 ms at 13 and 1497.8 at 10, fitting `182.3 ms + 20.07 us per region`
+with residuals under 4 ms. Each bucket region costs ~20 us of fixed overhead,
+so halving the region doubles how often that is paid; freeing threadgroup
+memory buys nothing. **Do not lower `--region` looking for occupancy.** The
+same fit extrapolates region 14 at ~22% off the sieve stage. The 128 bytes
+blocking it are `nslice_pow2 * 2`, a read-only table copied into threadgroup
+memory (`bench_kernels_body.metal.inc:538`) from a `device const` pointer the
+kernel already has — an NVIDIA optimisation with no obvious Apple rationale.
+Dropping that copy would make region 14 need exactly 32,768 B, which fits.
+Not attempted; `sievecheck` would falsify it cheaply.
+
 **Two traps this port fell into; do not repeat them.**
 1. `NULL` is `0L` in C++, NOT a pointer. Passed to a binding template it takes
    the non-pointer branch and binds eight bytes of zeros as a constant buffer,
