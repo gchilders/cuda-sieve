@@ -241,6 +241,31 @@ Toolchain: Xcode 26.5 (17F42), Metal Toolchain 17F42, `metal` frontend
 the measurement that makes `portable_log2.h` load-bearing rather than
 speculative — see section 3.3 and Phase 7.
 
+**fp32 divide and fma — 2^20 samples each, against the host**
+
+| operation | differs | of which involve a subnormal or zero | **differs between normals** |
+|---|---|---|---|
+| `a / b` | 45,238 | 45,238 | **0** |
+| `fma(a,b,c)` | 25 | 25 | **0** |
+
+Two things follow, and they point in opposite directions.
+
+The good one: fp32 divide and fma are **correctly rounded and bit-exact
+against the host** wherever neither side is subnormal. That is what lets
+`portable_log2.h` use `/` and `fma` directly instead of emulating them — its
+intermediates are all bounded well inside the normal range.
+
+The one to watch: **Apple GPUs flush subnormals to zero.** Every single
+disagreement above is that, and nothing else. It cannot affect `softfp64.h`,
+which is integer-only by construction, but it is a live hazard for the fp32
+sieve path in `k_apply`, where `s = fabsf(acc)` is *deliberately* a
+catastrophically cancelled quantity. The existing `fmaxf(s, 1e-30f)` clamp
+(`bench_kernels.cu:566`) lands above the smallest normal float (~1.18e-38), and
+a cancellation deep enough to reach subnormal territory would already have
+tripped the `NORM_CANCEL_TOL` guard into the fp64 path — so the two existing
+guards appear to cover it. **Appear to** is doing real work in that sentence;
+Phase 5 should confirm it rather than inherit it.
+
 ---
 
 ## 6. The load-bearing design decision
@@ -330,7 +355,7 @@ facts, and an empty drift ledger.
 
 **Gate:** committed.
 
-### Phase 2 — Portability primitives, tested standalone
+### Phase 2 — Portability primitives, tested standalone — **DONE**
 The real work of this port, and it must be bit-exact before a single kernel
 is ported:
 - `softfp64.h` — add/sub/mul/div/compare/`i64→f64`/`f64→f32`, round-to-
@@ -344,10 +369,33 @@ is ported:
   or a `-DNORM_PORTABLE_LOG2` on the CUDA build as well.
 - `msl_compat.h` — type and address-space shims.
 
-**Gate:** a standalone test proving every primitive matches the host's
-hardware fp64 and libm bit-for-bit, mirroring `hip-port`'s
-`probe_headers.hip`. Include `bn_to_double`'s exact accumulation sequence
-(`prp.cuh:175-180`) and `cof_classify`'s gap loop as named cases.
+**Gate: PASSING.** `make -f Makefile.metal metalcheck`, three parts:
+
+| part | what it proves | result |
+|---|---|---|
+| `sf_test_host` | the host build of `softfp64.h` against **hardware fp64** | 3,752,050 operations, 0 mismatches |
+| `sf_test_device` | the **Metal build** of the same headers against the host build | 2,097,152 results, 0 mismatches |
+| `sf_sites_test` | `sf_bn_to_double` / `sf_cof_gap_test` against `prp.cuh`'s own fp64, with `prp.cuh` compiled **unmodified** | 800,000 cases, 0 mismatches |
+
+Chained, the first two say the GPU's soft-fp64 *is* fp64, bit for bit. The
+corpus is deliberately hostile: subnormals, infinities, NaNs, exact powers of
+two, near-equal operands that force massive cancellation, and fully random bit
+patterns — not just the value ranges the siever happens to produce. NaN
+payloads are the one thing compared loosely, because IEEE does not pin them
+and neither does any vendor.
+
+Two implementation notes worth keeping:
+
+- `sf_fma` is genuinely single-rounded: the 128-bit product keeps its low
+  word alive into the addition, rather than rounding to fp64 first. This
+  matters because nvcc contracts `a*b+c` into fma by default, so the CUDA
+  build's norm Horner is almost certainly fused and the Metal build has to be
+  able to fuse identically. (Phase 5 must confirm *which* multiply nvcc fuses
+  at `bench_kernels.cu:531`; the primitive is ready either way.)
+- In `bn_to_double` the contraction question is moot and provably so:
+  multiplying by 2^32 is exact, so `fma(d, 2^32, v)` and `d * 2^32 + v` round
+  identically. Recorded in `sf_sites.h` rather than left for someone to
+  rediscover.
 
 ### Phase 3 — Runtime shim
 `metal_rt` + `LAUNCH` + a pipeline-state cache, proven end to end on one
@@ -384,13 +432,31 @@ Run the full pipeline on the oracle jobs against the CUDA build. Then
    cells differing by +/-1.
 2. Diff the relation sets.
 
-If divergence is negligible, the byte-identical gate stands and
-`portable_log2.h` is never wired in. If it is not, the same measurement says
-whether a Metal-only portable log2 suffices or whether the CUDA build needs
-`-DNORM_PORTABLE_LOG2` too — the latter being a CUDA-side change requiring a
-drift-ledger row.
+**Phase 2 has already narrowed this decision from three options to two.**
+The original plan held out "portable log2 in the Metal build only" as a
+middle path that left CUDA untouched. Building the thing showed that option
+is empty: `pl_log2f` disagrees with the host's `log2f` on 1.02% of inputs by
+up to 3 ULP — the same order as `metal::log2`'s 3 ULP. A portable log2 is not
+*more accurate* than MSL's, and was never meant to be; its whole value is
+that **both sides compute the same sequence**. Used on one side only it buys
+exactly nothing for byte-identity.
 
-**Gate:** a recorded number, and a decision justified by it.
+So the real choice is:
+
+1. **Both builds use `pl_log2f`** (`-DNORM_PORTABLE_LOG2` on the CUDA side).
+   The sieve bytes then agree by construction on any GPU, any vendor, forever
+   — this also retires the same latent risk for the HIP port and for future
+   NVIDIA toolkit versions. Costs a CUDA-side change and a drift-ledger row,
+   and requires re-pinning `cofcheck.sh`'s counts if any relation moves.
+2. **Accept a divergent relation set**, and weaken the gate from
+   byte-identical relations to relation-set comparison plus the built-in
+   self-check, documenting the expected divergence.
+
+Option 1 is the better engineering and the one to expect; the measurement
+decides whether it is *necessary*, and how much moves if it is adopted.
+
+**Gate:** a recorded number — cells flipped, relations gained/lost — and a
+decision justified by it, not by this paragraph.
 
 ### Phase 8 — Constraints and tuning
 `log_region <= 13` default; threadgroup sizing measured from scratch —
