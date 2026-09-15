@@ -90,3 +90,9 @@ __pycache__/
 # bench.<tag>-<date> and kept on disk until the finding is superseded -- but a
 # 53 MB fat binary does not belong in the history.
 bench/bench.*-[0-9]*
+
+# Metal port artifacts
+metal-probe/*.air
+metal-probe/*.metallib
+metal-probe/probe
+*.metallib
