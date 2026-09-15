@@ -286,3 +286,20 @@ $(BUILD)/classify_test: metal/classify_test.cpp metal/metal_rt.mm | $(BUILD)
 .PHONY: classifycheck
 classifycheck: $(BUILD)/classify_test $(BUILD)/classify_test.metallib
 	@$(BUILD)/classify_test $(BUILD)/classify_test.metallib
+
+# ---- Phase 6 gate: cofcheck.sh, the formal one -------------------------
+#
+# The tree's own golden test, unmodified except for two BSD/GNU portability
+# fallbacks (sha256sum, head -c -1) that are recorded in the drift ledger.
+# It drives ./bench --pipeline, so it needs the binary staged next to it and
+# oracle/c183.fb1 present -- which our own fbgen_gpu generates in ~7 s.
+../oracle/c183.fb1: $(BUILD)/fbgen_gpu
+	CUDA_SIEVE_METALLIB=$(CURDIR)/$(BUILD)/bench.metallib $(BUILD)/fbgen_gpu \
+	    --poly ../oracle/c183.poly --lim 134200000 --maxbits 15 \
+	    --scale 1.925 --out $@
+
+.PHONY: cofcheckgate
+cofcheckgate: $(BUILD)/bench ../oracle/c183.fb1
+	@cp $(BUILD)/bench ./bench
+	@CUDA_SIEVE_METALLIB=$(CURDIR)/$(BUILD)/bench.metallib sh cofcheck.sh; \
+	  rc=$$?; rm -f ./bench; exit $$rc
