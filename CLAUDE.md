@@ -267,7 +267,15 @@ call site cannot do one and forget the other.
   without measuring: from 80 to 1152 threadgroups the wall is flat inside a
   0.77% noise band.
 
-  **The cofactor stage is 59% of wall and is immune to launch geometry** --
+  **The cofactor stage is ~39% of wall at a production band size, and is
+  SMALLER than the sieve (464 vs 537 ms/q).** The 59% figure below came from a
+  one-q band and is an artifact: `CQ_FLUSH` is 131,072 records (~67 special-q)
+  and one q hands the queue 1,852, i.e. 1.4% of a batch. Per-q wall is 1183 ms
+  at `--nq 72` against 2572 ms at `--nq 1`. **Never quote a queued stage's cost
+  from a single-q run** — plan 8h. The sieve is unaffected either way
+  (527-546 ms/q at every band size).
+
+  **The cofactor stage is immune to launch geometry** --
   under 2% across a 16x range of threadgroup sizes and 115x of counts. It is
   critical-path bound, not occupancy bound: halving the records in a launch
   leaves the launch's cost unchanged (1508 -> 1540 ms). Grid shape cannot
