@@ -155,13 +155,20 @@ disappointing GPU result. The HIP port's gfx1103 iGPU did comparable work in
   pins and what las finds at this q.
   `make -f Makefile.metal argbufcheck` — the `cofq_t` argument-buffer
   mechanism, proven with a negative control.
-  **The entire device side now compiles: 75 kernels in one metallib** across
-  `bench_kernels.metal` (19), `td.metal` (26), `fbgen_gpu.metal` (16),
-  `cofac.metal` (8) and `scan.metal` (6). MSL copies of the shared arithmetic
-  headers are generated from the untouched originals: `bigint_msl.h`,
-  `prp_msl.h`, `plattice_msl.h`, `slab_msl.h`, `td_msl.h`.
-  Still to do: the six inline-queue kernels the pipeline needs
-  (`k_cof_enqueue` and friends), then `pipeline.cuh` and `bench_main.cu`.
+  **The device side of the port is COMPLETE: 84 kernels in one metallib**
+  across `bench_kernels.metal`, `td.metal`, `fbgen_gpu.metal`, `cofac.metal`
+  and `scan.metal`, every translation unit compiling with zero errors. MSL
+  copies of the shared arithmetic headers are generated from the untouched
+  originals: `bigint_msl.h`, `prp_msl.h`, `plattice_msl.h`, `slab_msl.h`,
+  `td_msl.h`.
+  Still to do: `pipeline.cuh` and `bench_main.cu` — the last piece, and the
+  one the Phase 3 shim was built for.
+
+**The `cofq_t` argument buffer is wired but NOT yet exercised.** `run_cofac`
+never reaches `k_cof_enqueue` or `k_rel_pack`; `cofcheck.sh` will be the first
+thing that runs them. Pass such a struct as `mtl_argbuf_t` — it binds the
+buffer and calls `mtlUseResource` on every pointer inside in one step, so a
+call site cannot do one and forget the other.
 - Phases 7-9: not started.
 
 **Residency is load-bearing and easy to get wrong.** Any pointer reached

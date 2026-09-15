@@ -733,18 +733,43 @@ a wrong-branch one, exactly the class the HIP port's ledger calls out. Fixed
 with a real preprocessor walk, plus an assertion that refuses to emit a header
 whose conditionals are unbalanced or whose `#else`/`#elif` is orphaned.
 
+**6d. The inline-queue kernels, and the argument buffer wired end to end.**
+`k_cof_enqueue` (4 instantiations), `k_rel_pack`, `k_cof_gate`,
+`k_cof_status_hist`, `k_rel_flags`, `k_rel_gather`. **The device side of the
+port is now complete: 84 kernels in one metallib**, every translation unit
+compiling with zero errors.
+
+`cofq_t` is the payoff from 6a. The device sees `cofq_dev_t`, a struct of
+17 GPU addresses — only the fields the kernels actually read; the host-side
+bookkeeping, including the `double` members MSL could not express, stays on
+the host. The host mirrors it in `cofq_argbuf()` and passes it as an
+`mtl_argbuf_t`, a new `metal_rt` type that binds the struct **and** calls
+`mtlUseResource` on every pointer inside it in one step — so a call site
+cannot bind the buffer and forget the residency, which is the failure that
+gives garbage rather than an error.
+
+`k_cof_status_hist`'s eight 64-bit status counters became uint32 pairs, the
+last 64-bit atomic in the tree. As everywhere else, two little-endian uint32
+words at one address *are* a little-endian uint64, so the host's readback is
+unchanged.
+
+`td_msl.h` now also carries the `TD_*` bounds that `td.cuh` keeps inside its
+own `__CUDACC__` guard, lifted by name, so every Metal translation unit shares
+one statement of each.
+
 **Still to do for this phase:**
 - **One duplication remains, on the HOST side only**: `cofac_metal.cpp`'s
   copies of `TD_SCAN_BLK` and `TD_FMAX`. Forking `td.cuh` fixed the device
   side but not this — `td_msl.h` is MSL. The clean fix is a CUDA-side change,
   lifting those two defines above `td.cuh`'s `__CUDACC__` guard, which would
   need a drift-ledger row.
-- The inline-queue kernels the pipeline needs but `run_cofac` does not:
-  `k_cof_enqueue` (with the `cofq_t` argument buffer, mechanism proven in 6a),
-  `k_cof_gate`, `k_cof_status_hist`, `k_rel_flags`, `k_rel_gather`,
-  `k_rel_pack`. The generator already reports these as unported.
-- `pipeline.cuh` and `bench_main.cu`, which `cofcheck.sh` needs because it
-  drives `./bench --pipeline`.
+- `pipeline.cuh` (~4,000 lines of orchestration) and `bench_main.cu`
+  (~3,200 lines of CLI and band driving), which `cofcheck.sh` needs because it
+  drives `./bench --pipeline`. This is the last piece, and the one the Phase 3
+  shim was built for: the orchestration should port largely by renaming.
+- The argument-buffer path compiles but is **not yet exercised** — `run_cofac`
+  does not reach `k_cof_enqueue` or `k_rel_pack`. `cofcheck.sh` will be the
+  first thing that runs them.
 
 **An intermediate gate exists and should be used first:** `run_cofac()`
 (`cofac.cuh:2728`) is a standalone cofactorisation entry point that reads a
