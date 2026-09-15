@@ -96,3 +96,4 @@ metal-probe/*.air
 metal-probe/*.metallib
 metal-probe/probe
 *.metallib
+bench/.metal-build/
