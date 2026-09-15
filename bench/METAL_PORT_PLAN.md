@@ -1226,7 +1226,8 @@ inside ~20 ms of wall is noise.
 | algebraic queue | 1504.9 | 1574.4 | 1502.9 | 1570.3 | 1519.9 | 1696.2 |
 | **wall** | 3018.7 | 2785.6 | 2559.9 | 2600.6 | **2530.3** | 2761.2 |
 
-**`--blocks`:** flat from 80 upward.
+**`--blocks`:** flat from 80 upward **at this section's one-q band size --
+see 8i, where it is not flat at all.**
 
 > **CORRECTION.** This section said the default was the inherited `48 * 6` =
 > 288. It is not: `bench_main_metal.cpp` sets `cfg.blocks` to
@@ -1599,6 +1600,77 @@ the output says so: the per-q breakdown looks exactly as authoritative at
 `--nq 1` as at `--nq 72`. Any future tuning of a *queued* stage must state its
 band size alongside the machine, exactly as this port already states the
 machine alongside every number.
+
+**Measured on a 10-core M3 in a fanless MacBook Air that also drives the
+display.**
+
+
+### 8i. `--cof-chunk` auto is wrong here, and the cause is `--blocks`
+
+8h predicted that 8b's `--cof-chunk` penalty needed re-measuring at a real band
+size. It did, and the answer is worse than "the old number was unrepresentative":
+**auto picks the worst available chunk**, and the reason is a grid sized for
+NVIDIA's idea of a core count.
+
+At `--nq 24` (46,893 records in the flush), auto selects 15,360 records/launch
+-- the floor, `blocks * threads` -- and splits each round into 4 launches:
+
+| `--cof-chunk` | launches/round | algebraic | cofac/q | wall/q |
+|---|---|---|---|---|
+| **15360 (auto)** | **4** | 423.9 | **466.2** | 1197 |
+| 30720 | 2 | 404.0 | 441.0 | 1157 |
+| 61440 | 1 | 377.5 | 416.9 | 1130 |
+| 131072 | 1 | 372.8 | 409.8 | 1129 |
+
+Monotonic: every subdivision costs. 1,114 relations at every point.
+
+**But turning chunking off is the wrong fix, because the floor is not the
+problem -- the grid is.** `cof_chunk_floor()` is `blocks * threads`, and the
+CUDA design's argument for it is sound: a slice of exactly one record per
+thread is fully loaded, so small devices subdivide for free. That argument
+depends on `blocks * threads` being a grid the device can actually fill, and
+on Metal it is not. `bench_main_metal.cpp` sets `blocks` to
+`multiProcessorCount * 6`, which is **60** on a 10-core M3, giving 15,360
+threads. CUDA's multiplier works because NVIDIA SM counts are large -- the
+same formula gives a 4090 768 blocks and 196,608 threads, which the comment in
+`cofac.cuh` notes "exceed CQ_FLUSH outright". Apple reports ~10-40 GPU cores,
+so the identical formula produces a grid **8.5x smaller than the flush it has
+to process**, and each thread walks several records serially.
+
+Fix the grid and both problems go away at once. At `--nq 72`, a full
+`CQ_FLUSH` batch of 140,363 records:
+
+| `--blocks` | threads | chunking | algebraic | cofac/q | wall/q |
+|---|---|---|---|---|---|
+| 60 (default) | 15,360 | 9 launches | 423.8 | 465.3 | 1180.7 |
+| 288 | 73,728 | 2 launches | 330.5 | 365.3 | 1069.2 |
+| **576** | **147,456** | **none** | **312.4** | **346.6** | **1051.9** |
+| 1152 | 294,912 | none | 318.7 | 353.4 | 1058.9 |
+
+A bracketed interior minimum at 576, and 3,385 relations at every point.
+Against the shipped default that is **-25.5% on the cofactor stage and -10.9%
+on wall**. 576 x 256 = 147,456 threads clears `CQ_FLUSH`'s 131,072, so the
+build lands on exactly the "large device" path `cofac.cuh` describes: one
+slice, one record per thread, no chunking.
+
+**This is not a weaker watchdog margin -- it is a stronger one.** The risk
+chunking exists to bound is the duration of a single launch. At 60 blocks an
+unchunked launch would make every thread walk ~8.5 records end to end; at 576
+each thread handles at most one, so the launch is shorter as well as faster.
+Raising the grid shortens the very thing the chunk was protecting.
+
+**And it invalidates 8d's `--blocks` conclusion, for the third time from the
+same cause.** 8d swept `--blocks` and found it flat, concluding "do not
+hand-tune this". That sweep ran at `--nq 1`, where 1,852 records leave even a
+60-block grid oversubscribed, so grid size could not matter. At band size it
+is worth 10.9% of wall. Flatness measured on a starved stage says nothing
+about the stage when fed.
+
+**Recommended, not yet applied:** size the Metal cofactor grid from the work
+rather than the core count -- `blocks * threads >= CQ_FLUSH` -- which at the
+default 256 threads means `blocks >= 512`. Left as a recommendation because it
+changes a default that interacts with watchdog safety, and that is the user's
+call rather than a tuning pass's.
 
 **Measured on a 10-core M3 in a fanless MacBook Air that also drives the
 display.**
