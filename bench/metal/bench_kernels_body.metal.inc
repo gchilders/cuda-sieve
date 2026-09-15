@@ -765,7 +765,7 @@ report spurious cell mismatches. Pricing builds only, never for relations."
         }
 }
 
-kernel void k_apply_16_1_1_0(
+kernel void k_apply_16_0_0_0(
     device const uint32_t * buckets [[buffer(0)]],
     device const uint32_t * cnt [[buffer(1)]],
     constant uint32_t &cap [[buffer(2)]],
@@ -802,10 +802,10 @@ kernel void k_apply_16_1_1_0(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_apply_body<16, 1, 1, false>(buckets, cnt, cap, logI, log_region, slice_logp, nslice, N, CINIT, THRESH, tconst, dump, nsurv, dbg_cells, dbg_region, sp, srt, sg, slp, smag, nsmall, nblk, nwrp, probe_x, probe_out, survbits, not_both_even, j_base, sm, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    k_apply_body<16, 0, 0, false>(buckets, cnt, cap, logI, log_region, slice_logp, nslice, N, CINIT, THRESH, tconst, dump, nsurv, dbg_cells, dbg_region, sp, srt, sg, slp, smag, nsmall, nblk, nwrp, probe_x, probe_out, survbits, not_both_even, j_base, sm, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
-kernel void k_apply_16_1_1_1(
+kernel void k_apply_16_0_1_0(
     device const uint32_t * buckets [[buffer(0)]],
     device const uint32_t * cnt [[buffer(1)]],
     constant uint32_t &cap [[buffer(2)]],
@@ -842,7 +842,7 @@ kernel void k_apply_16_1_1_1(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_apply_body<16, 1, 1, true>(buckets, cnt, cap, logI, log_region, slice_logp, nslice, N, CINIT, THRESH, tconst, dump, nsurv, dbg_cells, dbg_region, sp, srt, sg, slp, smag, nsmall, nblk, nwrp, probe_x, probe_out, survbits, not_both_even, j_base, sm, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    k_apply_body<16, 0, 1, false>(buckets, cnt, cap, logI, log_region, slice_logp, nslice, N, CINIT, THRESH, tconst, dump, nsurv, dbg_cells, dbg_region, sp, srt, sg, slp, smag, nsmall, nblk, nwrp, probe_x, probe_out, survbits, not_both_even, j_base, sm, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_apply_16_1_0_0(
@@ -885,7 +885,7 @@ kernel void k_apply_16_1_0_0(
     k_apply_body<16, 1, 0, false>(buckets, cnt, cap, logI, log_region, slice_logp, nslice, N, CINIT, THRESH, tconst, dump, nsurv, dbg_cells, dbg_region, sp, srt, sg, slp, smag, nsmall, nblk, nwrp, probe_x, probe_out, survbits, not_both_even, j_base, sm, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
-kernel void k_apply_16_0_1_0(
+kernel void k_apply_16_1_1_0(
     device const uint32_t * buckets [[buffer(0)]],
     device const uint32_t * cnt [[buffer(1)]],
     constant uint32_t &cap [[buffer(2)]],
@@ -922,7 +922,207 @@ kernel void k_apply_16_0_1_0(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_apply_body<16, 0, 1, false>(buckets, cnt, cap, logI, log_region, slice_logp, nslice, N, CINIT, THRESH, tconst, dump, nsurv, dbg_cells, dbg_region, sp, srt, sg, slp, smag, nsmall, nblk, nwrp, probe_x, probe_out, survbits, not_both_even, j_base, sm, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    k_apply_body<16, 1, 1, false>(buckets, cnt, cap, logI, log_region, slice_logp, nslice, N, CINIT, THRESH, tconst, dump, nsurv, dbg_cells, dbg_region, sp, srt, sg, slp, smag, nsmall, nblk, nwrp, probe_x, probe_out, survbits, not_both_even, j_base, sm, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+}
+
+kernel void k_apply_8_0_0_0(
+    device const uint32_t * buckets [[buffer(0)]],
+    device const uint32_t * cnt [[buffer(1)]],
+    constant uint32_t &cap [[buffer(2)]],
+    constant int &logI [[buffer(3)]],
+    constant int &log_region [[buffer(4)]],
+    device const uint16_t * slice_logp [[buffer(5)]],
+    constant uint32_t &nslice [[buffer(6)]],
+    constant norm_t &N [[buffer(7)]],
+    constant uint32_t &CINIT [[buffer(8)]],
+    constant uint32_t &THRESH [[buffer(9)]],
+    constant uint32_t &tconst [[buffer(10)]],
+    device uint8_t * dump [[buffer(11)]],
+    device uint32_t * nsurv [[buffer(12)]],
+    device uint16_t * dbg_cells [[buffer(13)]],
+    constant uint32_t &dbg_region [[buffer(14)]],
+    device const uint32_t * sp [[buffer(15)]],
+    device const uint32_t * srt [[buffer(16)]],
+    device const uint32_t * sg [[buffer(17)]],
+    device const uint16_t * slp [[buffer(18)]],
+    device const uint32_t * smag [[buffer(19)]],
+    constant uint32_t &nsmall [[buffer(20)]],
+    constant uint32_t &nblk [[buffer(21)]],
+    constant uint32_t &nwrp [[buffer(22)]],
+    constant uint32_t &probe_x [[buffer(23)]],
+    device uint32_t * probe_out [[buffer(24)]],
+    device uint32_t * survbits [[buffer(25)]],
+    constant int &not_both_even [[buffer(26)]],
+    constant uint32_t &j_base [[buffer(27)]],
+    threadgroup uint32_t *sm [[threadgroup(0)]],
+    uint _tid [[thread_position_in_grid]],
+    uint _ntid [[threads_per_grid]],
+    uint _bid [[threadgroup_position_in_grid]],
+    uint _lid [[thread_position_in_threadgroup]],
+    uint _bdim [[threads_per_threadgroup]],
+    uint _gdim [[threadgroups_per_grid]])
+{
+    k_apply_body<8, 0, 0, false>(buckets, cnt, cap, logI, log_region, slice_logp, nslice, N, CINIT, THRESH, tconst, dump, nsurv, dbg_cells, dbg_region, sp, srt, sg, slp, smag, nsmall, nblk, nwrp, probe_x, probe_out, survbits, not_both_even, j_base, sm, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+}
+
+kernel void k_apply_8_0_1_0(
+    device const uint32_t * buckets [[buffer(0)]],
+    device const uint32_t * cnt [[buffer(1)]],
+    constant uint32_t &cap [[buffer(2)]],
+    constant int &logI [[buffer(3)]],
+    constant int &log_region [[buffer(4)]],
+    device const uint16_t * slice_logp [[buffer(5)]],
+    constant uint32_t &nslice [[buffer(6)]],
+    constant norm_t &N [[buffer(7)]],
+    constant uint32_t &CINIT [[buffer(8)]],
+    constant uint32_t &THRESH [[buffer(9)]],
+    constant uint32_t &tconst [[buffer(10)]],
+    device uint8_t * dump [[buffer(11)]],
+    device uint32_t * nsurv [[buffer(12)]],
+    device uint16_t * dbg_cells [[buffer(13)]],
+    constant uint32_t &dbg_region [[buffer(14)]],
+    device const uint32_t * sp [[buffer(15)]],
+    device const uint32_t * srt [[buffer(16)]],
+    device const uint32_t * sg [[buffer(17)]],
+    device const uint16_t * slp [[buffer(18)]],
+    device const uint32_t * smag [[buffer(19)]],
+    constant uint32_t &nsmall [[buffer(20)]],
+    constant uint32_t &nblk [[buffer(21)]],
+    constant uint32_t &nwrp [[buffer(22)]],
+    constant uint32_t &probe_x [[buffer(23)]],
+    device uint32_t * probe_out [[buffer(24)]],
+    device uint32_t * survbits [[buffer(25)]],
+    constant int &not_both_even [[buffer(26)]],
+    constant uint32_t &j_base [[buffer(27)]],
+    threadgroup uint32_t *sm [[threadgroup(0)]],
+    uint _tid [[thread_position_in_grid]],
+    uint _ntid [[threads_per_grid]],
+    uint _bid [[threadgroup_position_in_grid]],
+    uint _lid [[thread_position_in_threadgroup]],
+    uint _bdim [[threads_per_threadgroup]],
+    uint _gdim [[threadgroups_per_grid]])
+{
+    k_apply_body<8, 0, 1, false>(buckets, cnt, cap, logI, log_region, slice_logp, nslice, N, CINIT, THRESH, tconst, dump, nsurv, dbg_cells, dbg_region, sp, srt, sg, slp, smag, nsmall, nblk, nwrp, probe_x, probe_out, survbits, not_both_even, j_base, sm, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+}
+
+kernel void k_apply_8_1_0_0(
+    device const uint32_t * buckets [[buffer(0)]],
+    device const uint32_t * cnt [[buffer(1)]],
+    constant uint32_t &cap [[buffer(2)]],
+    constant int &logI [[buffer(3)]],
+    constant int &log_region [[buffer(4)]],
+    device const uint16_t * slice_logp [[buffer(5)]],
+    constant uint32_t &nslice [[buffer(6)]],
+    constant norm_t &N [[buffer(7)]],
+    constant uint32_t &CINIT [[buffer(8)]],
+    constant uint32_t &THRESH [[buffer(9)]],
+    constant uint32_t &tconst [[buffer(10)]],
+    device uint8_t * dump [[buffer(11)]],
+    device uint32_t * nsurv [[buffer(12)]],
+    device uint16_t * dbg_cells [[buffer(13)]],
+    constant uint32_t &dbg_region [[buffer(14)]],
+    device const uint32_t * sp [[buffer(15)]],
+    device const uint32_t * srt [[buffer(16)]],
+    device const uint32_t * sg [[buffer(17)]],
+    device const uint16_t * slp [[buffer(18)]],
+    device const uint32_t * smag [[buffer(19)]],
+    constant uint32_t &nsmall [[buffer(20)]],
+    constant uint32_t &nblk [[buffer(21)]],
+    constant uint32_t &nwrp [[buffer(22)]],
+    constant uint32_t &probe_x [[buffer(23)]],
+    device uint32_t * probe_out [[buffer(24)]],
+    device uint32_t * survbits [[buffer(25)]],
+    constant int &not_both_even [[buffer(26)]],
+    constant uint32_t &j_base [[buffer(27)]],
+    threadgroup uint32_t *sm [[threadgroup(0)]],
+    uint _tid [[thread_position_in_grid]],
+    uint _ntid [[threads_per_grid]],
+    uint _bid [[threadgroup_position_in_grid]],
+    uint _lid [[thread_position_in_threadgroup]],
+    uint _bdim [[threads_per_threadgroup]],
+    uint _gdim [[threadgroups_per_grid]])
+{
+    k_apply_body<8, 1, 0, false>(buckets, cnt, cap, logI, log_region, slice_logp, nslice, N, CINIT, THRESH, tconst, dump, nsurv, dbg_cells, dbg_region, sp, srt, sg, slp, smag, nsmall, nblk, nwrp, probe_x, probe_out, survbits, not_both_even, j_base, sm, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+}
+
+kernel void k_apply_8_1_1_0(
+    device const uint32_t * buckets [[buffer(0)]],
+    device const uint32_t * cnt [[buffer(1)]],
+    constant uint32_t &cap [[buffer(2)]],
+    constant int &logI [[buffer(3)]],
+    constant int &log_region [[buffer(4)]],
+    device const uint16_t * slice_logp [[buffer(5)]],
+    constant uint32_t &nslice [[buffer(6)]],
+    constant norm_t &N [[buffer(7)]],
+    constant uint32_t &CINIT [[buffer(8)]],
+    constant uint32_t &THRESH [[buffer(9)]],
+    constant uint32_t &tconst [[buffer(10)]],
+    device uint8_t * dump [[buffer(11)]],
+    device uint32_t * nsurv [[buffer(12)]],
+    device uint16_t * dbg_cells [[buffer(13)]],
+    constant uint32_t &dbg_region [[buffer(14)]],
+    device const uint32_t * sp [[buffer(15)]],
+    device const uint32_t * srt [[buffer(16)]],
+    device const uint32_t * sg [[buffer(17)]],
+    device const uint16_t * slp [[buffer(18)]],
+    device const uint32_t * smag [[buffer(19)]],
+    constant uint32_t &nsmall [[buffer(20)]],
+    constant uint32_t &nblk [[buffer(21)]],
+    constant uint32_t &nwrp [[buffer(22)]],
+    constant uint32_t &probe_x [[buffer(23)]],
+    device uint32_t * probe_out [[buffer(24)]],
+    device uint32_t * survbits [[buffer(25)]],
+    constant int &not_both_even [[buffer(26)]],
+    constant uint32_t &j_base [[buffer(27)]],
+    threadgroup uint32_t *sm [[threadgroup(0)]],
+    uint _tid [[thread_position_in_grid]],
+    uint _ntid [[threads_per_grid]],
+    uint _bid [[threadgroup_position_in_grid]],
+    uint _lid [[thread_position_in_threadgroup]],
+    uint _bdim [[threads_per_threadgroup]],
+    uint _gdim [[threadgroups_per_grid]])
+{
+    k_apply_body<8, 1, 1, false>(buckets, cnt, cap, logI, log_region, slice_logp, nslice, N, CINIT, THRESH, tconst, dump, nsurv, dbg_cells, dbg_region, sp, srt, sg, slp, smag, nsmall, nblk, nwrp, probe_x, probe_out, survbits, not_both_even, j_base, sm, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+}
+
+kernel void k_apply_16_1_1_1(
+    device const uint32_t * buckets [[buffer(0)]],
+    device const uint32_t * cnt [[buffer(1)]],
+    constant uint32_t &cap [[buffer(2)]],
+    constant int &logI [[buffer(3)]],
+    constant int &log_region [[buffer(4)]],
+    device const uint16_t * slice_logp [[buffer(5)]],
+    constant uint32_t &nslice [[buffer(6)]],
+    constant norm_t &N [[buffer(7)]],
+    constant uint32_t &CINIT [[buffer(8)]],
+    constant uint32_t &THRESH [[buffer(9)]],
+    constant uint32_t &tconst [[buffer(10)]],
+    device uint8_t * dump [[buffer(11)]],
+    device uint32_t * nsurv [[buffer(12)]],
+    device uint16_t * dbg_cells [[buffer(13)]],
+    constant uint32_t &dbg_region [[buffer(14)]],
+    device const uint32_t * sp [[buffer(15)]],
+    device const uint32_t * srt [[buffer(16)]],
+    device const uint32_t * sg [[buffer(17)]],
+    device const uint16_t * slp [[buffer(18)]],
+    device const uint32_t * smag [[buffer(19)]],
+    constant uint32_t &nsmall [[buffer(20)]],
+    constant uint32_t &nblk [[buffer(21)]],
+    constant uint32_t &nwrp [[buffer(22)]],
+    constant uint32_t &probe_x [[buffer(23)]],
+    device uint32_t * probe_out [[buffer(24)]],
+    device uint32_t * survbits [[buffer(25)]],
+    constant int &not_both_even [[buffer(26)]],
+    constant uint32_t &j_base [[buffer(27)]],
+    threadgroup uint32_t *sm [[threadgroup(0)]],
+    uint _tid [[thread_position_in_grid]],
+    uint _ntid [[threads_per_grid]],
+    uint _bid [[threadgroup_position_in_grid]],
+    uint _lid [[thread_position_in_threadgroup]],
+    uint _bdim [[threads_per_threadgroup]],
+    uint _gdim [[threadgroups_per_grid]])
+{
+    k_apply_body<16, 1, 1, true>(buckets, cnt, cap, logI, log_region, slice_logp, nslice, N, CINIT, THRESH, tconst, dump, nsurv, dbg_cells, dbg_region, sp, srt, sg, slp, smag, nsmall, nblk, nwrp, probe_x, probe_out, survbits, not_both_even, j_base, sm, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 

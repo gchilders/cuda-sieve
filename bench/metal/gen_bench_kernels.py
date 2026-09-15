@@ -46,9 +46,13 @@ K = {
  'k_transform':        (['bool SLABBED'], [('false',), ('true',)], False),
  'k_fill_atomic':      (['int RECBYTES', 'bool SLABBED'],
                         [('2','false'),('4','false'),('8','false'),('4','true')], False),
+ # Production uses <16,1,NORM_HORNER,SLABBED>; the rest are run_bench's own
+ # A/B pricing arms, which cost nothing to instantiate and would otherwise
+ # fail at run time with a missing-kernel error.
  'k_apply':            (['int CELLBITS','int ATOMIC','int NORMMODE','bool SLABBED'],
-                        [('16','1','1','false'),('16','1','1','true'),
-                         ('16','1','0','false'),('16','0','1','false')], True),
+                        [(c, a, n, 'false') for c in ('16', '8')
+                         for a in ('0', '1') for n in ('0', '1')]
+                        + [('16','1','1','true')], True),
  'k_build_summary_g':  (None, None, False),
  'k_build_summary':    (None, None, False),
  'k_resieve_rewalk':   (None, None, False),

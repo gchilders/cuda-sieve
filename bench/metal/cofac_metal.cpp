@@ -33,21 +33,10 @@ static int mtl_check_impl(mtlError_t err, const char *expr,
 #define CUDA_CHECKED(x) mtl_check_impl((x), #x, __FILE__, __LINE__)
 #define CK(x) do { if (CUDA_CHECKED(x)) return -1; } while (0)
 
-/* td.cuh puts these inside its own __CUDACC__ guard, so a HOST translation
- * unit does not see them. Values must track td.cuh (TD_SCAN_BLK at :365,
- * TD_FMAX at :589).
- *
- * Forking td.cuh for the DEVICE side (metal/td_msl.h) did not remove this:
- * that header is MSL. Removing it properly means either lifting these two
- * defines above td.cuh's guard -- a CUDA-side change, and the cleanest fix --
- * or giving the host a generated companion to td_msl.h. Left duplicated and
- * flagged rather than quietly forgotten. */
-#ifndef TD_SCAN_BLK
-#define TD_SCAN_BLK 256
-#endif
-#ifndef TD_FMAX
-#define TD_FMAX 64
-#endif
+/* td.cuh keeps its TD_* bounds inside its own __CUDACC__ guard, so a host
+ * translation unit never sees them. td_host.h is generated from td.cuh by
+ * metal/gen_td_host.py and lifts them by name -- no hand copies. */
+#include "metal/td_host.h"
 
 /* ---- borrowed verbatim from bench_kernels.cu, which defines these
  * above its #include of cofac.cuh. Extracted by the generator so they
