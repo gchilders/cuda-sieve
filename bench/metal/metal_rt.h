@@ -135,6 +135,26 @@ const char *mtlGetErrorString(mtlError_t e);
  * 32 KB is well under CUDA's opt-in tier. */
 mtlError_t  mtlFuncSetMaxThreadgroupMemory(const char *kernel, size_t bytes);
 
+/* ---- bindless: passing a struct full of device pointers ----------------- *
+ *
+ * CUDA passes cofq_t (cofac.cuh:1410, ~27 device pointers) to k_cof_enqueue
+ * BY VALUE. A host pointer means nothing to a shader, so on Metal the struct
+ * must carry GPU addresses and the kernel must declare its members as
+ * `device T*`. Two things are needed for that, and BOTH are required:
+ *
+ *   mtlDeviceAddress() turns a registered allocation pointer (interior
+ *   pointers included) into the GPU address the shader will dereference.
+ *
+ *   mtlUseResource() makes that allocation resident for the current encoder.
+ *   Metal only guarantees residency for resources it can see bound; one
+ *   reached through a raw address is invisible to it, and skipping this is
+ *   the classic way to get a page fault or silent garbage rather than a
+ *   clean error. Call it for every pointer inside the struct, after
+ *   mtl_launch_begin and before mtl_launch_end.
+ */
+uint64_t    mtlDeviceAddress(const void *p);
+void        mtlUseResource(const void *p);
+
 /* ---- launch plumbing (used by the template below, not called directly) --- */
 mtlError_t  mtl_launch_begin(const char *kernel, mtlStream_t s,
                              unsigned grid, unsigned block, size_t smem);

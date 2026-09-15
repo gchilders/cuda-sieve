@@ -85,7 +85,7 @@ $(BUILD)/sites_msl.air: metal/sf_sites.h metal/softfp64.h | $(BUILD)
 	$(METAL) $(MSLFLAGS) -c $(BUILD)/sites_msl.metal -o $@
 
 .PHONY: metalcheck
-metalcheck: rtcheck scancheck $(BUILD)/sf_test_host $(BUILD)/sf_test.metallib $(BUILD)/sf_test_device \
+metalcheck: rtcheck scancheck argbufcheck $(BUILD)/sf_test_host $(BUILD)/sf_test.metallib $(BUILD)/sf_test_device \
             $(BUILD)/sf_sites_test $(BUILD)/sites_msl.air
 	@echo "== softfp64 vs hardware fp64 (host) =="
 	@$(BUILD)/sf_test_host
@@ -185,3 +185,16 @@ sievecheck: $(BUILD)/phase5_test
 	@CUDA_SIEVE_METALLIB=$(CURDIR)/$(BUILD)/bench.metallib $(BUILD)/phase5_test \
 	    --poly ../oracle/c183.poly --lim 1000000 --logI 13 --J 4096 \
 	    --bound 300 --ncheck 512
+
+# ---- Phase 6 groundwork: bindless struct-of-device-pointers -------------
+$(BUILD)/argbuf.metallib: metal/argbuf.metal | $(BUILD)
+	$(METAL) $(MSLFLAGS) -c $< -o $(BUILD)/argbuf.air
+	$(METALLIB) $(BUILD)/argbuf.air -o $@
+
+$(BUILD)/argbuf_test: metal/argbuf_test.cpp metal/metal_rt.mm | $(BUILD)
+	$(CXX) $(HOSTFLAGS) metal/argbuf_test.cpp metal/metal_rt.mm \
+	    -framework Metal -framework Foundation -framework IOKit -o $@
+
+.PHONY: argbufcheck
+argbufcheck: $(BUILD)/argbuf_test $(BUILD)/argbuf.metallib
+	@cd $(BUILD) && ./argbuf_test argbuf.metallib
