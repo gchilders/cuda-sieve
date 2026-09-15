@@ -637,12 +637,51 @@ This substantially de-risks Phase 7, but does not settle it: it is one
 geometry, the expectation is order-1 rather than 0, and the question that
 actually matters is CUDA-vs-Metal relations, not Metal-vs-libm cells.
 
-### Phase 6 — Trial division and cofactorisation
-`td.cuh` and `cofac.cuh` device code, including the `cofq_t` argument
-buffer (section 4.1) and the soft-fp64 `cof_classify`.
+### Phase 6 — Trial division and cofactorisation — **groundwork done**
 
-**Gate:** `cofcheck.sh` — all ~52 pinned cases, `cofactor golden test
-passed`, exit 0. This is the formal gate the HIP port used.
+**6a. The `cofq_t` argument buffer: SOLVED and gated.** This was the one
+mechanism in the whole port with no CUDA-shaped equivalent, so it was
+de-risked before writing any of the 2,000 lines that depend on it.
+`k_cof_enqueue` takes `cofq_t` **by value** (`cofac.cuh:1410`) — ~27 device
+pointers in one struct — and a host pointer means nothing to a shader. On
+Metal the struct carries GPU addresses and the kernel declares its members as
+`device T*`. Two new `metal_rt` entry points make that work:
+
+- `mtlDeviceAddress(p)` — a registered allocation pointer, interior pointers
+  included, to the address the shader dereferences.
+- `mtlUseResource(p)` — residency. Metal only guarantees a resource is mapped
+  if it can see it bound, and one reached through a raw address is invisible
+  to it.
+
+**Gate: PASSING — `make -f Makefile.metal argbufcheck`**, and its negative
+control has real teeth: omit the residency calls and 4,095 of 4,096 values
+come back wrong.
+
+Getting that control right took two attempts, and the reason is worth
+recording. Run *after* the positive case it passes — **residency, once
+granted for a resource, persists within the process** — so the control now
+runs FIRST, before anything makes those buffers resident. A control that
+passes for the wrong reason is worse than none.
+
+**Still to do for this phase:**
+- `td.cuh` device code (14 kernels) including the soft-fp64 `cof_classify`,
+  and deleting the two helpers `bench_kernels.metal` currently duplicates
+  from it (`td_mod_magic`, `SS_KSHIFT` — noted there as a single source of
+  truth that must not stay duplicated).
+- `cofac.cuh` device code (9 kernels, the `mz<L>` Montgomery arithmetic, rho
+  and ECM), plus the `cofq_t` argument buffer now that the mechanism is proven.
+- The host halves, and then `pipeline.cuh` and `bench_main.cu`, which
+  `cofcheck.sh` needs because it drives `./bench --pipeline`.
+
+**An intermediate gate exists and should be used first:** `run_cofac()`
+(`cofac.cuh:2728`) is a standalone cofactorisation entry point that reads a
+batch file, and `oracle/c183.q120000053.cofac_candidates.txt` (1,852
+candidates) is in the tree. That exercises the whole cofactor path without the
+sieve pipeline, exactly as `fbgpucheck.sh` did for Phase 4.
+
+**Final gate:** `cofcheck.sh` — all ~52 pinned cases, `cofactor golden test
+passed`, exit 0. It needs `oracle/c183.fb1`, which our own `fbgen_gpu`
+generates in 7.1 s.
 
 ### Phase 7 — Relation comparison, and the log2 decision
 Run the full pipeline on the oracle jobs against the CUDA build. Then
