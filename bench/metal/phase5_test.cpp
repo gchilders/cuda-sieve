@@ -82,7 +82,7 @@ int main(int argc, char **argv)
     const uint32_t xmax = (1u << logI) * J;
     const uint32_t nregion = xmax >> log_region;
     const uint32_t ncell = 1u << log_region;
-    const size_t smem = (size_t)ncell * 2 + (size_t)nslice_pow2 * 2;
+    const size_t smem = mtl_apply_smem(ncell, 16);
     printf("geometry: logI %d, J %u, xmax %u, %u regions of %u cells;"
            " %zu B threadgroup memory\n", logI, J, xmax, nregion, ncell, smem);
     CK(mtlFuncSetMaxThreadgroupMemory("k_apply_16_1_1_0", smem));

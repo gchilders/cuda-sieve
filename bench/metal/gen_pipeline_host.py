@@ -41,6 +41,17 @@ src = re.sub(r'cudaFuncSetAttribute\(\s*k_apply<[^>]*>\s*,\s*\n?\s*cudaFuncAttri
              src)
 src = src.replace('cuda_optin_smem_limit', 'mtl_optin_smem_limit')
 
+# k_apply no longer keeps the slice-log table in threadgroup memory, so the
+# length the host binds must lose that term too, or the host would reserve
+# 128 bytes the kernel never indexes -- and at region 14 those 128 bytes are
+# the difference between fitting the ceiling and being refused.
+_smem_old = ("        const size_t smem = ((size_t)1 << cfg->log_region) * 2 +\n"
+             "                            (size_t)S->nslice_pow2 * sizeof(*hlogp);")
+_smem_new = "        const size_t smem = mtl_apply_smem(1u << cfg->log_region, 16);"
+assert _smem_old in src, 'pipeline apply smem shape changed'
+src = src.replace(_smem_old, _smem_new, 1)
+print('  apply threadgroup length via mtl_apply_smem')
+
 open(OUT, 'w').write(src)
 print('wrote %s (%d lines, %d launches rewritten)' % (OUT, src.count('\n'), nl))
 left = sorted(set(re.findall(r'\bcuda[A-Z]\w*', src)))

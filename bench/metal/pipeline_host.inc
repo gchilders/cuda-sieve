@@ -282,8 +282,7 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
         goto done;
     }
     {
-        const size_t smem = ((size_t)1 << cfg->log_region) * 2 +
-                            (size_t)S->nslice_pow2 * sizeof(*hlogp);
+        const size_t smem = mtl_apply_smem(1u << cfg->log_region, 16);
         if (smem > optin_smem_limit) {
             fprintf(stderr, "  apply needs %zu B of shared memory for %u"
                     " padded slices; selected device supports at most %zu B"
