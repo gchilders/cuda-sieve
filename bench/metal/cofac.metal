@@ -16,6 +16,8 @@
  */
 #include "cuda_msl_compat.h"
 #include "softfp64.h"
+#include "bigint_msl.h"
+#include "td_msl.h"   /* TD_FMAX and the shared td.cuh section */
 
 /* Status codes and sizes from cofac.cuh, which the extracted device body
  * references but which live above the extracted range. Values must track
@@ -30,10 +32,31 @@
 #define CF_ECM_NBABY   4u
 #define TD_SCAN_BLK  256
 
-/* bigint.cuh's bn_t, for the kernels that narrow a norm residual. */
-#ifndef BN_LIMBS
-#define BN_LIMBS 12
-#endif
-typedef struct { uint32_t v[BN_LIMBS]; } bn_t;
+
+/* cofq_t as the device sees it.
+ *
+ * CUDA passes cofq_t to k_cof_enqueue and k_rel_pack BY VALUE. A host pointer
+ * means nothing to a shader, so on Metal the struct carries GPU ADDRESSES and
+ * its members are declared `device T*`. Only the fields the kernels actually
+ * read are here -- the host-side bookkeeping (timings, counters, the `double`
+ * members MSL could not express anyway) stays on the host.
+ *
+ * ORDER AND TYPES MUST MATCH the host mirror in cofac_metal.cpp exactly; each
+ * member is one 64-bit address. And every pointer in here must have
+ * mtlUseResource() called on it before the launch, or the kernel reads
+ * garbage rather than failing cleanly -- metal/argbuf_test.cpp demonstrates
+ * that with a negative control.
+ */
+struct cofq_dev_t {
+    device uint32_t *d_c0;   device uint32_t *d_c1;
+    device uint8_t  *d_st0;  device uint8_t  *d_st1;
+    device uint64_t *d_sm0;  device uint64_t *d_sm1;
+    device int64_t  *d_a;    device int64_t  *d_b;
+    device uint32_t *d_f0;   device uint32_t *d_f1;
+    device uint8_t  *d_fn0;  device uint8_t  *d_fn1;
+    device uint64_t *d_sp0;  device uint64_t *d_sp1;
+    device uint8_t  *d_nsp0; device uint8_t  *d_nsp1;
+    device uint32_t *d_ovf;
+};
 
 #include "cofac_body.metal.inc"

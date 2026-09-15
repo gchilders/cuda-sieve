@@ -169,6 +169,23 @@ mtlError_t  mtl_launch_end(void);
  * copied inline. The MSL side must declare parameter i as [[buffer(i)]], in
  * the same order as the CUDA kernel's parameter list -- that one convention
  * is what keeps the port of each launch site mechanical. */
+/* A struct-of-device-pointers argument, i.e. what CUDA passes by value. The
+ * buffer holds GPU addresses; every pointer reached through it must also be
+ * made resident, which is what `refs` is for. Passing one of these through
+ * mtl_launch does both, so a call site cannot bind the struct and forget the
+ * residency -- the failure mode there is garbage, not an error. */
+struct mtl_argbuf_t {
+    const void *buf;
+    const void *const *refs;
+    int nrefs;
+};
+
+inline void mtl_bind_one(mtl_argbuf_t a, int i)
+{
+    mtl_bind_buffer(a.buf, i);
+    for (int k = 0; k < a.nrefs; k++) mtlUseResource(a.refs[k]);
+}
+
 template <class T>
 inline void mtl_bind_one(T a, int i)
 {
