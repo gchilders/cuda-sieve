@@ -1080,7 +1080,10 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) {
             const char *m = argv[++i];
             if (!strcmp(m, "atomic")) cfg.fill_mode = FILL_ATOMIC;
-            else if (!strcmp(m, "twolevel")) cfg.fill_mode = FILL_TWOLEVEL;
+            else if (!strcmp(m, "twolevel")) {
+                fprintf(stderr, "--mode twolevel is refused on Metal: the two-level fill kernels compile and fit, but they misplace records across regions (right total, wrong distribution -- run with --verify to see it). Not the production path; apply needs single-level 4 B records. See METAL_PORT_PLAN.md section 8.\n");
+                return 1;
+            }
             else {
                 fprintf(stderr, "--mode: want atomic or twolevel, got %s\n", m);
                 return 1;

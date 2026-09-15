@@ -973,7 +973,52 @@ a fix. What remains is to run a *band* rather than a single q, and on a
 geometry that exercises the `log_region <= 13` difference, before calling it
 settled.
 
-### Phase 8 — Constraints and tuning
+### Phase 8 — Constraints and tuning — **two-level fill: ceiling solved, path still wrong**
+
+**The threadgroup-ceiling constraint is resolved.** `k_fill_l1` and
+`k_fill_l2` declare `L1_NBUF*L1_CAP` uint32 plus two 128-word counters, and on
+Metal one more word for the `__syncthreads_or` vote:
+
+```
+128 * CAP * 4  +  128*4  +  128*4  +  4
+```
+
+At CUDA's `CAP = 64` that is **33,796 B** — the driver's own refusal, quoted
+verbatim: *"Threadgroup memory size (33796) exceeds the maximum threadgroup
+memory allowed (32768)"*. Note it is 4 bytes worse than the 33,792 predicted
+in Phase 5, because of the vote word. **61 is the largest value that fits**
+(32,260 B, 508 B spare) and the cap is a pure buffering depth — `L1_FLUSH` is
+derived from it and every store is bounds-checked against it — so the change
+alters how often a buffer flushes and nothing about what is produced.
+
+`__syncthreads_or` (a barrier *and* a block-wide vote, which MSL has no
+primitive for) is emulated in threadgroup memory: idempotent writes of 1
+between barriers, so the race between voters is benign.
+
+**But the two-level path computes the wrong answer, and it now fails closed.**
+With the kernels running, the per-region gate reports **~350-500 of 2,048
+regions off by about one, with the grand total exactly right** — which is
+precisely the failure `bench_kernels.cu:2617` exists to catch: *"every
+placement bug this project has hit had exactly the right total"*. Ruled out so
+far:
+
+- **Not the buffer cap.** Sweeping `CAP` over 61 / 48 / 32 changes the error
+  count (345 / 340 / 505) without ever reaching zero.
+- **Not the vote emulation.** Adding a third barrier after the read — closing
+  the one theoretical race — changed nothing.
+- **Not the lane mapping.** A new probe (`metal-probe/lanemap.metal`) confirms
+  `thread_index_in_simdgroup == tid & 31` and
+  `simdgroup_index_in_threadgroup == tid >> 5` over a 512-thread threadgroup,
+  so CUDA's `lane`/`warp` arithmetic and `__syncwarp` scope are valid. Phase 0
+  had verified ballot ordering and shuffle semantics but never this.
+
+`--mode twolevel` therefore **refuses** on the Metal build, with a message
+saying why. It is not the production path — apply requires single-level 4-byte
+records (`bench_kernels.cu:2660`), so `--pipeline` never reaches it — so
+refusing costs nothing today, and refusing rather than warning is this tree's
+own convention for a path known to compute the wrong thing.
+
+### Phase 8 (continued) — original scope
 `log_region <= 13` default; threadgroup sizing measured from scratch —
 `bench.h`'s 32-thread `k_fill_atomic` result is an NVIDIA L2-bound finding
 and must not be inherited; `--cof-chunk` retargeted at the macOS display
