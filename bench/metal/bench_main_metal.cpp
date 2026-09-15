@@ -512,14 +512,35 @@ static int resolve_and_check_cofactor_config(bench_cfg_t *cfg, uint32_t alim,
     }
     /* budget << r must not shift past the width, and a non-positive round
      * count would run no splitting at all yet still exit successfully. */
-    if (cof_rounds < 1 || cof_rounds > 24) {
-        fprintf(stderr, "--cof-rounds %d: must be 1..24 (budget << r overflows"
-                " beyond that, and < 1 splits nothing)\n", cof_rounds);
-        bad = 1;
-    }
-    if (cfg->cof_rounds < 1 || cfg->cof_rounds > 24) {
-        fprintf(stderr, "pipeline cof-rounds %d: must be 1..24\n", cfg->cof_rounds);
-        bad = 1;
+    {
+        /* 24 is rho's bound, not ECM's -- see metal/gen_cofac_host.py. The
+         * exact `budget << (rounds-1)` test below still gates rho. */
+        const int rho_in_use = (cfg->cof_meth0 == COF_METHOD_RHO ||
+                                cfg->cof_meth1 == COF_METHOD_RHO);
+        const int rmax = rho_in_use ? 24 : 1000;
+        if (cof_rounds < 1 || cof_rounds > rmax) {
+            fprintf(stderr, "--cof-rounds %d: must be 1..%d (%s)\n",
+                    cof_rounds, rmax, rho_in_use
+                    ? "budget << r overflows beyond that for rho, and < 1 splits nothing"
+                    : "ECM does not shift the budget; this bound is the sigma-block space, and < 1 splits nothing");
+            bad = 1;
+        }
+        if (cfg->cof_rounds < 1 || cfg->cof_rounds > rmax) {
+            fprintf(stderr, "pipeline cof-rounds %d: must be 1..%d\n",
+                    cfg->cof_rounds, rmax);
+            bad = 1;
+        }
+        /* Sigma blocks are 1000 wide and indexed by the round, so more than
+         * 994 curves in a round runs into the NEXT round's sigmas and
+         * repeats them. Harmless arithmetically, but it silently spends
+         * curves that cannot find anything new -- and it matters more now
+         * that many-rounds-of-few-curves is the recommended shape. */
+        if (cfg->ecm_curves > 994) {
+            fprintf(stderr, "--ecm-curves %u: must be <= 994, or a round's"
+                    " sigmas (c0*1000 + cv + 6) run into the next round's"
+                    " and repeat them\n", cfg->ecm_curves);
+            bad = 1;
+        }
     }
     /* A pinned slice below one full block is never what anyone means: the
      * grid is blocks x threads, so a chunk under `threads` leaves all but one
