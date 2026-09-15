@@ -1057,6 +1057,36 @@ CUDA build is untouched. **The shape of the curve should carry to other Apple
 GPUs; the exact optimum may not, and an M3 Max has four times the cores.
 Re-measure there rather than trusting 192.**
 
+### 8b. `--cof-chunk` costs far more on Metal than on CUDA
+
+Measured on the parity special-q, ECM, 1,852 records, production geometry.
+**Relations are 37 at every point**, so this is purely throughput.
+
+| `--cof-chunk` | algebraic queue | wall/q | vs one launch |
+|---|---|---|---|
+| auto | 1508.6 ms | 2673.6 ms | 1.00x |
+| 1852 (= one launch) | 1510.7 ms | 2672.7 ms | 1.00x |
+| 926 | 3080.3 ms | 4383.5 ms | **2.04x / 1.64x** |
+| 463 | 5044.3 ms | 6556.5 ms | **3.34x / 2.45x** |
+| 256 | 7696.1 ms | 9486.5 ms | **5.10x / 3.55x** |
+| 128 | refused — below one block | | |
+
+Halving the chunk roughly doubles the cofactor stage. The CUDA-side note
+records the same *shape* — "chunk at or above `blocks*threads` is free, below
+it costs up to +150%" — and here every chunk below 1,852 is already below
+`blocks*threads` (60 x 256 = 15,360), so all of these are in CUDA's expensive
+regime. **But the penalty is far steeper on Metal: +410% at chunk 256 against
+CUDA's worst case of +150%, and still climbing.**
+
+The practical consequence: **leave `--cof-chunk` on auto.** It exists to keep a
+single cofactor launch from running past a GPU watchdog, and on this hardware
+buying that insurance costs several times more than it does on CUDA. Reach for
+it only if a watchdog abort is actually observed, not prophylactically.
+
+(No watchdog abort has been observed here — a single command buffer ran 10 s
+without one — but that was not pushed to a limit and is not a claim that none
+exists.)
+
 ### Phase 8 (continued) — original scope
 `log_region <= 13` default; threadgroup sizing measured from scratch —
 `bench.h`'s 32-thread `k_fill_atomic` result is an NVIDIA L2-bound finding
