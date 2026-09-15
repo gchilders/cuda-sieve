@@ -1121,9 +1121,65 @@ changed.
    other bound. The Phase 5 harness derives both counts from the cell arrays
    at the threshold actually used instead.
 
+### 8c. Slab sizing: the target is four times too large on Metal
+
+`slab.h` picks a slab height from a target expressed in *bucket regions*,
+`SLAB_PERF_REGIONS << log_region` positions, not in positions directly. CUDA
+ships 32768 regions and defaults `--region` to 14, so its target is 2^29. The
+Metal build defaults `--region` to 13 (Phase 8a), which silently halves the
+target to 2^28 -- the region count was held fixed while the region shrank.
+
+Sweep at the production c183 geometry, `--qrange 120000053:120000053`,
+ECM, three runs each. **Relations are 37 at every point**, so this is
+throughput only.
+
+| `--slab-j` | slabs | sieve/q, both sides | vs 1 slab | bucket array |
+|---|---|---|---|---|
+| 16384 | 1 | 994.2 ms | — | 1.41 GB |
+| 8192 | 2 | 734.1 ms | -26% | 0.71 GB |
+| 4096 | 4 | 572.6 ms | -42% | 0.35 GB |
+| **2048** | **8** | **558.4 ms** | **-44%** | **0.18 GB** |
+| 1024 | 16 | 592.5 ms | -40% | 0.09 GB |
+
+The minimum is interior and bracketed on both sides, so it is a real optimum
+and not a boundary artefact: 1024 is worse than 2048. 2048 rows at
+`--region 13` is 8192 regions, i.e. **2^26 positions per slab, a quarter of
+CUDA's target**. Smaller slabs cost more launches but shrink the bucket array
+by 8x, and on a UMA part that memory is the same pool the sieve is reading
+through.
+
+Rather than fork `slab.h`, its `#define` is now `#ifndef`-guarded **with its
+default unchanged**, and `Makefile.metal` passes
+`-DSLAB_PERF_REGIONS=8192u` to both the host and the Metal compiles -- both,
+because `metal/slab_msl.h` carries a generated copy of the same constant and
+two copies that disagree are exactly the rot this port has been avoiding.
+(Today the device never calls `slab_perf_jmax`; the slab decision is made on
+the host and reaches the GPU as parameters. The define keeps it that way by
+construction rather than by luck.) See the drift ledger: the CUDA
+`make slabcheck` gate still passes, and it is *sensitive* to this constant,
+so that pass is evidence rather than a tautology.
+
+Auto mode at the production geometry now reports:
+
+```
+j-slabbing: 8 slabs, up to 2048 rows/slab (auto target 8192 bucket regions
+at --region 13; safety bounds may reduce it further)
+bucket array 8192 x 5786 x 4 B = 0.18 GB, shared by both sides
+sieve, both sides                  551.82 ms
+total relations                          37
+```
+
+**Measured on a 10-core M3 in a fanless MacBook Air that also drives the
+display.** The 4x gap against CUDA's target is a statement about this part's
+cache and memory system, not a universal one; a Max or Ultra has far more
+bandwidth and more cores to hide launch latency behind, and should be
+re-measured rather than inheriting 8192. `--slab-j` still overrides.
+
+
 ## 9. Drift ledger — CUDA-side changes made for this port
 
 | date | CUDA file(s) | change | verified how |
 |---|---|---|---|
 | 2026-09-14 | `bench/cofcheck.sh` | `head -c -1` (all but the last byte) is a GNU coreutils extension that BSD `head` rejects outright; falls back to `dd` where it is unsupported | Ran on macOS: the case it guards ("unterminated candidate file") passes, and the 43 cases before it were already passing when it aborted the script. No behaviour change where GNU `head` exists — the fallback is only taken when `head -c -1 /dev/null` itself fails. **Not run on Linux**, so "no change there" is by inspection of the probe, not by execution. |
 | 2026-09-14 | `bench/fbgpucheck.sh` | `sha256sum` (coreutils) falls back to `shasum -a 256` where absent, so the same script is the gate on macOS instead of being forked | Ran on macOS: 19/19 cases pass including the publish-guard case that uses the hash. No behaviour change where `sha256sum` exists, which is every Linux box the CUDA build runs on — the fallback is only taken when the command is missing. **Not run on Linux**, so "no change there" is by inspection of a two-branch `command -v` test, not by execution. |
+| 2026-09-14 | `bench/slab.h` | wrapped `#define SLAB_PERF_REGIONS 32768u` in `#ifndef`/`#endif` so a build can override it. **The default is unchanged**: a build that passes no `-D` sees the identical token it saw before. Only the Metal build overrides it, to `8192u`, because its `--region` default of 13 makes CUDA's region *count* mean a quarter of CUDA's slab size in positions -- see section 8c. | `make slabcheck` passes against the edited header. That pass is evidence rather than a tautology because the gate is *sensitive* to this constant: the same `slabtest.cpp` recompiled with `-DSLAB_PERF_REGIONS=8192u` fails on the first pinned row (`plan 0 got jmax=2048 n=2 enabled=1; want 4096/1/0`). The pinned rows do exercise the policy, and they still see 32768. |

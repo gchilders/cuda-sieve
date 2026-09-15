@@ -17,6 +17,12 @@ METAL     := $(XCRUN) metal
 METALLIB  := $(XCRUN) metallib
 CXX       ?= clang++
 
+# Slab size target, in bucket regions per slab. CUDA ships 32768; this box
+# measures a bracketed interior minimum four times lower -- see
+# METAL_PORT_PLAN.md section 8c. slab.h takes the default when unset, so the
+# CUDA build and slabtest's pinned expectations are untouched.
+SLAB_PERF_REGIONS ?= 8192u
+
 BN_LIMBS  ?= 12
 CF_LMAX   ?= 4
 
@@ -48,11 +54,13 @@ CF_LMAX   ?= 4
 # Phase 4's byte-identical gate is the proof.
 METAL_MIN_MACOS ?= 13.0
 MSLFLAGS  := -std=metal3.0 -mmacos-version-min=$(METAL_MIN_MACOS) \
+             -DSLAB_PERF_REGIONS=$(SLAB_PERF_REGIONS) \
              -fno-fast-math -Wno-c++17-extensions -I metal
 
 HOSTFLAGS := -std=c++17 -O2 -ffp-contract=off -I . -I metal \
              -mmacosx-version-min=$(METAL_MIN_MACOS) \
-             -DBN_LIMBS=$(BN_LIMBS) -DCF_LMAX=$(CF_LMAX)
+             -DBN_LIMBS=$(BN_LIMBS) -DCF_LMAX=$(CF_LMAX) \
+             -DSLAB_PERF_REGIONS=$(SLAB_PERF_REGIONS)
 
 BUILD := .metal-build
 
