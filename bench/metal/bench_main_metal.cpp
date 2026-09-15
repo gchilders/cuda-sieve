@@ -1,6 +1,10 @@
 /* CLI for the standalone bucket-fill benchmark. */
 #include "bench.h"
 #include "metal/metal_rt.h"
+/* metal/cofac_host.inc, compiled into bench_host.cpp. Declared rather than
+ * included: this file needs the one setter, not the cofactor host. */
+void mtl_set_cof_floor_blocks(int b);
+uint32_t mtl_cof_flush_capacity(void);
 #include "platform.h"
 #include "ckpt.h"
 #include "runlog.h"
@@ -133,12 +137,12 @@ static void usage(void)
 "  --logI N         log2 of sieve width I      [15]   (gnfs-lasieve4I14e -> 14)\n"
 "  --J N            sieve height J             [2^(logI-1), CADO's convention]\n"
 "  --slab-j N       pipeline: force at most N j rows per slab; 0/omitted =\n"
-"                   automatic. Auto targets 8192 bucket regions/slab in this\n"
-"                   build (CUDA ships 32768; measured on a 10-core M3), so\n"
-"                   BOTH the cap and the split trigger move with --region: at\n"
-"                   this build's default --region 13 the cap is 2^26 positions\n"
-"                   and the trigger 2^27. An area below TWICE the target is\n"
-"                   not split for performance alone (deliberate hysteresis)\n"
+"                   automatic. Auto targets 32768 bucket regions/slab, so BOTH\n"
+"                   the cap and the split trigger move with --region: at the\n"
+"                   default --region 14 the cap is 2^29 positions and the\n"
+"                   trigger 2^30, at --region 12 they are 2^27 and 2^28. An\n"
+"                   area below TWICE the target is not split for performance\n"
+"                   alone (deliberate hysteresis)\n"
 "  --qspan          pipeline: report each q's GPU-timeline span, which\n"
 "                   splits `unaccounted` into host-with-no-GPU-work-in-\n"
 "                   flight and idle between stages (STATUS item 19)\n"
@@ -227,9 +231,7 @@ static void usage(void)
 "  --scale S / --scale0 S   las byte scale per side\n"
 "  --fbbound N      truncate FB at this p      [alim]  (GGNFS truncates at q)\n"
 "  --bkthresh N     bucket-sieve p >= this     [1<<logI]\n"
-"  --region N       log2 bucket region size    [13]  (8192 16-bit cells, 16 KB)\n"
-"                   13, not CUDA's 14: Apple's threadgroup ceiling is a hard\n"
-"                   32 KB and k_apply wants 32,896 B at 14\n"
+"  --region N       log2 bucket region size    [14]  (16384 16-bit cells, 32 KB)\n"
 "  --maxbits N      prime powers below 2^N      [logI]; used by generated FBs,\n"
 "                   and should match the maxbits recorded by a cached --fb1 file\n"
 "\n"
@@ -308,8 +310,7 @@ static void usage(void)
 "  --cells N        16 | 8 bits per sieve cell [16]  (8 is unsafe; cost only)\n"
 "  --norm M         horner | const             [horner]\n"
 "  --apply-mode M   atomic | plain             [atomic]  (plain is racy)\n"
-"  --apply-threads N  threads per apply block  [192] (max 512)\n"
-"                   192, not CUDA's 512: a measured 26%% win on a 10-core M3\n"
+"  --apply-threads N  threads per apply block  [512] (max 512)\n"
 "  --reps N         timing repetitions         [3]\n"
 "  --verify         run the CPU cross-check (slow)\n"
 "  --no-smallsieve  skip the p < bkthresh line sieve\n"
@@ -1905,7 +1906,11 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
                 dev, ndev, prop.name);
 #endif
         {
-            const uint64_t ab = (uint64_t)prop.multiProcessorCount * 6u;
+            const uint64_t ab_cores = (uint64_t)prop.multiProcessorCount * 6u;
+            /* One record per thread for a full CQ_FLUSH batch. */
+            const uint64_t ab_work = (mtl_cof_flush_capacity() + (uint64_t)cfg.threads - 1)
+                                     / (uint64_t)cfg.threads;
+            const uint64_t ab = ab_cores > ab_work ? ab_cores : ab_work;
             if (!ab || ab > BENCH_BLOCKS_MAX ||
                 ab > (uint64_t)prop.maxGridSize[0]) {
                 fprintf(stderr, "bench: automatic grid %llu is outside the"
@@ -1915,6 +1920,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
                 return 1;
             }
             auto_blocks = (int)ab;
+            mtl_set_cof_floor_blocks((int)ab_cores);
         }
         if (cfg.blocks && cfg.blocks > prop.maxGridSize[0]) {
             fprintf(stderr, "--blocks %d exceeds this device's grid-x limit %d\n",
@@ -1943,8 +1949,10 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
          * block records having already fixed once. */
         if (cfg.blocks == 0) {
             cfg.blocks = auto_blocks;
-            printf("grid: %d SMs x 6 = %d blocks (dev %d: %s, %d MB L2)\n",
-                   prop.multiProcessorCount, cfg.blocks, dev, prop.name,
+            printf("grid: %d blocks = max(%d cores x 6, %u records / %d threads)"
+                   " (dev %d: %s, %d MB L2)\n",
+                   cfg.blocks, prop.multiProcessorCount,
+                   (unsigned)mtl_cof_flush_capacity(), cfg.threads, dev, prop.name,
                    prop.l2CacheSize >> 20);
         } else {
             printf("grid: %d blocks on %d SMs (dev %d: %s, %d MB L2)  [--blocks;"

@@ -1727,6 +1727,86 @@ value there is unmeasured. Either decouple the chunk floor from the grid so
 display.**
 
 
+### 8j. Decoupling done. It works, and it proves the budget is the real bug.
+
+Applied, as two independent changes:
+
+**1. The grid is sized from the work.** `bench_main_metal.cpp` now computes
+`max(multiProcessorCount * 6, ceil(CQ_FLUSH / threads))`, using the live
+`--threads` and reaching `CQ_FLUSH` through an accessor rather than a second
+`#define`, since the constant must have one definition and the grid must
+track it. On this box: `grid: 512 blocks = max(10 cores x 6, 131072 records /
+256 threads)`. The core rule survives as a floor for a hypothetical very large
+Apple GPU.
+
+**2. The chunk floor no longer follows the grid.** `cof_chunk_floor()` used
+`blocks * threads`, so a work-sized grid would have made the floor equal a
+whole flush and retired subdivision on every Apple GPU by construction. It now
+uses its own core-derived count (`mtl_set_cof_floor_blocks`, set once at init),
+falling back to the caller's grid if never set. Subdivision stays reachable for
+a slow part -- and it is not pointless there, because a launch costs roughly
+`(records / resident threads) x one ECM chain` and a 10-core part cannot hold
+131,072 threads resident.
+
+Both verified. All five gates green, 3,385 relations unchanged.
+
+**And by default it changes nothing, because `--cof-chunk auto` is not
+adaptive on this hardware -- it never was.**
+
+| `--nq 72` | chunk | cofac/q | wall/q |
+|---|---|---|---|
+| auto, decoupled floor | 15,360 | 465.5 | 1201.9 |
+| explicit `--cof-chunk 131072` | 130,940 | **348.5** | **1085.0** |
+
+The adaptive loop halves the chunk when `stage > COF_CHUNK_TARGET_MS` and
+doubles it when `stage < TARGET/4`, where `stage` is a whole SIDE's device time
+for the flush -- summed over every round and every slice. `COF_CHUNK_TARGET_MS`
+is 250. Measured here, `stage` is **9.8 s at one slice and 11.2 s at the floor:
+39x and 45x the target**. The test is true at every chunk size this hardware
+can produce, so the loop halves on every flush and parks at the floor forever.
+It is a saturated signal, not a controller. **An always-true test is not a
+safety mechanism; it is an unconditional slowdown.**
+
+That saturation was harmless on CUDA and AMD because there the floor *is* a
+fully loaded grid -- `cofac.cuh` says so: "over-chunking costs nothing on the
+devices that ever reach this path". Parking at the floor is the free point
+when the floor is one record per thread for a device-filling grid. Decoupling
+the floor on Metal is correct for watchdog reachability and simultaneously
+removes that harmlessness: parking now costs 25% of the stage.
+
+**Why no threshold on `stage` can fix this.** Dividing by slices does not help
+-- `stage` is dominated by total ECM work across rounds, not by one launch.
+Even a correct per-launch figure is about 3 s here (roughly `stage` over ~8
+rounds), still 12x a 250 ms budget that was chosen for an 8x margin against
+Windows' 2 s TDR. Yet those ~3 s launches have run repeatedly on this machine,
+across every one-slice arm in 8i and 8j, with no timeout and no reset. **The
+250 ms target is simply not calibrated for macOS**, and the honest options are
+about that number, not about the floor.
+
+#### Where this leaves the decision
+
+- **(a) Raise `COF_CHUNK_TARGET_MS` for Metal**, `#ifndef`-guarded like
+  `SLAB_PERF_REGIONS`. Auto then stays at one slice on a healthy device and
+  still descends on one substantially slower. Needs a value justified by
+  observation rather than by a documented macOS limit, because Apple publishes
+  none -- ours would be calibrated on a single M3.
+- **(b) Fix the signal first**: measure a real per-launch duration with events
+  instead of a whole-side sum, then pick a target against a quantity that
+  actually means what the target says. More work, and the only option that
+  leaves a genuinely adaptive controller.
+- **(c) Leave auto alone and document `--cof-chunk 131072` as the production
+  setting.** Costs nothing, wins nothing by default, keeps every existing
+  safety property.
+
+**Not chosen here.** All three change a watchdog-safety default on hardware
+this port has partly never run on -- an M1 remains untested (5.1a) -- and that
+is the user's call. The measured facts are above; the 25% is available with
+one flag today.
+
+**Measured on a 10-core M3 in a fanless MacBook Air that also drives the
+display.**
+
+
 ## 9. Drift ledger — CUDA-side changes made for this port
 
 | date | CUDA file(s) | change | verified how |
