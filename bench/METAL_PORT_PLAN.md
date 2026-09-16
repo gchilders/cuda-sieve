@@ -1813,11 +1813,12 @@ file's existence.
 
 | | sha256 |
 |---|---|
-| `bench` | `9e975aa55fe628383a49864475681fe4b63df9ed40c004ad16a179c627422cb0` |
-| `bench.sig` | `3cc09a211c7cc3d26795ad91e8868168da23d616ae43c025906a2f05e40a4533` |
+| `bench` | `52f6280b42c126c752626ef24a108bbeb888b5c22a51a890ce628ca5fc96fd57` |
+| `bench.sig` | `c4c9cdfdc258601edde6de1e03fbb2e4cc989d98a8089baba497075e95e0e829` |
 
-**Re-staged and re-signed 2026-09-16 after 9z's leak fix.** The superseded
-artifact was `25ab6b65…2fdac977`; it is not the one to ship. The binary grew
+**Re-staged and re-signed 2026-09-16 after 9z's leak fix.** Superseded artifacts, neither of
+which is the one to ship: `25ab6b65…2fdac977` (pre-leak-fix) and
+`9e975aa5…27422cb0` (pre-autorelease-fix). The binary grew
 80 bytes (1,726,104 -> 1,726,184). The signature was re-made from scratch --
 a signature is over content, so the old one does not verify the new binary
 (and the negative control above is exactly that check).
@@ -1910,20 +1911,8 @@ is only ever called outside it.
 
 ### Open, not fixed
 
-**1. No `@autoreleasepool` anywhere in the shim, and the leak was holding it
-together.** `commit()` stores `st->last = st->cb` where `cb` came from
-`[st->q commandBuffer]` -- **autoreleased, never retained** -- and `sync()`
-reads `st->last` afterwards. With no pool in the process nothing ever drains,
-so the object survives by accident. **Adding a pool naively would turn a leak
-into a use-after-free.** The fix is to retain command buffers explicitly and
-release them after completion, not to wrap a pool around the loop.
-
-Measured alongside it: RSS over a 144-q band rises **372 -> 399 MB in 75 s**,
-roughly linearly (~0.36 MB/s). **Cause not established** -- it could be these
-autoreleased objects, or the legitimate cross-q relation queue. The trace is
-monotone rather than saw-toothed across two `CQ_FLUSH` cycles, which argues
-against the queue, but that is an inference. **This is the top remaining item**
-and it matters most exactly where it is least tested: a multi-hour BOINC task.
+**1. FIXED: no `@autoreleasepool` anywhere in the shim, and the leak was
+holding it together.** See 9z-b below.
 
 **2. A zero-sized launch is silently skipped.** `mtl_launch_end` dispatches
 only `if (g_bind_grid && g_bind_block)`; CUDA returns
@@ -1941,6 +1930,63 @@ rather than by luck.
 **4. `pso_for` caches `nil`**, so the "no kernel named" diagnostic repeats once
 per launch attempt (three times in the control above). Harmless, slightly
 noisy.
+
+### 9z-b. The autorelease fix: ownership first, then the pool
+
+`commit()` stored `st->last = st->cb` where `cb` came from `[st->q
+commandBuffer]` -- **autoreleased and never retained** -- and `sync()`, plus
+every event query, read it afterwards. The same held for the two encoders and
+for `mtlEventOpaque::cb`. With no pool anywhere in this process (a plain C++
+`main()`, no Cocoa run loop) nothing ever drained, so those objects survived by
+accident. **The leak was standing in for a lifetime, which is why a pool alone
+would have been a use-after-free rather than a fix.**
+
+**So the ownership came first.** `cb`, `cenc`, `benc`, `last`, the stream's
+`MTLCommandQueue` and the event's `MTLEvent` are now retained on store and
+released on replace or teardown, with `stream_teardown()` for the two places
+that used to drop a queue on the floor (`mtlStreamDestroy`, `mtlShutdown`).
+`mtlEventRecordOn` takes its **own** reference, retain-before-release, because
+the event outlives the stream's next commit.
+
+**Then the pool, at the creation site.** Balancing our own retain with a
+release is *not* sufficient: the pending autorelease also has to fire, and
+without a pool it never does -- the object is immortal however carefully we
+balance our own reference. So the three factory calls create inside a pool and
+retain before it drains:
+
+```objc
+void ensure_cb(Stream *st)
+{
+    if (st->cb) return;
+    @autoreleasepool { st->cb = [[st->q commandBuffer] retain]; }
+}
+```
+
+Local, and the boundary sits on the thing it governs. A pool per entry point
+would also have been correct -- but only *after* the ownership work, and it
+would have put the boundary far from the object.
+
+**Measured on the same 144-q band:**
+
+| | RSS start | RSS at +75 s | rate |
+|---|---|---|---|
+| before | 372.0 MB | **399.0 MB** | ~0.36 MB/s |
+| after | 361.9 MB | **367.4 MB** | **~0.07 MB/s** |
+
+**About 80% of the growth gone**, and what remains steps and then flattens
+(361.9, 361.9, 363.5, 367.3, 367.3, 367.4) rather than rising -- the shape of
+the cross-q relation queue filling toward a flush, which is work, not a leak.
+That also answers 9z's open question about which of the two causes it was:
+mostly the autoreleased objects.
+
+**It is not a small class of object.** A command buffer retains every resource
+it references, so each leaked one pinned its share of the sieve's buffers too,
+and the port commits one per event record.
+
+**Validated as a lifetime change deserves**, because a premature release is a
+wrong answer rather than a leak: twelve gates green, `cofcheck.sh` 54 PASS /
+0 FAIL, and the 288-q band **byte-identical** at 13,485 relations,
+`sha256 8e79762c…dafbc002`, `cmp` clean.
 
 Still open from earlier phases: `--mode twolevel` misplaces records and
 refuses (Phase 8), and nothing has run under a real BOINC client (9e).
