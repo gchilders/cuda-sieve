@@ -1805,7 +1805,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
      * and apply still pay their own first-launch cost inside q0. They are the
      * reps-stable stages and the cost is one-time either way, but a band short
      * enough to care should be treated as a warm-up run, not a measurement. */
-    MTL_LAUNCH_NAMED((SLABBED ? "k_transform_1" : "k_transform_0"), blocks, cfg->threads, 0, 0, S1.primes, S1.roots, S1.plat, 0u, cfg->logI, cfg->J, 1, 0, 0, 1, S1.d_nproj, S1.d_nlost, S1.walk_cur);
+    MTL_LAUNCH_NAMED((SLABBED ? "k_transform_1" : "k_transform_0"), blocks, cfg->threads, 0, 0, S1.primes, S1.roots, S1.plat, 0u, cfg->logI, cfg->J, (int64_t)1, (int64_t)0, (int64_t)0, (int64_t)1, S1.d_nproj, S1.d_nlost, S1.walk_cur);
     PIPE_CK(mtlDeviceSynchronize());
     PIPE_CK(mtlGetLastError());
     if (pipe_td_init(&C, fbs1, fbs0, POLY, nbitword_alloc)) { rc = -1; goto done; }

@@ -156,6 +156,27 @@ assert 'cofq_flush' not in src or src.count('cfg->cof_rounds,') == 0 or True
 print('  %d cofq_flush site(s) use the derived round count' % _n)
 
 
+# ---- widen the warm-up launch's integer literals --------------------------
+# k_transform declares a0/a1/b0/b1 as int64_t. CUDA's launch converts the
+# literals `1, 0, 0, 1` implicitly at the call site, so the CUDA build is
+# correct as written; Metal binds by VALUE and takes the literal's own width,
+# so it bound 4 bytes for an argument the kernel reads as 8 -- the upper half
+# being whatever followed. Harmless in practice only because this warm-up
+# passes n = 0u and the loop never runs, but it is a real host/device type
+# mismatch and Metal's validation layer refuses to dispatch it:
+#
+#   Compute Function(k_transform_1): argument a0[0] from Buffer(6) with
+#   offset(0) and length(4) has space for 4 bytes, but argument has a
+#   length(8).
+#
+# Metal-side only; pipeline.cuh is untouched.
+_w_old = "cfg->logI, cfg->J, 1, 0, 0, 1, S1.d_nproj, S1.d_nlost, S1.walk_cur);"
+_w_new = ("cfg->logI, cfg->J, (int64_t)1, (int64_t)0, (int64_t)0, (int64_t)1,"
+          " S1.d_nproj, S1.d_nlost, S1.walk_cur);")
+assert _w_old in src, 'warm-up launch shape changed'
+src = src.replace(_w_old, _w_new, 1)
+print('  warm-up k_transform literals widened to int64_t')
+
 open(OUT, 'w').write(src)
 print('wrote %s (%d lines, %d launches rewritten)' % (OUT, src.count('\n'), nl))
 left = sorted(set(re.findall(r'\bcuda[A-Z]\w*', src)))

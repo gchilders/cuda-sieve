@@ -977,32 +977,35 @@ missing-kernel diagnostic repeats per attempt.
 
 ## Second review, 2026-09-16 (plan 9z-c)
 
-**`MTL_DEBUG_LAYER=1` ABORTS THE SIEVE — the Metal validation layer cannot be
-used on this port.** Stack:
-`validateComputeFunctionArgumentsCommon` ← `dispatchThreadgroups` ←
-`mtl_launch_end` ← `scan_rec` ← `mtlSelectFlaggedU32` ← `afb_build_gpu`.
+**FIXED (plan 9z-d/9z-e): the sieve now runs clean under `MTL_DEBUG_LAYER=1`,
+and `make -f Makefile.metal validationcheck` keeps it that way.** Optional
+buffers are declared under an MSL **function constant** — when the constant is
+false the argument does not exist and Metal asks for no binding. metal_rt
+computes a nil-mask from the launch arguments (runtime value, not spelling),
+`pso_for` caches per (name, mask), and one uint constant at index 0 carries
+"argument i is bound". **A bitmask, not one Bool per index, because Metal
+rejects a constant value for an index a function does not declare.**
+**Discovery is `functionConstantsDictionary`** — a plain `newFunctionWithName:`
+does NOT return nil for a specialised function; it returns an object that
+cannot build a pipeline, and Metal asserts **in ordinary builds**.
 
-**Cause: the port binds `nil` for optional buffer arguments, and Metal requires
-every declared buffer argument to be bound.** `k_scan_block` declares
-`device uint *bsum [[buffer(1)]]`; `scan_rec` passes `nullptr` at the deepest
-recursion level, and the kernel guards `if (... && bsum)` — which is why it has
-always worked. Apple's driver tolerates it.
+Wrappers forward through a local (`if (mtl_bound_11) dump_opt = dump;`) because
+a function-constant argument may be **named** only where it exists — **the
+`_body` templates are untouched** and still test the pointer. Converted:
+`k_scan_block`, `k_apply` (11,13,24,25), `k_intersect_compact`,
+`k_fill_atomic`, `k_transform`, `k_resieve_scatter`, `k_td`, `k_cofac`.
 
-**Systemic, not one site: 20 launches pass `nullptr`** — 14 `bench_host.cpp`,
-6 `pipeline_host.inc` (including the **production** `k_apply`, which passes
-three), 1 `metal_scan.cpp`. The idiom is deliberate: `mtl_bind_one(nullptr_t)`
-exists to route them to `setBuffer:nil`.
+**Two were invisible to a static audit:** `k_apply` 25 (`survbits` — null only
+in `phase5_test`, not the pipeline) and `k_cofac` 10 (`iters` — a **runtime**
+null variable, not a literal). Grep cannot find those; the runtime mask does.
 
-**What it costs is the best tool for catching binding bugs, in the port most
-exposed to them** — 84 kernels reached by *string name*, arguments bound
-*positionally*, templated variants via mangled `[[host_name]]`. **A partial fix
-is worthless** (the abort just moves to the next `nullptr` launch). Options:
-templated variants per optional argument (fits the port's existing style, but
-`k_apply` → 8 instantiations), or a sentinel buffer plus a present-flag.
-**NOT fixed deliberately** — architectural, ~20 sites plus kernel signatures,
-in a validated/signed/staged port, and invisible to every gate because no gate
-runs under validation. It should be its own change **with the validation layer
-as its acceptance test**.
+**AND VALIDATION FOUND A REAL BUG, not just hygiene.** `k_transform` declares
+`a0..b1` as `int64_t`; the warm-up launch (`pipeline.cuh:1844`) passes literals
+`1, 0, 0, 1`. **CUDA converts at the call site; Metal binds by value and takes
+the literal's width** — 4 bytes bound for an 8-byte read. Harmless only because
+that warm-up passes `n = 0u`. **It is a class**: any narrower literal or
+variable meeting a wider kernel parameter binds the wrong width silently, and
+nothing but the validation layer sees it. Fixed Metal-side.
 
 **My 9z-b retain/release work was cleared dynamically, not by reading:**
 `OBJC_DEBUG_MISSING_POOLS=YES` → **0** "autoreleased with no pool" (the pools
