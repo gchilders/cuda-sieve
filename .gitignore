@@ -50,6 +50,15 @@ bench/.defs.stamp
 bench/.cflmax.stamp
 bench/.bnlimbs.stamp
 bench/.pipek.stamp
+bench/.metalflags.stamp
+
+# Droppings of any HAVE_BOINC build run from bench/ (the stub gate, or the real
+# binary): the BOINC runtime redirects stderr to stderr.txt in the working
+# directory and writes boinc_finish_called on exit. Untracked files set the
+# build stamp's -dirty flag, so one gate run would otherwise brand every later
+# build in the checkout as dirty.
+bench/stderr.txt
+bench/boinc_finish_called
 *.d
 
 # All per-job working state lives under work/: poly, factor base, relations,
