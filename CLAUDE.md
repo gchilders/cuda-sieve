@@ -787,6 +787,33 @@ call site cannot do one and forget the other.
   distribution on macOS needs a real signature or notarization is UNTESTED
   here.**
 
+  **SIGNED AND STAGED (plan 9f).** `~/code/dist/` holds `bench` (sha256
+  `25ab6b65…`) and `bench.sig` (256 hex chars, a 1024-bit RSA signature).
+  `crypt_prog` is NOT built by `--disable-server` (`lib/Makefile.am` puts it
+  and `libboinc_crypt` under `if ENABLE_SERVER`, and `SSL_LIBS` is empty), so
+  it was compiled by hand against the already-built tree with Homebrew
+  `openssl@3` — `crypt_prog.cpp` needs `<openssl/encoder.h>`, i.e. OpenSSL 3.x.
+
+  **BOINC's key parser rejects CRLF key files, and that is a real bug.** The
+  project key failed with `Error: scan_private_key_hex`. **Diagnosed without
+  opening it**, from file size alone: a fresh BOINC 1024-bit key is 1437 bytes
+  with 24 newlines, the project key is 1461 — **exactly one extra byte per
+  line**. Converting a throwaway key to CRLF gave 1461 bytes and the identical
+  error. Two places in `lib/crypt.cpp`: `sscan_key_hex` requires every char
+  before `'\n'` to be a digit, and `sscan_hex_data` skips `'\n'` but *breaks*
+  on non-hex, truncating the key. Both now skip CR. **Patched in the local
+  BOINC tree (`~/code/boinc/lib/crypt.cpp`), NOT in this repo**; original at
+  `/tmp/crypt.cpp.orig`. After the patch the same key in LF and CRLF form
+  produce an identical signature.
+
+  **`bench.sig` is NOT cryptographically verified** — that needs
+  `code_sign_public`, which is not on this machine. Only checked: exit 0,
+  re-signing is byte-identical, and the shape matches a self-test signature
+  that did verify. Close it with `crypt_prog -verify bench bench.sig
+  <project>/keys/code_sign_public`. **The key was never read or copied** — it
+  appears once, as an argv. This is BOINC's file signature, **not** a macOS
+  Gatekeeper signature, which remains untested.
+
   **NOT established:** still standalone mode, no `init_data.xml`, so slot
   filename resolution, a real GPU assignment and checkpointing are
   unexercised. **That is the only Phase 9 item left** — it needs a real BOINC

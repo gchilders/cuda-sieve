@@ -1738,6 +1738,84 @@ that *are* sent still resolve through `bench_boinc_resolve_path`.
   ld puts there, not a Developer ID. **Whether BOINC distribution on macOS
   needs a real signature or notarization is untested here** and is a question
   for the project, not a claim this port can make either way.
+### 9f. Signed with the project key -- and a CRLF bug in BOINC's key parser
+
+The distributable binary is in **`~/code/dist/`**, outside this repository:
+
+```
+bench        1,726,104 B   sha256 25ab6b6550d44b0f…2fdac977
+bench.sig          262 B   256 hex chars + "." -- a 1024-bit RSA signature
+```
+
+`crypt_prog` is not built by `--disable-server`: `lib/Makefile.am` puts it
+under `if ENABLE_SERVER`, and so does `libboinc_crypt`. Rather than reconfigure
+the tree that produced the validated library, it was compiled by hand against
+it, which is also the whole recipe:
+
+```
+brew install openssl@3
+clang++ -O2 -std=c++17 -I . -I lib -I api -I $SSL/include \
+    lib/crypt_prog.cpp lib/crypt.cpp -L $SSL/lib -lcrypto lib/libboinc.a \
+    -o crypt_prog
+```
+
+`SSL_LIBS` is empty in the generated Makefile for the same reason, so OpenSSL
+has to come from outside; `crypt_prog.cpp` needs `<openssl/encoder.h>`, i.e.
+**OpenSSL 3.x**.
+
+#### The key would not parse, and the diagnosis never opened the file
+
+`crypt_prog -sign` failed with `Error: scan_private_key_hex`. The key must not
+be read or copied, which rules out looking at it -- so the diagnosis was done
+entirely on **file size**, against keys generated locally:
+
+| | bytes |
+|---|---|
+| fresh BOINC 1024-bit private key (LF) | 1437 |
+| newlines in it | **24** |
+| the project key | **1461** |
+| 1461 - 1437 | **24 -- exactly one extra byte per line** |
+
+One extra byte per line is a CR. Converting the throwaway key to CRLF made it
+**1461 bytes**, byte-for-byte the same size, and reproduced the identical
+`Error: scan_private_key_hex`. Hypothesis confirmed without opening the file.
+
+**It is a real bug in `lib/crypt.cpp`, in two places.** `sscan_key_hex` reads
+the leading bit-count line and requires every character before `'\n'` to be a
+digit, so it rejects the `'\r'` outright; and `sscan_hex_data` skips `'\n'`
+but *breaks* on anything that is not a hex digit, so a `'\r'` would truncate
+the key even if the first line were accepted. Both now skip CR. **Patched in
+the local BOINC tree, not here** -- `~/code/boinc/lib/crypt.cpp` -- and the
+original is at `/tmp/crypt.cpp.orig`. Anyone reproducing this needs the same
+two-line change, or a key with Unix line endings.
+
+**The tool was proven before the key was blamed.** A throwaway
+`-genkey 1024` pair signs and verifies (`signature is valid`); after the patch
+the same key in LF and CRLF form both verify and produce an **identical**
+signature, which is what "same key, different line endings" should mean.
+
+#### What is NOT established
+
+`bench.sig` **has not been cryptographically verified**, because verification
+needs `code_sign_public` and there is no such file on this machine. What is
+checked: `crypt_prog` exited 0, re-signing is byte-identical (deterministic
+PKCS#1 v1.5), and the output has the same shape -- 262 bytes, 256 hex chars,
+`.` terminator -- as a signature that *did* verify in the self-test. To close
+this properly, run
+
+```
+crypt_prog -verify bench bench.sig <project>/keys/code_sign_public
+```
+
+with the project's public key, which normally lives on the server.
+
+**The key was never read or copied.** It appears exactly once, as an argv to
+`crypt_prog`, and nothing in `~/code/dist` refers to it.
+
+**This is BOINC's file signature, not a macOS one.** It is what the client
+checks against the project's public key on download; it says nothing about
+Gatekeeper, whose requirements for a BOINC-distributed macOS application
+remain untested (9e).
 ---
 
 ## 10. Open questions for the CUDA side
