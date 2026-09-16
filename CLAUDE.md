@@ -762,9 +762,23 @@ call site cannot do one and forget the other.
   libraries and every one is part of macOS (Metal, Foundation, IOKit,
   CoreFoundation, libSystem, libc++, libobjc). The tree's one `dlopen` is
   `libnvidia-ml.so.1` for optional NVML telemetry — impossible on macOS,
-  `runlog_gpu_bind` returns -1, caller carries on. The **job** is separate and
-  always was: `--poly` (462 B) and the factor base (110 MB for c183) are
-  workunit inputs, which is what `bench_boinc_resolve_path` is for.
+  `runlog_gpu_bind` returns -1, caller carries on.
+
+  **AND THE 110 MB FACTOR BASE NEED NOT BE SHIPPED EITHER.** With no
+  `--fb1`/`--cadofb`, pipeline mode generates the complete algebraic FB on the
+  GPU at startup — 7,605,616 ideals in **6.5 s**, once per process.
+  **Verified over the same 288 q: 13,485 relations, sha256 `8e79762c…`,
+  `cmp` clean against the cached-file run**, from a directory containing
+  nothing but the 1.7 MB executable. So a workunit needs the poly (462 B) and
+  the parameters, not the factor base.
+
+  **But get `alim` right per job.** `genlim = min(fbbound, alim)`, and `alim`
+  comes from a GGNFS `.job`, from `--alim`, or from a **compiled-in default of
+  134,200,000** (`bench_main_metal.cpp:989`). A CADO `.poly` carries no alim,
+  so the verified run above took that default — which for c183 *is* the
+  production alim. **That is a coincidence of this job, not a derivation from
+  the polynomial.** For any other composite pass `--alim` or a `.job`, or the
+  factor base is silently the wrong size.
 
   Three things a project must know, none a missing file: **arm64 only,
   non-fat** (an Intel Mac cannot run it — Rosetta goes x86_64→arm64, not the
