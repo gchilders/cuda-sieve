@@ -201,14 +201,46 @@ void stream_teardown(Stream *st)
     [st->q release];    st->q = nil;
 }
 
+/* REPORT THE REAL REASON, ALWAYS.
+ *
+ * This used to print cb.error.localizedDescription only under
+ * CUDA_SIEVE_METAL_TRACE and collapse everything that was not Timeout or
+ * OutOfMemory into one code, so a field failure reached a volunteer's
+ * uploaded stderr.txt as the single word "kernel launch failed" with the
+ * diagnosis discarded. A real report looked like this, and nothing in it can
+ * be acted on:
+ *
+ *   fbgen_gpu: mtlMemcpy(...) failed at fbgen_gpu_metal.cpp:568:
+ *   kernel launch failed
+ *
+ * Metal's own description distinguishes the cases that matter -- a page fault
+ * (a bad address, i.e. the class 9z-c was about), a GPU hang, the process
+ * being a victim of someone else's fault, device removal, a stack overflow --
+ * and a failure is fatal anyway, so there is no cost to saying which. The
+ * error code goes out too: descriptions are localised, the code is not. */
 mtlError_t cb_status(id<MTLCommandBuffer> cb)
 {
     if (!cb || !cb.error) return mtlSuccess;
-    if (tracing())
-        @autoreleasepool {
-            fprintf(stderr, "metal_rt: [trace] command buffer failed: %s\n",
-                    cb.error.localizedDescription.UTF8String);
+    @autoreleasepool {
+        const char *what = "?";
+        switch (cb.error.code) {
+        case MTLCommandBufferErrorNone:            what = "none"; break;
+        case MTLCommandBufferErrorInternal:        what = "internal"; break;
+        case MTLCommandBufferErrorTimeout:         what = "timeout (GPU watchdog)"; break;
+        case MTLCommandBufferErrorPageFault:       what = "page fault (bad device address)"; break;
+        case MTLCommandBufferErrorNotPermitted:    what = "not permitted"; break;
+        case MTLCommandBufferErrorOutOfMemory:     what = "out of memory"; break;
+        case MTLCommandBufferErrorInvalidResource: what = "invalid resource"; break;
+        case MTLCommandBufferErrorMemoryless:      what = "memoryless"; break;
+        case MTLCommandBufferErrorDeviceRemoved:   what = "device removed"; break;
+        case MTLCommandBufferErrorStackOverflow:   what = "stack overflow"; break;
+        default: break;
         }
+        fprintf(stderr, "metal_rt: command buffer failed: %s (code %ld): %s\n",
+                what, (long)cb.error.code,
+                cb.error.localizedDescription
+                    ? cb.error.localizedDescription.UTF8String : "(no description)");
+    }
     if (cb.error.code == MTLCommandBufferErrorTimeout) return mtlErrorLaunchTimeout;
     if (cb.error.code == MTLCommandBufferErrorOutOfMemory) return mtlErrorLaunchOutOfResources;
     return mtlErrorLaunchFailure;

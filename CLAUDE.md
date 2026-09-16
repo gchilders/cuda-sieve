@@ -1120,6 +1120,37 @@ there is no data from that host to tune either.
 dead band, so the controller never steers. The change earns its place on
 larger GPUs (an M4 Max opens at 61,440) and at tighter bounds.
 
+## Field failure 9z-i: a command-buffer error the log could not explain
+
+An **M2** task died in fbgen at ~37% with `kernel launch failed` after
+`k_alg_roots_fixed_mark_*`. **The memcpy that reported it is not the fault** —
+it is the first sync that noticed an asynchronous command-buffer error; the
+`mtlGetLastError()` before it passes because that carries only launch-
+*configuration* failures.
+
+**Ruled out here:** the `mtlFree` leak (per-segment fbgen allocations are only
+~39 MB — `GPU_FB_MAX_ROOTS` 9, 8M-odd segments — so ~150 MB by 37%, nowhere
+near an 8 GB M2); a nil binding (fbgen's `scan_rec` buffer is synced and
+checked at line 551, which passed); a null `c_alg` (set at line 484 under
+`MTL_OR_DIE`). **Not ruled out and not distinguishable from that log:** a real
+GPU page fault, a watchdog hang, memory pressure, or eviction.
+
+**THE DEFECT IS THAT THE LOG COULDN'T SAY.** `cb_status` collapsed every
+non-Timeout, non-OOM command-buffer error into one code and printed Metal's
+`localizedDescription` **only under `CUDA_SIEVE_METAL_TRACE`**, which no
+volunteer sets. Now reported unconditionally with the numeric code (
+descriptions are localised, codes are not) and named cases for internal,
+timeout, **page fault**, not-permitted, OOM, invalid resource, memoryless,
+device-removed and stack-overflow. A failure is fatal anyway.
+
+**Reading the next one:** `page fault` → a bad address, the 9z-c class;
+`timeout` → the watchdog, argues for splitting the root finder's grid; `out of
+memory`/victim → the rest of the volunteer's machine.
+
+**The deployed binary is old** — its stderr still says "this is a CUDA
+application", so it pre-dates 9z-g and therefore also the leak fix (9z), the
+autorelease fix (9z-b) and the nil-binding fix (9z-e).
+
 ## Drift ledger — CUDA-side changes made for this port
 
 **The ledger lives in `bench/METAL_PORT_PLAN.md` section 9, and only there.**

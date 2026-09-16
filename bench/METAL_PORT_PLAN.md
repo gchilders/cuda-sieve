@@ -2393,6 +2393,74 @@ and at tighter bounds.
 `validationcheck`, `boinccheck` green, and the 288-q band **`cmp`-identical**
 at 13,485 relations.
 
+### 9z-i. A field failure that cannot be diagnosed, and why
+
+An **Apple M2** task died during factor-base generation, ~37-50% through the
+prime range:
+
+```
+fbgen_gpu: CUDA mtlMemcpy(&failures, d_failures, ...) failed at
+metal/fbgen_gpu_metal.cpp:568: kernel launch failed
+```
+
+**The memcpy is not the fault; it is the first synchronisation that noticed
+one.** Line 568 follows `k_alg_roots_fixed_mark_*`, the algebraic root finder,
+so that kernel's command buffer came back with an error. The
+`mtlGetLastError()` on the line before passed because that only carries
+launch-*configuration* failures -- an asynchronous command-buffer error
+surfaces at the next sync.
+
+#### Four hypotheses, three of them ruled out here
+
+- **The `mtlFree` leak (9z).** Ruled out on size. The per-segment allocations
+  are `d_rootbuf` + `d_out_p/r/special`; with `GPU_FB_MAX_ROOTS` = 9 and 8M-odd
+  segments that is **~39 MB per segment**, so ~150 MB by 37%. Nowhere near
+  exhausting even an 8 GB M2. (The deployed binary *does* leak it -- the fix
+  post-dates that build -- but it is not this.)
+- **A nil buffer binding (9z-c).** Ruled out by sequence: fbgen's
+  `mtlSelectFlaggedU32` -> `scan_rec` is the nil-binding site, and its command
+  buffer is synced and checked at line 551, which passed. The failing buffer is
+  a later one.
+- **A null `c_alg`.** That launch passes `mtlGetSymbol("c_alg")`, which returns
+  `nullptr` for an unset symbol -- the same runtime-null class that only the
+  mask caught for `k_cofac`. Ruled out: it is set at line 484 under
+  `MTL_OR_DIE`.
+- **A genuine GPU fault, hang, or eviction** in the root finder -- page fault,
+  watchdog, memory pressure from the rest of the volunteer's machine, or being
+  the victim of another process's fault. **Not distinguishable from this log.**
+
+#### The actual defect: the port discards the diagnosis
+
+`cb_status` collapsed **every** command-buffer error that was not `Timeout` or
+`OutOfMemory` into one code, and printed Metal's own
+`localizedDescription` **only under `CUDA_SIEVE_METAL_TRACE`** -- which no
+volunteer sets. So the one string that separates a page fault from a hang from
+an eviction was thrown away at exactly the moment it mattered, on the only
+machine that reproduced the problem.
+
+Now reported unconditionally, with the code as well as the description
+(descriptions are localised; codes are not):
+
+```
+metal_rt: command buffer failed: page fault (bad device address) (code 3): ...
+```
+
+with named cases for internal, timeout, page fault, not-permitted, OOM,
+invalid resource, memoryless, device-removed and stack-overflow. A failure is
+fatal anyway, so there is no cost to saying which.
+
+**What to do with the next report.** `page fault` points at a bad address --
+the 9z-c class, and worth taking seriously even though the scan was cleared
+here. `timeout` points at the watchdog and argues for splitting the root
+finder's grid. `out of memory` or being a victim points outward, at the rest
+of the volunteer's machine.
+
+**Also: the deployed binary is old.** Its stderr still says "this is a CUDA
+application", so it pre-dates 9z-g -- and therefore also pre-dates the
+`mtlFree` leak fix (9z), the autorelease fix (9z-b) and the nil-binding fix
+(9z-e). Whatever this failure turns out to be, the current build is a better
+starting point for the next report.
+
 Still open from earlier phases: `--mode twolevel` misplaces records and
 refuses (Phase 8), and nothing has run under a real BOINC client (9e).
 
