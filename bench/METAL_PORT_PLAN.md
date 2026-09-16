@@ -2624,6 +2624,50 @@ are all below the 2^15 small-prime bound and `g`, `sh` are tiny, so six fields
 plausibly fit in four words. That changes the table the host builds, so it is a
 larger change than anything above and is left as the next step.
 
+#### The 16-byte packed layout: built, and it is a wash
+
+The measured field maxima on c183, over every entry of both sides, say the
+packing is comfortable: `m <= 32,749`, `rt <= 32,382`, `cst <= 16,384` -- all
+15 bits -- with `g <= 19` and `sh <= 14`. So the six hot fields fit one `uint4`:
+
+```
+w.x = magic              w.z = cst | (g  << 16)
+w.y = m | (rt << 16)     w.w = sh
+```
+
+`recip` cannot fit, so it moved out. Built it, with a host-side check that
+**refuses rather than truncates** if a job's small-prime bound ever exceeds
+16 bits, since those widths are a property of this job and not a theorem.
+
+| | test | division | TD total |
+|---|---|---|---|
+| struct copy (shipped) | 224.1 | 54 | 301-306 |
+| packed, `recip` from device | 201.7 | **76.5** | ~301 |
+| packed, `recip` in its own threadgroup array | 200.5 | **70.8** | 299-303 |
+
+**The packing works -- the test drops 10%, exactly as the load-count theory
+predicted -- and it is cancelled every time by the division.** Moving `recip`
+out of the tile costs the division 54 -> 76.5 ms, and giving it back its own
+threadgroup array recovers only a third of that. Standalone TD is 301 ms either
+way, against 301-306 for the struct copy: **a wash.**
+
+In the pipeline it is worse than a wash: `norms + trial division` goes
+**106.9 -> 199.5 ms/q**, on the `RECORD=1` and warp-recording variants the
+standalone path never exercises. Relations stayed at 2,282 and wall did not
+move, but a measured stage doubling is not something to ship on the strength of
+a standalone number that says "no change".
+
+Reverted. The tile keeps the 32-byte struct copy.
+
+**What that leaves.** The load-count theory survives its own prediction -- one
+`uint4` really is ~10% better than one 32-byte struct copy for the test -- but
+the win is smaller than what removing `recip` from the tile costs, and this
+port has no way to have both without a third layout. The honest summary is that
+**the tile layout is now within ~10% of whatever is achievable this way**, and
+the remaining gap is elsewhere. Anyone resuming should profile the RECORD=1
+variant specifically: it is the one the pipeline actually runs, it is the one
+that regressed here, and no measurement in this section has isolated it.
+
 **The remaining 2.75x is still unexplained** and is now the whole of TD's gap.
 
 #### A correction to this section's own earlier reasoning
