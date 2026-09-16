@@ -275,9 +275,11 @@ _rf_new = chr(10).join([
     "        {",
     "            const uint32_t ablocks = std::min<uint32_t>((nprime + 127u) / 128u,",
     "                                                        (uint32_t)prop.multiProcessorCount * 8u);",
-    "            /* One grid-stride covers `wave` primes; cap each launch at",
-    "             * FB_ROOTS_STRIDES_PER_LAUNCH of them so the command buffer stays",
-    "             * short on every device. See metal/gen_fbgen_host.py. */",
+    "            /* One grid-stride covers `wave` primes; cap each SUBMISSION at",
+    "             * FB_ROOTS_STRIDES_PER_LAUNCH of them. The flush is the load-",
+    "             * bearing half: macOS's interactivity watchdog judges a command",
+    "             * buffer, and the stream would otherwise batch every slice into",
+    "             * one. See metal/gen_fbgen_host.py and plan 9z-k. */",
     "            const uint32_t wave = ablocks * 128u;",
     "            const uint64_t step64 = (uint64_t)wave * FB_ROOTS_STRIDES_PER_LAUNCH;",
     "            const uint32_t step = step64 >= nprime ? nprime : (uint32_t)step64;",
@@ -289,6 +291,7 @@ _rf_new = chr(10).join([
     "                    MTL_LAUNCH(k_alg_roots_fixed_mark_6_1, sb, 128, 0, 0, d_primes + off, cnt, r_off, d_counts + off, d_special + off, d_failures, (const gpu_big_t *)mtlGetSymbol(\"c_alg\"), *(const int *)mtlGetSymbol(\"c_alg_deg\"));",
     "                else",
     "                    MTL_LAUNCH(k_alg_roots_fixed_mark_8_1, sb, 128, 0, 0, d_primes + off, cnt, r_off, d_counts + off, d_special + off, d_failures, (const gpu_big_t *)mtlGetSymbol(\"c_alg\"), *(const int *)mtlGetSymbol(\"c_alg_deg\"));",
+    "                MTL_OR_DIE(mtlStreamFlush(0));",
     "            }",
     "        }"])
 assert _rf_old in s, 'root-finder launch shape changed'
@@ -298,12 +301,16 @@ _k_old = "#define GPU_FB_MAX_ROOTS (BENCH_MAX_DEGREE + 1)"
 _k_new = chr(10).join([
     "#define GPU_FB_MAX_ROOTS (BENCH_MAX_DEGREE + 1)",
     "",
-    "/* Grid-strides per root-finder launch. 32 puts this M3's ~790 ms launch at",
-    " * ~250 ms, leaving room for a device that is slower per stride. Raise it",
-    " * only with a measurement; the failure mode for too-large is a workunit",
-    " * killed by macOS for impacting interactivity, not a slow one. */",
+    "/* Grid-strides per root-finder SUBMISSION -- each slice is flushed, so this",
+    " * bounds a command buffer rather than a dispatch, which is the unit macOS's",
+    " * interactivity watchdog actually judges. Measured on this 10-core M3: the",
+    " * unsliced segment is a 790 ms command buffer; at 16 it is ~100 ms, leaving",
+    " * ~7x for a device slower per stride (an M1 has 7-8 cores). Raise it only",
+    " * with a measurement of GPUEndTime - GPUStartTime, NOT of dispatch time --",
+    " * measuring the dispatch is how 9z-j came to report a fix that changed",
+    " * nothing. Too large is a workunit killed by macOS, not a slow one. */",
     "#ifndef FB_ROOTS_STRIDES_PER_LAUNCH",
-    "#define FB_ROOTS_STRIDES_PER_LAUNCH 32u",
+    "#define FB_ROOTS_STRIDES_PER_LAUNCH 16u",
     "#endif"])
 assert _k_old in s, 'GPU_FB_MAX_ROOTS define not found'
 s = s.replace(_k_old, _k_new, 1)

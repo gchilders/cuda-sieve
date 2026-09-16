@@ -1056,6 +1056,16 @@ static void cf_run_rounds(const mz<L> *d_n, mz<L> lim2, uint32_t lpb, uint32_t n
                 mtlEventRecord(g_cof_peak->b);
                 g_cof_peak->armed = 0; g_cof_peak->fired = 1;
             }
+            /* ONE cofactor launch per command buffer. The chunker bounds a
+             * LAUNCH at COF_CHUNK_TARGET_MS, but macOS's interactivity
+             * watchdog judges a COMMAND BUFFER, and the stream batches
+             * every round's launch into one: measured here, 50 rounds of a
+             * 244 ms launch became a single 3,180 ms submission, 4x the
+             * bound the chunker thought it was holding. The _peak bracket
+             * above hid it -- an event record commits, so the one launch
+             * being MEASURED was the one launch not batched. See 9z-k.
+             */
+            mtlStreamFlush(0);   /* cannot fail; sync() reports the work */
         }
     }
 }

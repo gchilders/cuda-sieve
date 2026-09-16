@@ -369,7 +369,17 @@ _lines.insert(_j[0] + 2,
     "            if (_peak) {" + chr(10) +
     "                mtlEventRecord(g_cof_peak->b);" + chr(10) +
     "                g_cof_peak->armed = 0; g_cof_peak->fired = 1;" + chr(10) +
-    "            }")
+    "            }" + chr(10) +
+    "            /* ONE cofactor launch per command buffer. The chunker bounds a" + chr(10) +
+    "             * LAUNCH at COF_CHUNK_TARGET_MS, but macOS's interactivity" + chr(10) +
+    "             * watchdog judges a COMMAND BUFFER, and the stream batches" + chr(10) +
+    "             * every round's launch into one: measured here, 50 rounds of a" + chr(10) +
+    "             * 244 ms launch became a single 3,180 ms submission, 4x the" + chr(10) +
+    "             * bound the chunker thought it was holding. The _peak bracket" + chr(10) +
+    "             * above hid it -- an event record commits, so the one launch" + chr(10) +
+    "             * being MEASURED was the one launch not batched. See 9z-k." + chr(10) +
+    "             */" + chr(10) +
+    "            mtlStreamFlush(0);   /* cannot fail; sync() reports the work */")
 src = chr(10).join(_lines)
 print('  per-launch bracket added to cf_run_rounds')
 
