@@ -512,9 +512,19 @@ call site cannot do one and forget the other.
   went **106.9 -> 199.5 ms/q** on the RECORD=1 and warp variants the standalone
   path never runs. Reverted.
 
-  **Next person: profile the RECORD=1 variant specifically.** It is what the
-  pipeline runs, it is what regressed, and nothing here has isolated it — every
-  measurement in 8q used the standalone `--td` path.
+  **PROFILED: RECORD=1 is 2.7% of the stage, and the pipeline's hot pass is
+  RECORD=0.** An earlier note here claimed the opposite; it was wrong.
+  `pipe_td_perq` launches `k_td_1_0_0_*` — the same variant the standalone
+  `--td` runs. RECORD=1 appears only in `pipe_td_verify` (first q, skippable)
+  and the 4.98 ms/q recording pass. Its scattered `fac[t*TD_FMAX+nf]` writes
+  are not worth chasing. `SLABBED` is real but small: **105.7 ms/q slabbed vs
+  94.1 unslabbed, ~12%** (and unslabbed costs 1358 ms/q of wall vs 981, so it
+  is not an option).
+
+  **Device breakdown, --nq 24 (ms/q):** norms+TD 105.3 (57.5%), **resieve +
+  scatter 48.8 (26.7%)**, classify 18.3 (10.0%), record 5.0 (2.7%). **Nothing
+  in this port has ever measured resieve+scatter** — it is the second-largest
+  piece of the TD stage and unexamined.
 
   **The remaining 2.75x is unexplained** and is the whole of TD's gap.
 
