@@ -1217,7 +1217,8 @@ static inline void k_td_record_warp_body(
                     const uint32_t e = c + lane;
                     bool hit = false;
                     if (e < cnt) {
-                        const uint32_t m = tile[e].m, g = tile[e].g;
+                        const tdsmall_t te = tile[e];
+                        const uint32_t m = te.m, g = te.g;
                         uint32_t jp = jlocal;
                         hit = true;
                         if (g > 1) {
@@ -1225,7 +1226,7 @@ static inline void k_td_record_warp_body(
                             else jp = jglobal / g;
                         }
                         if (hit && tile[e].magic) {
-                            const uint32_t w = tile[e].rt * jp + hi;
+                            const uint32_t w = te.rt * jp + hi;
                             if (td_mod_magic(w, m, tile[e].magic, tile[e].sh)
                                 != tile[e].cst) hit = false;
                         }
