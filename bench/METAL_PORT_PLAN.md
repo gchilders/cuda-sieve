@@ -1226,7 +1226,10 @@ watchdog; slab sizing for a 16 GB UMA carveout shared with the OS.
 correctness vehicle.
 
 ### Phase 9 — Packaging
-`Makefile.metal`, metallib embedding, arm64 BOINC.
+`Makefile.metal`, metallib embedding, arm64 BOINC. **All three done: 9a the
+BOINC library, 9b the `HAVE_BOINC` wiring, 9c what the log actually says, 9d
+embedding.** What is left is a real BOINC client -- no `init_data.xml` has
+ever been in front of this binary.
 
 ### 9a. The BOINC library builds on arm64 -- with three flags the instruction did not name
 
@@ -1555,6 +1558,98 @@ generator does not create and cannot delete -- rather than off the chunker
 block it adds. 9c's bug was exactly an anchor pointing at a line the generator
 had introduced and later removed. **Anchor on the upstream source, never on
 this generator's own output.**
+### 9d. Metallib embedding: the application is one file
+
+`bench` carried its shaders in a separate `bench.metallib` that had to sit
+beside it, be found by `$CUDA_SIEVE_METALLIB`, or be passed by path. For a
+BOINC project that is a second file to ship, land in the slot, and keep in
+step with the executable -- missing, stale and mismatched are three failure
+modes that stop existing once the shaders are inside.
+
+**The mechanism is one linker flag and one lookup.** `ld` writes the library
+into a Mach-O section:
+
+```
+-sectcreate __DATA __metallib $(BUILD)/bench.metallib
+```
+
+and `metal_rt` reads it back with `getsectiondata(&_mh_execute_header,
+"__DATA", "__metallib", &n)`, wrapping the bytes in a `dispatch_data_t` with
+an **empty destructor block** -- they are in our own `__DATA` and live as long
+as the process, so there is nothing to free and
+`DISPATCH_DATA_DESTRUCTOR_DEFAULT` would copy the whole megabyte. No generated
+byte array, no extra compile step.
+
+**Four places, and the order is deliberate:**
+
+| | source | why here |
+|---|---|---|
+| 1 | the explicit `mtlInit` path | a caller that names a library means it |
+| 2 | `$CUDA_SIEVE_METALLIB` | **every gate in this Makefile drives the library it just built through this** |
+| 3 | **embedded `__DATA,__metallib`** | a binary carrying its own shaders should trust itself |
+| 4 | `bench.metallib` beside the executable | the old behaviour, unchanged |
+
+3 before 4 because a stale `bench.metallib` in the working directory is
+exactly what a BOINC slot accumulates, and the copy inside the binary is the
+one that matches it by construction.
+
+**Cost:** 718 KB -> **1,726,104 bytes**, the metallib being 987,730 of them.
+`EMBED_METALLIB=0` opts out and is what the gate's control uses.
+
+#### The gate: `make -f Makefile.metal metallibcheck`
+
+**Control first, in its own build.** It builds with `EMBED_METALLIB=0`,
+asserts the section is absent, and asserts the binary **fails**:
+
+```
+PASS   control: no __metallib section, as intended
+PASS   control fails with no library to find (exit 1)
+       metal_rt: cannot load shader library '/…/tmp.o51ok885qJ/bench.metallib':
+       Error Domain=MTLLibraryErrorDomain Code=6 "library not found"
+```
+
+Then the real case:
+
+```
+PASS   __DATA,__metallib present (987730 bytes)
+PASS   sieved from the embedded library alone: 37 relations at the parity q
+```
+
+**Both runs happen in a temporary directory with no `bench.metallib` in it and
+with `CUDA_SIEVE_METALLIB` unset (`env -u`).** That negative space is the
+whole check: every other gate here *exports* that variable, so **not one of
+them would notice embedding being broken**. `boinclinkcheck` now asserts the
+section too -- a distributable binary that needs a file beside it is not
+distributable.
+
+**End to end, and this is what the phase was for.** One 1.7 MB file alone in a
+directory, `HAVE_BOINC=1`, no environment variable:
+
+```
+$ ls -l
+-rwxr-xr-x  1 gchilders  wheel  1726104  bench
+$ env -u CUDA_SIEVE_METALLIB ./bench --pipeline …
+exit 0    total relations 37
+```
+
+with the same six-line `stderr.txt` from 9c.
+
+**One `-A2` that should have been `-A4`.** `otool -l` prints `sectname`,
+`segname`, `addr`, *then* `size`, so the gate's size probe found nothing and
+reported "nothing was embedded" about a binary that had, on the very next
+line, sieved 37 relations out of its own embedded library. **The two checks
+disagreeing is what caught it** -- a gate with only the section probe would
+have failed a working build, and one with only the run would have passed a
+binary whose section was some other size than intended.
+
+**Not embedded: `fbgen_gpu`.** It is a development and project-side tool, not
+the distributed application, and it takes `$CUDA_SIEVE_METALLIB` from the
+gates exactly as before.
+
+Gates after the `metal_rt.mm` change -- it is linked by all of them:
+`rtcheck`, `scancheck`, `fbcheck`, `sievecheck`, `argbufcheck`,
+`classifycheck`, `cofaccheck`, `cofcheck.sh` 54 PASS / 0 FAIL,
+`boinccheck`, `boinclinkcheck` 8/8, `metallibcheck` with its control.
 ---
 
 ## 10. Open questions for the CUDA side
