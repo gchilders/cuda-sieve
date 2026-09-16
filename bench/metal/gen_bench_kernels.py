@@ -110,10 +110,41 @@ def split_top(s):
         else: cur += ch
     out.append(cur); return out
 
-def bufparam(p, i):
+# ---- optional buffer arguments ------------------------------------------
+# Buffer indices the HOST sometimes passes nullptr for. Metal has no "unbound
+# argument": setBuffer:nil is an UNSET argument and the validation layer
+# refuses to dispatch (plan 9z-c). So these are declared under an MSL function
+# constant instead -- when the constant is false the argument does not exist
+# and Metal asks for nothing.
+#
+# metal_rt sets ONE constant, a uint bitmask at index 0, bit i meaning
+# "argument i is bound"; the per-argument booleans are derived from it below.
+#
+# The list is the union over every launch site, taken from the audit in plan
+# 9z-c. An index missing here that is passed nullptr somewhere shows up as a
+# validation abort naming the kernel and the index, which is how these were
+# found in the first place.
+OPTIONAL_BUFFERS = {
+    'k_apply':             [11, 13, 24, 25],
+    'k_fill_atomic':       [10, 11],
+    'k_transform':         [12],
+    'k_resieve_scatter':   [2, 14],
+    'k_intersect_compact': [9, 10, 11, 16],
+}
+
+MASK_DECL = """/* Optional buffer arguments: see metal/gen_bench_kernels.py.
+ * metal_rt supplies bit i = "kernel argument i is bound". */
+constant uint mtl_bound_mask [[function_constant(0)]];
+"""
+
+def bound_name(i):
+    return 'mtl_bound_%d' % i
+
+def bufparam(p, i, opt=()):
     p = p.strip()
-    if '*' in p: return 'device %s [[buffer(%d)]]' % (p, i)
-    return 'constant %s [[buffer(%d)]]' % (re.sub(r'(\w+)$', r'&\1', p), i)
+    fc = (', function_constant(%s)' % bound_name(i)) if i in opt else ''
+    if '*' in p: return 'device %s [[buffer(%d)%s]]' % (p, i, fc)
+    return 'constant %s [[buffer(%d)%s]]' % (re.sub(r'(\w+)$', r'&\1', p), i, fc)
 
 def plainparam(p):
     p = p.strip()
@@ -204,13 +235,24 @@ for name, (tparams, insts, dynsmem) in K.items():
                    ',\n    '.join([plainparam(p) for p in params] + smem_plain
                                     + tg_params + IDS_PLAIN)))
         wrappers = []
+        opt = set(OPTIONAL_BUFFERS.get(name, ()))
         args = [argname(p) for p in params] + smem_args + tg_args + IDS_ARGS
-        kps = [bufparam(p, k) for k, p in enumerate(params)] + smem_param + IDS
+        kps = [bufparam(p, k, opt) for k, p in enumerate(params)] + smem_param + IDS
         decls = ('\n'.join(tg_decl_lines) + '\n') if tg_decl_lines else ''
+        # A function-constant argument may be NAMED only where it exists, so
+        # the forward goes through a local that is null when it does not. The
+        # _body template is untouched: it still receives a possibly-null
+        # pointer and still tests it.
+        optdecl = ''
+        for k in sorted(opt):
+            pk = params[k].strip(); an = argname(pk)
+            optdecl += ('    device %s = nullptr;\n' % re.sub(r'(\w+)\s*$', an + '_opt', pk))
+            optdecl += ('    if (%s) %s_opt = %s;\n' % (bound_name(k), an, an))
+            args[k] = an + '_opt'
         for inst in insts:
-            wrappers.append('kernel void %s_%s(\n    %s)\n{\n%s    %s_body<%s>(%s);\n}\n'
-                            % (name, suffix_of(inst), ',\n    '.join(kps), decls, name,
-                               ', '.join(inst), ', '.join(args)))
+            wrappers.append('kernel void %s_%s(\n    %s)\n{\n%s%s    %s_body<%s>(%s);\n}\n'
+                            % (name, suffix_of(inst), ',\n    '.join(kps), decls, optdecl,
+                               name, ', '.join(inst), ', '.join(args)))
         newtext = head + inner + '}\n\n' + '\n'.join(wrappers)
     body = body[:m.start()] + newtext + body[end:]
 
@@ -281,7 +323,13 @@ body, nq = head_re.subn(lambda m: m.group(1) + qual(m.group(3), m.group(2)) + m.
 # consistent rather than atomic as a unit. Nothing computes from them.
 COUNTERS64 = ['nlost', 'nprobe', 'npass1', 'nread', 'npre', 'nqb']
 for c in COUNTERS64:
-    body = re.sub(r'device ulong \*( ?)' + c + r'\b', r'device uint32_t *\1' + c, body)
+    # ...and the `_opt` local the optional-buffer wrappers forward through,
+    # which the bare \b would not match because `_` is a word character. A
+    # local declared `device ulong *` while the body expects uint32_t is a
+    # compile error, which is how this was found.
+    body = re.sub(r'device ulong \*( ?)' + c + r'(_opt)?\b',
+                  lambda m, c=c: 'device uint32_t *' + m.group(1) + c + (m.group(2) or ''),
+                  body)
     body = re.sub(r'\batomicAdd\(\s*' + c + r'\s*,', 'atomicAdd64(' + c + ',', body)
 
 # ---- k_apply's slice-log table: keep it in device memory -----------------
@@ -365,6 +413,16 @@ if OLD_FP64 not in body:
     raise SystemExit('fp64 fallback block not found -- did bench_kernels.cu change?')
 body = body.replace(OLD_FP64, NEW_FP64)
 print('fp64 fallback rewritten onto softfp64')
+
+# The function-constant declarations every optional argument derives from.
+# One uint from the host, booleans derived here, so a kernel never needs the
+# host to know which constant indices it declares -- which matters because
+# Metal REJECTS a constant value for an index a function does not declare.
+_idx = sorted({i for v in OPTIONAL_BUFFERS.values() for i in v})
+_decl = MASK_DECL + ''.join(
+    'constant bool %s = (mtl_bound_mask & (1u << %d)) != 0;\n' % (bound_name(i), i)
+    for i in _idx) + '\n'
+body = _decl + body
 
 open(OUT, 'w').write(body + '\n')
 print('wrote %s (%d lines, %d heads qualified)' % (OUT, body.count('\n'), nq))
