@@ -276,8 +276,8 @@ static void usage(void)
 "\n"
 "RUNTIME\n"
 #ifdef HAVE_BOINC
-"  --device N       select CUDA device N, used only when the BOINC client did\n"
-"                   not assign one; its assignment wins  [CUDA's default]\n"
+"  --device N       select Metal device N, used only when the BOINC client did\n"
+"                   not assign one; its assignment wins  [the system default]\n"
 #else
 "  --device N       select Metal device N  [the system default device]\n"
 #endif
@@ -1786,13 +1786,13 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         else if (cuda_device < 0) {
             /* Distinguishes "the client assigned device 0" from "the client
              * assigned nothing", which is what tells a project whether its app
-             * version's plan class actually declares an NVIDIA coprocessor.
+             * version's plan class actually declares a GPU coprocessor at all.
              * Without that declaration the client sets neither this field nor
              * --device, and every task on the host lands on the same card no
              * matter what the application does. */
             fprintf(stderr,
                     "BOINC: no usable GPU assignment in init_data.xml; using"
-                    " CUDA's default device\n");
+                    " the system default Metal device\n");
         }
 #endif
     }
@@ -1923,7 +1923,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         /* The one line that answers "did this task actually run on the card the
          * client gave it?". The grid: line below carries the same ordinal, but
          * on stdout, which the client discards with the slot directory. */
-        fprintf(stderr, "BOINC: running on CUDA device %d of %d: %s\n",
+        fprintf(stderr, "BOINC: running on Metal device %d of %d: %s\n",
                 dev, ndev, prop.name);
 #endif
         {
