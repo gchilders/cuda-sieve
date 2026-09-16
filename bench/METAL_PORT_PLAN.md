@@ -2315,6 +2315,84 @@ slow run started straight after the full gate suite; this is a fanless
 MacBook Air and CLAUDE.md's warning about sustained load is not theoretical.
 A number from this box taken right after a long GPU burn is not a measurement.
 
+### 9z-h. The launch bound at a FULL flush -- the regime every earlier measurement missed
+
+8h and 8i both sampled **single-q runs of ~1,852 records**, where a
+131,072-thread grid is so oversubscribed that the launch is chain-bound and
+the chunk does nothing. That produced two conclusions this section has to
+retract for the full-flush case:
+
+- 8h: "halving the records in a launch leaves the launch's cost unchanged
+  (1508 -> 1540 ms)";
+- 8i/8j: "`--cof-chunk` auto ... costs 25% of the cofactor stage".
+
+**At a real 130k-record flush the launch is RECORD-bound and very nearly
+linear in the chunk.** Measured twice, back to back:
+
+| chunk | launch (ms) | us/record |
+|---|---|---|
+| 15,360 | 242.5 | 15.8 |
+| 30,720 | 483.4 | 15.7 |
+| 61,440 | 975.8 | 15.9 |
+| 131,072 | 1713.2 | 13.1 |
+
+So the 750 ms bound **is** controllable at a full flush -- on this M3 it is not
+even binding, because the opening chunk of 15,360 measures ~240 ms.
+
+**Linearity holds only in the large-chunk regime.** Pushed down with a
+deliberately tight bound, the response flattens and then reverses: 1,996
+records -> 94.0 ms, 1,792 -> 139.9 ms. That is the chain reasserting itself,
+and it is exactly what the no-progress guard exists for -- it fired, restored
+1,996 and parked. The guard is untouched.
+
+#### Proportional steering replaces halve/double
+
+Against a linear response, halving is the wrong step size: it takes one flush
+per factor of two, and each of those flushes runs ~67 special-q at a chunk
+already known to be wrong. A proportional step aims straight at 0.8x the
+bound. Measured, from a 6x overshoot:
+
+```
+flush 1: 15,360 records -> 246.2 ms      (over)
+         -> 1,996 records               ONE step
+flush 2:  1,996 records ->  94.0 ms
+```
+
+Halving would have needed **three** flushes (7,680 / 3,840 / 1,920) to reach
+the same place. At the 150 ms bound it converged in one step and then held:
+137.6, 145.3, 140.7, 136.0 ms over four flushes.
+
+**`COF_CHUNK_TARGET_MS` is now `#ifndef`-guarded**, which is how the controller
+was exercised at 150 and 40 ms without faking hardware.
+
+#### What this does NOT establish, and one correction to my own reasoning
+
+**The throughput cost of meeting the bound is not established.** A sweep of
+wall/q against chunk came back **non-monotone** -- 825, 1501, 1658, 1208, 916
+ms/q at 15,360 / 30,720 / 47,000 / 61,440 / 131,072 -- a 2x spread with no
+ordering. Run-to-run variance on this fanless box is larger than the effect.
+Relations were 6,724 in every run, so nothing is *wrong*; the timing simply
+cannot be read.
+
+**And the field oscillation is NOT a control-law artifact.** I assumed it was.
+For a linear response it cannot be: halving lands at >= 0.5x the bound, which
+can never fall below the `target/4` threshold that triggers the doubling
+branch. The M4 Max log's `61440 -> 30720 -> 61440` requires consecutive
+flushes to measure 4802 ms and then under 187 ms -- a **25x swing at 2x fewer
+records**. That is measurement variance on that host, not the controller
+choosing badly, and proportional steering does not fix it. Fixing it would
+need hysteresis or averaging over flushes, and there is no data from that host
+to tune either.
+
+**On this M3 nothing changes**: the opening chunk sits inside the dead band at
+the shipped 750 ms, so the controller never steers at all. The change earns
+its place on larger GPUs -- an M4 Max opens at 61,440, four times this box --
+and at tighter bounds.
+
+**Validated:** `cofcheck.sh` 54 PASS / 0 FAIL, `cofaccheck`,
+`validationcheck`, `boinccheck` green, and the 288-q band **`cmp`-identical**
+at 13,485 relations.
+
 Still open from earlier phases: `--mode twolevel` misplaces records and
 refuses (Phase 8), and nothing has run under a real BOINC client (9e).
 
