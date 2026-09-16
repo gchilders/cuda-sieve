@@ -238,5 +238,76 @@ for _o, _n in [
     s = s.replace(_o, _n, 1)
 print('  fbgen device messages name Metal')
 
+# ---- bound the root finder's launch duration -----------------------------
+# macOS kills a command buffer that hogs the GPU against the UI. A field task
+# on an M1 died with
+#
+#   command buffer failed: internal (code 1): Impacting Interactivity
+#   (0000000e:kIOGPUCommandBufferCallbackErrorImpactingInteractivity)
+#
+# and the reason is the grid: ablocks is min((n+127)/128, cores*8), so the
+# SMALLER the GPU the MORE primes each thread must loop over. Measured on a
+# 10-core M3, 80 blocks: ~790 ms per launch, ~105 primes per thread -- already
+# past this build's own 750 ms interactivity policy, which until now applied
+# only to the cofactoriser. An M1 gets 56-64 blocks and a slower core, so the
+# same launch runs into the seconds. That is the whole family correlation:
+# M1/M2 fail, M3/M4 Max do not, and an idle machine survives where a machine
+# in use does not.
+#
+# Sliced by ITERATIONS PER THREAD rather than by a fixed prime count, so the
+# bound is machine-independent in the right way: every device does K
+# grid-strides per launch and only the per-stride cost varies.
+#
+# No kernel change. The slices are taken with pointer arithmetic on the
+# allocation registry -- an interior pointer resolves to (buffer, offset) at
+# bind time, which is exactly what the registry is for -- so the device side
+# is untouched and fbgen_gpu.cu stays as it is.
+_rf_old = chr(10).join([
+    "        {",
+    "            const uint32_t ablocks = std::min<uint32_t>((nprime + 127u) / 128u,",
+    "                                                        (uint32_t)prop.multiProcessorCount * 8u);",
+    "            if (P->deg <= 6)",
+    "                MTL_LAUNCH(k_alg_roots_fixed_mark_6_1, ablocks, 128, 0, 0, d_primes, nprime, d_rootbuf, d_counts, d_special, d_failures, (const gpu_big_t *)mtlGetSymbol(\"c_alg\"), *(const int *)mtlGetSymbol(\"c_alg_deg\"));",
+    "            else",
+    "                MTL_LAUNCH(k_alg_roots_fixed_mark_8_1, ablocks, 128, 0, 0, d_primes, nprime, d_rootbuf, d_counts, d_special, d_failures, (const gpu_big_t *)mtlGetSymbol(\"c_alg\"), *(const int *)mtlGetSymbol(\"c_alg_deg\"));",
+    "        }"])
+_rf_new = chr(10).join([
+    "        {",
+    "            const uint32_t ablocks = std::min<uint32_t>((nprime + 127u) / 128u,",
+    "                                                        (uint32_t)prop.multiProcessorCount * 8u);",
+    "            /* One grid-stride covers `wave` primes; cap each launch at",
+    "             * FB_ROOTS_STRIDES_PER_LAUNCH of them so the command buffer stays",
+    "             * short on every device. See metal/gen_fbgen_host.py. */",
+    "            const uint32_t wave = ablocks * 128u;",
+    "            const uint64_t step64 = (uint64_t)wave * FB_ROOTS_STRIDES_PER_LAUNCH;",
+    "            const uint32_t step = step64 >= nprime ? nprime : (uint32_t)step64;",
+    "            for (uint32_t off = 0; off < nprime; off += step) {",
+    "                const uint32_t cnt = (nprime - off) < step ? (nprime - off) : step;",
+    "                const uint32_t sb = std::min<uint32_t>((cnt + 127u) / 128u, ablocks);",
+    "                uint32_t *r_off = d_rootbuf + (size_t)off * GPU_FB_MAX_ROOTS;",
+    "                if (P->deg <= 6)",
+    "                    MTL_LAUNCH(k_alg_roots_fixed_mark_6_1, sb, 128, 0, 0, d_primes + off, cnt, r_off, d_counts + off, d_special + off, d_failures, (const gpu_big_t *)mtlGetSymbol(\"c_alg\"), *(const int *)mtlGetSymbol(\"c_alg_deg\"));",
+    "                else",
+    "                    MTL_LAUNCH(k_alg_roots_fixed_mark_8_1, sb, 128, 0, 0, d_primes + off, cnt, r_off, d_counts + off, d_special + off, d_failures, (const gpu_big_t *)mtlGetSymbol(\"c_alg\"), *(const int *)mtlGetSymbol(\"c_alg_deg\"));",
+    "            }",
+    "        }"])
+assert _rf_old in s, 'root-finder launch shape changed'
+s = s.replace(_rf_old, _rf_new, 1)
+
+_k_old = "#define GPU_FB_MAX_ROOTS (BENCH_MAX_DEGREE + 1)"
+_k_new = chr(10).join([
+    "#define GPU_FB_MAX_ROOTS (BENCH_MAX_DEGREE + 1)",
+    "",
+    "/* Grid-strides per root-finder launch. 32 puts this M3's ~790 ms launch at",
+    " * ~250 ms, leaving room for a device that is slower per stride. Raise it",
+    " * only with a measurement; the failure mode for too-large is a workunit",
+    " * killed by macOS for impacting interactivity, not a slow one. */",
+    "#ifndef FB_ROOTS_STRIDES_PER_LAUNCH",
+    "#define FB_ROOTS_STRIDES_PER_LAUNCH 32u",
+    "#endif"])
+assert _k_old in s, 'GPU_FB_MAX_ROOTS define not found'
+s = s.replace(_k_old, _k_new, 1)
+print('  root finder sliced to bound its launch duration')
+
 open(OUT, 'w').write(s)
 print('re-wrote %s with macro dispatch fixed' % OUT)
