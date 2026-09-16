@@ -1813,12 +1813,13 @@ file's existence.
 
 | | sha256 |
 |---|---|
-| `bench` | `1e85fd5e4308d7bde19380e4a42a4bb0a53d069e2d1146ff5895afd7858079eb` |
+| `bench` | `961bdbc30c9882c70b0fe282661ffbeefb4a9ccb2ae6b23ddae59a9f2c58c19d` |
 | `bench.sig` | (re-made; verified with the one-bit-flip control) |
 
-**Re-staged and re-signed 2026-09-16 after 9z's leak fix.** Superseded artifacts, neither of
-which is the one to ship: `25ab6b65…2fdac977` (pre-leak-fix) and
-`9e975aa5…27422cb0` (pre-autorelease-fix). The binary grew
+**Re-staged and re-signed 2026-09-16 after 9z's leak fix.** Superseded artifacts, none of
+which is the one to ship: `25ab6b65…` (pre-leak-fix), `9e975aa5…`
+(pre-autorelease-fix), `52f6280b…` (pre-nil-binding-fix), `2e1a2d5f…`
+(pre-mask-guard), `1e85fd5e…` (pre-9z-h/9z-i). The binary grew
 80 bytes (1,726,104 -> 1,726,184). The signature was re-made from scratch --
 a signature is over content, so the old one does not verify the new binary
 (and the negative control above is exactly that check).
