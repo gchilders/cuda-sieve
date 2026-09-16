@@ -744,10 +744,39 @@ call site cannot do one and forget the other.
   embedded library. **The two checks disagreeing is what caught it.**
   `fbgen_gpu` is deliberately NOT embedded: dev/project-side tool.
 
+  **VALIDATED OVER 288 SPECIAL-Q (plan 9e): the packaged binary's relations are
+  BYTE-IDENTICAL to the stock build's** — 13,485 relations, 564,696 records
+  enqueued (exactly Phase 7's numbers against real CUDA), `cmp` clean,
+  sha256 `8e79762c…`. The packaged binary ran **in a directory containing
+  nothing but itself**, `CUDA_SIEVE_METALLIB` unset. Wall 258 s stock vs 280 s
+  packaged — that ~8% is this fanless box across back-to-back runs, NOT a
+  measurement of packaging overhead.
+
+  **A comparison that agrees can still be measuring almost nothing.** The first
+  pair of runs omitted `--cofactor`, emitted 2,381 relations, and were also
+  byte-identical — and useless, because without the cofactoriser the band only
+  emits relations that need no splitting. The tell was in the output all along:
+  `records enqueued 564696 (of which 2381 needed no splitting)`.
+
+  **SHIPPING: ONE executable file, plus the job data.** `otool -L` lists seven
+  libraries and every one is part of macOS (Metal, Foundation, IOKit,
+  CoreFoundation, libSystem, libc++, libobjc). The tree's one `dlopen` is
+  `libnvidia-ml.so.1` for optional NVML telemetry — impossible on macOS,
+  `runlog_gpu_bind` returns -1, caller carries on. The **job** is separate and
+  always was: `--poly` (462 B) and the factor base (110 MB for c183) are
+  workunit inputs, which is what `bench_boinc_resolve_path` is for.
+
+  Three things a project must know, none a missing file: **arm64 only,
+  non-fat** (an Intel Mac cannot run it — Rosetta goes x86_64→arm64, not the
+  reverse — and the port refuses non-Apple GPUs anyway); **`minos 13.0`**; and
+  **the signature is ad-hoc/linker-signed, not Developer ID — whether BOINC
+  distribution on macOS needs a real signature or notarization is UNTESTED
+  here.**
+
   **NOT established:** still standalone mode, no `init_data.xml`, so slot
   filename resolution, a real GPU assignment and checkpointing are
-  unexercised. **That is now the only Phase 9 item left** — it needs a real
-  BOINC client, not this machine.
+  unexercised. **That is the only Phase 9 item left** — it needs a real BOINC
+  client, not this machine.
 
 **Candidate counts do not compare across sievers; relation sets do.** Our 1,845
 cofactorisation candidates against the oracle's 1,851 is not a defect: the 7
