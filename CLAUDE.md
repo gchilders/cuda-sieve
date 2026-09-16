@@ -467,7 +467,25 @@ call site cannot do one and forget the other.
   this GPU** (probe: 401.54 ms vs 84.12 for the same loop). `bn_divmod_u32_pre`
   runs a `mulhi(ulong,ulong)` plus a 64-bit multiply PER LIMB, and Apple's
   32-bit ALUs emulate both, against a card where `__umul64hi` is an
-  instruction. **The fix, not attempted:** `d` is uint32 and `rem < d`, so
+  instruction.
+
+  **THE 32-BIT DIVISION WAS TRIED AND IS 2x SLOWER (plan 8q).** Knuth D in base
+  2^16, exact — verified against `(2^64-1)/d` for **every d in [2, 2^27]**
+  (134,217,727 values, the whole range a factor-base prime can occupy) plus 4M
+  random — and **4.46x faster as an isolated primitive** (2,231 ms vs 9,958).
+  In `k_td` it made TD **254.8 ms/q against 128.9**. Inlined twice per call
+  inside two nested loops, its two data-dependent correction loops cost
+  register pressure and SIMD divergence a uniform-input probe cannot see. And
+  the direction settles the diagnosis: **something 4.46x cheaper cannot double
+  a stage it dominates**, so the reciprocal was never the bottleneck. Reverted.
+
+  **Same lesson as 8h in another costume:** there a one-q band made a queued
+  stage look like 59% of wall; here a primitive probe made one operation look
+  like the bottleneck. Both were precise, reproducible, and about the wrong
+  thing. **The next attempt needs a profile of the real kernel, not another
+  plausible primitive.**
+
+  **What remains:** `d` is uint32 and `rem < d`, so
   quotient and remainder both fit in 32 bits — only `cur` is 64-bit. The
   standard 2-word-by-1-word division needs only 32x32→64 products, would live
   in `bigint_msl.h` (Metal-only, no CUDA change), and the gates to verify it
