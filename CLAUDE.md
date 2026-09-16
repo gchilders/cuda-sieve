@@ -788,10 +788,12 @@ call site cannot do one and forget the other.
   here.**
 
   **SIGNED AND STAGED (plan 9f).** `~/code/dist/` holds `bench` (sha256
-  `52f6280b…`) and `bench.sig` (256 hex chars, a 1024-bit RSA signature).
-  **Re-staged and re-signed 2026-09-16 after 9z and 9z-b** — the superseded
-  `25ab6b65…` (pre-leak-fix) and `9e975aa5…` (pre-autorelease-fix) are NOT the
-  artifacts to ship. Revalidated over the full 288 q
+  `961bdbc3…`) and `bench.sig` (256 hex chars, a 1024-bit RSA signature).
+  **Re-staged and re-signed 2026-09-16 after 9z-i.** Superseded, none to be
+  shipped: `25ab6b65…` (pre-leak-fix), `9e975aa5…` (pre-autorelease-fix),
+  `52f6280b…` (pre-nil-binding-fix), `2e1a2d5f…` (pre-mask-guard),
+  `1e85fd5e…` (pre-9z-h/9z-i). **The binary in the field is older than all of
+  them** — its stderr still says "this is a CUDA application". Revalidated over the full 288 q
   from a one-file directory: **13,485 relations, `cmp` clean, sha256
   `8e79762c…` unchanged**, and free memory ends at **10.84 GB against 8.13
   before** (2.71 GB recovered). A signature is over content, so re-signing was
