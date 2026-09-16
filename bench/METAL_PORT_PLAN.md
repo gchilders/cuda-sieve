@@ -1794,20 +1794,31 @@ two-line change, or a key with Unix line endings.
 the same key in LF and CRLF form both verify and produce an **identical**
 signature, which is what "same key, different line endings" should mean.
 
-#### What is NOT established
-
-`bench.sig` **has not been cryptographically verified**, because verification
-needs `code_sign_public` and there is no such file on this machine. What is
-checked: `crypt_prog` exited 0, re-signing is byte-identical (deterministic
-PKCS#1 v1.5), and the output has the same shape -- 262 bytes, 256 hex chars,
-`.` terminator -- as a signature that *did* verify in the self-test. To close
-this properly, run
+#### Verified against the project's public key, with a negative control
 
 ```
-crypt_prog -verify bench bench.sig <project>/keys/code_sign_public
+$ crypt_prog -verify bench bench.sig code_sign_public
+signature is valid                                   exit 0
 ```
 
-with the project's public key, which normally lives on the server.
+**And the control fails.** One bit flipped at byte 863,052 of a copy
+(`0x0f -> 0x0e`), same signature:
+
+```
+signature is invalid                                 exit 1
+```
+
+so the verification is answering about *these* bytes and not merely about the
+file's existence.
+
+| | sha256 |
+|---|---|
+| `bench` | `25ab6b6550d44b0f11a5ee60a79cb5dea76e5a6c64a729ab1456bc8d2fdac977` |
+| `bench.sig` | `77204967131da29a6abb7ef7bfcc25832f93c8498209424e84993ac1bcb24622` |
+
+The public key is the project's 1024-bit `code_sign_public` and is not secret;
+it was supplied for this check and is not stored in the repository. Re-signing
+is also byte-identical (deterministic PKCS#1 v1.5).
 
 **The key was never read or copied.** It appears exactly once, as an argv to
 `crypt_prog`, and nothing in `~/code/dist` refers to it.

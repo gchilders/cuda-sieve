@@ -806,13 +806,13 @@ call site cannot do one and forget the other.
   `/tmp/crypt.cpp.orig`. After the patch the same key in LF and CRLF form
   produce an identical signature.
 
-  **`bench.sig` is NOT cryptographically verified** — that needs
-  `code_sign_public`, which is not on this machine. Only checked: exit 0,
-  re-signing is byte-identical, and the shape matches a self-test signature
-  that did verify. Close it with `crypt_prog -verify bench bench.sig
-  <project>/keys/code_sign_public`. **The key was never read or copied** — it
-  appears once, as an argv. This is BOINC's file signature, **not** a macOS
-  Gatekeeper signature, which remains untested.
+  **`bench.sig` VERIFIES against the project's public key** — `crypt_prog
+  -verify` says `signature is valid`, exit 0 — **and the control fails**: one
+  bit flipped at byte 863,052 of a copy gives `signature is invalid`, exit 1.
+  `sha256(bench) = 25ab6b65…2fdac977`, `sha256(bench.sig) = 77204967…bcb24622`.
+  **The private key was never read or copied** — it appears once, as an argv.
+  This is BOINC's file signature, **not** a macOS Gatekeeper signature, which
+  remains untested.
 
   **NOT established:** still standalone mode, no `init_data.xml`, so slot
   filename resolution, a real GPU assignment and checkpointing are
