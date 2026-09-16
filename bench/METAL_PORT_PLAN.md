@@ -2664,9 +2664,47 @@ Reverted. The tile keeps the 32-byte struct copy.
 the win is smaller than what removing `recip` from the tile costs, and this
 port has no way to have both without a third layout. The honest summary is that
 **the tile layout is now within ~10% of whatever is achievable this way**, and
-the remaining gap is elsewhere. Anyone resuming should profile the RECORD=1
-variant specifically: it is the one the pipeline actually runs, it is the one
-that regressed here, and no measurement in this section has isolated it.
+the remaining gap is elsewhere. ~~Anyone resuming should profile the RECORD=1 variant specifically.~~
+**That handoff note was wrong -- see below.**
+
+#### Profiling RECORD=1: the pipeline does not run it
+
+The note above said the pipeline's hot TD pass is `RECORD=1` and that the
+standalone `--td` path measures something else. **It is the other way round.**
+`pipe_td_perq` -- the per-q, per-side loop the "norms + trial division" timer
+brackets -- launches `k_td_1_0_0_*`: **`RECORD=0`, the same variant the
+standalone runs.** `RECORD=1` appears only in `pipe_td_verify`, which runs on
+the first q of a band and is skipped by `--no-td-verify`, and in the small
+recording pass.
+
+Measured, `--nq 24`, Metal, device time per q:
+
+| TD + classify sub-stage | ms/q | share |
+|---|---|---|
+| rank scan | 2.411 | 1.3% |
+| emit (x,a,b) | 2.963 | 1.6% |
+| survivor filter | 0.121 | 0.1% |
+| resieve + scatter | 48.840 | 26.7% |
+| **norms + trial division** -- `k_td_1_0_0_*`, **RECORD=0** | **105.250** | **57.5%** |
+| classify | 18.287 | 10.0% |
+| joint accept + compact | 0.280 | 0.2% |
+| **record candidate factorisations** -- **RECORD=1** | **4.980** | **2.7%** |
+
+**`RECORD=1` is 2.7% of the stage.** It could be free and TD would barely move.
+The scattered `fac[t * TD_FMAX + nf]` writes it performs -- 256 bytes of stride
+per thread, the thing that made it a plausible suspect -- are not worth chasing.
+
+`SLABBED` was the other candidate, since the pipeline runs `SLABBED=1` and the
+standalone `SLABBED=0`. Measured at the same geometry: **105.7 ms/q slabbed
+against 94.1 unslabbed, about 12%** -- real, but nothing like the 2x the packed
+layout regressed by. (Unslabbed also costs 1358 ms/q of wall against 981, which
+is 8c all over again, so it is not an option regardless.)
+
+**So the packed layout's pipeline regression remains unexplained**, and it is
+neither of the two things this section proposed. What the profile does settle is
+where the remaining time actually is: `norms + trial division` at 57.5% and
+**`resieve + scatter` at 26.7%**, which no measurement in this port has ever
+looked at.
 
 **The remaining 2.75x is still unexplained** and is now the whole of TD's gap.
 
