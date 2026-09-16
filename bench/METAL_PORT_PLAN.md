@@ -1692,9 +1692,39 @@ part of macOS**: Metal, Foundation, IOKit and CoreFoundation from
 `runlog_gpu_bind` returns -1, and the caller carries on without it. So the
 **application** is one file.
 
-The **job** is not, and never was: `--poly` (462 B) and the factor base
-(110 MB for c183) are workunit inputs, downloaded per task into the slot,
-which is what `bench_boinc_resolve_path` is for.
+The **job** is not -- but it is much smaller than it looks. `--poly` is 462 B,
+and **the 110 MB factor base does not have to be shipped at all**: with no
+`--fb1`/`--cadofb`, pipeline mode generates the complete algebraic factor base
+on the GPU at startup.
+
+**Verified over the same 288 q, against the same reference.** A directory
+containing nothing but the 1.7 MB executable, run with only `--poly`:
+
+```
+bench: no --fb1 supplied; generating algebraic factor base on GPU through 134200000
+afb_build_gpu: 7605616 ideals through 134200000 (207 prime-power);
+               7605407 ordinary GPU roots, 38 exact primes; 6.502 s wall
+```
+
+| | relations | sha256 |
+|---|---|---|
+| `--cadofb c183.fb1` (110 MB on disk) | 13,485 | `8e79762c…dafbc002` |
+| **no factor base anywhere** | **13,485** | **`8e79762c…dafbc002`** |
+
+`cmp` clean. 7,605,616 ideals is the canonical `c183.fb1`'s own entry count,
+and the 6.5 s is once per process.
+
+**The one thing to get right per job is `alim`.** The generator truncates at
+the job's alim (`genlim = min(fbbound, alim)`), and `alim` comes from a GGNFS
+`.job`, from `--alim`, or -- failing both -- from a **compiled-in default of
+134,200,000** (`bench_main_metal.cpp:989`). A CADO `.poly` carries no alim, so
+the run above took that default, which for c183 *is* the production alim. That
+is a coincidence of this job, **not a derivation from the polynomial**: for
+any other composite, pass `--alim` or a `.job` that carries it, or the factor
+base will silently be the wrong size.
+
+So a workunit needs the poly and the parameters, not the factor base. Files
+that *are* sent still resolve through `bench_boinc_resolve_path`.
 
 **Three things a project needs to know, none of them a missing file.**
 
