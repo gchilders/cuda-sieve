@@ -4402,6 +4402,23 @@ sit at 400-600 ms per submission indefinitely and never trigger a reduction. If
 field failures continue, `COF_CHUNK_TARGET_MS` is the knob -- and lowering it
 is a policy decision, not a tuning one.
 
+**LOWERED TO 400 by the user, same day.** 750 was chosen in 8k against what was
+believed to be a launch bound and was really a bound on one dispatch; after
+9z-k one cofactor launch is one command buffer, so the constant now means what
+8k intended. 400 is half the ~800 ms at which M1/M2 command buffers were
+actually killed, rather than a hair under it. `COF_BOUND_MS` in
+`Makefile.metal` tracks it, so `cbtimecheck` asserts the policy the build
+holds.
+
+Measured consequence on this 10-core M3: **none, as expected.** At a full
+`CQ_FLUSH` the chunker still settles at 15,360 records/launch and the longest
+cofactor command buffer is **250.76 ms**, already inside 400, so the controller
+never steers. 288 q `cmp`-identical at 13,485 relations / `8e79762c…`, wall
+3m39.8 vs ~3m39; `cofcheck.sh` 54/0; `cofaccheck`, `validationcheck` and
+`cbtimecheck` green, the last with its control still failing at 805 ms. The
+bound exists for devices slower than this one, where a launch at 1.5-2x this
+cost now gets steered down instead of parking at 400-600 ms per submission.
+
 ## 9. Drift ledger — CUDA-side changes made for this port
 
 | date | CUDA file(s) | change | verified how |
