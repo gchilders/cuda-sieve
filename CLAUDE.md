@@ -711,9 +711,43 @@ call site cannot do one and forget the other.
   the broken anchor pointed at a line the generator itself had added and later
   removed. `ms_launch_max` now hangs off `cofac.cuh`'s own timing declaration.
 
+  **THE METALLIB IS EMBEDDED; THE APPLICATION IS ONE FILE (plan 9d).**
+  `-sectcreate __DATA __metallib` at link, read back in `metal_rt` with
+  `getsectiondata(&_mh_execute_header, ...)` and wrapped in a `dispatch_data_t`
+  with an **empty destructor block** — the bytes are in our own `__DATA` and
+  outlive any use, so there is nothing to free and
+  `DISPATCH_DATA_DESTRUCTOR_DEFAULT` would copy the whole megabyte.
+
+  **Four sources, and the order is deliberate:** explicit `mtlInit` path →
+  **`$CUDA_SIEVE_METALLIB`** → **embedded section** → `bench.metallib` beside
+  the executable. The env var stays ahead of the embedded copy because **every
+  gate here drives the library it just built through it**; the embedded copy
+  goes ahead of the file because a stale `bench.metallib` is exactly what a
+  BOINC slot accumulates. 718 KB → **1,726,104 bytes**. `EMBED_METALLIB=0`
+  opts out.
+
+  **`make -f Makefile.metal metallibcheck`**, control first: a
+  `EMBED_METALLIB=0` build must have no section AND must fail to run. Both
+  runs happen in a temp directory with no `bench.metallib` and with
+  `CUDA_SIEVE_METALLIB` unset (`env -u`) — **that negative space is the whole
+  check, because every other gate EXPORTS that variable and so none of them
+  would notice embedding being broken.** `boinclinkcheck` asserts the section
+  too (8 checks now): a distributable binary that needs a file beside it is
+  not distributable.
+
+  **End to end:** one 1.7 MB file alone in a directory, `HAVE_BOINC=1`, no
+  environment variable → exit 0, 37 relations, the same six-line `stderr.txt`.
+
+  **A `-A2` that should have been `-A4`** — `otool -l` prints `sectname`,
+  `segname`, `addr`, *then* `size` — made the gate report "nothing was
+  embedded" about a binary that had just sieved 37 relations from its own
+  embedded library. **The two checks disagreeing is what caught it.**
+  `fbgen_gpu` is deliberately NOT embedded: dev/project-side tool.
+
   **NOT established:** still standalone mode, no `init_data.xml`, so slot
   filename resolution, a real GPU assignment and checkpointing are
-  unexercised. Remaining Phase 9 work: metallib embedding.
+  unexercised. **That is now the only Phase 9 item left** — it needs a real
+  BOINC client, not this machine.
 
 **Candidate counts do not compare across sievers; relation sets do.** Our 1,845
 cofactorisation candidates against the oracle's 1,851 is not a defect: the 7
