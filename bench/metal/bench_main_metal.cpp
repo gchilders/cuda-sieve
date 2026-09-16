@@ -2815,39 +2815,12 @@ resume_artifacts_ready:
              * ten thousand. Warned rather than clamped: it is the job file's
              * stated parameter and silently overriding it would make a run
              * something other than what was asked for. */
-            {
-                const double sl1 = cfg.allowance  - (double)(cfg.mfb ? cfg.mfb : 92);
-                const double sl0 = cfg.allowance0 - (double)cfg.mfb0;
-                /* Compared against what the derivation WOULD have produced,
-                 * not against a fixed number of bits over mfb. A fixed 2.0
-                 * threshold fired on the derived default itself whenever
-                 * scale < 1 -- which happens for any maxnorm above 254 bits,
-                 * since slack is 2/scale -- telling the operator to "drop the
-                 * override" and use the very value already in force.
-                 *
-                 * Per side, too: one overridden side used to print and
-                 * "correct" both, naming a side-0 override that was never
-                 * passed. */
-                const double d1 = sieve_allowance(m1, cfg.scale,
-                                                  cfg.mfb ? cfg.mfb : 92);
-                const double d0 = sieve_allowance(m0, cfg.scale0, cfg.mfb0);
-                if (cfg.allowance > d1 + 0.01)
-                    fprintf(stderr,
-                        "note: side 1 allowance %.2f is %.2f bits looser than"
-                        " the derived %.2f; the surplus\n"
-                        "      admits survivors the cofactoriser then rejects"
-                        " (mfb %u).\n",
-                        cfg.allowance, cfg.allowance - d1, d1,
-                        cfg.mfb ? cfg.mfb : 92);
-                if (cfg.allowance0 > d0 + 0.01)
-                    fprintf(stderr,
-                        "note: side 0 allowance %.2f is %.2f bits looser than"
-                        " the derived %.2f; the surplus\n"
-                        "      admits survivors the cofactoriser then rejects"
-                        " (mfb %u).\n",
-                        cfg.allowance0, cfg.allowance0 - d0, d0, cfg.mfb0);
-                (void)sl1; (void)sl0;
-            }
+            /* CUDA warns here when an --allowance is looser than the
+             * derived value. Dropped in this build: under HAVE_BOINC it
+             * lands in the volunteer's uploaded stderr.txt, where it is
+             * noise and unactionable -- the allowance came from the job
+             * file the project sent. The stdout line above still reports
+             * the value in force. */
             /* Setup's own label. Without one the phase read whatever the last
              * resume gate had set, so a stall in the GPU root finder was
              * reported under the name of a scan that finished minutes before

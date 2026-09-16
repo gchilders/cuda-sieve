@@ -221,6 +221,35 @@ assert _nv_old in src, 'BOINC assignment comment shape changed'
 src = src.replace(_nv_old, _nv_new, 1)
 print('  BOINC stderr lines name Metal, not CUDA')
 
+# ---- drop the allowance advisory ------------------------------------------
+# Two stderr notes, emitted once per run, saying an --allowance is looser than
+# the derived value. Useful at a terminal, noise in a BOINC log: under
+# HAVE_BOINC every one of them lands in the volunteer's uploaded stderr.txt,
+# and this build's parity settings (--allowance 101.6 --allowance0 68.1) fire
+# BOTH of them on every single q. The advice is also unactionable there --
+# the allowance comes from the job file the project sent.
+#
+# The whole braced block goes: sl1/sl0/d1/d0 exist only to produce those two
+# notes, so leaving the block would trade two messages for four unused
+# variables under -Wall -Wextra. m0/m1 stay live in the printf above it.
+# CUDA's own behaviour is unchanged -- this is a Metal-side removal, and the
+# stdout line above still reports the allowance in force.
+_a0 = src.index("            {" + chr(10) +
+                "                const double sl1 = cfg.allowance")
+_a1 = src.index("                (void)sl1; (void)sl0;" + chr(10) +
+                "            }" + chr(10), _a0)
+_a1 += len("                (void)sl1; (void)sl0;" + chr(10) +
+           "            }" + chr(10))
+src = src[:_a0] + chr(10).join([
+    "            /* CUDA warns here when an --allowance is looser than the",
+    "             * derived value. Dropped in this build: under HAVE_BOINC it",
+    "             * lands in the volunteer's uploaded stderr.txt, where it is",
+    "             * noise and unactionable -- the allowance came from the job",
+    "             * file the project sent. The stdout line above still reports",
+    "             * the value in force. */",
+    ""]) + src[_a1:]
+print('  allowance advisory dropped (Metal-side only)')
+
 # ---- lift the 24-round cap for ECM ----------------------------------------
 # The cap's own message says why it exists: "budget << r overflows beyond
 # that". That is RHO's iteration budget. ECM never shifts it -- the ECM

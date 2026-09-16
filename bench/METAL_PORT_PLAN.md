@@ -1425,19 +1425,110 @@ binary, one q at the parity special-q, in a clean directory:
 ```
 exit 0, total relations 37            <- the golden number, from a BOINC build
 stdout.log: 1 mention of "BOINC"      <- everything else went to the file
-stderr.txt:
-  BOINC: no usable GPU assignment in init_data.xml; using the system default Metal device
-  BOINC: running on Metal device 0 of 1: Apple M3
-  BOINC: slab plan: 2048 rows/slab, 8 slabs (auto-calibrated)
-  cofactor queue: 12 curves/round is about 119 ms ... over this build's 750 ms bound
 ```
 
-Both rewritten lines name Metal, the slab-plan and launch-bound advisories are
-there, and the 750 ms policy from 8k is being reported through BOINC's own
-channel. **Still not a client**: standalone mode, no `init_data.xml`, so slot
-filename resolution, a real GPU assignment and checkpointing remain
-unexercised.
+Both rewritten lines name Metal. What `stderr.txt` contained is 9c, which is
+where reading it turned into work. **Still not a client**: standalone mode, no
+`init_data.xml`, so slot filename resolution, a real GPU assignment and
+checkpointing remain unexercised.
 
+### 9c. What was actually in `stderr.txt`, and cutting it to six lines
+
+Reading the file rather than assuming its contents is the whole point of 9b's
+rule, and it found 14 lines of which most were noise or wrong. A BOINC
+volunteer uploads this file; a project reads it when a task fails.
+
+**Before:**
+
+```
+ 1  ...: Can't open init data file - running in standalone mode
+ 2  BOINC: no usable GPU assignment in init_data.xml; using the system default Metal device
+ 3  BOINC: running on Metal device 0 of 1: Apple M3
+ 4  note: side 1 allowance 101.60 is 8.03 bits looser than the derived 93.57; the surplus
+ 5        admits survivors the cofactoriser then rejects (mfb 92).
+ 6  note: side 0 allowance 68.10 is 6.60 bits looser than the derived 61.50; the surplus
+ 7        admits survivors the cofactoriser then rejects (mfb 60).
+ 8  BOINC: slab plan: 2048 rows/slab, 8 slabs (auto-calibrated)
+ 9    cofactor queue: 12 curves/round is about 119 ms in one launch, over this build's 750 ms bound. ...
+10    Shorter launches, same B1/B2: --ecm-curves 2 with more --cof-rounds (ECM allows 1000).
+11    cofactor chunk: 1852 records/launch, 1 launch per round over 1852 records (auto)
+12    cofactor: longest kernel launch 93 ms (1852 records/launch, 1852 in flush)
+13    cofactor chunk: 1852 records/launch, 1 launch per round over 1852 records (auto)
+14  ...: called boinc_finish(0)
+```
+
+**After** -- same run, same 37 relations, exit 0:
+
+```
+ 1  ...: Can't open init data file - running in standalone mode
+ 2  BOINC: no usable GPU assignment in init_data.xml; using the system default Metal device
+ 3  BOINC: running on Metal device 0 of 1: Apple M3
+ 4  BOINC: slab plan: 2048 rows/slab, 8 slabs (auto-calibrated)
+ 5    cofactor chunk: 1852 records/launch, 1 launch per round over 1852 records (auto)
+ 6  ...: called boinc_finish(0)
+```
+
+**Line 9 was false, and its guard explains why.** It said 119 ms was "over
+this build's 750 ms bound". The branch is gated on
+
+```c
+if (ms_one_curve <= COF_LAUNCH_REFUSE_MS && Q->ecm_curves > 2u)
+```
+
+-- curves-per-round above two, with **no test of the launch time against the
+bound at all**. The behaviour is right and 8n says so explicitly ("aim at 2
+and let the bound lower it further"); the *message* justified it with a bound
+violation that had not happened, and at B1 200 a curve is 9.9 ms, so twelve of
+them are nowhere near 750. The surviving line in the acting branch now states
+what it did (`%u curves/round -> %u x %u (~%.0f ms/launch, ...)`) and mentions
+no bound. The advisory branch is gone entirely: when the derivation cannot
+act -- an explicit `--ecm-curves`, or a side running rho, which is the
+default -- it is silent rather than printing guidance into a volunteer's log.
+
+**Lines 11 and 13 are the same line twice, and `cof_report_chunk`'s own
+comment forbids it** ("Only on change, never per flush"). Its arithmetic
+defeated it: `step` is `min(chunk, n)`, so when the old and new chunk both
+exceed `n`, the internal value changes and the rendered line does not. Here
+the opening choice printed it, then a 93 ms flush triggered the doubling
+branch and printed it again, identically. It now compares **what it is about
+to print**, not the internal slice.
+
+**Lines 4-7 and 12 are terminal diagnostics in the wrong place.** The
+allowance notes advise changing a parameter that arrived in the job file the
+project sent, and this build's own parity settings fire both of them. The
+longest-launch line is a per-band high-water mark. Both dropped Metal-side.
+The chunker still *steers* on the measured launch -- only the printing went,
+and with it `cofq_t::ms_launch_max`, which nothing else read.
+
+**Every removal is Metal-side, in the generators.** The strings live in
+`bench_main.cu` and `cofac.cuh`; editing those would be a CUDA-side
+**behaviour** change, not the inert kind the drift ledger has rows for, and it
+would reach HIP too. `gen_bench_main.py` and `gen_cofac_host.py` do the
+removal instead, so the CUDA build's stderr is untouched and the two builds
+now deliberately differ in what they log. No gate reads any of these strings.
+
+#### A generator bug this uncovered: an unasserted `replace` is a silent no-op
+
+Dropping the `ms_launch_max` field broke an anchor two hundred lines away:
+
+```python
+_fld_old = "    float  ms_launch_max;   /* longest single launch seen, ms */"
+src = src.replace(_fld_old, _fld_old + ... "uint32_t ecm_rounds; ...", 1)
+```
+
+No assert. The anchor was gone, the replace matched nothing, and the generator
+**printed success** while emitting a `cofq_t` with `Q->ecm_rounds` assigned in
+two places and declared in none. The compiler caught it here, but only because
+the missing thing was a field; a missing *statement* would have compiled.
+Re-anchored, with an assert. Audited the rest: the only other unasserted
+replaces are the bulk `cuda*->mtl*` and `LAUNCH_APPLY` tables, where matching
+nothing is legitimate, and the one at `gen_cofac_host.py:402` carries a
+stronger `assert src.count(...) == 1`. **Every single-site anchor in these
+generators must be asserted** -- it is the same failure as the regex that
+deleted half of `bigint.cuh`.
+
+Gates: `cofcheck.sh` 54 PASS / 0 FAIL, `cofaccheck` 37 in all four
+configurations, `boinccheck`, `boinclinkcheck` 7/7.
 ---
 
 ## 10. Open questions for the CUDA side

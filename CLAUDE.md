@@ -664,8 +664,40 @@ call site cannot do one and forget the other.
 
   **End-to-end, done by hand once:** a `HAVE_BOINC=1` binary at the parity
   special-q gives **exit 0 and the golden 37 relations**, with `stderr.txt`
-  carrying `BOINC: running on Metal device 0 of 1: Apple M3`, the slab plan,
-  and 8k's 750 ms launch-bound advisory — while stdout mentioned BOINC once.
+  carrying `BOINC: running on Metal device 0 of 1: Apple M3` — while stdout
+  mentioned BOINC once.
+
+  **READING that file cut it from 14 lines to 6 (plan 9c), and one of the 14
+  was FALSE.** A volunteer uploads `stderr.txt`; a project reads it when a task
+  fails.
+  - The curves/round advisory claimed 119 ms was "over this build's 750 ms
+    bound". Its guard is `ecm_curves > 2u` with **no test against the bound at
+    all** — the behaviour is right (8n: aim at 2, the bound is a ceiling) but
+    the message invented a violation. The acting line now says what it did;
+    the advisory branch is gone, so when the derivation cannot act (explicit
+    `--ecm-curves`, or a rho side — **the default**) it is silent.
+  - `cof_report_chunk` printed the SAME line twice against its own "only on
+    change" comment: `step` is `min(chunk, n)`, so when both chunks exceed `n`
+    the internal value changes and the rendered line does not. It now compares
+    **what it is about to print**.
+  - The allowance notes and the longest-launch high-water line are terminal
+    diagnostics, dropped. The chunker still *steers* on the measured launch;
+    only the printing went, with `cofq_t::ms_launch_max`.
+
+  **All of it removed in the GENERATORS, never in `bench_main.cu`/`cofac.cuh`**
+  — editing those is a CUDA-side *behaviour* change (not the inert kind the
+  drift ledger covers) and would reach HIP. The two builds now deliberately
+  differ in what they log. No gate reads these strings.
+
+  **AN UNASSERTED `src.replace` IN A GENERATOR IS A SILENT NO-OP.** Dropping
+  `ms_launch_max` broke an anchor 200 lines away that had no assert: the
+  replace matched nothing, the generator **printed success**, and it emitted a
+  `cofq_t` with `Q->ecm_rounds` assigned twice and declared never. A missing
+  field fails to compile; a missing *statement* would not have. **Every
+  single-site anchor must be asserted** — same failure as the regex that
+  deleted half of `bigint.cuh`. Audited: the only other unasserted replaces
+  are the bulk `cuda*->mtl*` and `LAUNCH_APPLY` tables (matching nothing is
+  legitimate there) plus one with a stronger `assert src.count(...) == 1`.
 
   **NOT established:** still standalone mode, no `init_data.xml`, so slot
   filename resolution, a real GPU assignment and checkpointing are
