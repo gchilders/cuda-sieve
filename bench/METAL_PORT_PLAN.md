@@ -2455,6 +2455,57 @@ here. `timeout` points at the watchdog and argues for splitting the root
 finder's grid. `out of memory` or being a victim points outward, at the rest
 of the volunteer's machine.
 
+#### More field data: it is FAMILY-CORRELATED and NOT deterministic
+
+Several failures, **all on M1 and M2** -- and **a different M2 completed
+successfully**. M3 and M4 Max succeed.
+
+**The log positively excludes two of the four candidates.** "kernel launch
+failed" is `mtlErrorLaunchFailure`, and `cb_status` maps `Timeout` and
+`OutOfMemory` to their own codes with their own strings ("command buffer timed
+out (GPU watchdog)", "launch out of resources"). So it was **neither a
+watchdog timeout nor an out-of-memory command buffer**. What remains is page
+fault, internal error, invalid resource, device removed, or stack overflow.
+
+**The root finder itself is statically clean**, checked rather than assumed:
+`t` is a correct grid-stride index bounded by `t < n`; `rootbuf` is indexed by
+**prime index**, not thread index, so the machine-dependent grid width
+(`min((n+127)/128, cores*8)`, which really does differ from 56 blocks on an M1
+to 320 on an M4 Max) cannot put it out of range; `fp_split_linear` returns at
+most `CAP` roots and the one extra `roots[nr++] = p` reaches `CAP+1 <= 7`
+against a 9-element array.
+
+**Which lands on the thing this plan has flagged since Phase 0 and never
+closed.** CLAUDE.md, unchanged since 2026-09-14:
+
+> **Untested on real M1 hardware** -- the floor is set by what the toolchain
+> accepts and by `supportsFamily`, not by a run on an M1. Anything
+> family-gated (`mulhi(ulong,ulong)`, argument buffers) should be re-verified
+> the first time an M1 or M2 is available.
+
+Every probe, every gate and every measurement in this port ran on **one
+`MTLGPUFamilyApple9` device**. M1 is Apple7 and M2 is Apple8. This is the first
+evidence bearing on that gap, and it is exactly the shape the note predicted:
+works on the family it was developed on, fails on the families it never ran on.
+
+**Non-determinism narrows it further.** fbgen depends only on the polynomial
+and `lim`, so a deterministic arithmetic fault would kill *every* M2 at the
+same segment. One M2 finished. So the mechanism is sensitive to something
+outside the input -- scheduling, contention with other GPU work on the
+volunteer's machine, or thermal state -- which fits a marginal fault (a spill
+or a race) far better than a wrong `mulhi`.
+
+**The bottleneck now is data, not analysis.** Two things would settle it, in
+order of cost:
+
+1. **Deploy a build with 9z-i's error reporting.** The next failure names the
+   code: `page fault` and `stack overflow` point in very different directions.
+2. **Run `make -f Makefile.metal metalcheck` on an M1 or M2.** It is the
+   Phase 2 gate -- 6.6M results compared against the host, needs no job data
+   and takes seconds -- and it is precisely the instrument for the
+   family-gated arithmetic this plan has listed as unverified for two weeks.
+   A volunteer with an M1 can run it.
+
 **Also: the deployed binary is old.** Its stderr still says "this is a CUDA
 application", so it pre-dates 9z-g -- and therefore also pre-dates the
 `mtlFree` leak fix (9z), the autorelease fix (9z-b) and the nil-binding fix
