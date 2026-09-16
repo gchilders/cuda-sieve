@@ -1,3 +1,12 @@
+/* Optional buffer arguments: metal_rt supplies bit i = "argument i is bound". */
+constant uint mtl_bound_mask [[function_constant(0)]];
+constant bool mtl_bound_2 = (mtl_bound_mask & (1u << 2)) != 0;
+constant bool mtl_bound_3 = (mtl_bound_mask & (1u << 3)) != 0;
+constant bool mtl_bound_14 = (mtl_bound_mask & (1u << 14)) != 0;
+constant bool mtl_bound_16 = (mtl_bound_mask & (1u << 16)) != 0;
+constant bool mtl_bound_17 = (mtl_bound_mask & (1u << 17)) != 0;
+constant bool mtl_bound_18 = (mtl_bound_mask & (1u << 18)) != 0;
+
 
 /* Move the direct-test congruence origin forward by delta_j global rows. This
  * is deliberately a separate tiny kernel: it performs one 64-bit modulo per
@@ -461,7 +470,7 @@ static inline void k_resieve_scatter_body(
 kernel void k_resieve_scatter_1_0(
     device const plat_t * plat [[buffer(0)]],
     device const uint32_t * primes [[buffer(1)]],
-    device const uint8_t * ispow [[buffer(2)]],
+    device const uint8_t * ispow [[buffer(2), function_constant(mtl_bound_2)]],
     constant uint32_t &n [[buffer(3)]],
     constant uint32_t &xmax [[buffer(4)]],
     constant int &logI [[buffer(5)]],
@@ -473,7 +482,7 @@ kernel void k_resieve_scatter_1_0(
     constant uint32_t &K [[buffer(11)]],
     device uint32_t * noverflow [[buffer(12)]],
     constant int &log_gran [[buffer(13)]],
-    device const uint64_t * walk_cur [[buffer(14)]],
+    device const uint64_t * walk_cur [[buffer(14), function_constant(mtl_bound_14)]],
     uint _tid [[thread_position_in_grid]],
     uint _ntid [[threads_per_grid]],
     uint _bid [[threadgroup_position_in_grid]],
@@ -481,13 +490,17 @@ kernel void k_resieve_scatter_1_0(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_resieve_scatter_body<1, false>(plat, primes, ispow, n, xmax, logI, summary, bits, gbase, plist, pcnt, K, noverflow, log_gran, walk_cur, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device const uint8_t * ispow_opt = nullptr;
+    if (mtl_bound_2) ispow_opt = ispow;
+    device const uint64_t * walk_cur_opt = nullptr;
+    if (mtl_bound_14) walk_cur_opt = walk_cur;
+    k_resieve_scatter_body<1, false>(plat, primes, ispow_opt, n, xmax, logI, summary, bits, gbase, plist, pcnt, K, noverflow, log_gran, walk_cur_opt, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_resieve_scatter_2_0(
     device const plat_t * plat [[buffer(0)]],
     device const uint32_t * primes [[buffer(1)]],
-    device const uint8_t * ispow [[buffer(2)]],
+    device const uint8_t * ispow [[buffer(2), function_constant(mtl_bound_2)]],
     constant uint32_t &n [[buffer(3)]],
     constant uint32_t &xmax [[buffer(4)]],
     constant int &logI [[buffer(5)]],
@@ -499,7 +512,7 @@ kernel void k_resieve_scatter_2_0(
     constant uint32_t &K [[buffer(11)]],
     device uint32_t * noverflow [[buffer(12)]],
     constant int &log_gran [[buffer(13)]],
-    device const uint64_t * walk_cur [[buffer(14)]],
+    device const uint64_t * walk_cur [[buffer(14), function_constant(mtl_bound_14)]],
     uint _tid [[thread_position_in_grid]],
     uint _ntid [[threads_per_grid]],
     uint _bid [[threadgroup_position_in_grid]],
@@ -507,13 +520,17 @@ kernel void k_resieve_scatter_2_0(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_resieve_scatter_body<2, false>(plat, primes, ispow, n, xmax, logI, summary, bits, gbase, plist, pcnt, K, noverflow, log_gran, walk_cur, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device const uint8_t * ispow_opt = nullptr;
+    if (mtl_bound_2) ispow_opt = ispow;
+    device const uint64_t * walk_cur_opt = nullptr;
+    if (mtl_bound_14) walk_cur_opt = walk_cur;
+    k_resieve_scatter_body<2, false>(plat, primes, ispow_opt, n, xmax, logI, summary, bits, gbase, plist, pcnt, K, noverflow, log_gran, walk_cur_opt, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_resieve_scatter_4_0(
     device const plat_t * plat [[buffer(0)]],
     device const uint32_t * primes [[buffer(1)]],
-    device const uint8_t * ispow [[buffer(2)]],
+    device const uint8_t * ispow [[buffer(2), function_constant(mtl_bound_2)]],
     constant uint32_t &n [[buffer(3)]],
     constant uint32_t &xmax [[buffer(4)]],
     constant int &logI [[buffer(5)]],
@@ -525,7 +542,7 @@ kernel void k_resieve_scatter_4_0(
     constant uint32_t &K [[buffer(11)]],
     device uint32_t * noverflow [[buffer(12)]],
     constant int &log_gran [[buffer(13)]],
-    device const uint64_t * walk_cur [[buffer(14)]],
+    device const uint64_t * walk_cur [[buffer(14), function_constant(mtl_bound_14)]],
     uint _tid [[thread_position_in_grid]],
     uint _ntid [[threads_per_grid]],
     uint _bid [[threadgroup_position_in_grid]],
@@ -533,13 +550,17 @@ kernel void k_resieve_scatter_4_0(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_resieve_scatter_body<4, false>(plat, primes, ispow, n, xmax, logI, summary, bits, gbase, plist, pcnt, K, noverflow, log_gran, walk_cur, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device const uint8_t * ispow_opt = nullptr;
+    if (mtl_bound_2) ispow_opt = ispow;
+    device const uint64_t * walk_cur_opt = nullptr;
+    if (mtl_bound_14) walk_cur_opt = walk_cur;
+    k_resieve_scatter_body<4, false>(plat, primes, ispow_opt, n, xmax, logI, summary, bits, gbase, plist, pcnt, K, noverflow, log_gran, walk_cur_opt, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_resieve_scatter_8_0(
     device const plat_t * plat [[buffer(0)]],
     device const uint32_t * primes [[buffer(1)]],
-    device const uint8_t * ispow [[buffer(2)]],
+    device const uint8_t * ispow [[buffer(2), function_constant(mtl_bound_2)]],
     constant uint32_t &n [[buffer(3)]],
     constant uint32_t &xmax [[buffer(4)]],
     constant int &logI [[buffer(5)]],
@@ -551,7 +572,7 @@ kernel void k_resieve_scatter_8_0(
     constant uint32_t &K [[buffer(11)]],
     device uint32_t * noverflow [[buffer(12)]],
     constant int &log_gran [[buffer(13)]],
-    device const uint64_t * walk_cur [[buffer(14)]],
+    device const uint64_t * walk_cur [[buffer(14), function_constant(mtl_bound_14)]],
     uint _tid [[thread_position_in_grid]],
     uint _ntid [[threads_per_grid]],
     uint _bid [[threadgroup_position_in_grid]],
@@ -559,13 +580,17 @@ kernel void k_resieve_scatter_8_0(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_resieve_scatter_body<8, false>(plat, primes, ispow, n, xmax, logI, summary, bits, gbase, plist, pcnt, K, noverflow, log_gran, walk_cur, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device const uint8_t * ispow_opt = nullptr;
+    if (mtl_bound_2) ispow_opt = ispow;
+    device const uint64_t * walk_cur_opt = nullptr;
+    if (mtl_bound_14) walk_cur_opt = walk_cur;
+    k_resieve_scatter_body<8, false>(plat, primes, ispow_opt, n, xmax, logI, summary, bits, gbase, plist, pcnt, K, noverflow, log_gran, walk_cur_opt, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_resieve_scatter_4_1(
     device const plat_t * plat [[buffer(0)]],
     device const uint32_t * primes [[buffer(1)]],
-    device const uint8_t * ispow [[buffer(2)]],
+    device const uint8_t * ispow [[buffer(2), function_constant(mtl_bound_2)]],
     constant uint32_t &n [[buffer(3)]],
     constant uint32_t &xmax [[buffer(4)]],
     constant int &logI [[buffer(5)]],
@@ -577,7 +602,7 @@ kernel void k_resieve_scatter_4_1(
     constant uint32_t &K [[buffer(11)]],
     device uint32_t * noverflow [[buffer(12)]],
     constant int &log_gran [[buffer(13)]],
-    device const uint64_t * walk_cur [[buffer(14)]],
+    device const uint64_t * walk_cur [[buffer(14), function_constant(mtl_bound_14)]],
     uint _tid [[thread_position_in_grid]],
     uint _ntid [[threads_per_grid]],
     uint _bid [[threadgroup_position_in_grid]],
@@ -585,7 +610,11 @@ kernel void k_resieve_scatter_4_1(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_resieve_scatter_body<4, true>(plat, primes, ispow, n, xmax, logI, summary, bits, gbase, plist, pcnt, K, noverflow, log_gran, walk_cur, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device const uint8_t * ispow_opt = nullptr;
+    if (mtl_bound_2) ispow_opt = ispow;
+    device const uint64_t * walk_cur_opt = nullptr;
+    if (mtl_bound_14) walk_cur_opt = walk_cur;
+    k_resieve_scatter_body<4, true>(plat, primes, ispow_opt, n, xmax, logI, summary, bits, gbase, plist, pcnt, K, noverflow, log_gran, walk_cur_opt, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 
@@ -808,7 +837,7 @@ kernel void k_td_0_0_0_0(
     device const int64_t * A [[buffer(0)]],
     device const int64_t * B [[buffer(1)]],
     device const uint32_t * X [[buffer(2)]],
-    device const uint32_t * sel [[buffer(3)]],
+    device const uint32_t * sel [[buffer(3), function_constant(mtl_bound_3)]],
     constant uint32_t &n [[buffer(4)]],
     constant int &logI [[buffer(5)]],
     device const tdpoly_t * P [[buffer(6)]],
@@ -821,9 +850,9 @@ kernel void k_td_0_0_0_0(
     device bn_t * cof [[buffer(13)]],
     device uint8_t * cofbits [[buffer(14)]],
     device uint32_t * flags [[buffer(15)]],
-    device uint32_t * nhit [[buffer(16)]],
-    device uint32_t * fac [[buffer(17)]],
-    device uint32_t * faccnt [[buffer(18)]],
+    device uint32_t * nhit [[buffer(16), function_constant(mtl_bound_16)]],
+    device uint32_t * fac [[buffer(17), function_constant(mtl_bound_17)]],
+    device uint32_t * faccnt [[buffer(18), function_constant(mtl_bound_18)]],
     constant uint32_t &fmax [[buffer(19)]],
     constant uint32_t &j_base [[buffer(20)]],
     uint _tid [[thread_position_in_grid]],
@@ -834,14 +863,22 @@ kernel void k_td_0_0_0_0(
     uint _gdim [[threadgroups_per_grid]])
 {
     threadgroup tdsmall_t tile[TD_TILE];
-    k_td_body<0, 0, 0, false>(A, B, X, sel, n, logI, P, sq, plist, pcnt, K, sm, nsm, cof, cofbits, flags, nhit, fac, faccnt, fmax, j_base, tile, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device const uint32_t * sel_opt = nullptr;
+    if (mtl_bound_3) sel_opt = sel;
+    device uint32_t * nhit_opt = nullptr;
+    if (mtl_bound_16) nhit_opt = nhit;
+    device uint32_t * fac_opt = nullptr;
+    if (mtl_bound_17) fac_opt = fac;
+    device uint32_t * faccnt_opt = nullptr;
+    if (mtl_bound_18) faccnt_opt = faccnt;
+    k_td_body<0, 0, 0, false>(A, B, X, sel_opt, n, logI, P, sq, plist, pcnt, K, sm, nsm, cof, cofbits, flags, nhit_opt, fac_opt, faccnt_opt, fmax, j_base, tile, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_td_1_0_0_0(
     device const int64_t * A [[buffer(0)]],
     device const int64_t * B [[buffer(1)]],
     device const uint32_t * X [[buffer(2)]],
-    device const uint32_t * sel [[buffer(3)]],
+    device const uint32_t * sel [[buffer(3), function_constant(mtl_bound_3)]],
     constant uint32_t &n [[buffer(4)]],
     constant int &logI [[buffer(5)]],
     device const tdpoly_t * P [[buffer(6)]],
@@ -854,9 +891,9 @@ kernel void k_td_1_0_0_0(
     device bn_t * cof [[buffer(13)]],
     device uint8_t * cofbits [[buffer(14)]],
     device uint32_t * flags [[buffer(15)]],
-    device uint32_t * nhit [[buffer(16)]],
-    device uint32_t * fac [[buffer(17)]],
-    device uint32_t * faccnt [[buffer(18)]],
+    device uint32_t * nhit [[buffer(16), function_constant(mtl_bound_16)]],
+    device uint32_t * fac [[buffer(17), function_constant(mtl_bound_17)]],
+    device uint32_t * faccnt [[buffer(18), function_constant(mtl_bound_18)]],
     constant uint32_t &fmax [[buffer(19)]],
     constant uint32_t &j_base [[buffer(20)]],
     uint _tid [[thread_position_in_grid]],
@@ -867,14 +904,22 @@ kernel void k_td_1_0_0_0(
     uint _gdim [[threadgroups_per_grid]])
 {
     threadgroup tdsmall_t tile[TD_TILE];
-    k_td_body<1, 0, 0, false>(A, B, X, sel, n, logI, P, sq, plist, pcnt, K, sm, nsm, cof, cofbits, flags, nhit, fac, faccnt, fmax, j_base, tile, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device const uint32_t * sel_opt = nullptr;
+    if (mtl_bound_3) sel_opt = sel;
+    device uint32_t * nhit_opt = nullptr;
+    if (mtl_bound_16) nhit_opt = nhit;
+    device uint32_t * fac_opt = nullptr;
+    if (mtl_bound_17) fac_opt = fac;
+    device uint32_t * faccnt_opt = nullptr;
+    if (mtl_bound_18) faccnt_opt = faccnt;
+    k_td_body<1, 0, 0, false>(A, B, X, sel_opt, n, logI, P, sq, plist, pcnt, K, sm, nsm, cof, cofbits, flags, nhit_opt, fac_opt, faccnt_opt, fmax, j_base, tile, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_td_1_0_0_1(
     device const int64_t * A [[buffer(0)]],
     device const int64_t * B [[buffer(1)]],
     device const uint32_t * X [[buffer(2)]],
-    device const uint32_t * sel [[buffer(3)]],
+    device const uint32_t * sel [[buffer(3), function_constant(mtl_bound_3)]],
     constant uint32_t &n [[buffer(4)]],
     constant int &logI [[buffer(5)]],
     device const tdpoly_t * P [[buffer(6)]],
@@ -887,9 +932,9 @@ kernel void k_td_1_0_0_1(
     device bn_t * cof [[buffer(13)]],
     device uint8_t * cofbits [[buffer(14)]],
     device uint32_t * flags [[buffer(15)]],
-    device uint32_t * nhit [[buffer(16)]],
-    device uint32_t * fac [[buffer(17)]],
-    device uint32_t * faccnt [[buffer(18)]],
+    device uint32_t * nhit [[buffer(16), function_constant(mtl_bound_16)]],
+    device uint32_t * fac [[buffer(17), function_constant(mtl_bound_17)]],
+    device uint32_t * faccnt [[buffer(18), function_constant(mtl_bound_18)]],
     constant uint32_t &fmax [[buffer(19)]],
     constant uint32_t &j_base [[buffer(20)]],
     uint _tid [[thread_position_in_grid]],
@@ -900,14 +945,22 @@ kernel void k_td_1_0_0_1(
     uint _gdim [[threadgroups_per_grid]])
 {
     threadgroup tdsmall_t tile[TD_TILE];
-    k_td_body<1, 0, 0, true>(A, B, X, sel, n, logI, P, sq, plist, pcnt, K, sm, nsm, cof, cofbits, flags, nhit, fac, faccnt, fmax, j_base, tile, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device const uint32_t * sel_opt = nullptr;
+    if (mtl_bound_3) sel_opt = sel;
+    device uint32_t * nhit_opt = nullptr;
+    if (mtl_bound_16) nhit_opt = nhit;
+    device uint32_t * fac_opt = nullptr;
+    if (mtl_bound_17) fac_opt = fac;
+    device uint32_t * faccnt_opt = nullptr;
+    if (mtl_bound_18) faccnt_opt = faccnt;
+    k_td_body<1, 0, 0, true>(A, B, X, sel_opt, n, logI, P, sq, plist, pcnt, K, sm, nsm, cof, cofbits, flags, nhit_opt, fac_opt, faccnt_opt, fmax, j_base, tile, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_td_1_1_0_0(
     device const int64_t * A [[buffer(0)]],
     device const int64_t * B [[buffer(1)]],
     device const uint32_t * X [[buffer(2)]],
-    device const uint32_t * sel [[buffer(3)]],
+    device const uint32_t * sel [[buffer(3), function_constant(mtl_bound_3)]],
     constant uint32_t &n [[buffer(4)]],
     constant int &logI [[buffer(5)]],
     device const tdpoly_t * P [[buffer(6)]],
@@ -920,9 +973,9 @@ kernel void k_td_1_1_0_0(
     device bn_t * cof [[buffer(13)]],
     device uint8_t * cofbits [[buffer(14)]],
     device uint32_t * flags [[buffer(15)]],
-    device uint32_t * nhit [[buffer(16)]],
-    device uint32_t * fac [[buffer(17)]],
-    device uint32_t * faccnt [[buffer(18)]],
+    device uint32_t * nhit [[buffer(16), function_constant(mtl_bound_16)]],
+    device uint32_t * fac [[buffer(17), function_constant(mtl_bound_17)]],
+    device uint32_t * faccnt [[buffer(18), function_constant(mtl_bound_18)]],
     constant uint32_t &fmax [[buffer(19)]],
     constant uint32_t &j_base [[buffer(20)]],
     uint _tid [[thread_position_in_grid]],
@@ -933,14 +986,22 @@ kernel void k_td_1_1_0_0(
     uint _gdim [[threadgroups_per_grid]])
 {
     threadgroup tdsmall_t tile[TD_TILE];
-    k_td_body<1, 1, 0, false>(A, B, X, sel, n, logI, P, sq, plist, pcnt, K, sm, nsm, cof, cofbits, flags, nhit, fac, faccnt, fmax, j_base, tile, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device const uint32_t * sel_opt = nullptr;
+    if (mtl_bound_3) sel_opt = sel;
+    device uint32_t * nhit_opt = nullptr;
+    if (mtl_bound_16) nhit_opt = nhit;
+    device uint32_t * fac_opt = nullptr;
+    if (mtl_bound_17) fac_opt = fac;
+    device uint32_t * faccnt_opt = nullptr;
+    if (mtl_bound_18) faccnt_opt = faccnt;
+    k_td_body<1, 1, 0, false>(A, B, X, sel_opt, n, logI, P, sq, plist, pcnt, K, sm, nsm, cof, cofbits, flags, nhit_opt, fac_opt, faccnt_opt, fmax, j_base, tile, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_td_1_1_0_1(
     device const int64_t * A [[buffer(0)]],
     device const int64_t * B [[buffer(1)]],
     device const uint32_t * X [[buffer(2)]],
-    device const uint32_t * sel [[buffer(3)]],
+    device const uint32_t * sel [[buffer(3), function_constant(mtl_bound_3)]],
     constant uint32_t &n [[buffer(4)]],
     constant int &logI [[buffer(5)]],
     device const tdpoly_t * P [[buffer(6)]],
@@ -953,9 +1014,9 @@ kernel void k_td_1_1_0_1(
     device bn_t * cof [[buffer(13)]],
     device uint8_t * cofbits [[buffer(14)]],
     device uint32_t * flags [[buffer(15)]],
-    device uint32_t * nhit [[buffer(16)]],
-    device uint32_t * fac [[buffer(17)]],
-    device uint32_t * faccnt [[buffer(18)]],
+    device uint32_t * nhit [[buffer(16), function_constant(mtl_bound_16)]],
+    device uint32_t * fac [[buffer(17), function_constant(mtl_bound_17)]],
+    device uint32_t * faccnt [[buffer(18), function_constant(mtl_bound_18)]],
     constant uint32_t &fmax [[buffer(19)]],
     constant uint32_t &j_base [[buffer(20)]],
     uint _tid [[thread_position_in_grid]],
@@ -966,14 +1027,22 @@ kernel void k_td_1_1_0_1(
     uint _gdim [[threadgroups_per_grid]])
 {
     threadgroup tdsmall_t tile[TD_TILE];
-    k_td_body<1, 1, 0, true>(A, B, X, sel, n, logI, P, sq, plist, pcnt, K, sm, nsm, cof, cofbits, flags, nhit, fac, faccnt, fmax, j_base, tile, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device const uint32_t * sel_opt = nullptr;
+    if (mtl_bound_3) sel_opt = sel;
+    device uint32_t * nhit_opt = nullptr;
+    if (mtl_bound_16) nhit_opt = nhit;
+    device uint32_t * fac_opt = nullptr;
+    if (mtl_bound_17) fac_opt = fac;
+    device uint32_t * faccnt_opt = nullptr;
+    if (mtl_bound_18) faccnt_opt = faccnt;
+    k_td_body<1, 1, 0, true>(A, B, X, sel_opt, n, logI, P, sq, plist, pcnt, K, sm, nsm, cof, cofbits, flags, nhit_opt, fac_opt, faccnt_opt, fmax, j_base, tile, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_td_1_1_1_0(
     device const int64_t * A [[buffer(0)]],
     device const int64_t * B [[buffer(1)]],
     device const uint32_t * X [[buffer(2)]],
-    device const uint32_t * sel [[buffer(3)]],
+    device const uint32_t * sel [[buffer(3), function_constant(mtl_bound_3)]],
     constant uint32_t &n [[buffer(4)]],
     constant int &logI [[buffer(5)]],
     device const tdpoly_t * P [[buffer(6)]],
@@ -986,9 +1055,9 @@ kernel void k_td_1_1_1_0(
     device bn_t * cof [[buffer(13)]],
     device uint8_t * cofbits [[buffer(14)]],
     device uint32_t * flags [[buffer(15)]],
-    device uint32_t * nhit [[buffer(16)]],
-    device uint32_t * fac [[buffer(17)]],
-    device uint32_t * faccnt [[buffer(18)]],
+    device uint32_t * nhit [[buffer(16), function_constant(mtl_bound_16)]],
+    device uint32_t * fac [[buffer(17), function_constant(mtl_bound_17)]],
+    device uint32_t * faccnt [[buffer(18), function_constant(mtl_bound_18)]],
     constant uint32_t &fmax [[buffer(19)]],
     constant uint32_t &j_base [[buffer(20)]],
     uint _tid [[thread_position_in_grid]],
@@ -999,14 +1068,22 @@ kernel void k_td_1_1_1_0(
     uint _gdim [[threadgroups_per_grid]])
 {
     threadgroup tdsmall_t tile[TD_TILE];
-    k_td_body<1, 1, 1, false>(A, B, X, sel, n, logI, P, sq, plist, pcnt, K, sm, nsm, cof, cofbits, flags, nhit, fac, faccnt, fmax, j_base, tile, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device const uint32_t * sel_opt = nullptr;
+    if (mtl_bound_3) sel_opt = sel;
+    device uint32_t * nhit_opt = nullptr;
+    if (mtl_bound_16) nhit_opt = nhit;
+    device uint32_t * fac_opt = nullptr;
+    if (mtl_bound_17) fac_opt = fac;
+    device uint32_t * faccnt_opt = nullptr;
+    if (mtl_bound_18) faccnt_opt = faccnt;
+    k_td_body<1, 1, 1, false>(A, B, X, sel_opt, n, logI, P, sq, plist, pcnt, K, sm, nsm, cof, cofbits, flags, nhit_opt, fac_opt, faccnt_opt, fmax, j_base, tile, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_td_1_1_1_1(
     device const int64_t * A [[buffer(0)]],
     device const int64_t * B [[buffer(1)]],
     device const uint32_t * X [[buffer(2)]],
-    device const uint32_t * sel [[buffer(3)]],
+    device const uint32_t * sel [[buffer(3), function_constant(mtl_bound_3)]],
     constant uint32_t &n [[buffer(4)]],
     constant int &logI [[buffer(5)]],
     device const tdpoly_t * P [[buffer(6)]],
@@ -1019,9 +1096,9 @@ kernel void k_td_1_1_1_1(
     device bn_t * cof [[buffer(13)]],
     device uint8_t * cofbits [[buffer(14)]],
     device uint32_t * flags [[buffer(15)]],
-    device uint32_t * nhit [[buffer(16)]],
-    device uint32_t * fac [[buffer(17)]],
-    device uint32_t * faccnt [[buffer(18)]],
+    device uint32_t * nhit [[buffer(16), function_constant(mtl_bound_16)]],
+    device uint32_t * fac [[buffer(17), function_constant(mtl_bound_17)]],
+    device uint32_t * faccnt [[buffer(18), function_constant(mtl_bound_18)]],
     constant uint32_t &fmax [[buffer(19)]],
     constant uint32_t &j_base [[buffer(20)]],
     uint _tid [[thread_position_in_grid]],
@@ -1032,7 +1109,15 @@ kernel void k_td_1_1_1_1(
     uint _gdim [[threadgroups_per_grid]])
 {
     threadgroup tdsmall_t tile[TD_TILE];
-    k_td_body<1, 1, 1, true>(A, B, X, sel, n, logI, P, sq, plist, pcnt, K, sm, nsm, cof, cofbits, flags, nhit, fac, faccnt, fmax, j_base, tile, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device const uint32_t * sel_opt = nullptr;
+    if (mtl_bound_3) sel_opt = sel;
+    device uint32_t * nhit_opt = nullptr;
+    if (mtl_bound_16) nhit_opt = nhit;
+    device uint32_t * fac_opt = nullptr;
+    if (mtl_bound_17) fac_opt = fac;
+    device uint32_t * faccnt_opt = nullptr;
+    if (mtl_bound_18) faccnt_opt = faccnt;
+    k_td_body<1, 1, 1, true>(A, B, X, sel_opt, n, logI, P, sq, plist, pcnt, K, sm, nsm, cof, cofbits, flags, nhit_opt, fac_opt, faccnt_opt, fmax, j_base, tile, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 

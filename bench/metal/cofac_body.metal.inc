@@ -1,3 +1,7 @@
+/* Optional buffer arguments: metal_rt supplies bit i = "argument i is bound". */
+constant uint mtl_bound_mask [[function_constant(0)]];
+constant bool mtl_bound_10 = (mtl_bound_mask & (1u << 10)) != 0;
+
 template <int L> struct mz { uint32_t v[L]; };
 
 template <int L> static inline int mz_cmp(const thread mz<L> *a, const thread mz<L> *b)
@@ -833,7 +837,7 @@ kernel void k_cofac_3_1_1(
     device uint8_t * status [[buffer(7)]],
     device uint64_t * fac [[buffer(8)]],
     device uint8_t * nfac [[buffer(9)]],
-    device ulong * iters [[buffer(10)]],
+    device ulong * iters [[buffer(10), function_constant(mtl_bound_10)]],
     device const uint32_t * s [[buffer(11)]],
     constant uint32_t &ns [[buffer(12)]],
     device const uint8_t * s2mask [[buffer(13)]],
@@ -848,7 +852,9 @@ kernel void k_cofac_3_1_1(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_cofac_body<3, 1, 1>(n, lim2, lpb, c0, budget, sel, njp, status, fac, nfac, iters, s, ns, s2mask, s2vmin, s2nv, ibeg, iend, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device ulong * iters_opt = nullptr;
+    if (mtl_bound_10) iters_opt = iters;
+    k_cofac_body<3, 1, 1>(n, lim2, lpb, c0, budget, sel, njp, status, fac, nfac, iters_opt, s, ns, s2mask, s2vmin, s2nv, ibeg, iend, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_cofac_3_1_0(
@@ -862,7 +868,7 @@ kernel void k_cofac_3_1_0(
     device uint8_t * status [[buffer(7)]],
     device uint64_t * fac [[buffer(8)]],
     device uint8_t * nfac [[buffer(9)]],
-    device ulong * iters [[buffer(10)]],
+    device ulong * iters [[buffer(10), function_constant(mtl_bound_10)]],
     device const uint32_t * s [[buffer(11)]],
     constant uint32_t &ns [[buffer(12)]],
     device const uint8_t * s2mask [[buffer(13)]],
@@ -877,7 +883,9 @@ kernel void k_cofac_3_1_0(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_cofac_body<3, 1, 0>(n, lim2, lpb, c0, budget, sel, njp, status, fac, nfac, iters, s, ns, s2mask, s2vmin, s2nv, ibeg, iend, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device ulong * iters_opt = nullptr;
+    if (mtl_bound_10) iters_opt = iters;
+    k_cofac_body<3, 1, 0>(n, lim2, lpb, c0, budget, sel, njp, status, fac, nfac, iters_opt, s, ns, s2mask, s2vmin, s2nv, ibeg, iend, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_cofac_3_0_0(
@@ -891,7 +899,7 @@ kernel void k_cofac_3_0_0(
     device uint8_t * status [[buffer(7)]],
     device uint64_t * fac [[buffer(8)]],
     device uint8_t * nfac [[buffer(9)]],
-    device ulong * iters [[buffer(10)]],
+    device ulong * iters [[buffer(10), function_constant(mtl_bound_10)]],
     device const uint32_t * s [[buffer(11)]],
     constant uint32_t &ns [[buffer(12)]],
     device const uint8_t * s2mask [[buffer(13)]],
@@ -906,7 +914,9 @@ kernel void k_cofac_3_0_0(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_cofac_body<3, 0, 0>(n, lim2, lpb, c0, budget, sel, njp, status, fac, nfac, iters, s, ns, s2mask, s2vmin, s2nv, ibeg, iend, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device ulong * iters_opt = nullptr;
+    if (mtl_bound_10) iters_opt = iters;
+    k_cofac_body<3, 0, 0>(n, lim2, lpb, c0, budget, sel, njp, status, fac, nfac, iters_opt, s, ns, s2mask, s2vmin, s2nv, ibeg, iend, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_cofac_4_1_1(
@@ -920,7 +930,7 @@ kernel void k_cofac_4_1_1(
     device uint8_t * status [[buffer(7)]],
     device uint64_t * fac [[buffer(8)]],
     device uint8_t * nfac [[buffer(9)]],
-    device ulong * iters [[buffer(10)]],
+    device ulong * iters [[buffer(10), function_constant(mtl_bound_10)]],
     device const uint32_t * s [[buffer(11)]],
     constant uint32_t &ns [[buffer(12)]],
     device const uint8_t * s2mask [[buffer(13)]],
@@ -935,7 +945,9 @@ kernel void k_cofac_4_1_1(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_cofac_body<4, 1, 1>(n, lim2, lpb, c0, budget, sel, njp, status, fac, nfac, iters, s, ns, s2mask, s2vmin, s2nv, ibeg, iend, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device ulong * iters_opt = nullptr;
+    if (mtl_bound_10) iters_opt = iters;
+    k_cofac_body<4, 1, 1>(n, lim2, lpb, c0, budget, sel, njp, status, fac, nfac, iters_opt, s, ns, s2mask, s2vmin, s2nv, ibeg, iend, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_cofac_4_1_0(
@@ -949,7 +961,7 @@ kernel void k_cofac_4_1_0(
     device uint8_t * status [[buffer(7)]],
     device uint64_t * fac [[buffer(8)]],
     device uint8_t * nfac [[buffer(9)]],
-    device ulong * iters [[buffer(10)]],
+    device ulong * iters [[buffer(10), function_constant(mtl_bound_10)]],
     device const uint32_t * s [[buffer(11)]],
     constant uint32_t &ns [[buffer(12)]],
     device const uint8_t * s2mask [[buffer(13)]],
@@ -964,7 +976,9 @@ kernel void k_cofac_4_1_0(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_cofac_body<4, 1, 0>(n, lim2, lpb, c0, budget, sel, njp, status, fac, nfac, iters, s, ns, s2mask, s2vmin, s2nv, ibeg, iend, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device ulong * iters_opt = nullptr;
+    if (mtl_bound_10) iters_opt = iters;
+    k_cofac_body<4, 1, 0>(n, lim2, lpb, c0, budget, sel, njp, status, fac, nfac, iters_opt, s, ns, s2mask, s2vmin, s2nv, ibeg, iend, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_cofac_4_0_0(
@@ -978,7 +992,7 @@ kernel void k_cofac_4_0_0(
     device uint8_t * status [[buffer(7)]],
     device uint64_t * fac [[buffer(8)]],
     device uint8_t * nfac [[buffer(9)]],
-    device ulong * iters [[buffer(10)]],
+    device ulong * iters [[buffer(10), function_constant(mtl_bound_10)]],
     device const uint32_t * s [[buffer(11)]],
     constant uint32_t &ns [[buffer(12)]],
     device const uint8_t * s2mask [[buffer(13)]],
@@ -993,7 +1007,9 @@ kernel void k_cofac_4_0_0(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_cofac_body<4, 0, 0>(n, lim2, lpb, c0, budget, sel, njp, status, fac, nfac, iters, s, ns, s2mask, s2vmin, s2nv, ibeg, iend, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device ulong * iters_opt = nullptr;
+    if (mtl_bound_10) iters_opt = iters;
+    k_cofac_body<4, 0, 0>(n, lim2, lpb, c0, budget, sel, njp, status, fac, nfac, iters_opt, s, ns, s2mask, s2vmin, s2nv, ibeg, iend, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 

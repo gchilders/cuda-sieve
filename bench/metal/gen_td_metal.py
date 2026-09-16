@@ -65,10 +65,24 @@ def split_top(s):
         else: cur += ch
     out.append(cur); return out
 
-def bufparam(p, i):
+# Buffer indices the host sometimes passes nullptr for. Metal has no unbound
+# argument -- setBuffer:nil is an UNSET argument and dispatch is refused -- so
+# these are declared under an MSL function constant, exactly as
+# gen_bench_kernels.py does. See plan 9z-c/9z-d.
+OPTIONAL_BUFFERS = {'k_td': [3, 16, 17, 18], 'k_resieve_scatter': [2, 14]}
+
+MASK_DECL = ('/* Optional buffer arguments: metal_rt supplies bit i ='
+             ' "argument i is bound". */\n'
+             'constant uint mtl_bound_mask [[function_constant(0)]];\n')
+
+def bound_name(i):
+    return 'mtl_bound_%d' % i
+
+def bufparam(p, i, opt=()):
     p = p.strip()
-    if '*' in p: return 'device %s [[buffer(%d)]]' % (p, i)
-    return 'constant %s [[buffer(%d)]]' % (re.sub(r'(\w+)$', r'&\1', p), i)
+    fc = (', function_constant(%s)' % bound_name(i)) if i in opt else ''
+    if '*' in p: return 'device %s [[buffer(%d)%s]]' % (p, i, fc)
+    return 'constant %s [[buffer(%d)%s]]' % (re.sub(r'(\w+)$', r'&\1', p), i, fc)
 def plainparam(p):
     p = p.strip()
     return ('device ' + p) if '*' in p else ('constant ' + re.sub(r'(\w+)$', r'&\1', p))
@@ -138,12 +152,23 @@ for name, (tparams, insts) in K.items():
                 for tn, tv in zip(tnames, inst):
                     q = re.sub(r'\b' + tn + r'\b', tv, q)
                 cps.append(q)
-            kps = [bufparam(pp, k) for k, pp in enumerate(cps)] + IDS
+            opt = set(OPTIONAL_BUFFERS.get(name, ()))
+            kps = [bufparam(pp, k, opt) for k, pp in enumerate(cps)] + IDS
             suffix = '_'.join('1' if a == 'true' else '0' if a == 'false' else a for a in inst)
             decls = (chr(10).join(tg_bufs) + chr(10)) if tg_bufs else ''
-            wr.append('kernel void %s_%s(\n    %s)\n{\n%s    %s_body<%s>(%s);\n}\n'
-                      % (name, suffix, ',\n    '.join(kps), decls, name,
-                         ', '.join(inst), ', '.join(args)))
+            # A function-constant argument may be NAMED only where it exists,
+            # so forward through a local that is null when it is absent. The
+            # _body template is untouched and still tests the pointer.
+            wargs = list(args)
+            optdecl = ''
+            for k in sorted(opt):
+                pk = cps[k].strip(); an = argname(pk)
+                optdecl += '    device %s = nullptr;\n' % re.sub(r'(\w+)\s*$', an + '_opt', pk)
+                optdecl += '    if (%s) %s_opt = %s;\n' % (bound_name(k), an, an)
+                wargs[k] = an + '_opt'
+            wr.append('kernel void %s_%s(\n    %s)\n{\n%s%s    %s_body<%s>(%s);\n}\n'
+                      % (name, suffix, ',\n    '.join(kps), decls, optdecl, name,
+                         ', '.join(inst), ', '.join(wargs)))
         new = head + inner + '}\n\n' + '\n'.join(wr)
     body = body[:m.start()] + new + body[j + 1:]
 
@@ -169,7 +194,13 @@ body, nq = head_re.subn(lambda m: m.group(1) + qual(m.group(3), m.group(2)) + m.
 # at all. Two little-endian uint32 words at one address ARE a little-endian
 # uint64, so the host's 8-byte readback is unchanged.
 for c in ('noverflow', 'nhit', 'ntested', 'ndiv'):
-    body = re.sub(r'device ulong \*( ?)' + c + r'\b', r'device uint32_t *\1' + c, body)
+    # The `(_opt)?` also covers the local the optional-buffer wrappers
+    # forward through: a bare \b will not match it because `_` is a word
+    # character, and a local declared `device ulong *` while the body expects
+    # uint32_t is a compile error. That is how this was caught.
+    body = re.sub(r'device ulong \*( ?)' + c + r'(_opt)?\b',
+                  lambda mm, c=c: 'device uint32_t *' + mm.group(1) + c + (mm.group(2) or ''),
+                  body)
     body = re.sub(r'\batomicAdd\(\s*' + c + r'\s*,', 'atomicAdd64(' + c + ',', body)
 
 # k_classify takes the factor-base bound as a `double` because CADO's gap
@@ -229,6 +260,11 @@ if _wf_old in body:
         if _a in body: body = body.replace(_a, _b, 1)
     _te += 1
 print('  k_td: tile[e] copied once per prime in both variants (%d sites)' % _te)
+
+_idx = sorted({i for v in OPTIONAL_BUFFERS.values() for i in v})
+body = (MASK_DECL + ''.join(
+    'constant bool %s = (mtl_bound_mask & (1u << %d)) != 0;\n' % (bound_name(i), i)
+    for i in _idx) + '\n') + body
 
 open(OUT, 'w').write(body + '\n')
 print('wrote %s (%d lines, %d heads qualified)' % (OUT, body.count('\n'), nq))

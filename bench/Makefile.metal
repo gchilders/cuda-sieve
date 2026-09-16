@@ -342,6 +342,29 @@ metallibcheck: ../oracle/c183.fb1
 	@sh metal/metallibcheck.sh $(CURDIR)/$(BUILD)/bench \
 	    $(CURDIR)/../oracle/c183.poly $(CURDIR)/../oracle/c183.fb1
 
+# ---- Metal API validation gate -----------------------------------------
+# The property 9z-d bought: the sieve dispatches cleanly with MTL_DEBUG_LAYER
+# on. Nothing else here runs under validation, so without this gate the
+# property rots the first time someone adds a kernel with an optional buffer
+# and binds nil for it -- which is exactly how the port got into that state.
+#
+# The failure is an ABORT, not a diff: Metal asserts and the run dies naming
+# the kernel and the buffer index, e.g.
+#   Compute Function(k_apply_16_1_1_0): missing Buffer binding at index 11
+# so `exit 0 with the expected relation count` is the whole check.
+.PHONY: validationcheck
+validationcheck: $(BUILD)/bench ../oracle/c183.fb1
+	@echo "== the pipeline under MTL_DEBUG_LAYER=1 =="
+	@MTL_DEBUG_LAYER=1 CUDA_SIEVE_METALLIB=$(CURDIR)/$(BUILD)/bench.metallib \
+	    $(BUILD)/bench --pipeline --cadofb ../oracle/c183.fb1 \
+	    --poly ../oracle/c183.poly --qrange 120000053:120000053 \
+	    --allowance 101.6 --allowance0 68.1 --cofactor 2>&1 \
+	  | tee $(BUILD)/validation.log | grep -E "total relations" | tail -1
+	@grep -q "total relations *37$$" $(BUILD)/validation.log \
+	  && echo "METAL VALIDATION GATE: PASS" \
+	  || { echo "METAL VALIDATION GATE: FAIL"; \
+	       grep -iE "assertion|missing Buffer" $(BUILD)/validation.log | head -3; exit 1; }
+
 # ---- Phase 5 gate: the sieve against the tree's own CPU ground truth -----
 
 SIEVE_CPUOBJ := verify_cpu.o fbgen_lib.o fb_load.o fb_cado.o poly.o primes.o \

@@ -1813,8 +1813,8 @@ file's existence.
 
 | | sha256 |
 |---|---|
-| `bench` | `52f6280b42c126c752626ef24a108bbeb888b5c22a51a890ce628ca5fc96fd57` |
-| `bench.sig` | `c4c9cdfdc258601edde6de1e03fbb2e4cc989d98a8089baba497075e95e0e829` |
+| `bench` | `2e1a2d5f9e5f7c26f863d328867a6a2bbdfeb1b5e6d4093c848e11caebc1abc6` |
+| `bench.sig` | (re-made; verified with the one-bit-flip control) |
 
 **Re-staged and re-signed 2026-09-16 after 9z's leak fix.** Superseded artifacts, neither of
 which is the one to ship: `25ab6b65…2fdac977` (pre-leak-fix) and
@@ -2079,6 +2079,91 @@ the post-clamp value -- is what gets reported and reused.
 
 Carried, minor: `mtlEventSynchronize` reads `e->cb` under the lock and then
 uses it after unlocking. Safe only because events are single-threaded here.
+
+### 9z-e. The nil bindings are gone: the sieve runs under Metal validation
+
+```
+$ make -f Makefile.metal validationcheck
+== the pipeline under MTL_DEBUG_LAYER=1 ==
+  total relations                          37
+METAL VALIDATION GATE: PASS
+```
+
+Every optional buffer now goes through the 9z-d mechanism. The work was
+**driven by the validation layer itself**, which names one kernel and one
+buffer index per run, so the loop was: run, read the name, convert, rebuild.
+That turned an all-or-nothing refactor into six visible steps.
+
+| kernel | optional buffer indices | generator |
+|---|---|---|
+| `k_scan_block` | 1 | hand-written `scan.metal` |
+| `k_apply` | 11, 13, 24, **25** | `gen_bench_kernels.py` |
+| `k_intersect_compact` | 9, 10, 11, 16 | `gen_bench_kernels.py` |
+| `k_fill_atomic` | 10, 11 | `gen_bench_kernels.py` |
+| `k_transform` | 12 | `gen_bench_kernels.py` |
+| `k_resieve_scatter` | 2, 14 | `gen_td_metal.py` |
+| `k_td` | 3, 16, 17, 18 | `gen_td_metal.py` |
+| `k_cofac` | 10 | `gen_cofac_metal.py` |
+
+**Two of those were invisible to the static audit**, which is why the audit was
+not enough on its own:
+- `k_apply` **25** (`survbits`): the pipeline passes a real buffer here and
+  only `phase5_test` passes null, so scanning the production launcher missed it.
+- `k_cofac` **10** (`iters`): passed as a **variable that is null at runtime**,
+  not a literal `nullptr`. No grep can see that. It is caught because the mask
+  is computed from the argument's *value*, not its spelling.
+
+#### The mechanism, as it ended up
+
+The wrapper/body split was the real design constraint: a function-constant
+argument may be **named** only where it exists, and every wrapper forwards its
+arguments **by name** into a shared `_body` template. Templating the body on
+the optional flags would have multiplied instantiations (`k_apply` alone ->
+8x). Instead each wrapper declares a local that is null when the argument is
+absent:
+
+```metal
+device uint8_t * dump_opt = nullptr;
+if (mtl_bound_11) dump_opt = dump;
+k_apply_body<16, 1, 1, false>(..., dump_opt, ...);
+```
+
+**The `_body` templates are untouched** -- they still receive a
+possibly-null pointer and still test it. Only the wrappers changed, and they
+are generated.
+
+#### A REAL BUG the validation layer found on the way
+
+Not an API-hygiene issue -- a host/device type mismatch:
+
+```
+Compute Function(k_transform_1): argument a0[0] from Buffer(6) with offset(0)
+and length(4) has space for 4 bytes, but argument has a length(8).
+```
+
+`k_transform` declares `a0/a1/b0/b1` as `int64_t`. The warm-up launch
+(`pipeline.cuh:1844`) passes the literals `1, 0, 0, 1`. **CUDA converts them
+at the call site; Metal binds by value and takes the literal's own width**, so
+4 bytes were bound for an argument the kernel reads as 8 -- the upper half
+being whatever followed in the temporary buffer. Harmless in practice only
+because that warm-up passes `n = 0u` and the loop never runs.
+
+**This is a class, not an instance**: anywhere a narrower literal or variable
+meets a wider kernel parameter, CUDA's implicit conversion is lost and Metal
+binds the wrong width silently. The validation layer is the only thing that
+sees it. Fixed Metal-side in `gen_pipeline_host.py`; `pipeline.cuh` untouched.
+
+#### Kept honest by a gate
+
+`make -f Makefile.metal validationcheck` runs the pipeline under
+`MTL_DEBUG_LAYER=1`. The failure mode is an **abort**, not a diff, so "exit 0
+with 37 relations" is the whole check. Without it this property rots the first
+time a kernel gains an optional buffer -- which is precisely how the port got
+here.
+
+**Validated:** twelve gates green, `cofcheck.sh` 54 PASS / 0 FAIL, and the
+288-q band **byte-identical** at 13,485 relations, `sha256 8e79762c…dafbc002`,
+`cmp` clean. Re-staged and re-signed.
 
 Still open from earlier phases: `--mode twolevel` misplaces records and
 refuses (Phase 8), and nothing has run under a real BOINC client (9e).

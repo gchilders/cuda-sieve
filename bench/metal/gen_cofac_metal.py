@@ -140,7 +140,23 @@ def split_top(s):
         else: cur += ch
     out.append(cur); return out
 
-def bufparam(p, i):
+# Buffer indices the host sometimes passes a null pointer for -- here a
+# RUNTIME null (a variable that happens to be nullptr), which a grep for the
+# literal cannot see and only the validation layer found. Same mechanism as
+# gen_bench_kernels.py; see plan 9z-c/9z-d.
+OPTIONAL_BUFFERS = {'k_cofac': [10]}
+
+MASK_DECL = ('/* Optional buffer arguments: metal_rt supplies bit i ='
+             ' "argument i is bound". */\n'
+             'constant uint mtl_bound_mask [[function_constant(0)]];\n')
+
+def _fc(i, opt):
+    return (', function_constant(%s)' % bound_name(i)) if i in opt else ''
+
+def bound_name(i):
+    return 'mtl_bound_%d' % i
+
+def bufparam(p, i, opt=()):
     p = p.strip()
     # cofq_t is passed BY VALUE in CUDA and carries ~27 device pointers, which
     # a host pointer value cannot express on a GPU. It becomes an argument
@@ -148,8 +164,8 @@ def bufparam(p, i):
     # pointer inside made resident by mtlUseResource (see metal/argbuf_test).
     if p.startswith('cofq_t '):
         return 'constant cofq_dev_t &%s [[buffer(%d)]]' % (p.split()[-1], i)
-    if '*' in p: return 'device %s [[buffer(%d)]]' % (p, i)
-    return 'constant %s [[buffer(%d)]]' % (re.sub(r'(\w+)$', r'&\1', p), i)
+    if '*' in p: return 'device %s [[buffer(%d)%s]]' % (p, i, _fc(i, opt))
+    return 'constant %s [[buffer(%d)%s]]' % (re.sub(r'(\w+)$', r'&\1', p), i, _fc(i, opt))
 def plainparam(p):
     p = p.strip()
     if p.startswith('cofq_t '):
@@ -200,10 +216,17 @@ for name, (tparams, insts) in K.items():
                 for tn, tv in zip(tnames, inst):
                     q = re.sub(r'\b' + tn + r'\b', tv, q)
                 cps.append(q)
-            kps = [bufparam(pp, k) for k, pp in enumerate(cps)] + IDS
-            wr.append('kernel void %s_%s(\n    %s)\n{\n    %s_body<%s>(%s);\n}\n'
-                      % (name, '_'.join(inst), ',\n    '.join(kps), name,
-                         ', '.join(inst), ', '.join(args)))
+            opt = set(OPTIONAL_BUFFERS.get(name, ()))
+            kps = [bufparam(pp, k, opt) for k, pp in enumerate(cps)] + IDS
+            wargs = list(args); optdecl = ''
+            for k in sorted(opt):
+                pk = cps[k].strip(); an = re.sub(r'.*?(\w+)\s*$', r'\1', pk.replace('*', ' '))
+                optdecl += '    device %s = nullptr;\n' % re.sub(r'(\w+)\s*$', an + '_opt', pk)
+                optdecl += '    if (%s) %s_opt = %s;\n' % (bound_name(k), an, an)
+                wargs[k] = an + '_opt'
+            wr.append('kernel void %s_%s(\n    %s)\n{\n%s    %s_body<%s>(%s);\n}\n'
+                      % (name, '_'.join(inst), ',\n    '.join(kps), optdecl, name,
+                         ', '.join(inst), ', '.join(wargs)))
         # A by-value struct parameter (mz<L> lim2) is the kernel's OWN COPY in
         # CUDA. In MSL it arrives as a constant-space reference, which the body
         # then cannot take the address of, so give the body back a thread-local
@@ -254,6 +277,11 @@ body, nq = head_re.subn(lambda m: m.group(1) + qual(m.group(3)) + m.group(4), bo
 
 # Local pointer VARIABLES need an address space too, not only parameters.
 body = body.replace('const mpt<L> *G =', 'const thread mpt<L> *G =')
+
+_idx = sorted({i for v in OPTIONAL_BUFFERS.values() for i in v})
+body = (MASK_DECL + ''.join(
+    'constant bool %s = (mtl_bound_mask & (1u << %d)) != 0;\n' % (bound_name(i), i)
+    for i in _idx) + '\n') + body
 
 open(OUT, 'w').write(body + '\n')
 print('wrote %s (%d lines, %d heads qualified)' % (OUT, body.count('\n'), nq))
