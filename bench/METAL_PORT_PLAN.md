@@ -2823,8 +2823,50 @@ pipeline's pass directly -- swapping its timed launch for the `DIVIDE=0`
 instantiation, to separate test from division at pipeline scale -- **does not
 work**: the pipeline depends on that division downstream and never reaches the
 timer. Doing it properly needs instrumentation that runs the variants side by
-side rather than substituting one for the other. Not done here, and it is the
-honest next step.
+side rather than substituting one for the other.
+
+#### The side-by-side instrumentation, and what it says
+
+Done. Three launches per TD call, gated on `TD_PROBE`, run **before** the real
+one so it overwrites everything they touch and results are unaffected:
+`nsm = 0` (norm + special-q + large primes), `DIVIDE = 0` (adds the congruence
+test), and the real launch (adds the division). Differences give the split.
+Applied to both builds; on CUDA the template instantiates implicitly, on Metal
+it needed `k_td<0,0,0,true>` added.
+
+| share of `norms + trial division` | GTX 1080 | M3 |
+|---|---|---|
+| norm + special-q + large primes | 8.3% | 14.5% |
+| **small-prime congruence test** | **75.8%** | **70.8%** |
+| division | 15.9% | 14.7% |
+
+**The composition is the same on both platforms.** The test dominates equally,
+the division is ~15% on each. So Metal's 4.49x on this pass is **not**
+concentrated in one component -- it is a broadly uniform slowdown, and there is
+no single sub-step to attack. That is a different answer from "the test is the
+gap", which is what the standalone decomposition suggested, and it is the more
+useful one: it says the remaining TD gap is the kernel's overall efficiency on
+this hardware, not a hot spot.
+
+**Two things this probe got wrong before it got it right**, both worth
+recording because both looked like success:
+
+1. **`k_td<0,0,0,true>` does not exist.** The Metal instantiation list has
+   `('0','0','0','false')` only, and the pipeline is always slabbed. Launching
+   the missing name returned in ~0.01 ms, which read as "the test costs
+   nothing" -- a *negative* test time in the first run's arithmetic. A missing
+   kernel fails fast and looks like a fast kernel.
+2. **`nhit = nullptr` deletes the test.** With no observable sink, the whole
+   congruence loop is dead code and the compiler removes it. The probe has to
+   pass a real counter or it measures the norm twice.
+
+**One thing it still gets wrong.** The two runs disagree about how many
+candidates they processed -- CUDA 1,078,042 over 8 launches, Metal 3,772,546
+over 88, on the same `--nq 4` band, where the two-sided survivor totals should
+match. Until that is explained, **per-candidate normalisation from this probe
+is not trustworthy** and only the within-platform shares above are. The
+per-q stage timers (23.6 vs 106.5 ms, 4.49x) remain the sound cross-platform
+number.
 
 **Measured on a 10-core M3 in a fanless MacBook Air that also drives the
 display, against a GTX 1080 in an NRP k8s pod.**

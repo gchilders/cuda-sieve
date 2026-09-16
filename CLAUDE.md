@@ -534,9 +534,23 @@ call site cannot do one and forget the other.
   (one launch, ~16M candidates) against **4.49x in the pipeline** (~270k
   candidates over 8 slabs x 2 sides, ~17k records per launch against a
   131k-thread grid). Slab count explains ~9% (94.6/87.1/88.9/95.3 at 1/2/4/8)
-  and `SLABBED` ~12%; **the rest is unexplained**. Swapping the pipeline's
-  timed launch for `DIVIDE=0` to decompose it at pipeline scale does NOT work —
-  the pipeline needs the division downstream and never reaches the timer.
+  and `SLABBED` ~12%; **the rest is unexplained**. **SIDE-BY-SIDE PROBE DONE (plan 8r): the composition is
+  the SAME on both platforms** — test 75.8% (CUDA) vs 70.8% (Metal), division
+  15.9% vs 14.7%, norm 8.3% vs 14.5%. So Metal's 4.49x is a broadly uniform
+  slowdown of the whole kernel, **not a hot spot** — there is no single
+  sub-step left to attack. Probe = three launches per call (nsm=0, DIVIDE=0,
+  real) run BEFORE the real one, which overwrites them.
+
+  **Two traps it hit first, both of which looked like success:**
+  `k_td<0,0,0,true>` is NOT instantiated (only the unslabbed one), and
+  launching a missing kernel returns in ~0.01 ms — reads as "free", gives a
+  NEGATIVE component time. And `nhit=nullptr` makes the congruence loop dead
+  code, so the compiler deletes it; the probe must pass a real sink.
+
+  **Unresolved:** the two runs disagree on candidates processed (CUDA 1,078,042
+  / 8 launches vs Metal 3,772,546 / 88) on the same band, so per-candidate
+  normalisation from this probe is NOT trustworthy — only the within-platform
+  shares, plus the per-q stage timers (23.6 vs 106.5 ms).
 
   **`UNROLL` is flat on Metal** (48.7/50.0/51.0/49.9/49.8 at 1/2/4/8/16), so
   this kernel is NOT latency-bound here the way `td.cuh` says it is on NVIDIA.
