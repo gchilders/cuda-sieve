@@ -788,9 +788,10 @@ call site cannot do one and forget the other.
   here.**
 
   **SIGNED AND STAGED (plan 9f).** `~/code/dist/` holds `bench` (sha256
-  `9e975aa5…`) and `bench.sig` (256 hex chars, a 1024-bit RSA signature).
-  **Re-staged and re-signed 2026-09-16 after 9z's leak fix** — the superseded
-  `25ab6b65…` is NOT the artifact to ship. Revalidated over the full 288 q
+  `52f6280b…`) and `bench.sig` (256 hex chars, a 1024-bit RSA signature).
+  **Re-staged and re-signed 2026-09-16 after 9z and 9z-b** — the superseded
+  `25ab6b65…` (pre-leak-fix) and `9e975aa5…` (pre-autorelease-fix) are NOT the
+  artifacts to ship. Revalidated over the full 288 q
   from a one-file directory: **13,485 relations, `cmp` clean, sha256
   `8e79762c…` unchanged**, and free memory ends at **10.84 GB against 8.13
   before** (2.71 GB recovered). A signature is over content, so re-signing was
@@ -941,15 +942,33 @@ Same bug fixed in `mtlShutdown` and `pso_for`'s `MTLFunction`.
 - **No lock recursion**: `mtlUseResource` deliberately skips `g_lock`;
   `mtlDeviceAddress` takes it and is only called outside the bind window.
 
-**TOP REMAINING ITEM: there is no `@autoreleasepool` anywhere in the shim, and
-the leak was holding it together.** `commit()` stores `st->last = st->cb` where
-`cb` is **autoreleased and never retained**, and `sync()` reads it later —
-nothing drains, so it survives by accident. **Adding a pool naively converts a
-leak into a use-after-free**; the fix is explicit retain/release on command
-buffers. Measured alongside: RSS rises **372 → 399 MB over 75 s** of a 144-q
-band, roughly linear, **cause not established** (could be these objects or the
-legitimate cross-q queue). It matters most where it is least tested: a
-multi-hour BOINC task.
+**FIXED: the autorelease problem, ownership first (plan 9z-b).** There was no
+`@autoreleasepool` anywhere in the shim, and **the leak was standing in for a
+lifetime**: `commit()` stored `st->last = st->cb` from `[st->q commandBuffer]`
+— **autoreleased and never retained** — and `sync()` and every event query read
+it later. Nothing drained, so it survived by accident. **A pool alone would
+have been a use-after-free, not a fix.**
+
+So ownership came first: `cb`, `cenc`, `benc`, `last`, the stream's
+`MTLCommandQueue` and the event's `MTLEvent` are retained on store and released
+on replace or teardown (`stream_teardown()` — two places used to drop a queue
+on the floor). `mtlEventRecordOn` takes its own reference, retain-before-
+release. **Then** the pool, at the creation site — because balancing our own
+retain/release is NOT enough, the pending autorelease must also fire, and
+without a pool it never does:
+
+```objc
+void ensure_cb(Stream *st)
+{ if (st->cb) return; @autoreleasepool { st->cb = [[st->q commandBuffer] retain]; } }
+```
+
+**Measured, same 144-q band: RSS growth 372→399 MB (~0.36 MB/s) becomes
+361.9→367.4 (~0.07) — about 80% gone**, and what remains steps then flattens,
+the shape of the cross-q queue filling toward a flush. That also settles 9z's
+open question: it was mostly the autoreleased objects, not the queue. A command
+buffer retains every resource it references, so each leaked one pinned buffers
+too. **Validated as a lifetime change must be — twelve gates, cofcheck 54/0,
+and 288 q byte-identical at `sha256 8e79762c…`.**
 
 Lesser, open: a zero-sized launch is silently skipped where CUDA returns
 `cudaErrorInvalidConfiguration`; `mtlDeviceAddress` lacks the "do not call
