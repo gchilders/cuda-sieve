@@ -1228,6 +1228,126 @@ correctness vehicle.
 ### Phase 9 — Packaging
 `Makefile.metal`, metallib embedding, arm64 BOINC.
 
+### 9a. The BOINC library builds on arm64 -- with three flags the instruction did not name
+
+**Done and working**, but the bare `./configure --disable-server
+--disable-client --disable-manager` produces a library this port cannot ship.
+Three additions are load-bearing, and each was found by inspecting the
+artifact rather than by a build failure -- all four configurations above build
+and link with exit 0.
+
+**What was built.** BOINC master `55a5644`, `AC_INIT(BOINC, 8.3.0)`, shallow
+clone. Prerequisites via Homebrew: `autoconf automake libtool pkg-config`
+(the machine had none of them; `/usr/bin/libtool` is Apple's, not GNU's).
+
+**`_autosetup` needs `LIBTOOLIZE` set.** Homebrew installs GNU libtool's
+commands under a `g` prefix, and BOINC's version checker looks only for
+`libtoolize`:
+
+```
+Checking version of 'libtoolize' >= 105... Didn't find application
+```
+
+Fix: `export LIBTOOLIZE=/opt/homebrew/bin/glibtoolize`. It then bootstraps
+clean and configure reports exactly the intended scope:
+
+```
+--- Configuring BOINC 8.3.0 (Release) ---
+--- Build Components: ( libraries) ---
+```
+
+**The configure line this port actually needs:**
+
+```
+export PATH=/opt/homebrew/bin:$PATH
+export LIBTOOLIZE=/opt/homebrew/bin/glibtoolize
+export MACOSX_DEPLOYMENT_TARGET=13.0
+./_autosetup
+./configure --disable-server --disable-client --disable-manager \
+            --disable-shared --enable-static \
+            --prefix=$HOME/code/boinc-install \
+            CFLAGS="-O2 -mmacosx-version-min=13.0" \
+            CXXFLAGS="-O2 -mmacosx-version-min=13.0"
+make -j8 && make install
+```
+
+**1. `--disable-shared` is NOT optional.** Without it libtool installs
+`libboinc_api.8.dylib` alongside `libboinc_api.a`, and `-lboinc_api` prefers
+the dylib. The probe binary came out depending on
+
+```
+/Users/gchilders/code/boinc-install/lib/libboinc_api.8.dylib
+```
+
+-- an absolute path on the build machine, baked into a binary meant to run on
+a volunteer's. It links and runs here, which is exactly why this has to be
+checked with `otool -L` rather than by whether the build succeeded. With
+`--disable-shared` the binary depends on `/usr/lib/libSystem.B.dylib` and
+`/usr/lib/libc++.1.dylib` only, both shipped with macOS. Note only `api` and
+`opencl` ever grew a dylib; `libboinc` was static either way.
+
+**2. The deployment target must be set, or the library contradicts
+`METAL_MIN_MACOS`.** A default build stamps every object with the host SDK:
+
+| build | `minos` (all 46 objects) |
+|---|---|
+| default | **26.0** |
+| `-mmacosx-version-min=13.0` | **13.0** |
+
+`Makefile.metal` targets macOS 13 (M1/Apple7 floor). A `minos 26.0` archive
+linked into it produces a binary that will not start on anything older than
+the build host -- the support floor silently becoming "whatever this laptop
+runs". Verified across every object in both archives, not just the first.
+
+**3. `BOINC_HOST_STATIC`'s default is a hard error with Apple clang.**
+`Makefile` line 348 defaults it to `-static-libstdc++ -static-libgcc`:
+
+| flag | Apple clang |
+|---|---|
+| `-static-libstdc++` | `warning: argument unused during compilation` |
+| `-static-libgcc` | **`error: unsupported option '-static-libgcc'`** |
+
+So any macOS BOINC link must pass `BOINC_HOST_STATIC=` explicitly. The
+Makefile already documents that opt-out ("set `BOINC_HOST_STATIC=` to opt out
+explicitly") -- on macOS it is mandatory, not a choice. It also costs nothing:
+the reason the CUDA build does this is glibc/libstdc++ skew across Linux
+distributions, and macOS ships libc++ and libSystem with the OS.
+
+**What was verified, beyond "it compiled".** `boinc_support.cpp` compiles
+against the real BOINC 8.3.0 headers with `-Wall -Wextra` and **zero
+warnings**, and `metal/boinc_link_probe.cpp` links the whole
+`bench_boinc_*` surface against the static archives. The probe references
+`bench_boinc_init` behind an `argc` gate rather than `if (0)`, because at -O2
+the optimiser deletes a dead call and then `boinc_api.o` is never pulled from
+the archive -- a link that resolved nothing and looked identical. With the
+gate, `nm` confirms `_boinc_init_parallel`, `_boinc_finish` and
+`_boinc_fraction_done` are all in the binary.
+
+Run with an argument, the round trip works:
+
+```
+BOINC: API initialised (standalone mode)
+init rc=0
+```
+
+and then **exits without returning** -- `bench_boinc_finish` calls
+`boinc_finish`, which terminates the process. It also leaves
+`boinc_finish_called` and `stderr.txt` in the working directory: **the BOINC
+runtime redirects stderr to `stderr.txt` in cwd**, which Phase 9 has to
+reconcile with `runlog`'s own stderr half (and with `g_runlog_quiet`).
+
+Without an argument it reports `is_managed=0 gpu_device=-1` and refuses
+`bench_boinc_resolve_path` before init, which is the correct unmanaged
+behaviour.
+
+**What this does NOT establish.** The probe is not a BOINC client: nothing
+here ran under a real `init_data.xml`, so slot-directory filename resolution,
+`boinc_get_init_data`'s GPU device assignment, checkpointing and the
+suspend/quit messages are all still unexercised. It also says nothing about
+`Makefile.metal`, which has no `HAVE_BOINC` path at all yet -- only
+`Makefile` does. Wiring that, with `BOINC_HOST_STATIC=`, is the Phase 9 work
+this unblocks.
+
 ---
 
 ## 10. Open questions for the CUDA side
@@ -2920,6 +3040,6 @@ display, against a GTX 1080 in an NRP k8s pod.**
 | 2026-09-14 | `bench/fbgpucheck.sh` | `sha256sum` (coreutils) falls back to `shasum -a 256` where absent, so the same script is the gate on macOS instead of being forked | Ran on macOS: 19/19 cases pass including the publish-guard case that uses the hash. No behaviour change where `sha256sum` exists, which is every Linux box the CUDA build runs on — the fallback is only taken when the command is missing. **Not run on Linux**, so "no change there" is by inspection of a two-branch `command -v` test, not by execution. |
 | 2026-09-14 | `bench/slab.h` | wrapped `#define SLAB_PERF_REGIONS 32768u` in `#ifndef`/`#endif` so a build can override it. **The default is unchanged**: a build that passes no `-D` sees the identical token it saw before. Only the Metal build overrides it, to `8192u`, because its `--region` default of 13 makes CUDA's region *count* mean a quarter of CUDA's slab size in positions -- see section 8c. | `make slabcheck` passes against the edited header. That pass is evidence rather than a tautology because the gate is *sensitive* to this constant: the same `slabtest.cpp` recompiled with `-DSLAB_PERF_REGIONS=8192u` fails on the first pinned row (`plan 0 got jmax=2048 n=2 enabled=1; want 4096/1/0`). The pinned rows do exercise the policy, and they still see 32768. |
 | 2026-09-15 | `bench/runlog.c`, `bench/runlog.h` | added `int g_runlog_quiet` (default 0) and a `if (!g_runlog_quiet)` guard around `runlog_warn`'s **stderr half only**; the log-file half is untouched. Verbatim from `hip-port`. **No CUDA-side code sets it**, so the CUDA build sees an unconditional `0` and identical behaviour. | Compiles clean in the default build (`make runlog.o`, `-Wall -Wextra`). Behaviour unchanged by inspection of a one-line guard on a variable no CUDA translation unit writes; **not exercised on a CUDA build**, since there is no nvcc on this machine. |
-| 2026-09-15 | `bench/boinc_support.cpp`, `bench/bench.h` | added `bench_boinc_progress_suspend(int)` and a `if (progress_suspended) return;` early-out in `bench_boinc_fraction_done`, placed **before** the monotonic high-water mark. Verbatim from `hip-port`. Nothing in the CUDA build calls the setter, so `progress_suspended` is permanently 0 there and the early-out never fires. | `make -f Makefile.metal boinccheck`: compiles `boinc_support.cpp` with `-DHAVE_BOINC` against a stub client API and drives both cases in separate processes. The control, run first, reproduces the HIP port's field bug (task pinned at 99%); the gate shows the suspend prevents it while preserving monotonicity. Also compiles clean both with and without `HAVE_BOINC` (`-Wall -Wextra`). **The real BOINC SDK is not installed here**, so this is verified against a stub, not against a client. |
+| 2026-09-15 | `bench/boinc_support.cpp`, `bench/bench.h` | added `bench_boinc_progress_suspend(int)` and a `if (progress_suspended) return;` early-out in `bench_boinc_fraction_done`, placed **before** the monotonic high-water mark. Verbatim from `hip-port`. Nothing in the CUDA build calls the setter, so `progress_suspended` is permanently 0 there and the early-out never fires. | `make -f Makefile.metal boinccheck`: compiles `boinc_support.cpp` with `-DHAVE_BOINC` against a stub client API and drives both cases in separate processes. The control, run first, reproduces the HIP port's field bug (task pinned at 99%); the gate shows the suspend prevents it while preserving monotonicity. Also compiles clean both with and without `HAVE_BOINC` (`-Wall -Wextra`). **Updated 2026-09-15 (plan 9a): the real BOINC SDK is now built here** (8.3.0, arm64, static, `minos 13.0`) and `boinc_support.cpp` compiles against its real headers with zero warnings and links against its real archives. That is a stronger check than the stub for the *link*, but still not a client: no `init_data.xml`, so the stub remains the only thing exercising the progress logic. |
 | 2026-09-15 | `bench/cofcheck.sh` | build detection from `--help` (`select Metal device` vs `select CUDA device`, refusing to guess if neither), and the `--ecm-b1 400000` case inverted on Metal to assert a refusal instead of an acceptance. **CUDA's path is unchanged**: `IS_METAL=0` takes the original branch verbatim. | Ran on Metal: 54 PASS / 0 FAIL / exit 0, with `large B1 with derived B2 -> refused, as Metal must`. The case it replaces crashed WindowServer twice on this machine. **Not run on a CUDA build** -- the CUDA branch is unchanged by inspection of a two-way `if`, not by execution. The HIP port skips this case for the same underlying reason (`cofac.cuh`'s own warning block says so). |
 | 2026-09-15 | `bench/td.cuh` | wrapped `#define TD_TILE 512` in `#ifndef`/`#endif`. **Default unchanged**, so a build passing no `-D` sees the identical token; only the Metal build overrides it, and 8q measured that override to be worth nothing, so it does not. | `make slabcheck` passes; six Metal gates green including `sievecheck` (4,194,304 cells) and `cofcheck.sh` (54 cases). Behaviour change is nil by inspection of an `#ifndef` around an unchanged value. **Not compiled by nvcc** — no CUDA build was run against this edit. |
