@@ -42,7 +42,7 @@ int main(int argc, char **argv)
         memcpy(&d_limbs[i * BN_LIMBS], &host[i], sizeof(bn_t));
     }
 
-    mtlError_t e = mtl_launch_begin("k_classify_probe", 0, N / 256, 256, 0);
+    mtlError_t e = mtl_launch_begin("k_classify_probe", 0, N / 256, 256, 0, 0u);
     if (e != mtlSuccess) { printf("launch: %s\n", mtlGetErrorString(e)); return 1; }
     mtl_bind_buffer(d_out, 0); mtl_bind_buffer(d_limbs, 1); mtl_bind_buffer(d_bits, 2);
     mtl_bind_bytes(&lpb, 4, 3); mtl_bind_bytes(&mfb, 4, 4);
