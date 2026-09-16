@@ -2501,7 +2501,54 @@ A 4.77x penalty on the operation TD spends its time in, against a card where
 `__umul64hi` is an instruction. That is the structural cause, and it is why no
 amount of tile sizing or thread counting moved it.
 
-**The fix, not attempted here:** `d` is a `uint32_t`, `rem < d`, and therefore
+#### The 32-bit division: built, proven exact, and 2x SLOWER
+
+Attempted. It does not work, and the way it fails is the useful part.
+
+Probing the primitives in isolation (65,536 threads x 200,000 iterations, best
+of 3) said the target was obvious:
+
+| primitive | ms | vs the cheapest |
+|---|---|---|
+| Granlund-Moller 2/1 step, 32-bit | 172 | 1.00x |
+| plain 32-bit division | 251 | 1.42x |
+| the per-limb Barrett (64-bit) | 433 | 2.52x |
+| **`bn_recip_u32`'s `(2^64-1)/d`** | **9958** | **57.82x** |
+
+`td_divide_out` calls `bn_recip_u32` **once per prime per candidate**, so a
+57x primitive looked like the whole story -- costing more than the division it
+exists to accelerate.
+
+Replaced it with Knuth's algorithm D in base 2^16, which needs only 32-bit
+division. **The arithmetic is exact**: verified on the host against
+`(2^64-1)/d` for **every d in [2, 2^27]** -- 134,217,727 values, the entire
+range a factor-base prime can occupy at `alim` 134,200,000 -- plus 4,000,256
+random values across the full 32-bit range including the top 256. Zero
+mismatches. Probed on the GPU it is **4.46x faster** than the 64-bit division,
+2,231 ms against 9,958.
+
+In the actual kernel it made TD **2x slower**: 254.8 ms/q against 128.9.
+Relations stayed at 2,282, so it was exact there too -- just slow.
+
+**Why the microbenchmark lied.** Isolated, the routine is 25 lines of 32-bit
+work replacing one expensive instruction sequence. Inlined twice per
+`bn_recip_u32`, inside `td_divide_out`'s loop, inside `k_td`'s per-candidate
+loop, it is a large body with two *data-dependent correction loops* -- so it
+costs register pressure and SIMD divergence that a probe with uniform inputs
+never sees. And the direction of the result says the reciprocal was **not**
+dominant to begin with: something 4.46x cheaper made the stage twice as slow,
+which it could not do if it were the bottleneck.
+
+Reverted. `bigint_msl.h` keeps CUDA's `(2^64-1)/d`.
+
+**This is 8h's lesson in a different costume.** There, a one-q band made a
+queued stage look like 59% of wall. Here, a primitive probe made one operation
+look like the bottleneck. **Both times the isolated measurement was precise,
+reproducible and about the wrong thing.** A profile of the real kernel -- which
+this port does not have -- is what the next attempt needs, rather than another
+plausible primitive.
+
+**What remains, for whoever picks it up:** `d` is a `uint32_t`, `rem < d`, and therefore
 both the quotient and the remainder fit in 32 bits -- only `cur` is 64-bit.
 This is the standard 2-word-by-1-word division (`udiv_qrnnd` with a 32-bit
 inverse), which needs only 32x32->64 products. Done in `bigint_msl.h` it would
