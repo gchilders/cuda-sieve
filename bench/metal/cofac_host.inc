@@ -1235,6 +1235,11 @@ static void cof_report_chunk(uint32_t chunk, uint32_t n, int pinned)
 {
     const uint32_t step = (chunk && chunk < n) ? chunk : n;
     const uint32_t nl = step ? (n + step - 1) / step : 1u;
+    static uint32_t last_step, last_nl, last_n;
+    static int last_pinned = -1;
+    if (step == last_step && nl == last_nl && n == last_n
+        && pinned == last_pinned) return;
+    last_step = step; last_nl = nl; last_n = n; last_pinned = pinned;
     fprintf(stderr, "  cofactor chunk: %u records/launch, %u launch%s per"
             " round over %u records (%s)\n", step, nl, nl == 1 ? "" : "es", n,
             pinned ? "pinned by --cof-chunk" : "auto");
@@ -1304,11 +1309,10 @@ typedef struct {
     int meth[2];
     uint8_t  *d_s2mask; uint32_t s2vmin, s2nv;/* ECM stage-2 schedule      */
     double ms_rat, ms_alg, ms_host;
-    float  ms_launch_max;   /* longest single launch seen, ms */
-    uint32_t ecm_rounds;    /* rounds to actually run; derived or the caller's */
     float  ms_launch_prev;  /* launch time before the last halving      */
     uint32_t chunk_prev;    /* the chunk that produced it               */
     int    chunk_parked;    /* halving stopped paying; descend no more  */
+    uint32_t ecm_rounds;    /* rounds to actually run; derived or the caller's */
     unsigned long long nseen, nrel;
     /* Per side, per CF_* status, accumulated over flushes. `ndead`/`nstuck`
      * used to be two scalars here that NOTHING ever wrote -- which is the
@@ -1583,9 +1587,12 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
          * it; 8 curves at B1 2000 measured 740 ms, i.e. 92.5 ms each
          * over 2,237 units. Calibrated on a 10-core M3. */
         const double ms_one_curve = 0.0413 * (double)(Q->ns + Q->s2nv);
-        const double ms_round = ms_one_curve * (double)Q->ecm_curves;
         const int both_ecm = Q->meth[0] && Q->meth[1];
-        if (ms_one_curve <= COF_LAUNCH_REFUSE_MS && Q->ecm_curves > 2u) {
+        /* No advisory branch: when this cannot act -- an explicit
+         * --ecm-curves, or a side running rho -- it stays silent rather
+         * than printing guidance into a volunteer's stderr.txt. */
+        if (ms_one_curve <= COF_LAUNCH_REFUSE_MS && Q->ecm_curves > 2u
+            && !curves_set && both_ecm) {
             /* NOT the largest count that fits the bound -- that is 8 at
              * B1 2000 and costs 265 ms/q against 180. Measured at --nq 144,
              * 192 curves, B1 2000/B2 60000, cofac ms/q by curves/round:
@@ -1600,33 +1607,25 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
             while (fit > 1u && ms_one_curve * (double)fit > COF_CHUNK_TARGET_MS)
                 fit--;
             if (fit > Q->ecm_curves) fit = Q->ecm_curves;
-            if (!curves_set && both_ecm) {
-                /* Same total curves, shorter launches. */
-                const uint64_t budget = (uint64_t)Q->ecm_curves * rounds_in;
-                uint64_t r = (budget + fit - 1u) / fit;
-                if (r > 1000u) r = 1000u;
-                if (r < 1u) r = 1u;
-                printf("  cofactor queue: %u curves/round is ~%.0f ms in one"
-                       " launch, over the %.0f ms bound; using %u x %u"
-                       " instead (~%.0f ms, %llu curves vs %llu)\n",
-                       Q->ecm_curves, ms_round, (double)COF_CHUNK_TARGET_MS,
-                       fit, (unsigned)r, ms_one_curve * (double)fit,
-                       (unsigned long long)((uint64_t)fit * r),
-                       (unsigned long long)budget);
-                Q->ecm_curves = fit;
-                Q->ecm_rounds = (uint32_t)r;
-            } else {
-                fprintf(stderr,
-                        "  cofactor queue: %u curves/round is about %.0f ms in"
-                        " one launch, over this build's %.0f ms bound."
-                        " --cof-chunk splits RECORDS and cannot divide a"
-                        " chain, so the chunker will subdivide without"
-                        " reaching it and lose throughput doing so.\n",
-                        Q->ecm_curves, ms_round, (double)COF_CHUNK_TARGET_MS);
-                fprintf(stderr,
-                        "  Shorter launches, same B1/B2: --ecm-curves %u"
-                        " with more --cof-rounds (ECM allows 1000).\n", fit);
-            }
+            const uint64_t budget = (uint64_t)Q->ecm_curves * rounds_in;
+            uint64_t r = (budget + fit - 1u) / fit;
+            if (r > 1000u) r = 1000u;
+            if (r < 1u) r = 1u;
+            /* Says what it DID. The line it replaces asserted that the
+             * caller's split was 'over the bound', which is false
+             * whenever a curve is cheap -- at B1 200 twelve curves are
+             * 119 ms against a 750 ms bound, and it said so anyway. The
+             * reason to move is that 2/round is the measured optimum;
+             * the bound is a ceiling that can lower it further, not the
+             * thing being enforced here. */
+            printf("  cofactor queue: %u curves/round -> %u x %u"
+                   " (~%.0f ms/launch, %llu curves vs %llu)\n",
+                   Q->ecm_curves, fit, (unsigned)r,
+                   ms_one_curve * (double)fit,
+                   (unsigned long long)((uint64_t)fit * r),
+                   (unsigned long long)budget);
+            Q->ecm_curves = fit;
+            Q->ecm_rounds = (uint32_t)r;
         }
         if (ms_one_curve > COF_LAUNCH_REFUSE_MS) {
             fprintf(stderr,
@@ -1874,14 +1873,6 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
             && p > launch_ms) launch_ms = p;
     }
     Q->ms_rat += t0; Q->ms_alg += t1;
-    if (launch_ms > 0.0f && launch_ms > Q->ms_launch_max) {
-        Q->ms_launch_max = launch_ms;
-        fprintf(stderr,
-                "  cofactor: longest kernel launch %.0f ms (%u records/launch,"
-                " %u in flush)\n",
-                (double)launch_ms,
-                Q->chunk_cur < n ? Q->chunk_cur : n, n);
-    }
 
     /* Steer the NEXT flush. Only in auto mode, and only ever between flushes,
      * so the slice is fixed for the whole of the one just measured.
