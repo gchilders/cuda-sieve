@@ -245,6 +245,16 @@ inline mtlError_t mtl_launch(const char *kernel, mtlStream_t s, unsigned grid,
      * computed here and not discovered while binding: setComputePipelineState
      * happens inside mtl_launch_begin. Runtime value, not compile-time -- a
      * pointer variable that merely happens to be null counts too. */
+    /* The mask is a uint32, so `1u << b` is undefined past 31 -- and the
+     * failure would be SILENT: a null argument above index 31 would report as
+     * bound, Metal would demand a binding for an argument declared under a
+     * false constant, and the port would be back to 9z-c's bug with nothing
+     * to show for it. The widest kernel here is k_apply at 29 bound
+     * arguments; this makes the next one that grows past 32 a compile error
+     * instead. */
+    static_assert(sizeof...(A) <= 32,
+                  "kernel has more arguments than the nil-mask has bits; widen "
+                  "nilmask to uint64_t and the constant in the .metal sources");
     uint32_t nilmask = 0; int b = 0;
     (..., (nilmask |= (mtl_arg_is_null(args) ? 1u : 0u) << b, ++b));
     mtlError_t e = mtl_launch_begin(kernel, s, grid, block, smem, nilmask);
