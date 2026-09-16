@@ -1157,12 +1157,21 @@ static int cf_run_rounds_dyn(int L, const uint32_t *d_n, uint64_t lim,
  * deliberately conservative, and free to be, because over-chunking costs
  * nothing on the devices that ever reach this path (see the floor below).
  */
-/* 750 ms on ONE launch: a UI-responsiveness bound as much as a watchdog
+/* 400 ms on ONE launch: a UI-responsiveness bound as much as a watchdog
  * one, and explicitly worth throughput to hold. CUDA keeps 250 ms against
- * a whole-side sum; this is 750 against a measured launch, so the two
- * numbers are not comparable. See gen_cofac_host.py. */
+ * a whole-side sum; this is 400 against a measured launch, so the two
+ * numbers are not comparable. See gen_cofac_host.py.
+ *
+ * WAS 750, lowered 2026-09-16 after 9z-k. 750 was set (8k) against what
+ * was believed to be a launch bound but was in fact a bound on one
+ * DISPATCH, while macOS kills a COMMAND BUFFER -- and the observed kills
+ * on M1/M2 were command buffers of roughly 800 ms. 9z-k makes one launch
+ * one command buffer, so this number is now the real thing the watchdog
+ * sees, and 400 puts it at half the shortest duration anyone has been
+ * killed at rather than a hair under it. The true threshold is still
+ * undocumented and unmeasured. */
 #ifndef COF_CHUNK_TARGET_MS
-#define COF_CHUNK_TARGET_MS   750.0f
+#define COF_CHUNK_TARGET_MS   400.0f
 #endif
 
 /* Giant steps per curve above which cofq_init warns that record chunking can
