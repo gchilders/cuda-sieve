@@ -2557,6 +2557,58 @@ relations, so it wants its own care -- but the gates to check it already exist
 and are strong: `sievecheck` compares 4,194,304 cells, `cofcheck.sh` pins ~25
 relation counts, and Phase 7 can re-run byte-identity against real CUDA.
 
+#### The profile, at last -- and it is neither of the things I tried
+
+`--td` already decomposes the stage on both platforms; nothing had to be
+written to get this. Same q, same geometry, **identical work on both --
+17,625,929 hits, 7.28 per survivor** -- against a GTX 1080 (sm_61):
+
+| part of `k_td` | GTX 1080 | M3 | M3/CUDA | CUDA share | Metal share |
+|---|---|---|---|---|---|
+| norm + special-q + 16 large primes | 13.6 | 27.8 | 2.05x | 10.8% | 6.9% |
+| **small-prime congruence test** | **81.2** | **324.2** | **3.99x** | 64.4% | **80.1%** |
+| division | 31.4 | 52.9 | **1.68x** | 24.9% | 13.1% |
+| **norms + trial division** | **126.2** | **404.9** | **3.21x** | | |
+| classify | 25.6 | 30.4 | 1.19x | | |
+
+**The division is the best-performing part of the stage at 1.68x**, and this
+port tried twice to optimise it. The congruence test is the entire gap: 3.99x,
+and 80% of Metal's TD. Had the test matched CUDA, TD would be **1.28x rather
+than 3.21x**.
+
+#### The fix: one struct load instead of six field loads
+
+Per prime the test reads **six fields of `tile[e]` separately** -- `m`, `g`,
+`magic`, `rt`, `sh`, `cst` -- out of threadgroup memory, and every thread in
+the SIMD group reads the same element, so they are broadcasts. Copying the
+32-byte `tdsmall_t` once and using the copy lets the compiler issue wide loads
+instead of six scalar ones:
+
+| | before | after | |
+|---|---|---|---|
+| congruence test (standalone `--td`) | 324.2 ms | **223.4 ms** | **-31%** |
+| norms + trial division (standalone) | 404.9 ms | **306.3 ms** | **-24%** |
+| norms + trial division (pipeline, ms/q) | 130.3 | **106.2 / 106.2 / 107.3** | **-18%** |
+
+17,625,929 hits before and after, 2,282 relations, `sievecheck` /
+`cofaccheck` / `cofcheckgate` green. Wall moves about -15 ms/q against a
++/-11 ms band -- real but small, because TD is ~11% of wall.
+
+That takes the test from 3.99x to **2.75x** CUDA and TD from 3.21x to 2.43x.
+**The remaining 2.75x is still unexplained** and is now the whole of TD's gap;
+the loop that carries it is six threadgroup broadcasts, a multiply and
+`td_mod_magic` per prime, 3,633 primes per candidate.
+
+#### A correction to this section's own earlier reasoning
+
+An earlier draft cited `bigint.cuh`'s comment -- "30 ms of a 43 ms kernel
+[division] against 13 ms for the congruence tests" -- as evidence that CUDA's
+shape was the mirror of Metal's. It is not. **On this card and this job the
+test dominates CUDA too**, 64.4% against the division's 24.9%. That comment
+describes a different configuration and should not have been read as a
+statement about this one. The two platforms agree about which part of TD is
+expensive; they disagree about by how much.
+
 #### Two latent bugs found while doing this, both fixed
 
 1. **`MSLFLAGS` was not passing `-DBN_LIMBS`.** `bigint_msl.h` declares `bn_t`
