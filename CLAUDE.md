@@ -621,10 +621,55 @@ call site cannot do one and forget the other.
   return** (`boinc_finish` exits), and the BOINC runtime **redirects stderr to
   `stderr.txt` in cwd** — which Phase 9 must reconcile with `runlog`.
 
-  **NOT established:** nothing ran under a real client or `init_data.xml`, so
-  slot filename resolution, GPU device assignment and checkpointing are
-  unexercised. And **`Makefile.metal` has no `HAVE_BOINC` path at all** yet —
-  only `Makefile` does. That wiring is the next Phase 9 step.
+  **`HAVE_BOINC` IS NOW WIRED INTO `Makefile.metal` (plan 9b), gate green.**
+  `make -f Makefile.metal benchbin HAVE_BOINC=1 BOINC_DIR=<prefix>`. Default
+  stays 0. The ported TUs already carried the whole integration; only the
+  build wiring was missing, and neither needs a BOINC header — everything goes
+  through `bench.h`.
+
+  **THE `--help` BUILD MARKER HAD ROTTED, AND THE ROT IS MACHINE-CRASHING.**
+  `gen_bench_main.py` rewrote CUDA's `--device` line to "select Metal device"
+  in the **`#else` branch only**; a `-DHAVE_BOINC` build takes the `#ifdef`
+  branch, which still said **"select CUDA device"**. `cofcheck.sh` classifies
+  the build from exactly that string, so a BOINC build was detected as CUDA —
+  and would then run the `--ecm-b1 400000` case that took WindowServer down
+  twice. **A marker that holds in one branch of the `#ifdef` it is printed
+  from is not a marker.** Both branches fixed, plus two stderr lines that said
+  "running on CUDA device" out of a Metal binary.
+
+  **`.metalflags.stamp`: this Makefile never tracked a flag change.** Flipping
+  `HAVE_BOINC` left objects compiled the other way, and a `bench_main.o`
+  without the define never calls `bench_boinc_init()` — a silently wrong
+  binary, not a link error. The stamp covers the whole
+  `HOSTFLAGS|MSLFLAGS|BOINC_LINK|CPUOBJ_TUNE` signature, so changing **any**
+  tunable rebuilds what it affects. That also retires 8q's stale-artifact
+  trap. `HOSTFLAGS` is split into `HOSTFLAGS_BASE` + BOINC flags because
+  include search is left to right: with `BOINC_CPPFLAGS` in `HOSTFLAGS`, the
+  stub gate's `-I metal/boinc_stub` would **lose to the real SDK** and
+  `boinccheck` would quietly stop testing the stub.
+
+  **`make -f Makefile.metal boinclinkcheck HAVE_BOINC=1 BOINC_DIR=...`** — 7
+  checks, all green, **and the control fails** (run against the
+  `HAVE_BOINC=0` binary it reports the three BOINC symbols missing). It
+  refuses to run at `HAVE_BOINC=0` rather than vacuously pass. Every check is
+  for something that builds and links with exit 0 and is still wrong.
+
+  **UNDER BOINC, stderr GOES TO `stderr.txt` IN THE WORKING DIRECTORY**, from
+  `boinc_init` onward — which is before argument parsing. **A check that greps
+  stderr from a terminal or a `2>&1` pipe finds nothing and "passes" for the
+  wrong reason.** Assert on stderr only by reading `stderr.txt`; the gate
+  prints the stderr-only assertions to check by hand rather than faking them.
+  `--help` is `printf`, i.e. stdout, which is why the marker check and
+  `cofcheck.sh`'s detection are sound.
+
+  **End-to-end, done by hand once:** a `HAVE_BOINC=1` binary at the parity
+  special-q gives **exit 0 and the golden 37 relations**, with `stderr.txt`
+  carrying `BOINC: running on Metal device 0 of 1: Apple M3`, the slab plan,
+  and 8k's 750 ms launch-bound advisory — while stdout mentioned BOINC once.
+
+  **NOT established:** still standalone mode, no `init_data.xml`, so slot
+  filename resolution, a real GPU assignment and checkpointing are
+  unexercised. Remaining Phase 9 work: metallib embedding.
 
 **Candidate counts do not compare across sievers; relation sets do.** Our 1,845
 cofactorisation candidates against the oracle's 1,851 is not a defect: the 7
