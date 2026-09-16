@@ -1813,8 +1813,14 @@ file's existence.
 
 | | sha256 |
 |---|---|
-| `bench` | `25ab6b6550d44b0f11a5ee60a79cb5dea76e5a6c64a729ab1456bc8d2fdac977` |
-| `bench.sig` | `77204967131da29a6abb7ef7bfcc25832f93c8498209424e84993ac1bcb24622` |
+| `bench` | `9e975aa55fe628383a49864475681fe4b63df9ed40c004ad16a179c627422cb0` |
+| `bench.sig` | `3cc09a211c7cc3d26795ad91e8868168da23d616ae43c025906a2f05e40a4533` |
+
+**Re-staged and re-signed 2026-09-16 after 9z's leak fix.** The superseded
+artifact was `25ab6b65…2fdac977`; it is not the one to ship. The binary grew
+80 bytes (1,726,104 -> 1,726,184). The signature was re-made from scratch --
+a signature is over content, so the old one does not verify the new binary
+(and the negative control above is exactly that check).
 
 The public key is the project's 1024-bit `code_sign_public` and is not secret;
 it was supplied for this check and is not stored in the repository. Re-signing
@@ -1938,6 +1944,27 @@ noisy.
 
 Still open from earlier phases: `--mode twolevel` misplaces records and
 refuses (Phase 8), and nothing has run under a real BOINC client (9e).
+
+### The fix is in the shipped artifact, and it was revalidated end to end
+
+`mtlFree` changes **when GPU buffers are deallocated**, so byte-identity is
+the check that earns its keep here -- a buffer released while still in flight
+would not be a leak, it would be a wrong answer. Rebuilt packaged
+(`HAVE_BOINC=1`, embedded metallib), then over the full 288-q band from a
+directory containing only the executable:
+
+| | relations | records enqueued | `sha256(relations)` |
+|---|---|---|---|
+| reference (pre-fix) | 13,485 | 564,696 | `8e79762c…dafbc002` |
+| **shipped (post-fix)** | **13,485** | **564,696** | **`8e79762c…dafbc002`** |
+
+`cmp` clean. And on that same 288-q band the leak is gone: free memory ends at
+**10.84 GB against 8.13 before**, **2.71 GB recovered**.
+
+`boinclinkcheck` 8/8, signature verified against the project's public key,
+negative control fails. **`--slab-j` is not a mitigation for production** --
+the production band does not pass it, so the calibration path runs and the
+leak was the full 2.7 GB.
 ---
 
 ## 10. Open questions for the CUDA side

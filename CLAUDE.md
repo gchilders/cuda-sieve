@@ -788,7 +788,13 @@ call site cannot do one and forget the other.
   here.**
 
   **SIGNED AND STAGED (plan 9f).** `~/code/dist/` holds `bench` (sha256
-  `25ab6b65…`) and `bench.sig` (256 hex chars, a 1024-bit RSA signature).
+  `9e975aa5…`) and `bench.sig` (256 hex chars, a 1024-bit RSA signature).
+  **Re-staged and re-signed 2026-09-16 after 9z's leak fix** — the superseded
+  `25ab6b65…` is NOT the artifact to ship. Revalidated over the full 288 q
+  from a one-file directory: **13,485 relations, `cmp` clean, sha256
+  `8e79762c…` unchanged**, and free memory ends at **10.84 GB against 8.13
+  before** (2.71 GB recovered). A signature is over content, so re-signing was
+  mandatory, not optional.
   `crypt_prog` is NOT built by `--disable-server` (`lib/Makefile.am` puts it
   and `libboinc_crypt` under `if ENABLE_SERVER`, and `SSL_LIBS` is empty), so
   it was compiled by hand against the already-built tree with Homebrew
