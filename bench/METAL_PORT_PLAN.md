@@ -2788,6 +2788,44 @@ left to relieve.
 shipping for a curve that is flat and a ratio that is already good. Recorded
 here so the next person does not rediscover either the lock or the flatness.
 
+#### Inside `norms + trial division`, and the ratio that does not transfer
+
+The pass is already decomposed, by 8q, on the standalone `--td` path:
+
+| inside `norms + trial division` | GTX 1080 | M3 | M3/CUDA |
+|---|---|---|---|
+| norm + special-q + 16 large primes | 13.6 | 27.8 | 2.05x |
+| **small-prime congruence test** | **81.2** | **223** (after 8q's fix) | **2.75x** |
+| division | 31.4 | 52.9 | 1.68x |
+
+**The congruence test is the gap inside the pass, as it is inside TD.**
+
+But the pass's ratio is not the same in the two places it gets measured:
+
+| | CUDA | Metal | ratio |
+|---|---|---|---|
+| standalone `--td`: one q, ~16M candidates, one launch | 126.2 | ~301 | **2.39x** |
+| pipeline: ~270k candidates over 8 slabs x 2 sides | 23.6 | 106.5 | **4.49x** |
+
+Same kernel variant, `k_td_1_0_0_*`. **Metal does relatively worse at the
+pipeline's scale**, where a launch sees ~17k records against a 131k-thread
+grid, than at the standalone's, where one launch sees 16M.
+
+Two candidates tested, neither sufficient:
+
+- **Slab count** -- fewer slabs, bigger launches: 94.6 / 87.1 / 88.9 / 95.3
+  ms/q at 1 / 2 / 4 / 8 slabs. **About 9%**, shallow minimum at 2-4.
+- **`SLABBED` itself** (8q): 105.7 slabbed against 94.1 unslabbed, **~12%** --
+  and unslabbed costs 1358 ms/q of wall against 981 anyway.
+
+**So the scale dependence is real and mostly unexplained.** Decomposing the
+pipeline's pass directly -- swapping its timed launch for the `DIVIDE=0`
+instantiation, to separate test from division at pipeline scale -- **does not
+work**: the pipeline depends on that division downstream and never reaches the
+timer. Doing it properly needs instrumentation that runs the variants side by
+side rather than substituting one for the other. Not done here, and it is the
+honest next step.
+
 **Measured on a 10-core M3 in a fanless MacBook Air that also drives the
 display, against a GTX 1080 in an NRP k8s pod.**
 
