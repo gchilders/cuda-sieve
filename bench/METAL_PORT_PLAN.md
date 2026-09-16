@@ -2165,6 +2165,78 @@ here.
 288-q band **byte-identical** at 13,485 relations, `sha256 8e79762c…dafbc002`,
 `cmp` clean. Re-staged and re-signed.
 
+### 9z-f. Third review: the new mechanism, and memory over a full band
+
+Two rounds each found something real, so this one led with the largest new
+surface -- 9z-d/9z-e, which touched three generators, every device wrapper and
+the launch path.
+
+#### Found and fixed: the nil-mask had no width guard
+
+`mtl_launch` builds the mask with `1u << b` over its argument pack. Past index
+31 that is **undefined behaviour, and the failure would be silent**: a null
+argument above 31 would report as *bound*, Metal would then demand a binding
+for an argument declared under a false constant, and the port would be back to
+9z-c's bug with nothing to show for it.
+
+The widest kernel is `k_apply` at **29 bound arguments, max buffer index 27**,
+so there was headroom -- but nothing protecting it, and this port's kernels
+have grown before. Now a compile error:
+
+```cpp
+static_assert(sizeof...(A) <= 32,
+              "kernel has more arguments than the nil-mask has bits; widen "
+              "nilmask to uint64_t and the constant in the .metal sources");
+```
+
+#### Verified: validation is clean everywhere, not just the pipeline
+
+`validationcheck` covers the pipeline. The other five binaries were run under
+`MTL_DEBUG_LAYER=1` by hand, and all are clean -- **exit 0, zero assertions**:
+`phase5_test`, `scan_test`, `argbuf_test`, `classify_test`, `cofac_test`.
+
+#### Verified: memory is FLAT over a full band
+
+This closes the question 9z-b left open. RSS across the whole 288-q band, on
+the shipping binary:
+
+| t | RSS |
+|---|---|
+| 40 s | 362.8 MB |
+| 80 s | 368.1 MB |
+| 120 s | 368.1 MB |
+| 180 s | 368.2 MB |
+| 240 s | **368.3 MB** |
+
+It rises for the first ~80 s and then **plateaus: +0.2 MB over the next 160
+seconds**. So the residual growth 9z-b measured and could not attribute was
+the cross-q relation queue filling toward its first flush, exactly as
+hypothesised -- **there is no unbounded component**. Free GPU memory ends at
+10.84 GB as before, and relations are the usual 13,485.
+
+Caveat, stated rather than glossed: this is four minutes, not four hours. It
+rules out a per-flush or per-q leak, which is what the earlier trace looked
+like; it cannot rule out something with a much longer period.
+
+#### Verified, no findings
+
+- **`fbgen_gpu_metal.cpp` is generator-reproducible.** 1,518 lines on the
+  production path, and `gen_fbgen_metal.py` is described as "NOT wired into the
+  build" -- which is about the build, not about drift. Running both fbgen
+  generators leaves `git status` clean.
+- **No emulated 64-bit counter feeds a host decision.** `atomicAdd64` folds a
+  carry across two uint32 words, so a concurrent read can tear; CLAUDE.md
+  claims nothing computes from them, and `nlost`, `nhit`, `noverflow`,
+  `ntested`, `ndiv` and `nproj` are read only for reporting. The hazard stays
+  diagnostic-only.
+
+#### Minor, not fixed
+
+`argbuf_test.cpp` and `classify_test.cpp` ignore `mtlMalloc`'s return at six
+call sites. Production code uses `MTL_OR_DIE`. An allocation failure in those
+two gates would surface as a confusing fault rather than a message -- gate
+ergonomics, not a shipped defect.
+
 Still open from earlier phases: `--mode twolevel` misplaces records and
 refuses (Phase 8), and nothing has run under a real BOINC client (9e).
 
