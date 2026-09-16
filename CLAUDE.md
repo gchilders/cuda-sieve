@@ -528,6 +528,16 @@ call site cannot do one and forget the other.
   target only because it is large in absolute terms. **The gap is `norms +
   trial division` alone, at 4.49x.**
 
+  **Inside that pass (8q's decomposition): norm 2.05x, congruence test 2.75x
+  (~80% of the pass), division 1.68x** — the test is the gap at every level.
+  But the pass's RATIO does not transfer between scales: **2.39x standalone**
+  (one launch, ~16M candidates) against **4.49x in the pipeline** (~270k
+  candidates over 8 slabs x 2 sides, ~17k records per launch against a
+  131k-thread grid). Slab count explains ~9% (94.6/87.1/88.9/95.3 at 1/2/4/8)
+  and `SLABBED` ~12%; **the rest is unexplained**. Swapping the pipeline's
+  timed launch for `DIVIDE=0` to decompose it at pipeline scale does NOT work —
+  the pipeline needs the division downstream and never reaches the timer.
+
   **`UNROLL` is flat on Metal** (48.7/50.0/51.0/49.9/49.8 at 1/2/4/8/16), so
   this kernel is NOT latency-bound here the way `td.cuh` says it is on NVIDIA.
   Note the slabbed path had **only UNROLL=4 instantiated** — the pipeline is
