@@ -442,33 +442,12 @@ src = (src[:_d] + chr(10) + "done:" + chr(10) +
        src[_d + len(chr(10) + "done:"):])
 print('  auto chunker now steers on a measured launch duration')
 
-# Report the measured launch duration: what the chunker now steers on, what a
-# watchdog and a stalled compositor both care about, and until now invisible.
-# stderr, like the chunk line -- a BOINC client keeps stderr.txt and discards
-# stdout with the slot directory. Only on a new maximum, so a long band does
-# not emit one line per flush.
-_rep_old = "    Q->ms_rat += t0; Q->ms_alg += t1;"
-_rep_new = _rep_old + chr(10) + chr(10).join([
-    "    if (launch_ms > 0.0f && launch_ms > Q->ms_launch_max) {",
-    "        Q->ms_launch_max = launch_ms;",
-    "        fprintf(stderr,",
-    "                \"  cofactor: longest kernel launch %.0f ms (%u records/launch,\"",
-    "                \" %u in flush)\\n\",",
-    "                (double)launch_ms,",
-    "                Q->chunk_cur < n ? Q->chunk_cur : n, n);",
-    "    }"])
-assert _rep_old in src, 'ms accumulation shape changed'
-src = src.replace(_rep_old, _rep_new, 1)
-
-# The high-water field itself.
-_fld_old = "    double ms_rat, ms_alg;"
-if _fld_old not in src:
-    import re as _re
-    _m = _re.search(r"\n(\s*)double ms_rat[^;]*;", src)
-    assert _m, 'cofq_t timing fields not found'
-    _fld_old = _m.group(0).lstrip(chr(10))
-src = src.replace(_fld_old, _fld_old + chr(10) + "    float  ms_launch_max;   /* longest single launch seen, ms */", 1)
-print('  longest-launch reporting added')
+# The measured launch duration is NOT reported. It was, on every new maximum,
+# and it is exactly the kind of line that reads well at a terminal and badly in
+# a BOINC log: stderr.txt is uploaded from the volunteer's host, and a per-band
+# high-water line tells a project nothing it can act on. The chunker still
+# STEERS on the measurement (above) -- only the printing is gone, and with it
+# cofq_t's ms_launch_max, which nothing else read.
 
 # ---- (a), done properly: defend a launch-duration bound -------------------
 # The target is a UI-responsiveness and watchdog bound on ONE kernel launch:
@@ -523,7 +502,11 @@ _h_new = chr(10).join([
 assert _h_old in src, 'halve body shape changed'
 src = src.replace(_h_old, _h_new, 1)
 
-_f_old = "    float  ms_launch_max;   /* longest single launch seen, ms */"
+# Anchored on cofac.cuh's own timing fields. This used to hang off the
+# ms_launch_max field inserted above, which no longer exists -- the
+# longest-launch REPORT was dropped, and with it the high-water field nothing
+# else read. These three are the chunker's state and are still needed.
+_f_old = "    double ms_rat, ms_alg, ms_host;"
 _f_new = chr(10).join([
     _f_old,
     "    float  ms_launch_prev;  /* launch time before the last halving      */",
@@ -671,9 +654,12 @@ print('  refuses an ECM chain no chunk size can bound')
 # overflow that 8m showed is checked against the caller's rounds, not ours.
 _adv_old = "        if (ms_one_curve > COF_LAUNCH_REFUSE_MS) {"
 _adv_new = chr(10).join([
-    "        const double ms_round = ms_one_curve * (double)Q->ecm_curves;",
     "        const int both_ecm = Q->meth[0] && Q->meth[1];",
-    "        if (ms_one_curve <= COF_LAUNCH_REFUSE_MS && Q->ecm_curves > 2u) {",
+    "        /* No advisory branch: when this cannot act -- an explicit",
+    "         * --ecm-curves, or a side running rho -- it stays silent rather",
+    "         * than printing guidance into a volunteer's stderr.txt. */",
+    "        if (ms_one_curve <= COF_LAUNCH_REFUSE_MS && Q->ecm_curves > 2u",
+    "            && !curves_set && both_ecm) {",
     "            /* NOT the largest count that fits the bound -- that is 8 at",
     "             * B1 2000 and costs 265 ms/q against 180. Measured at --nq 144,",
     "             * 192 curves, B1 2000/B2 60000, cofac ms/q by curves/round:",
@@ -688,33 +674,25 @@ _adv_new = chr(10).join([
     "            while (fit > 1u && ms_one_curve * (double)fit > COF_CHUNK_TARGET_MS)",
     "                fit--;",
     "            if (fit > Q->ecm_curves) fit = Q->ecm_curves;",
-    "            if (!curves_set && both_ecm) {",
-    "                /* Same total curves, shorter launches. */",
-    "                const uint64_t budget = (uint64_t)Q->ecm_curves * rounds_in;",
-    "                uint64_t r = (budget + fit - 1u) / fit;",
-    "                if (r > 1000u) r = 1000u;",
-    "                if (r < 1u) r = 1u;",
-    "                printf(\"  cofactor queue: %u curves/round is ~%.0f ms in one\"",
-    "                       \" launch, over the %.0f ms bound; using %u x %u\"",
-    "                       \" instead (~%.0f ms, %llu curves vs %llu)\\n\",",
-    "                       Q->ecm_curves, ms_round, (double)COF_CHUNK_TARGET_MS,",
-    "                       fit, (unsigned)r, ms_one_curve * (double)fit,",
-    "                       (unsigned long long)((uint64_t)fit * r),",
-    "                       (unsigned long long)budget);",
-    "                Q->ecm_curves = fit;",
-    "                Q->ecm_rounds = (uint32_t)r;",
-    "            } else {",
-    "                fprintf(stderr,",
-    "                        \"  cofactor queue: %u curves/round is about %.0f ms in\"",
-    "                        \" one launch, over this build's %.0f ms bound.\"",
-    "                        \" --cof-chunk splits RECORDS and cannot divide a\"",
-    "                        \" chain, so the chunker will subdivide without\"",
-    "                        \" reaching it and lose throughput doing so.\\n\",",
-    "                        Q->ecm_curves, ms_round, (double)COF_CHUNK_TARGET_MS);",
-    "                fprintf(stderr,",
-    "                        \"  Shorter launches, same B1/B2: --ecm-curves %u\"",
-    "                        \" with more --cof-rounds (ECM allows 1000).\\n\", fit);",
-    "            }",
+    "            const uint64_t budget = (uint64_t)Q->ecm_curves * rounds_in;",
+    "            uint64_t r = (budget + fit - 1u) / fit;",
+    "            if (r > 1000u) r = 1000u;",
+    "            if (r < 1u) r = 1u;",
+    "            /* Says what it DID. The line it replaces asserted that the",
+    "             * caller's split was 'over the bound', which is false",
+    "             * whenever a curve is cheap -- at B1 200 twelve curves are",
+    "             * 119 ms against a 750 ms bound, and it said so anyway. The",
+    "             * reason to move is that 2/round is the measured optimum;",
+    "             * the bound is a ceiling that can lower it further, not the",
+    "             * thing being enforced here. */",
+    "            printf(\"  cofactor queue: %u curves/round -> %u x %u\"",
+    "                   \" (~%.0f ms/launch, %llu curves vs %llu)\\n\",",
+    "                   Q->ecm_curves, fit, (unsigned)r,",
+    "                   ms_one_curve * (double)fit,",
+    "                   (unsigned long long)((uint64_t)fit * r),",
+    "                   (unsigned long long)budget);",
+    "            Q->ecm_curves = fit;",
+    "            Q->ecm_rounds = (uint32_t)r;",
     "        }",
     "        if (ms_one_curve > COF_LAUNCH_REFUSE_MS) {"])
 assert _adv_old in src, 'refusal guard shape changed'
@@ -731,7 +709,13 @@ _sig_new = ("static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap," + chr
 assert _sig_old in src, 'cofq_init signature changed'
 src = src.replace(_sig_old, _sig_new, 1)
 
-_fld_old = "    float  ms_launch_max;   /* longest single launch seen, ms */"
+# Anchored on the chunker state inserted above, not on the dropped
+# ms_launch_max field -- and ASSERTED. This replace carried no assert, so when
+# its anchor went away it silently did nothing and left Q->ecm_rounds assigned
+# but never declared. That is a compile error two functions later, and the
+# generator reported success.
+_fld_old = "    int    chunk_parked;    /* halving stopped paying; descend no more  */"
+assert _fld_old in src, 'chunker state fields missing'
 src = src.replace(_fld_old, _fld_old + chr(10) +
                   "    uint32_t ecm_rounds;    /* rounds to actually run; derived or the caller's */", 1)
 
@@ -741,6 +725,27 @@ src = src.replace(_init_old, _init_old + chr(10) +
                   "    Q->ecm_rounds = rounds_in ? rounds_in : 1u;", 1)
 print('  curves/round derived from the launch bound when --ecm-curves is unset')
 
+
+# ---- report a change in what is PRINTED, not in the internal slice --------
+# cof_report_chunk's own comment says "only on change, never per flush", and
+# it was defeated by its own arithmetic: step is min(chunk, n), so when the
+# old and new chunk BOTH exceed n the internal value changes and the rendered
+# line does not. One q printed it twice, verbatim -- the opening choice, then
+# the doubling that followed a 93 ms flush. Compare what goes out.
+_rc_old = chr(10).join([
+    "    fprintf(stderr, \"  cofactor chunk: %u records/launch, %u launch%s per\"",
+    "            \" round over %u records (%s)\\n\", step, nl, nl == 1 ? \"\" : \"es\", n,",
+    "            pinned ? \"pinned by --cof-chunk\" : \"auto\");"])
+_rc_new = chr(10).join([
+    "    static uint32_t last_step, last_nl, last_n;",
+    "    static int last_pinned = -1;",
+    "    if (step == last_step && nl == last_nl && n == last_n",
+    "        && pinned == last_pinned) return;",
+    "    last_step = step; last_nl = nl; last_n = n; last_pinned = pinned;",
+    _rc_old])
+assert _rc_old in src, 'cof_report_chunk shape changed'
+src = src.replace(_rc_old, _rc_new, 1)
+print('  chunk report de-duplicated on rendered content')
 
 open(OUT, 'w').write(src)
 print('wrote %s: %d kernels removed, %d launches rewritten' % (OUT, nk, nl))
