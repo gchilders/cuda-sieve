@@ -1282,13 +1282,26 @@ exceeds `COF_BOUND_MS` (750), runs **without `--fb1`** because that is the path
 and the gate catches it. This is the gate whose absence let 9z-j ship: the tree
 had no instrument for the quantity that was killing tasks.
 
-**Still not measured: the real threshold.** 750 ms is the port's own policy
-(8k), not Apple's documented line; the observed kills were around 800 ms of
-command buffer on M1/M2. The margin now is 3-5x on an M3. **The remaining
-exposure is the cofactoriser on a slow device** -- its chunker only steers when
-a launch exceeds 750 ms, so an M1 could sit at 400-600 ms per submission
-indefinitely. If failures continue, `COF_CHUNK_TARGET_MS` is the knob, and it
-is a policy decision rather than a tuning one.
+**Still not measured: the real threshold.** The observed kills were command
+buffers of roughly 800 ms on M1/M2; Apple documents no line.
+
+**`COF_CHUNK_TARGET_MS` IS NOW 400, LOWERED FROM 750 BY THE USER AFTER 9z-k.**
+750 was set (8k) against what was believed to be a launch bound but was in fact
+a bound on one dispatch; 9z-k makes one cofactor launch one command buffer, so
+the number finally means what it always claimed to. 400 sits at half the
+shortest duration anyone has been killed at rather than a hair under it.
+`COF_BOUND_MS` in `Makefile.metal` tracks it so `cbtimecheck` enforces the
+policy the build actually holds.
+
+**It changes nothing on this M3, and that is the expected result.** At a full
+`CQ_FLUSH` the chunker still settles at 15,360 records/launch and the longest
+cofactor command buffer is **250.76 ms** -- already inside 400, so the
+controller never steers. 288 q `cmp`-identical at 13,485 / `8e79762c…`, wall
+3m39.8 against ~3m39, `cofcheck.sh` 54/0, `cofaccheck` and `validationcheck`
+green, `cbtimecheck` passing at the tighter bound with the control still
+failing (805 ms). **The bound binds on slower devices, which is its whole
+purpose** -- an M1 whose per-launch cost is 1.5-2x this one now gets steered
+down instead of sitting at 400-600 ms per submission forever.
 
 ## Drift ledger — CUDA-side changes made for this port
 
