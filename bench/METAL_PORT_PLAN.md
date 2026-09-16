@@ -2740,6 +2740,58 @@ display.** Six gates green, plus the CUDA-side `slabcheck`, since `td.cuh` was
 touched.
 
 
+### 8r. resieve + scatter is not the problem: 1.63x
+
+8q ended by pointing at `resieve + scatter` -- 26.7% of the TD stage and never
+measured in this port. Measured now, same geometry and settings on both, GTX
+1080 against the M3, warm (a cold first run reads 45-67 ms on the card and is
+not the number):
+
+| TD sub-stage, `--nq 24` | GTX 1080 | M3 | M3/CUDA |
+|---|---|---|---|
+| **resieve + scatter** | **30.56** | **49.4** | **1.63x** |
+| norms + trial division | 23.61 | 107.1 | **4.49x** |
+| classify | 13.7-19.3 | 18.3 | ~1.1x |
+| record candidate factorisations | 5.39 | 5.0 | 0.93x |
+
+**1.63x is among the best ratios in this port** -- the same neighbourhood as
+the division's 1.68x and better than the sieve's 1.74x. `resieve + scatter`
+looked like a target only because it is large in absolute terms; relative to
+the card it is already fine. The gap is still `norms + trial division`, alone,
+at 4.49x.
+
+#### The unroll knob the slabbed path never had
+
+`td.cuh` documents `k_resieve_scatter` as **latency-bound on dependent summary
+probes**, with `UNROLL` existing to multiply memory-level parallelism -- "the
+fix for latency is more loads in flight, not fewer loads". It also records the
+NVIDIA measurement that established this: making the summary finer, so 96.5% of
+probes were rejected earlier, did *not* help, which is what identified latency
+rather than probe count as the cost.
+
+The Metal build instantiated `UNROLL` 1, 2, 4 and 8 for the **unslabbed**
+kernel and **only 4 for the slabbed one** -- and the pipeline is always slabbed
+at production geometry. So 4 was not a choice there; it was the only symbol
+that existed. Added slabbed 1/2/8/16, made the depth selectable, and swept:
+
+| `RESIEVE_UNROLL` | 1 | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| resieve ms/q | 48.7 | 50.0 | 51.0 | 49.9 | 49.8 |
+
+**Flat across a 16x range**, 1,114 relations throughout. So on Apple this kernel
+is *not* latency-bound the way it is on NVIDIA: putting sixteen times more
+summary probes in flight changes nothing. Whatever limits it here, more
+memory-level parallelism does not relieve it -- and at 1.63x there is little
+left to relieve.
+
+**Reverted.** Five extra kernel instantiations and a knob are not worth
+shipping for a curve that is flat and a ratio that is already good. Recorded
+here so the next person does not rediscover either the lock or the flatness.
+
+**Measured on a 10-core M3 in a fanless MacBook Air that also drives the
+display, against a GTX 1080 in an NRP k8s pod.**
+
+
 ## 9. Drift ledger — CUDA-side changes made for this port
 
 | date | CUDA file(s) | change | verified how |

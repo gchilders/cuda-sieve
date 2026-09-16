@@ -522,9 +522,17 @@ call site cannot do one and forget the other.
   is not an option).
 
   **Device breakdown, --nq 24 (ms/q):** norms+TD 105.3 (57.5%), **resieve +
-  scatter 48.8 (26.7%)**, classify 18.3 (10.0%), record 5.0 (2.7%). **Nothing
-  in this port has ever measured resieve+scatter** — it is the second-largest
-  piece of the TD stage and unexamined.
+  scatter 48.8 (26.7%)**, classify 18.3 (10.0%), record 5.0 (2.7%). **resieve+scatter measured (plan 8r): 1.63x — NOT the
+  problem.** 30.56 ms on the 1080 against 49.4 on the M3, the same neighbourhood
+  as the division's 1.68x and better than the sieve's 1.74x. It looked like a
+  target only because it is large in absolute terms. **The gap is `norms +
+  trial division` alone, at 4.49x.**
+
+  **`UNROLL` is flat on Metal** (48.7/50.0/51.0/49.9/49.8 at 1/2/4/8/16), so
+  this kernel is NOT latency-bound here the way `td.cuh` says it is on NVIDIA.
+  Note the slabbed path had **only UNROLL=4 instantiated** — the pipeline is
+  always slabbed, so 4 was never a choice; adding 1/2/8/16 and sweeping is what
+  showed it does not matter. Reverted rather than ship five unused kernels.
 
   **The remaining 2.75x is unexplained** and is the whole of TD's gap.
 
