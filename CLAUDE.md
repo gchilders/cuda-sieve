@@ -788,7 +788,7 @@ call site cannot do one and forget the other.
   here.**
 
   **SIGNED AND STAGED (plan 9f).** `~/code/dist/` holds `bench` (sha256
-  `961bdbc3…`) and `bench.sig` (256 hex chars, a 1024-bit RSA signature).
+  `e5995826…`) and `bench.sig` (256 hex chars, a 1024-bit RSA signature).
   **Re-staged and re-signed 2026-09-16 after 9z-i.** Superseded, none to be
   shipped: `25ab6b65…` (pre-leak-fix), `9e975aa5…` (pre-autorelease-fix),
   `52f6280b…` (pre-nil-binding-fix), `2e1a2d5f…` (pre-mask-guard),
@@ -1176,6 +1176,41 @@ never verified off Apple9.
 **The deployed binary is old** — its stderr still says "this is a CUDA
 application", so it pre-dates 9z-g and therefore also the leak fix (9z), the
 autorelease fix (9z-b) and the nil-binding fix (9z-e).
+
+## 9z-j: macOS was killing fbgen for IMPACTING INTERACTIVITY
+
+9z-i's error reporting answered it on the first failure after deployment. An
+**M1**: `command buffer failed: internal (code 1): Impacting Interactivity
+(kIOGPUCommandBufferCallbackErrorImpactingInteractivity)`. **macOS killed the
+command buffer for hogging the GPU against the UI** — a soft watchdog, not
+`MTLCommandBufferErrorTimeout`, which is why the old build could only say
+"kernel launch failed".
+
+**The family correlation falls straight out of the grid.** The root finder uses
+`min((nprime+127)/128, cores*8)` blocks, so **a smaller GPU means MORE primes
+per thread**: M4 Max 320 blocks/~21 each, M3 80/~105 (**790 ms measured**), M1
+56–64/~150–190 (seconds). 790 ms already breached this build's own **750 ms
+interactivity policy — which had only ever been applied to the cofactoriser;
+fbgen was never bounded.** Whether an M1 gets killed depends on what else the
+machine is doing, hence one M2 finishing and others not. The root finder is
+790 ms of each 819 ms segment, so there is no second offender.
+
+**Fix: slice by GRID-STRIDES (`FB_ROOTS_STRIDES_PER_LAUNCH` = 32)**, so every
+device does the same iterations per launch and only per-stride cost varies —
+sliced by iterations, not a fixed prime count, because a fixed count is exactly
+what made small GPUs loop longer. **No device-side change**: slices are taken
+with pointer arithmetic (`d_primes + off`, `d_rootbuf + off*GPU_FB_MAX_ROOTS`,
+…) and the allocation registry resolves interior pointers at bind time — what
+it exists for. `fbgen_gpu.cu` untouched; `d_failures` accumulates across slices.
+
+**Measured: 790 ms → 238–279 ms per launch, fbgen 6.550 s → 6.616 s** (1% for
+4× the launches). Identical output (7,605,616 ideals, 207 prime-power, 38 exact
+primes) and a 288-q band **run the field's way with no `--fb1`** is
+`cmp`-identical at 13,485.
+
+**`fbcheck` does NOT cover this path** — it exercises the standalone
+`fbgen_gpu` tool, which has its own copy of the launch. The no-`--fb1` band is
+the check that matters.
 
 ## Drift ledger — CUDA-side changes made for this port
 
