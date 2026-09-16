@@ -166,7 +166,11 @@ HOSTFLAGS_BASE := -std=c++17 -O2 -ffp-contract=off -I . -I metal \
 # them rebuilds boinc_support.o.
 METAL_BOINC_GPU := -DBENCH_BOINC_METAL_GPU
 
-HOSTFLAGS := $(HOSTFLAGS_BASE) $(BOINC_DEFS) $(BOINC_CPPFLAGS) $(METAL_BOINC_GPU)
+# Escape hatch for the cbtimecheck control ONLY: it defeats the fbgen root
+# finder's slicing so the gate has something over-bound to detect. Empty in
+# every real build, and part of METAL_SIGNATURE so flipping it rebuilds.
+METAL_EXTRA_DEFS ?=
+HOSTFLAGS := $(HOSTFLAGS_BASE) $(BOINC_DEFS) $(BOINC_CPPFLAGS) $(METAL_BOINC_GPU) $(METAL_EXTRA_DEFS)
 
 # One setting for every delegation to the default Makefile. It folds these
 # into a stamp that all its objects depend on, so passing them inconsistently
@@ -350,6 +354,25 @@ metallibcheck: ../oracle/c183.fb1
 	@$(MAKE) -f Makefile.metal $(BUILD)/bench EMBED_METALLIB=1 >/dev/null
 	@sh metal/metallibcheck.sh $(CURDIR)/$(BUILD)/bench \
 	    $(CURDIR)/../oracle/c183.poly $(CURDIR)/../oracle/c183.fb1
+
+# ---- command-buffer duration gate (9z-k) --------------------------------
+# The watchdog's unit is a COMMAND BUFFER, not a dispatch. Nothing in this tree
+# measured that until a shipped "fix" (9z-j) turned out to have changed only
+# the dispatch count. The control builds with the fbgen slicing defeated and
+# must FAIL; without that, a gate that passes proves nothing.
+COF_BOUND_MS ?= 750
+.PHONY: cbtimecheck
+cbtimecheck:
+	@echo "== control: fbgen root finder UNSLICED (must exceed the bound) =="
+	@$(MAKE) -f Makefile.metal $(BUILD)/bench \
+	    METAL_EXTRA_DEFS='-DFB_ROOTS_STRIDES_PER_LAUNCH=4000000u' >/dev/null
+	@sh metal/cbtimecheck.sh $(CURDIR)/$(BUILD)/bench \
+	    $(CURDIR)/../oracle/c183.poly $(COF_BOUND_MS) control
+	@echo
+	@echo "== gate: as shipped =="
+	@$(MAKE) -f Makefile.metal $(BUILD)/bench >/dev/null
+	@sh metal/cbtimecheck.sh $(CURDIR)/$(BUILD)/bench \
+	    $(CURDIR)/../oracle/c183.poly $(COF_BOUND_MS)
 
 # ---- Metal API validation gate -----------------------------------------
 # The property 9z-d bought: the sieve dispatches cleanly with MTL_DEBUG_LAYER

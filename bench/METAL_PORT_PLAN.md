@@ -2515,6 +2515,11 @@ starting point for the next report.
 
 ### 9z-j. ANSWERED: macOS was killing fbgen for impacting interactivity
 
+> **SUPERSEDED BY 9z-k. The diagnosis in this section is correct; the fix is
+> not, and it shipped.** Slicing the root finder into more dispatches left them
+> all in the same command buffer, which is the unit the watchdog judges. The
+> "790 -> 238-279 ms" below is dispatch time. See 9z-k.
+
 9z-i's error reporting paid for itself on the first failure after deployment.
 An **M1**, one segment in:
 
@@ -4293,6 +4298,109 @@ not. Neither difference is visible in the number being compared. Pin
 **Measured on a 10-core M3 in a fanless MacBook Air that also drives the
 display, against a GTX 1080 in an NRP k8s pod.**
 
+
+### 9z-k. The watchdog judges a COMMAND BUFFER -- 9z-j fixed the wrong unit
+
+A second **M2** failed with the identical `Impacting Interactivity` error after
+9z-j was deployed. 9z-j could not have helped, and the reason was sitting in
+`metal_rt.mm`'s own header comment:
+
+> STREAMS. A stream owns one MTLCommandQueue and at most one open command
+> buffer ... the encoder is closed and the buffer committed only when something
+> demands ordering -- a sync, an event record, or a switch between compute and
+> blit work.
+
+Slicing one launch into four leaves all four **in the same command buffer**.
+
+**The instrument that settles it is new and permanent.**
+`CUDA_SIEVE_METAL_CBTIME=1` prints `GPUEndTime - GPUStartTime` plus the
+dispatch count and first/last kernel of every command buffer at each sync.
+That is the only quantity the watchdog reads, and nothing in this tree measured
+it before -- which is precisely how 9z-j was measured, reported, committed,
+signed and deployed while changing nothing.
+
+Run against the 9z-j binary, the fbgen segments were still
+**787-826 ms command buffers**: their pre-9z-j duration, unchanged.
+
+**The cofactoriser was four times worse.** With `--cadofb`, so fbgen never ran:
+
+```
+3179.61 ms [50 dispatches k_cofac_3_1_1..k_cofac_3_1_1]
+ 780.14 ms [51 dispatches k_cofac_3_0_0..k_cof_gate]
+ 243.79 ms [ 1 dispatch  k_cofac_3_1_1]
+ 205.98 ms [ 1 dispatch  k_cofac_3_0_0]
+```
+
+Fifty ECM rounds, one ~244 ms launch each -- every one inside 8k's 750 ms bound
+-- arriving at the GPU as a single 3,180 ms submission. **8k's launch bound has
+been measuring the wrong unit since it was set**, and every "launch duration"
+in 8h, 8i, 8j and 9z-h is a dispatch duration.
+
+**The bracket that measured the launch is what concealed the batching.**
+`g_cof_peak` records an event around the `r == 0 && b == 0` launch; an event
+record forces a commit; so the single launch being *measured* was the single
+launch not batched with the other 49. The measurement was accurate and
+systematically unrepresentative.
+
+#### The fix
+
+`mtlStreamFlush()` -- commit without waiting. There is no CUDA analogue because
+CUDA has no command-buffer object, so nothing in the shim's API surface
+suggested it was missing. Command buffers on one `MTLCommandQueue` execute in
+commit order, so splitting a run of dispatches across several changes nothing
+about ordering or hazard tracking; and unlike an event record it does not stall
+the CPU.
+
+Called per slice in the fbgen root finder, and **per launch in
+`cf_run_rounds`** -- both in the generators (`gen_fbgen_host.py`,
+`gen_cofac_host.py`), so `fbgen_gpu.cu` and `cofac.cuh` are untouched and no
+drift-ledger row is needed.
+
+| | before | after |
+|---|---|---|
+| fbgen root finder | 826 ms | **156 ms** |
+| cofactor round batch | 3,180 ms | **247 ms** |
+
+`FB_ROOTS_STRIDES_PER_LAUNCH` went 32 -> **16**, and now bounds a submission
+rather than a dispatch.
+
+#### The flush nearly reintroduced 9z-i
+
+`sync()` checked only `st->last`. Once buffers are committed without waiting,
+buffers 1..n-1 get replaced and released **unchecked** -- a failure in an early
+slice would vanish silently and the run would continue on garbage, undoing the
+error reporting 9z-i exists for. `Stream` now carries a `pending` vector and
+`sync()` walks every buffer, reporting the first failure (command buffers on a
+queue complete in order, so when the last finishes every earlier status is
+final). The first draft of the flush read `st->last` *after* `commit()` had
+released it -- an immediate SIGSEGV, the 9z-b ownership class a third time.
+
+#### Validation
+
+- 288-q band, no `--fb1`, `cmp`-identical: **13,485 relations, sha256
+  `8e79762c…`**, 564,696 records enqueued. Wall 3m45 against ~3m39, inside this
+  fanless box's noise. fbgen 6.550 -> 6.758 s (~3%).
+- Twelve gates green, `cofcheck.sh` **54 PASS / 0 FAIL**, `boinclinkcheck` 8/8.
+- Packaged `HAVE_BOINC=1` binary from a one-file directory: exit 0, 37
+  relations, longest command buffer 156 ms.
+
+#### Gated
+
+`make -f Makefile.metal cbtimecheck` asserts that no command buffer exceeds
+`COF_BOUND_MS` (750). It runs **without `--fb1`**, because that is the path
+`fbcheck` does not cover. **The control fails**: built with
+`METAL_EXTRA_DEFS=-DFB_ROOTS_STRIDES_PER_LAUNCH=4000000u` it measures 804.77 ms
+and the gate rejects it.
+
+#### What is still not known
+
+750 ms is this port's own policy (8k), not a documented Apple threshold; the
+observed kills were command buffers of roughly 800 ms on M1/M2. Margin is now
+3-5x on a 10-core M3. **The remaining exposure is the cofactoriser on a slow
+device**: its chunker steers only when a launch exceeds 750 ms, so an M1 may
+sit at 400-600 ms per submission indefinitely and never trigger a reduction. If
+field failures continue, `COF_CHUNK_TARGET_MS` is the knob -- and lowering it
+is a policy decision, not a tuning one.
 
 ## 9. Drift ledger — CUDA-side changes made for this port
 

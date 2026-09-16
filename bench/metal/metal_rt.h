@@ -120,6 +120,13 @@ void       *mtlGetSymbol(const char *name);
 mtlError_t  mtlStreamCreate(mtlStream_t *s);
 mtlError_t  mtlStreamDestroy(mtlStream_t s);
 mtlError_t  mtlStreamSynchronize(mtlStream_t s);
+/* Close and submit whatever is open WITHOUT waiting for it. No CUDA analogue:
+ * CUDA has no command-buffer object, so nothing there needs bounding. Here the
+ * stream batches every dispatch into one command buffer until something demands
+ * ordering, and macOS's interactivity watchdog judges a COMMAND BUFFER -- so a
+ * long run of dispatches must be broken into submissions, not just into
+ * launches. See the fbgen root finder (plan 9z-k). */
+mtlError_t  mtlStreamFlush(mtlStream_t s);
 mtlError_t  mtlStreamWaitEvent(mtlStream_t s, mtlEvent_t e, unsigned flags);
 mtlError_t  mtlDeviceSynchronize(void);
 
