@@ -68,6 +68,58 @@ METAL_MIN_MACOS ?= 13.0
 # every object depends on, so switching between builds rebuilds them; we do not
 # have to remember to.
 CPUOBJ_TUNE := -mcpu=apple-m1 -mmacosx-version-min=$(METAL_MIN_MACOS)
+# ---- optional BOINC application build ------------------------------------
+#
+# Mirrors the CUDA Makefile's switch, with the three macOS-specific
+# corrections plan section 9a measured. Default 0, so the fraction-done path
+# stays compiled out of every ordinary build and `boinccheck` remains the only
+# thing in the tree that reaches it.
+#
+#   make -f Makefile.metal benchbin HAVE_BOINC=1 BOINC_DIR=$HOME/code/boinc-install
+#
+# BOINC_DIR is a `make install` prefix and fills in both flag sets. Point
+# BOINC_CPPFLAGS/BOINC_LDFLAGS at the api/ and lib/ trees directly for a
+# layout that is not a prefix.
+#
+# THE BOINC TREE MUST BE CONFIGURED FOR THIS TARGET, and neither mistake is a
+# build failure -- see plan 9a, and `make -f Makefile.metal boinclinkcheck`,
+# which asserts both against the binary this produces:
+#   --disable-shared            or -lboinc_api takes an installed .dylib and
+#                               bakes the BUILD MACHINE's absolute path into a
+#                               binary meant for a volunteer's;
+#   -mmacosx-version-min=13.0   in the BOINC CFLAGS/CXXFLAGS, or its objects
+#                               are stamped with the build host's SDK and the
+#                               METAL_MIN_MACOS floor below becomes a fiction.
+HAVE_BOINC     ?= 0
+BOINC_DIR      ?=
+ifneq ($(BOINC_DIR),)
+BOINC_CPPFLAGS ?= -I $(BOINC_DIR)/include/boinc
+BOINC_LDFLAGS  ?= -L $(BOINC_DIR)/lib
+else
+BOINC_CPPFLAGS ?=
+BOINC_LDFLAGS  ?=
+endif
+BOINC_LIBS     ?= -lboinc_api -lboinc
+
+# The CUDA Makefile defaults BOINC_HOST_STATIC to `-static-libstdc++
+# -static-libgcc`, against glibc/libstdc++ skew across Linux distributions.
+# Apple clang REJECTS `-static-libgcc` outright ("unsupported option") and
+# ignores the other, and macOS ships libc++ and libSystem with the OS, so the
+# flags are both impossible and unnecessary here. Forced empty in the
+# delegation below rather than left to the default.
+BOINC_HOST_STATIC :=
+
+ifeq ($(HAVE_BOINC),1)
+ifeq ($(strip $(BOINC_CPPFLAGS)),)
+$(error HAVE_BOINC=1 needs BOINC_DIR=<prefix> (or BOINC_CPPFLAGS pointing at boinc_api.h))
+endif
+BOINC_DEFS := -DHAVE_BOINC
+BOINC_LINK := $(BOINC_LDFLAGS) $(BOINC_LIBS)
+else
+BOINC_DEFS :=
+BOINC_LINK :=
+endif
+
 # BN_LIMBS is used by BOTH sides -- bigint_msl.h declares bn_t with it and the
 # host declares the same struct -- but only HOSTFLAGS was passing it, so the
 # device silently kept bigint_msl.h's #ifndef default of 12 while the host took
@@ -78,10 +130,38 @@ MSLFLAGS  := -std=metal3.0 -mmacos-version-min=$(METAL_MIN_MACOS) \
              -DBN_LIMBS=$(BN_LIMBS) -DTD_TILE=$(TD_TILE) \
              -fno-fast-math -Wno-c++17-extensions -I metal
 
-HOSTFLAGS := -std=c++17 -O2 -ffp-contract=off -I . -I metal \
+HOSTFLAGS_BASE := -std=c++17 -O2 -ffp-contract=off -I . -I metal \
              -mmacosx-version-min=$(METAL_MIN_MACOS) \
              -DBN_LIMBS=$(BN_LIMBS) -DCF_LMAX=$(CF_LMAX) -DTD_TILE=$(TD_TILE) \
              -DSLAB_PERF_REGIONS=$(SLAB_PERF_REGIONS)
+
+# Split so `boinccheck` can keep its own boinc_api.h. Include search is
+# left to right, so with BOINC_CPPFLAGS already in HOSTFLAGS a later
+# `-I metal/boinc_stub` would LOSE to the real SDK and the stub gate would
+# quietly stop testing the stub.
+HOSTFLAGS := $(HOSTFLAGS_BASE) $(BOINC_DEFS) $(BOINC_CPPFLAGS)
+
+# One setting for every delegation to the default Makefile. It folds these
+# into a stamp that all its objects depend on, so passing them inconsistently
+# between targets here would make the gates rebuild each other's CPU objects
+# on every alternation. HOST_TUNE is passed on the command line and therefore
+# beats that Makefile's own `HOST_TUNE ?=` (which empties itself under
+# HAVE_BOINC so a distributed binary carries no -march=native): -mcpu=apple-m1
+# is this port's declared floor, not the build host's ISA, so it is the right
+# value for a distributed binary too.
+CPUOBJ_MAKEVARS := HOST_TUNE='$(CPUOBJ_TUNE)' HAVE_BOINC=$(HAVE_BOINC) \
+                   BOINC_CPPFLAGS='$(BOINC_CPPFLAGS)' BOINC_HOST_STATIC=
+
+# Unlike the CUDA Makefile, nothing here tracked a flag change, so flipping
+# HAVE_BOINC left a $(BUILD) full of objects compiled the other way -- and a
+# bench_main.o built without the define simply never calls bench_boinc_init(),
+# which is a silently wrong binary rather than a link error. The plan records
+# the same trap costing a TD measurement (8q). Stamp the whole signature, not
+# just HAVE_BOINC: every Metal-side object and the metallib depends on it, so
+# changing ANY tunable above rebuilds what it affects.
+METAL_STAMP := .metalflags.stamp
+METAL_SIGNATURE := $(HOSTFLAGS)|$(MSLFLAGS)|$(BOINC_LINK)|$(CPUOBJ_TUNE)
+$(shell [ "$$(cat $(METAL_STAMP) 2>/dev/null)" = '$(METAL_SIGNATURE)' ] || printf '%s' '$(METAL_SIGNATURE)' > $(METAL_STAMP))
 
 BUILD := .metal-build
 
@@ -153,14 +233,14 @@ rtcheck: $(BUILD)/rt_test $(BUILD)/rt_test.metallib
 METAL_OBJS   := $(BUILD)/metal_rt.o $(BUILD)/metal_scan.o
 FBGEN_CPUOBJ := fbgen_lib.o fb_load.o fb_cado.o poly.o primes.o platform.o
 
-$(BUILD)/metal_rt.o: metal/metal_rt.mm metal/metal_rt.h | $(BUILD)
+$(BUILD)/metal_rt.o: metal/metal_rt.mm metal/metal_rt.h $(METAL_STAMP) | $(BUILD)
 	$(CXX) $(HOSTFLAGS) -c $< -o $@
 
-$(BUILD)/metal_scan.o: metal/metal_scan.cpp metal/metal_scan.h | $(BUILD)
+$(BUILD)/metal_scan.o: metal/metal_scan.cpp metal/metal_scan.h $(METAL_STAMP) | $(BUILD)
 	$(CXX) $(HOSTFLAGS) -c $< -o $@
 
-$(BUILD)/fbgen_gpu: metal/fbgen_gpu_metal.cpp $(METAL_OBJS) $(BUILD)/bench.metallib
-	$(MAKE) HOST_TUNE='$(CPUOBJ_TUNE)' $(FBGEN_CPUOBJ)
+$(BUILD)/fbgen_gpu: metal/fbgen_gpu_metal.cpp $(METAL_OBJS) $(BUILD)/bench.metallib $(METAL_STAMP)
+	$(MAKE) $(CPUOBJ_MAKEVARS) $(FBGEN_CPUOBJ)
 	$(CXX) $(HOSTFLAGS) metal/fbgen_gpu_metal.cpp $(METAL_OBJS) $(FBGEN_CPUOBJ) \
 	    -framework Metal -framework Foundation -framework IOKit -lm -o $@
 
@@ -193,7 +273,7 @@ fbcheck: $(BUILD)/fbgen_gpu fbgen
 BOINC_GATE_OBJ := $(BUILD)/boinc_progress_test
 
 boinccheck: | $(BUILD)
-	$(CXX) $(HOSTFLAGS) -DHAVE_BOINC -I metal/boinc_stub \
+	$(CXX) $(HOSTFLAGS_BASE) -DHAVE_BOINC -I metal/boinc_stub \
 	    metal/boinc_progress_test.cpp metal/boinc_stub/boinc_stub.cpp \
 	    boinc_support.cpp -o $(BOINC_GATE_OBJ)
 	@echo "== control: WITHOUT the suspend, does the bug still exist? =="
@@ -203,6 +283,23 @@ boinccheck: | $(BUILD)
 	@$(BOINC_GATE_OBJ) suspended
 	@echo
 	@echo "BOINC PROGRESS GATE: PASS"
+
+# ---- BOINC link gate: is the HAVE_BOINC binary distributable? ------------
+# The companion to boinccheck above: that one drives the progress logic
+# against a stub, this one inspects the real binary. Everything it checks
+# BUILDS AND LINKS with exit 0 and is still wrong -- see plan 9a.
+.PHONY: boinclinkcheck
+boinclinkcheck:
+ifneq ($(HAVE_BOINC),1)
+	@echo "boinclinkcheck needs HAVE_BOINC=1, e.g."; \
+	 echo "  make -f Makefile.metal boinclinkcheck HAVE_BOINC=1 BOINC_DIR=<prefix>"; \
+	 exit 1
+else
+	@$(MAKE) -f Makefile.metal $(BUILD)/bench HAVE_BOINC=1 \
+	    BOINC_DIR='$(BOINC_DIR)' BOINC_CPPFLAGS='$(BOINC_CPPFLAGS)' \
+	    BOINC_LDFLAGS='$(BOINC_LDFLAGS)' >/dev/null
+	@sh metal/boinclinkcheck.sh $(BUILD)/bench $(METAL_MIN_MACOS)
+endif
 
 # ---- Phase 5 gate: the sieve against the tree's own CPU ground truth -----
 
@@ -217,7 +314,7 @@ $(BUILD)/bench.metallib: metal/bench_kernels.metal metal/bench_kernels_body.meta
                          metal/td.metal metal/td_body.metal.inc \
                          metal/fbgen_gpu.metal metal/fbgen_gpu_body.metal.inc \
                          metal/cofac.metal metal/cofac_body.metal.inc \
-                         metal/scan.metal $(MSL_HEADERS) | $(BUILD)
+                         metal/scan.metal $(MSL_HEADERS) $(METAL_STAMP) | $(BUILD)
 	$(METAL) $(MSLFLAGS) -c metal/bench_kernels.metal -o $(BUILD)/bench_kernels.air
 	$(METAL) $(MSLFLAGS) -c metal/td.metal            -o $(BUILD)/td.air
 	$(METAL) $(MSLFLAGS) -c metal/fbgen_gpu.metal     -o $(BUILD)/fbgen_gpu.air
@@ -227,8 +324,8 @@ $(BUILD)/bench.metallib: metal/bench_kernels.metal metal/bench_kernels_body.meta
 	            $(BUILD)/cofac.air $(BUILD)/scan.air -o $@
 
 $(BUILD)/phase5_test: metal/phase5_test.cpp metal/fbgen_gpu_metal.cpp \
-                      metal/metal_rt.mm metal/metal_scan.cpp $(BUILD)/bench.metallib
-	$(MAKE) HOST_TUNE='$(CPUOBJ_TUNE)' $(SIEVE_CPUOBJ)
+                      metal/metal_rt.mm metal/metal_scan.cpp $(BUILD)/bench.metallib $(METAL_STAMP)
+	$(MAKE) $(CPUOBJ_MAKEVARS) $(SIEVE_CPUOBJ)
 	$(CXX) $(HOSTFLAGS) -DFBGEN_GPU_LIBRARY metal/phase5_test.cpp \
 	    metal/fbgen_gpu_metal.cpp metal/metal_rt.mm metal/metal_scan.cpp \
 	    $(SIEVE_CPUOBJ) -framework Metal -framework Foundation -framework IOKit \
@@ -267,8 +364,8 @@ COFAC_CPUOBJ := verify_cpu.o fb_load.o fb_cado.o poly.o primes.o platform.o \
                 rfb.o watchdog.o runlog.o
 
 $(BUILD)/cofac_test: metal/cofac_test.cpp metal/cofac_metal.cpp metal/metal_rt.mm \
-                     $(BUILD)/bench.metallib
-	$(MAKE) HOST_TUNE='$(CPUOBJ_TUNE)' $(COFAC_CPUOBJ)
+                     $(BUILD)/bench.metallib $(METAL_STAMP)
+	$(MAKE) $(CPUOBJ_MAKEVARS) $(COFAC_CPUOBJ)
 	$(CXX) $(HOSTFLAGS) metal/cofac_test.cpp metal/cofac_metal.cpp \
 	    metal/metal_rt.mm $(COFAC_CPUOBJ) \
 	    -framework Metal -framework Foundation -framework IOKit -lm -o $@
@@ -297,19 +394,19 @@ BENCH_CPUOBJ := fb_load.o verify_cpu.o poly.o primes.o rfb.o fb_cado.o \
 METAL_TU := $(BUILD)/bench_main.o $(BUILD)/bench_host.o $(BUILD)/metal_rt.o \
             $(BUILD)/metal_scan.o $(BUILD)/fbgen_gpu_lib.o
 
-$(BUILD)/bench_main.o: metal/bench_main_metal.cpp | $(BUILD)
+$(BUILD)/bench_main.o: metal/bench_main_metal.cpp $(METAL_STAMP) | $(BUILD)
 	$(CXX) $(HOSTFLAGS) -DPIPE_K=16 -c $< -o $@
 
 $(BUILD)/bench_host.o: metal/bench_host.cpp metal/pipeline_host.inc \
-                       metal/cofac_host.inc metal/td_host.h | $(BUILD)
+                       metal/cofac_host.inc metal/td_host.h $(METAL_STAMP) | $(BUILD)
 	$(CXX) $(HOSTFLAGS) -DPIPE_K=16 -c $< -o $@
 
-$(BUILD)/fbgen_gpu_lib.o: metal/fbgen_gpu_metal.cpp | $(BUILD)
+$(BUILD)/fbgen_gpu_lib.o: metal/fbgen_gpu_metal.cpp $(METAL_STAMP) | $(BUILD)
 	$(CXX) $(HOSTFLAGS) -DFBGEN_GPU_LIBRARY -c $< -o $@
 
-$(BUILD)/bench: $(METAL_TU) $(BUILD)/bench.metallib
-	$(MAKE) HOST_TUNE='$(CPUOBJ_TUNE)' $(BENCH_CPUOBJ)
-	$(CXX) $(HOSTFLAGS) $(METAL_TU) $(BENCH_CPUOBJ) \
+$(BUILD)/bench: $(METAL_TU) $(BUILD)/bench.metallib $(METAL_STAMP)
+	$(MAKE) $(CPUOBJ_MAKEVARS) $(BENCH_CPUOBJ)
+	$(CXX) $(HOSTFLAGS) $(METAL_TU) $(BENCH_CPUOBJ) $(BOINC_LINK) \
 	    -framework Metal -framework Foundation -framework IOKit \
 	    -lm -ldl -lpthread -o $@
 
@@ -328,7 +425,7 @@ $(BUILD)/classify_test.metallib: metal/classify_test.metal $(MSL_HEADERS) | $(BU
 	$(METAL) $(MSLFLAGS) -c $< -o $(BUILD)/classify_test.air
 	$(METALLIB) $(BUILD)/classify_test.air -o $@
 
-$(BUILD)/classify_test: metal/classify_test.cpp metal/metal_rt.mm | $(BUILD)
+$(BUILD)/classify_test: metal/classify_test.cpp metal/metal_rt.mm $(METAL_STAMP) | $(BUILD)
 	$(CXX) $(HOSTFLAGS) metal/classify_test.cpp metal/metal_rt.mm \
 	    -framework Metal -framework Foundation -framework IOKit -o $@
 

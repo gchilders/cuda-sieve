@@ -179,6 +179,48 @@ assert _dev_old in src, '--device help line shape changed'
 src = src.replace(_dev_old, _dev_new, 1)
 print('  --help marks this as the Metal build')
 
+# ---- the SAME marker under HAVE_BOINC ------------------------------------
+# The rewrite above touches only the #else branch. A -DHAVE_BOINC build takes
+# the other one, so `--help` would say "select CUDA device" and cofcheck.sh
+# would classify this binary as the CUDA build -- and then run the
+# `--ecm-b1 400000` case that crashed WindowServer twice (plan 8k). The
+# detection marker has to hold in BOTH branches or it is not a marker.
+_devb_old = chr(10).join([
+    '"  --device N       select CUDA device N, used only when the BOINC client did\\n"',
+    '"                   not assign one; its assignment wins  [CUDA\'s default]\\n"'])
+_devb_new = chr(10).join([
+    '"  --device N       select Metal device N, used only when the BOINC client did\\n"',
+    '"                   not assign one; its assignment wins  [the system default]\\n"'])
+assert _devb_old in src, 'BOINC --device help line shape changed'
+src = src.replace(_devb_old, _devb_new, 1)
+print('  --help marks this as the Metal build under HAVE_BOINC too')
+
+# ---- the two runtime lines that name the wrong API ------------------------
+# Both are stderr, which is what a BOINC client keeps; a volunteer's log
+# saying "running on CUDA device 0" out of a Metal binary is a support ticket.
+_gpu_old = chr(10).join([
+    '                    "BOINC: no usable GPU assignment in init_data.xml; using"',
+    '                    " CUDA\'s default device\\n");'])
+_gpu_new = chr(10).join([
+    '                    "BOINC: no usable GPU assignment in init_data.xml; using"',
+    '                    " the system default Metal device\\n");'])
+assert _gpu_old in src, 'BOINC no-assignment message shape changed'
+src = src.replace(_gpu_old, _gpu_new, 1)
+
+_run_old = '        fprintf(stderr, "BOINC: running on CUDA device %d of %d: %s\\n",'
+_run_new = '        fprintf(stderr, "BOINC: running on Metal device %d of %d: %s\\n",'
+assert _run_old in src, 'BOINC device-report message shape changed'
+src = src.replace(_run_old, _run_new, 1)
+
+# The comment above the first of those explains the field in terms of an
+# NVIDIA coprocessor, which is the wrong vendor for this build and the wrong
+# advice for a project packaging it.
+_nv_old = "version's plan class actually declares an NVIDIA coprocessor."
+_nv_new = "version's plan class actually declares a GPU coprocessor at all."
+assert _nv_old in src, 'BOINC assignment comment shape changed'
+src = src.replace(_nv_old, _nv_new, 1)
+print('  BOINC stderr lines name Metal, not CUDA')
+
 # ---- lift the 24-round cap for ECM ----------------------------------------
 # The cap's own message says why it exists: "budget << r overflows beyond
 # that". That is RHO's iteration budget. ECM never shifts it -- the ECM

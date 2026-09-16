@@ -1340,13 +1340,103 @@ Without an argument it reports `is_managed=0 gpu_device=-1` and refuses
 `bench_boinc_resolve_path` before init, which is the correct unmanaged
 behaviour.
 
-**What this does NOT establish.** The probe is not a BOINC client: nothing
-here ran under a real `init_data.xml`, so slot-directory filename resolution,
+**What 9a does NOT establish.** The probe is not a BOINC client: nothing here
+ran under a real `init_data.xml`, so slot-directory filename resolution,
 `boinc_get_init_data`'s GPU device assignment, checkpointing and the
-suspend/quit messages are all still unexercised. It also says nothing about
-`Makefile.metal`, which has no `HAVE_BOINC` path at all yet -- only
-`Makefile` does. Wiring that, with `BOINC_HOST_STATIC=`, is the Phase 9 work
-this unblocks.
+suspend/quit messages are all unexercised. It also says nothing about
+`Makefile.metal`, which at this point had no `HAVE_BOINC` path at all -- only
+`Makefile` did. Wiring that, with `BOINC_HOST_STATIC=`, is what 9a unblocks
+and what 9b does.
+
+### 9b. `HAVE_BOINC` wired into `Makefile.metal` -- and a marker that had rotted
+
+`make -f Makefile.metal benchbin HAVE_BOINC=1 BOINC_DIR=<prefix>` now produces
+a BOINC application binary. Default stays 0, so the fraction-done path is
+still compiled out of every ordinary build. The ported TUs already carried the
+whole integration (`bench_main_metal.cpp` has 26 `bench_boinc_*` call sites,
+`pipeline_host.inc` five) -- only the build wiring was missing. Neither needs
+a BOINC header: everything goes through `bench.h`, and `boinc_support.cpp` is
+the one translation unit that includes `boinc_api.h`.
+
+**The marker in `--help` had rotted, and it is a machine-crashing rot.**
+`gen_bench_main.py` rewrote CUDA's `--device` help line to say "select Metal
+device"... in the `#else` branch only. A `-DHAVE_BOINC` build takes the
+`#ifdef` branch, which still said **"select CUDA device"**. `cofcheck.sh`
+classifies the build from exactly that string, so a BOINC build would be
+detected as CUDA -- and then run the `--ecm-b1 400000` case that took
+WindowServer down twice (8k). A marker that holds in one branch of the
+`#ifdef` it is printed from is not a marker. Both branches now say Metal, and
+the gate below asserts it on the binary.
+
+Two stderr lines under the same `#ifdef` also named the wrong API -- `BOINC:
+running on CUDA device %d of %d` and `using CUDA's default device`, out of a
+Metal binary, into the log a volunteer would send to a project. Both fixed in
+the generator, with the comment that explained the field in terms of "an
+NVIDIA coprocessor".
+
+**A flag stamp, which this Makefile never had.** Flipping `HAVE_BOINC` left
+`$(BUILD)` full of objects compiled the other way, and a `bench_main.o` built
+without the define simply never calls `bench_boinc_init()` -- a silently wrong
+binary, not a link error. `.metalflags.stamp` carries the whole
+`HOSTFLAGS|MSLFLAGS|BOINC_LINK|CPUOBJ_TUNE` signature and every Metal-side
+object and the metallib depend on it, so changing **any** tunable rebuilds
+what it affects. That also retires the stale-artifact trap 8q records costing
+a `TD_TILE` measurement. Verified: a no-op rebuild stays a no-op, and
+flipping `HAVE_BOINC` either way recompiles.
+
+`HOSTFLAGS` is split into `HOSTFLAGS_BASE` plus the BOINC flags for one
+reason: include search is left to right, so with `BOINC_CPPFLAGS` in
+`HOSTFLAGS` the stub gate's later `-I metal/boinc_stub` would **lose to the
+real SDK** and `boinccheck` would quietly stop testing the stub. And all four
+delegations to the default Makefile now pass one `CPUOBJ_MAKEVARS`, including
+**`BOINC_HOST_STATIC=`** (9a: `-static-libgcc` is an error with Apple clang),
+because that Makefile folds these into a stamp of its own and passing them
+inconsistently would have the gates rebuilding each other's CPU objects.
+
+#### The gate: `make -f Makefile.metal boinclinkcheck HAVE_BOINC=1 BOINC_DIR=...`
+
+Every check in it is for something that **builds and links with exit 0 and is
+still wrong**. It refuses to run at `HAVE_BOINC=0` rather than vacuously pass.
+
+| check | catches |
+|---|---|
+| no BOINC dylib in `otool -L` | BOINC built without `--disable-shared` |
+| every dependency under `/usr/lib` or `/System` | any build-host path at all |
+| `minos` equals `METAL_MIN_MACOS` | BOINC built without `-mmacosx-version-min` |
+| `_boinc_init_parallel`, `_boinc_finish`, `_boinc_fraction_done` present | a link that resolved nothing |
+| `--help` still says "select Metal device" | the rot above, i.e. `cofcheck.sh` running the machine-crashing case |
+
+All seven pass. **The control fails**: run against the `HAVE_BOINC=0` binary
+it reports the three symbols missing and exits 1, so the symbol checks are not
+tautologies.
+
+**What the gate cannot check, and says so.** Under `HAVE_BOINC` the runtime
+redirects stderr to **`stderr.txt` in the working directory** as soon as
+`boinc_init` runs -- which is before argument parsing -- so nothing written to
+stderr reaches a terminal or a `2>&1` pipe. **A check that greps stderr from a
+pipe finds nothing and "passes" for the wrong reason.** The gate prints the
+list of stderr-only assertions to read by hand instead of faking them.
+(`--help` itself is `printf`, i.e. stdout, which is why the marker check and
+`cofcheck.sh`'s detection are sound.)
+
+**Done by hand, once, and it is the real end-to-end proof.** A `HAVE_BOINC=1`
+binary, one q at the parity special-q, in a clean directory:
+
+```
+exit 0, total relations 37            <- the golden number, from a BOINC build
+stdout.log: 1 mention of "BOINC"      <- everything else went to the file
+stderr.txt:
+  BOINC: no usable GPU assignment in init_data.xml; using the system default Metal device
+  BOINC: running on Metal device 0 of 1: Apple M3
+  BOINC: slab plan: 2048 rows/slab, 8 slabs (auto-calibrated)
+  cofactor queue: 12 curves/round is about 119 ms ... over this build's 750 ms bound
+```
+
+Both rewritten lines name Metal, the slab-plan and launch-bound advisories are
+there, and the 750 ms policy from 8k is being reported through BOINC's own
+channel. **Still not a client**: standalone mode, no `init_data.xml`, so slot
+filename resolution, a real GPU assignment and checkpointing remain
+unexercised.
 
 ---
 
