@@ -1048,6 +1048,52 @@ build, not drift. And no emulated 64-bit counter (`nlost`, `nhit`,
 return at six sites (production uses `MTL_OR_DIE`) — gate ergonomics, not a
 shipped defect.
 
+## A FIELD RUN, and the GPU assignment it exposed (plan 9z-g)
+
+**The port has now run under a real BOINC client** — a successful workunit on
+an **M4 Max**, client 8.2.11, factor base generated on the GPU in **3.0 s**
+(6.5 s on this M3), `boinc_finish(0)`. That closes 9a–9f's standing "not
+established".
+
+**Its first line was wrong, and not only in wording.**
+`bench_boinc_gpu_device()` hardcoded `strncmp(aid.gpu_type, "NVIDIA", 6)`, so
+it **rejected the `apple_gpu` device the client correctly assigned**, then
+reported "no usable GPU assignment in init_data.xml" — which was false.
+**No wrong results and no wrong device** (Apple silicon exposes one Metal
+device; the log says `device 0 of 1`, so the fallback IS the assigned one) —
+what it costs is diagnosis, and it is exactly the line someone would trust
+while debugging a real assignment problem.
+
+Fixed with the port's usual shape, since `boinc_support.cpp` is shared
+CUDA-side code: **one selector, `-DBENCH_BOINC_METAL_GPU`**, picks
+`apple_gpu`/`Metal`/`an Apple`. **The CUDA build is byte-identical, message
+text included** — hence three macros, `KIND` carrying its own article so
+`"is not an NVIDIA one."` survives verbatim; verified by compiling both ways
+and diffing the strings. One flag rather than three quoted strings because
+those must survive make, a sub-make's `BOINC_CPPFLAGS` and two shells, and
+they do not (``No rule to make target `Apple"'``). Drift-ledger row added.
+
+**AND 9b's message pass was incomplete — the log is why.** 9b fixed the
+messages it had *seen fire*; the two "client assigned CUDA device" lines could
+not fire until the rejection was fixed, and `boinc_support.cpp` was never
+grepped. A proper multiline-safe scan of every `fprintf(stderr, ...)` across
+nine files found **nine** CUDA-named messages: 1 in `boinc_support.cpp`, 6 in
+`bench_main_metal.cpp`, 1 in `pipeline_host.inc`, 1 in `bench_host.cpp`, and
+**4 in `fbgen_gpu_metal.cpp` — which runs on every production task** that
+supplies no `--fb1`. All now say Metal; the scan reports **0 remaining**, the
+sole exception being the env-var name `CUDA_SIEVE_METAL_DEVICE`.
+
+**Measuring-rig note:** the first post-sweep 288-q run took **17m48s** against
+the usual ~3m35s; re-run immediately, **3m39s with identical relations**. It
+had started straight after the full gate suite. This is a fanless MacBook Air —
+a number taken right after a long GPU burn is not a measurement.
+
+**Still open from the field log:** `cofactor: kernel launch 4802 ms is over
+this build's 750 ms bound` on the M4 Max, with the chunker halving and then
+going back up. Every measurement behind that bound came from single-q runs of
+~1,852 records; the field flush is **130,944**. The 750 ms policy has never
+been tuned against a full `CQ_FLUSH` batch.
+
 ## Drift ledger — CUDA-side changes made for this port
 
 **The ledger lives in `bench/METAL_PORT_PLAN.md` section 9, and only there.**

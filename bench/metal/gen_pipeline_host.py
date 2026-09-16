@@ -177,6 +177,13 @@ assert _w_old in src, 'warm-up launch shape changed'
 src = src.replace(_w_old, _w_new, 1)
 print('  warm-up k_transform literals widened to int64_t')
 
+# The memory-diagnostic warning names the API too.
+_md_old = '"warning: CUDA memory diagnostic \'%s\' unavailable: %s\\n"'
+_md_new = '"warning: Metal memory diagnostic \'%s\' unavailable: %s\\n"'
+assert _md_old in src, 'memory-diagnostic warning shape changed'
+src = src.replace(_md_old, _md_new, 1)
+print('  memory-diagnostic warning names Metal')
+
 open(OUT, 'w').write(src)
 print('wrote %s (%d lines, %d launches rewritten)' % (OUT, src.count('\n'), nl))
 left = sorted(set(re.findall(r'\bcuda[A-Z]\w*', src)))
