@@ -680,9 +680,18 @@ call site cannot do one and forget the other.
     change" comment: `step` is `min(chunk, n)`, so when both chunks exceed `n`
     the internal value changes and the rendered line does not. It now compares
     **what it is about to print**.
-  - The allowance notes and the longest-launch high-water line are terminal
-    diagnostics, dropped. The chunker still *steers* on the measured launch;
-    only the printing went, with `cofq_t::ms_launch_max`.
+  - The allowance notes are terminal diagnostics that advise changing a
+    parameter the project sent in the job file — dropped.
+  - **The launch line reports only launches OVER the 750 ms bound.** A
+    per-band high-water line is a stream of messages saying nothing is wrong;
+    an over-bound launch is the condition 8k set the bound for and is
+    invisible elsewhere. Still gated on a new maximum (so a device that cannot
+    meet the bound goes quiet once the chunker parks), and **not** gated on
+    auto mode — a pinned `--cof-chunk` that overruns matters more, since
+    nothing will adapt. Verified both ways on one q: silent at a 401 ms
+    launch, and at `--ecm-curves 48` it prints `kernel launch 1508 ms is over
+    this build's 750 ms bound`, matching the reported `algebraic queue
+    1507.68 ms` from the other side. 37 relations either way.
 
   **All of it removed in the GENERATORS, never in `bench_main.cu`/`cofac.cuh`**
   — editing those is a CUDA-side *behaviour* change (not the inert kind the
@@ -698,6 +707,9 @@ call site cannot do one and forget the other.
   deleted half of `bigint.cuh`. Audited: the only other unasserted replaces
   are the bulk `cuda*->mtl*` and `LAUNCH_APPLY` tables (matching nothing is
   legitimate there) plus one with a stronger `assert src.count(...) == 1`.
+  **And anchor on the UPSTREAM source, never on this generator's own output** —
+  the broken anchor pointed at a line the generator itself had added and later
+  removed. `ms_launch_max` now hangs off `cofac.cuh`'s own timing declaration.
 
   **NOT established:** still standalone mode, no `init_data.xml`, so slot
   filename resolution, a real GPU assignment and checkpointing are

@@ -442,12 +442,40 @@ src = (src[:_d] + chr(10) + "done:" + chr(10) +
        src[_d + len(chr(10) + "done:"):])
 print('  auto chunker now steers on a measured launch duration')
 
-# The measured launch duration is NOT reported. It was, on every new maximum,
-# and it is exactly the kind of line that reads well at a terminal and badly in
-# a BOINC log: stderr.txt is uploaded from the volunteer's host, and a per-band
-# high-water line tells a project nothing it can act on. The chunker still
-# STEERS on the measurement (above) -- only the printing is gone, and with it
-# cofq_t's ms_launch_max, which nothing else read.
+# Report a launch only when it EXCEEDS the bound. The first version of this
+# printed every new maximum, which in a healthy run is a stream of lines saying
+# nothing is wrong -- noise in a volunteer's uploaded stderr.txt (9c). A launch
+# over 750 ms is the opposite: it is the condition 8k set the bound for, the
+# one a stalled compositor or a killed task would be explained by, and it is
+# invisible from anywhere else.
+#
+# Still gated on a new maximum, so a device that simply cannot meet the bound
+# emits a handful of lines and then goes quiet as the chunker parks, rather
+# than one per flush for the whole band. Not gated on auto mode: a pinned
+# --cof-chunk that overruns is exactly as worth knowing about, and more so,
+# since nothing will adapt.
+_rep_old = "    Q->ms_rat += t0; Q->ms_alg += t1;"
+_rep_new = _rep_old + chr(10) + chr(10).join([
+    "    if (launch_ms > COF_CHUNK_TARGET_MS && launch_ms > Q->ms_launch_max) {",
+    "        Q->ms_launch_max = launch_ms;",
+    "        fprintf(stderr,",
+    "                \"  cofactor: kernel launch %.0f ms is over this build's\"",
+    "                \" %.0f ms bound (%u records/launch, %u in flush)\\n\",",
+    "                (double)launch_ms, (double)COF_CHUNK_TARGET_MS,",
+    "                Q->chunk_cur < n ? Q->chunk_cur : n, n);",
+    "    }"])
+assert _rep_old in src, 'ms accumulation shape changed'
+src = src.replace(_rep_old, _rep_new, 1)
+
+# The high-water field, anchored on cofac.cuh's OWN timing declaration --
+# something this generator does not add and cannot delete. 9c broke the
+# ecm_rounds anchor precisely by hanging it off a field that was added here and
+# later removed; nothing else may hang off this one.
+_hw_old = "    double ms_rat, ms_alg, ms_host;"
+assert _hw_old in src, 'cofq_t timing fields missing'
+src = src.replace(_hw_old, _hw_old + chr(10) +
+                  "    float  ms_launch_max;   /* longest OVER-BOUND launch seen, ms       */", 1)
+print('  over-bound launches reported; in-bound ones are not')
 
 # ---- (a), done properly: defend a launch-duration bound -------------------
 # The target is a UI-responsiveness and watchdog bound on ONE kernel launch:

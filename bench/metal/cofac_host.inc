@@ -1313,6 +1313,7 @@ typedef struct {
     uint32_t chunk_prev;    /* the chunk that produced it               */
     int    chunk_parked;    /* halving stopped paying; descend no more  */
     uint32_t ecm_rounds;    /* rounds to actually run; derived or the caller's */
+    float  ms_launch_max;   /* longest OVER-BOUND launch seen, ms       */
     unsigned long long nseen, nrel;
     /* Per side, per CF_* status, accumulated over flushes. `ndead`/`nstuck`
      * used to be two scalars here that NOTHING ever wrote -- which is the
@@ -1873,6 +1874,14 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
             && p > launch_ms) launch_ms = p;
     }
     Q->ms_rat += t0; Q->ms_alg += t1;
+    if (launch_ms > COF_CHUNK_TARGET_MS && launch_ms > Q->ms_launch_max) {
+        Q->ms_launch_max = launch_ms;
+        fprintf(stderr,
+                "  cofactor: kernel launch %.0f ms is over this build's"
+                " %.0f ms bound (%u records/launch, %u in flush)\n",
+                (double)launch_ms, (double)COF_CHUNK_TARGET_MS,
+                Q->chunk_cur < n ? Q->chunk_cur : n, n);
+    }
 
     /* Steer the NEXT flush. Only in auto mode, and only ever between flushes,
      * so the slice is fixed for the whole of the one just measured.

@@ -1495,10 +1495,29 @@ to print**, not the internal slice.
 
 **Lines 4-7 and 12 are terminal diagnostics in the wrong place.** The
 allowance notes advise changing a parameter that arrived in the job file the
-project sent, and this build's own parity settings fire both of them. The
-longest-launch line is a per-band high-water mark. Both dropped Metal-side.
-The chunker still *steers* on the measured launch -- only the printing went,
-and with it `cofq_t::ms_launch_max`, which nothing else read.
+project sent, and this build's own parity settings fire both of them --
+dropped Metal-side.
+
+Line 12 came back, **conditioned**. A per-band high-water line is, in a
+healthy run, a stream of messages saying nothing is wrong. A launch *over the
+bound* is the opposite: it is the condition 8k set 750 ms for, the thing a
+stalled compositor or a killed task would be explained by, and it is invisible
+from anywhere else. So it reports only over-bound launches, still gated on a
+new maximum so a device that cannot meet the bound emits a few lines and then
+goes quiet as the chunker parks -- and **not** gated on auto mode, since a
+pinned `--cof-chunk` that overruns is more worth knowing about, not less,
+because nothing will adapt.
+
+Demonstrated both ways on the same q. Silent in bounds (the six-line file
+above, `--ecm-b1 2000 --ecm-curves 16`, a 401 ms launch: nothing). At
+`--ecm-curves 48`:
+
+```
+  cofactor: kernel launch 1508 ms is over this build's 750 ms bound (1852 records/launch, 1852 in flush)
+```
+
+against a reported `algebraic queue 1507.68 ms` -- the same launch, from the
+other side. 37 relations either way.
 
 **Every removal is Metal-side, in the generators.** The strings live in
 `bench_main.cu` and `cofac.cuh`; editing those would be a CUDA-side
@@ -1529,6 +1548,13 @@ deleted half of `bigint.cuh`.
 
 Gates: `cofcheck.sh` 54 PASS / 0 FAIL, `cofaccheck` 37 in all four
 configurations, `boinccheck`, `boinclinkcheck` 7/7.
+
+**One more anchor rule out of this.** Restoring `ms_launch_max` hung it off
+`cofac.cuh`'s own `double ms_rat, ms_alg, ms_host;` -- a declaration this
+generator does not create and cannot delete -- rather than off the chunker
+block it adds. 9c's bug was exactly an anchor pointing at a line the generator
+had introduced and later removed. **Anchor on the upstream source, never on
+this generator's own output.**
 ---
 
 ## 10. Open questions for the CUDA side
