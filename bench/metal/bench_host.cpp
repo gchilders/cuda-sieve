@@ -70,7 +70,7 @@ static int mtl_check_impl(mtlError_t err, const char *expr,
                            const char *file, int line)
 {
     if (err == mtlSuccess) return 0;
-    fprintf(stderr, "CUDA %s: %s at %s:%d\n",
+    fprintf(stderr, "Metal %s: %s at %s:%d\n",
             expr, mtlGetErrorString(err), file, line);
     return -1;
 }
