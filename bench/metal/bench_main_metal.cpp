@@ -1777,9 +1777,9 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
             if (cuda_device >= 0 && cuda_device != boinc_device)
                 fprintf(stderr,
                         "BOINC: ignoring --device %d; the client assigned this"
-                        " task CUDA device %d\n", cuda_device, boinc_device);
+                        " task Metal device %d\n", cuda_device, boinc_device);
             cuda_device = boinc_device;
-            fprintf(stderr, "BOINC: client assigned CUDA device %d\n",
+            fprintf(stderr, "BOINC: client assigned Metal device %d\n",
                     cuda_device);
         }
 #ifdef HAVE_BOINC
@@ -1820,17 +1820,17 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
          * safe ahead of the flag/selection ordering below. */
         err = mtlGetDeviceCount(&ndev);
         if (err != mtlSuccess) {
-            fprintf(stderr, "bench: cannot enumerate CUDA devices: %s\n",
+            fprintf(stderr, "bench: cannot enumerate Metal devices: %s\n",
                     mtlGetErrorString(err));
             return 1;
         }
         if (ndev < 1) {
-            fprintf(stderr, "bench: this process sees no CUDA device\n");
+            fprintf(stderr, "bench: this process sees no Metal device\n");
             return 1;
         }
         if (selected_device >= ndev) {
             fprintf(stderr,
-                    "bench: CUDA device %d requested, but this process sees"
+                    "bench: Metal device %d requested, but this process sees"
                     " only %d device%s (valid ordinals 0..%d).%s\n",
                     selected_device, ndev, ndev == 1 ? "" : "s", ndev - 1,
                     getenv("CUDA_SIEVE_METAL_DEVICE")
@@ -1882,7 +1882,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         int auto_blocks, effective_fill_blocks;
         if (mtlGetDevice(&dev) != mtlSuccess ||
             mtlGetDeviceProperties(&prop, dev) != mtlSuccess) {
-            fprintf(stderr, "bench: cannot query the CUDA device -- refusing to"
+            fprintf(stderr, "bench: cannot query the Metal device -- refusing to"
                     " fall back to a hardcoded grid width\n");
             return 1;
         }

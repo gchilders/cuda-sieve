@@ -158,7 +158,15 @@ HOSTFLAGS_BASE := -std=c++17 -O2 -ffp-contract=off -I . -I metal \
 # left to right, so with BOINC_CPPFLAGS already in HOSTFLAGS a later
 # `-I metal/boinc_stub` would LOSE to the real SDK and the stub gate would
 # quietly stop testing the stub.
-HOSTFLAGS := $(HOSTFLAGS_BASE) $(BOINC_DEFS) $(BOINC_CPPFLAGS)
+# BOINC names Apple GPUs "apple_gpu" in init_data.xml. Without these the
+# shared boinc_support.cpp rejects the client's assignment as non-NVIDIA and
+# then reports that no assignment arrived -- see the comment there, and the
+# field log in plan 9z-g. Passed through BOINC_CPPFLAGS because that is what
+# the default Makefile folds into the objects AND into its stamp, so changing
+# them rebuilds boinc_support.o.
+METAL_BOINC_GPU := -DBENCH_BOINC_METAL_GPU
+
+HOSTFLAGS := $(HOSTFLAGS_BASE) $(BOINC_DEFS) $(BOINC_CPPFLAGS) $(METAL_BOINC_GPU)
 
 # One setting for every delegation to the default Makefile. It folds these
 # into a stamp that all its objects depend on, so passing them inconsistently
@@ -169,7 +177,8 @@ HOSTFLAGS := $(HOSTFLAGS_BASE) $(BOINC_DEFS) $(BOINC_CPPFLAGS)
 # is this port's declared floor, not the build host's ISA, so it is the right
 # value for a distributed binary too.
 CPUOBJ_MAKEVARS := HOST_TUNE='$(CPUOBJ_TUNE)' HAVE_BOINC=$(HAVE_BOINC) \
-                   BOINC_CPPFLAGS='$(BOINC_CPPFLAGS)' BOINC_HOST_STATIC=
+                   BOINC_CPPFLAGS='$(BOINC_CPPFLAGS) $(METAL_BOINC_GPU)' \
+                   BOINC_HOST_STATIC=
 
 BUILD := .metal-build
 

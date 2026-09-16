@@ -14,6 +14,43 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* WHICH COPROCESSOR TYPE THIS BINARY ACCEPTS FROM THE CLIENT.
+ *
+ * BOINC names them in init_data.xml as "NVIDIA", "ATI", "intel_gpu" and
+ * "apple_gpu". Hardcoding "NVIDIA" made the Metal build REJECT the very
+ * assignment it wants: a field run on an M4 Max logged
+ *
+ *   BOINC: this is a CUDA application but the client assigned a 'apple_gpu'
+ *   device (index 0); ignoring the assignment.
+ *
+ * and then reported "no usable GPU assignment in init_data.xml", which was
+ * false -- the client had assigned correctly and the app threw it away.
+ *
+ * Costs nothing on Apple silicon today, which exposes exactly one Metal
+ * device, so the fallback IS the assigned device. It costs DIAGNOSIS: a
+ * project reading "this is a CUDA application" out of a Metal app version
+ * reasonably concludes the wrong binary was deployed, and the
+ * no-assignment line is exactly what someone would trust while debugging a
+ * real assignment problem.
+ *
+ * Defaults leave the CUDA build BYTE-IDENTICAL, message text included --
+ * hence three macros rather than one: KIND carries its own article so
+ * "is not an NVIDIA one" survives verbatim.
+ * Selected by ONE flag, -DBENCH_BOINC_METAL_GPU, rather than by passing three
+ * quoted strings on the command line: those have to survive make, a
+ * sub-make's BOINC_CPPFLAGS and two shells, and the embedded quotes do not
+ * ("No rule to make target `Apple\"'"). The strings belong in the source
+ * anyway, where they are readable. */
+#ifdef BENCH_BOINC_METAL_GPU
+#define BENCH_BOINC_GPU_TYPE "apple_gpu"   /* init_data.xml <gpu_type>     */
+#define BENCH_BOINC_GPU_DESC "Metal"       /* what this binary is          */
+#define BENCH_BOINC_GPU_KIND "an Apple"    /* article included, on purpose */
+#else
+#define BENCH_BOINC_GPU_TYPE "NVIDIA"
+#define BENCH_BOINC_GPU_DESC "CUDA"
+#define BENCH_BOINC_GPU_KIND "an NVIDIA"
+#endif
+
 #ifdef HAVE_BOINC
 #include <string>
 #ifndef _WIN32
@@ -194,11 +231,12 @@ extern "C" int bench_boinc_gpu_device(void)
      * whatever the client did place there -- the exact failure this function
      * exists to prevent. Refuse it and let CUDA's default device stand, with
      * the misconfiguration on the record in the uploaded stderr. */
-    if (aid.gpu_type[0] && strncmp(aid.gpu_type, "NVIDIA", 6) != 0) {
+    if (aid.gpu_type[0] && strncmp(aid.gpu_type, BENCH_BOINC_GPU_TYPE,
+                                   sizeof(BENCH_BOINC_GPU_TYPE) - 1) != 0) {
         fprintf(stderr,
-                "BOINC: this is a CUDA application but the client assigned a"
+                "BOINC: this is a " BENCH_BOINC_GPU_DESC " application but the client assigned a"
                 " '%s' device (index %d); ignoring the assignment. The app"
-                " version's plan class is not an NVIDIA one.\n",
+                " version's plan class is not " BENCH_BOINC_GPU_KIND " one.\n",
                 aid.gpu_type, aid.gpu_device_num);
         return -1;
     }

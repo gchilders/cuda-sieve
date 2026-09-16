@@ -1463,7 +1463,7 @@ static int pipe_mem_info_optional(const char *where,
 {
     const mtlError_t err = mtlMemGetInfo(free_bytes, total_bytes);
     if (err == mtlSuccess) return 0;
-    fprintf(stderr, "warning: CUDA memory diagnostic '%s' unavailable: %s\n",
+    fprintf(stderr, "warning: Metal memory diagnostic '%s' unavailable: %s\n",
             where, mtlGetErrorString(err));
     return -1;
 }
