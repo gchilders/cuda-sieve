@@ -912,6 +912,44 @@ more accurate, it is only *shared* — so it buys nothing for byte-identity
 unless the CUDA build uses it too. Phase 7 now decides between "both builds
 adopt it" and "accept a divergent relation set". See the plan's Phase 7.
 
+## Code review, 2026-09-16 (plan 9z)
+
+**`mtlFree` LEAKED THE WHOLE ALLOCATION — fixed.** `metal_rt.mm` is compiled
+**without `-fobjc-arc`**, so `Alloc`'s `id<MTLBuffer>` is unmanaged,
+`newBufferWithLength:` is +1, and the registry entry was the only owner;
+`reg_erase` erased it without releasing. **64 MB per malloc/free pair**, and it
+reached production: slab calibration builds and tears down the pipeline three
+times, so a band ended at **8.37 GB free instead of 10.62** — 2.25 GB
+recovered by the fix, relations unchanged, twelve gates green. Bounded (21
+allocation reports at 24 q and at 288 q alike), but fatal margin on an 8 GB M1.
+Same bug fixed in `mtlShutdown` and `pso_for`'s `MTLFunction`.
+
+**Verified with controls, not by reading:**
+- **A missing kernel fails CLOSED.** Sabotaging a production launch name gives
+  **exit 255, zero relations**, and `mtlGetLastError()` names
+  `pipeline_host.inc:1246`. (An older note here claimed the opposite; it was
+  about 8q probe code, not the port.)
+- **Zero generator drift**: all twelve `gen_*.py` reproduce their committed
+  output **byte for byte** — `git status` clean after regenerating everything.
+- **42 asserted anchors, 0 unasserted single-site `src.replace`.**
+- **No lock recursion**: `mtlUseResource` deliberately skips `g_lock`;
+  `mtlDeviceAddress` takes it and is only called outside the bind window.
+
+**TOP REMAINING ITEM: there is no `@autoreleasepool` anywhere in the shim, and
+the leak was holding it together.** `commit()` stores `st->last = st->cb` where
+`cb` is **autoreleased and never retained**, and `sync()` reads it later —
+nothing drains, so it survives by accident. **Adding a pool naively converts a
+leak into a use-after-free**; the fix is explicit retain/release on command
+buffers. Measured alongside: RSS rises **372 → 399 MB over 75 s** of a 144-q
+band, roughly linear, **cause not established** (could be these objects or the
+legitimate cross-q queue). It matters most where it is least tested: a
+multi-hour BOINC task.
+
+Lesser, open: a zero-sized launch is silently skipped where CUDA returns
+`cudaErrorInvalidConfiguration`; `mtlDeviceAddress` lacks the "do not call
+while binding" warning its sibling has; `pso_for` caches `nil` so the
+missing-kernel diagnostic repeats per attempt.
+
 ## Drift ledger — CUDA-side changes made for this port
 
 **The ledger lives in `bench/METAL_PORT_PLAN.md` section 9, and only there.**

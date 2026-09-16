@@ -1827,6 +1827,117 @@ is also byte-identical (deterministic PKCS#1 v1.5).
 checks against the project's public key on download; it says nothing about
 Gatekeeper, whose requirements for a BOINC-distributed macOS application
 remain untested (9e).
+## 9z. Code review of the port (2026-09-16)
+
+Review of the ~7,000 hand-written lines; the ~19,000 generated ones are
+reviewed through their generators. Every claim below is a measurement or a
+control, not a reading.
+
+### Found and fixed: `mtlFree` leaked the entire allocation
+
+**`metal_rt.mm` is compiled WITHOUT `-fobjc-arc`** (only `sf_test_device.mm`
+gets it). So the `id<MTLBuffer>` inside `Alloc` is an unmanaged pointer,
+`newBufferWithLength:` returns +1, and the registry entry is the only owner.
+`reg_erase` did `g_allocs.erase(it)` and nothing else -- **the buffer was never
+released.**
+
+Measured with `mtlMemGetInfo`, which reads `currentAllocatedSize`:
+
+| 64 MB malloc+free, repeated | before | after |
+|---|---|---|
+| after #1 | 64.5 MB used | 0.5 MB |
+| after #4 | 256.5 MB used | 0.5 MB |
+| after #8 | **512.5 MB used** | **0.5 MB** |
+
+**It reached the production path.** The pipeline's own free-memory reports
+fall monotonically through a run, because slab auto-calibration (8g) builds
+and tears down the bucket array and both factor bases **three times** before
+the real band:
+
+| end of a 24-q band | free memory |
+|---|---|
+| before the fix | 11.84 -> **8.37 GB** |
+| after | 11.84 -> **10.62 GB** |
+
+**2.25 GB recovered**, relations unchanged (1,114), twelve gates green. It is
+*bounded* -- 21 allocation reports whether the band is 24 q or 288 q, so it
+does not grow per special-q -- but 3.5 GB of dead allocations on an 8 GB M1
+is the difference between running and not.
+
+The same ownership bug was in `mtlShutdown` (`g_allocs.clear()`,
+`g_psos.clear()`) and in `pso_for`, which leaked an `MTLFunction` per kernel
+name. All three fixed.
+
+### Verified sound, each with a control
+
+**A missing kernel fails the run closed.** This was worth testing because the
+port reaches 84 kernels **by string name** and templated ones by mangled
+`[[host_name]]`, so a missing instantiation is a plausible silent no-op.
+Sabotaged a production launch (`k_group_counts` -> `k_group_countsZZ`), rebuilt
+and ran:
+
+```
+EXIT=255,  no relations emitted
+metal_rt: no kernel named 'k_group_countsZZ' in the shader library
+CUDA mtlGetLastError(): kernel not found in shader library at metal/pipeline_host.inc:1246
+```
+
+`mtl_launch_begin` refuses, and the ported code's `mtlGetLastError()` checks --
+CUDA's own idiom, kept -- carry it to an abort naming file and line. **An
+earlier note in this plan said a missing kernel "looks like success"; that was
+about probe code written for 8q, not about the port.**
+
+**Zero drift between the generators and the committed generated sources.** All
+twelve `gen_*.py` run and reproduce their output **byte for byte** -- `git
+status` after regenerating everything showed only the hand-edited
+`metal_rt.mm`. For a port whose correctness argument rests on "the generated
+files are what the generators produce", this is the load-bearing check.
+
+**Generator anchor discipline is now complete**: 42 asserted anchors, **0**
+unasserted single-site `src.replace`. The `src.index()` cuts need no assert --
+`str.index` raises. This is the discipline 9c's silent no-op established.
+
+**No lock recursion.** `g_lock` is a plain `std::mutex` held from
+`mtl_launch_begin` through `mtl_launch_end`. `mtlUseResource` deliberately
+does **not** take it (it runs inside that window); `mtlDeviceAddress` does, and
+is only ever called outside it.
+
+### Open, not fixed
+
+**1. No `@autoreleasepool` anywhere in the shim, and the leak was holding it
+together.** `commit()` stores `st->last = st->cb` where `cb` came from
+`[st->q commandBuffer]` -- **autoreleased, never retained** -- and `sync()`
+reads `st->last` afterwards. With no pool in the process nothing ever drains,
+so the object survives by accident. **Adding a pool naively would turn a leak
+into a use-after-free.** The fix is to retain command buffers explicitly and
+release them after completion, not to wrap a pool around the loop.
+
+Measured alongside it: RSS over a 144-q band rises **372 -> 399 MB in 75 s**,
+roughly linearly (~0.36 MB/s). **Cause not established** -- it could be these
+autoreleased objects, or the legitimate cross-q relation queue. The trace is
+monotone rather than saw-toothed across two `CQ_FLUSH` cycles, which argues
+against the queue, but that is an inference. **This is the top remaining item**
+and it matters most exactly where it is least tested: a multi-hour BOINC task.
+
+**2. A zero-sized launch is silently skipped.** `mtl_launch_end` dispatches
+only `if (g_bind_grid && g_bind_block)`; CUDA returns
+`cudaErrorInvalidConfiguration` for a zero grid dimension. Ported code must
+already guard `n == 0` to have worked on CUDA, so this is benign today -- but
+it is a place where a future ported bug would be caught on CUDA and masked
+here.
+
+**3. `mtlDeviceAddress` has no "do not call while binding" warning**, unlike
+`mtlUseResource` which has the matching one. Calling it between
+`mtl_launch_begin` and `mtl_launch_end` would deadlock on the non-recursive
+mutex. Nothing does; it is one comment away from being safe by documentation
+rather than by luck.
+
+**4. `pso_for` caches `nil`**, so the "no kernel named" diagnostic repeats once
+per launch attempt (three times in the control above). Harmless, slightly
+noisy.
+
+Still open from earlier phases: `--mode twolevel` misplaces records and
+refuses (Phase 8), and nothing has run under a real BOINC client (9e).
 ---
 
 ## 10. Open questions for the CUDA side

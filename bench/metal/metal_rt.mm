@@ -194,12 +194,22 @@ const Alloc *reg_find(const void *p)
     return nullptr;
 }
 
+/* RELEASE, not just forget. This file is compiled WITHOUT -fobjc-arc, so the
+ * `id<MTLBuffer>` inside Alloc is an unmanaged pointer: newBufferWithLength:
+ * returns +1 and the registry entry is the only owner. Erasing the entry
+ * without releasing leaked the whole allocation -- measured at 64 MB per
+ * malloc/free pair, and ~3.7 GB over a pipeline run, because slab calibration
+ * builds and tears down the bucket array and factor bases three times before
+ * the real band. Safe to release here for the same reason cudaFree is: a
+ * command buffer retains the resources it references, so work already
+ * encoded keeps the buffer alive past this call. */
 bool reg_erase(void *p)
 {
     uintptr_t v = (uintptr_t)p;
     auto it = std::lower_bound(g_allocs.begin(), g_allocs.end(), v,
                                [](const Alloc &x, uintptr_t q){ return x.base < q; });
     if (it == g_allocs.end() || it->base != v) return false;
+    [it->buf release];
     g_allocs.erase(it);
     return true;
 }
@@ -252,6 +262,7 @@ id<MTLComputePipelineState> pso_for(const char *name)
     if (!f) { g_psos[name] = nil; return nil; }
     NSError *err = nil;
     id<MTLComputePipelineState> p = [g_dev newComputePipelineStateWithFunction:f error:&err];
+    [f release];   /* +1 from newFunctionWithName:; the PSO holds what it needs */
     if (!p) fprintf(stderr, "metal_rt: pipeline for '%s' failed: %s\n",
                     name, err.description.UTF8String);
     g_psos[name] = p;
@@ -377,7 +388,11 @@ extern "C" void mtlShutdown(void)
     std::lock_guard<std::mutex> lk(g_lock);
     if (!g_dev) return;
     sync(&g_default);
+    /* Same ownership rule as reg_erase: clear() would drop the references
+     * without releasing them. */
+    for (Alloc &a : g_allocs) [a.buf release];
     g_allocs.clear();
+    for (auto &kv : g_psos) [kv.second release];
     g_psos.clear();
     g_symbols.clear();
     g_default = Stream();
