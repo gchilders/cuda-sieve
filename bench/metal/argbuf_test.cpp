@@ -54,7 +54,7 @@ int main(int argc, char **argv)
      * when it ran in a fresh process.) Run it before anything makes these
      * buffers resident. */
     memset(out, 0, N*4);
-    mtlError_t e = mtl_launch_begin("k_argbuf", 0, N/64, 64, 0);
+    mtlError_t e = mtl_launch_begin("k_argbuf", 0, N/64, 64, 0, 0u);
     if (e != mtlSuccess) { printf("launch_begin: %s\n", mtlGetErrorString(e)); return 1; }
     mtl_bind_buffer(q, 0);
     mtl_bind_buffer(out, 1);
@@ -72,7 +72,7 @@ int main(int argc, char **argv)
 
     /* Now the real thing. */
     memset(out, 0, N*4);
-    e = mtl_launch_begin("k_argbuf", 0, N/64, 64, 0);
+    e = mtl_launch_begin("k_argbuf", 0, N/64, 64, 0, 0u);
     if (e != mtlSuccess) { printf("launch_begin: %s\n", mtlGetErrorString(e)); return 1; }
     mtl_bind_buffer(q, 0);
     mtl_bind_buffer(out, 1);

@@ -305,21 +305,65 @@ int query_core_count(void)
     return cores > 0 ? cores : 8;
 }
 
-id<MTLComputePipelineState> pso_for(const char *name)
+/* Pipelines are cached per (name, nilmask): a kernel with an optional buffer
+ * is a DIFFERENT function object depending on whether that argument exists,
+ * because the argument is declared under an MSL function constant.
+ *
+ * ONE constant carries the whole answer -- a uint bitmask at index 0, bit i
+ * meaning "argument i is bound" -- and a kernel derives its per-argument
+ * booleans from it:
+ *
+ *     constant uint mtl_bound_mask [[function_constant(0)]];
+ *     constant bool bsum_bound = (mtl_bound_mask & (1u << 1)) != 0;
+ *
+ * A bitmask rather than one Bool per buffer index because the validation
+ * layer REJECTS a constant value for an index the function does not declare,
+ * so the host cannot set a whole range speculatively -- and it has no way to
+ * ask which indices a function declares without first creating it.
+ *
+ * Discovery is `functionConstantsDictionary`. A plain newFunctionWithName:
+ * does NOT return nil for a specialised function -- it returns an object that
+ * cannot build a pipeline, and Metal asserts when you try:
+ *
+ *     function k_scan_block cannot be used to build a pipeline state.
+ *     Use newFunctionWithName:constantValues:... to get the specialized function
+ *
+ * and that assertion fires in ordinary builds, not only under the validation
+ * layer. So the plain lookup is a probe: ask the function what constants it
+ * declares, and re-create it specialised when there are any. */
+id<MTLComputePipelineState> pso_for(const char *name, uint32_t nilmask)
 {
-    auto it = g_psos.find(name);
+    char key[256];
+    snprintf(key, sizeof key, "%s#%u", name, (unsigned)nilmask);
+    auto it = g_psos.find(key);
     if (it != g_psos.end()) return it->second;
     id<MTLComputePipelineState> p = nil;
     @autoreleasepool {
-        id<MTLFunction> f = [g_lib newFunctionWithName:[NSString stringWithUTF8String:name]];
-        if (!f) { g_psos[name] = nil; return nil; }
+        NSString *nm = [NSString stringWithUTF8String:name];
+        id<MTLFunction> f = [g_lib newFunctionWithName:nm];
+        if (f && f.functionConstantsDictionary.count) {
+            [f release];
+            f = nil;
+        }
+        if (!f) {
+            const uint32_t bound = ~nilmask;
+            MTLFunctionConstantValues *cv = [[MTLFunctionConstantValues alloc] init];
+            [cv setConstantValue:&bound type:MTLDataTypeUInt atIndex:0];
+            NSError *cerr = nil;
+            f = [g_lib newFunctionWithName:nm constantValues:cv error:&cerr];
+            [cv release];
+            if (!f)
+                fprintf(stderr, "metal_rt: specialising '%s' failed: %s\n",
+                        name, cerr.description.UTF8String);
+        }
+        if (!f) { g_psos[key] = nil; return nil; }
         NSError *err = nil;
         p = [g_dev newComputePipelineStateWithFunction:f error:&err];
         [f release];   /* +1 from newFunctionWithName:; the PSO holds what it needs */
         if (!p) fprintf(stderr, "metal_rt: pipeline for '%s' failed: %s\n",
                         name, err.description.UTF8String);
     }
-    g_psos[name] = p;   /* +1 from newComputePipelineState...; released at shutdown */
+    g_psos[key] = p;   /* +1 from newComputePipelineState...; released at shutdown */
     return p;
 }
 
@@ -797,11 +841,12 @@ extern "C" mtlError_t mtlFuncSetMaxThreadgroupMemory(const char *kernel, size_t 
 /* --------------------------------------------------------------- launch -- */
 
 extern "C" mtlError_t mtl_launch_begin(const char *kernel, mtlStream_t s,
-                                       unsigned grid, unsigned block, size_t smem)
+                                       unsigned grid, unsigned block, size_t smem,
+                                       uint32_t nilmask)
 {
     g_lock.lock();
     if (ensure_init_locked() != mtlSuccess) { g_lock.unlock(); return fail(mtlErrorInitialization); }
-    id<MTLComputePipelineState> pso = pso_for(kernel);
+    id<MTLComputePipelineState> pso = pso_for(kernel, nilmask);
     if (pso && !g_width_checked) {
         g_width_checked = true;
         if (pso.threadExecutionWidth != 32) {

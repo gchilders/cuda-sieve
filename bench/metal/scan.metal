@@ -30,8 +30,16 @@ using namespace metal;
 /* One threadgroup's exclusive scan, plus that block's total for the next
  * level up. Hillis-Steele in threadgroup memory, the same structure as
  * td.cuh's k_scan_pass1. */
+/* bsum is OPTIONAL: the deepest recursion level has no next level to
+ * accumulate into. Declared under a function constant rather than bound as
+ * nil, because Metal requires every declared buffer argument to be bound and
+ * the validation layer rejects the nil (plan 9z-c). metal_rt sets constant N
+ * to "argument N is bound", so the index here is the buffer index. */
+constant uint mtl_bound_mask [[function_constant(0)]];
+constant bool bsum_bound = (mtl_bound_mask & (1u << 1)) != 0;
+
 kernel void k_scan_block(device uint         *out   [[buffer(0)]],
-                         device uint         *bsum  [[buffer(1)]],
+                         device uint         *bsum  [[buffer(1), function_constant(bsum_bound)]],
                          device const uint   *in    [[buffer(2)]],
                          constant uint       &n     [[buffer(3)]],
                          threadgroup uint    *s     [[threadgroup(0)]],
@@ -49,7 +57,7 @@ kernel void k_scan_block(device uint         *out   [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (gid < n) out[gid] = s[lid] - v;          /* inclusive -> exclusive */
-    if (lid == SCAN_BLK - 1 && bsum) bsum[tgi] = s[lid];
+    if (bsum_bound && lid == SCAN_BLK - 1) bsum[tgi] = s[lid];
 }
 
 /* Add each block's exclusive base back into its elements. */

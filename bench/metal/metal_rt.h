@@ -161,8 +161,14 @@ uint64_t    mtlDeviceAddress(const void *p);
 void        mtlUseResource(const void *p);
 
 /* ---- launch plumbing (used by the template below, not called directly) --- */
-mtlError_t  mtl_launch_begin(const char *kernel, mtlStream_t s,
-                             unsigned grid, unsigned block, size_t smem);
+/* `nilmask` bit i is set when kernel argument i is a null pointer. Metal
+ * requires every DECLARED buffer argument to be bound -- binding nil is not
+ * "no argument", it is an unset argument, and the validation layer rejects it
+ * (plan 9z-c). So an optional buffer is declared under an MSL function
+ * constant instead, and the mask picks the specialisation: the argument does
+ * not exist when its constant is false, and Metal asks for no binding. */
+mtlError_t  mtl_launch_begin(const char *kernel, mtlStream_t s, unsigned grid,
+                            unsigned block, size_t smem, uint32_t nilmask);
 void        mtl_bind_buffer(const void *ptr, int index);
 void        mtl_bind_bytes(const void *data, size_t sz, int index);
 mtlError_t  mtl_launch_end(void);
@@ -205,6 +211,15 @@ inline void mtl_bind_one(mtl_argbuf_t a, int i)
  * here; this overload is what makes that rewrite mean something. */
 inline void mtl_bind_one(std::nullptr_t, int i) { mtl_bind_buffer(nullptr, i); }
 
+/* Which arguments are null, for the specialisation mask above. */
+inline bool mtl_arg_is_null(std::nullptr_t) { return true; }
+template <class T>
+inline bool mtl_arg_is_null(T a)
+{
+    if constexpr (std::is_pointer<T>::value) return a == nullptr;
+    else { (void)a; return false; }
+}
+
 template <class T>
 inline void mtl_bind_one(T a, int i)
 {
@@ -226,7 +241,13 @@ template <class... A>
 inline mtlError_t mtl_launch(const char *kernel, mtlStream_t s, unsigned grid,
                              unsigned block, size_t smem, A... args)
 {
-    mtlError_t e = mtl_launch_begin(kernel, s, grid, block, smem);
+    /* The mask has to be known BEFORE the pipeline is set, which is why it is
+     * computed here and not discovered while binding: setComputePipelineState
+     * happens inside mtl_launch_begin. Runtime value, not compile-time -- a
+     * pointer variable that merely happens to be null counts too. */
+    uint32_t nilmask = 0; int b = 0;
+    (..., (nilmask |= (mtl_arg_is_null(args) ? 1u : 0u) << b, ++b));
+    mtlError_t e = mtl_launch_begin(kernel, s, grid, block, smem, nilmask);
     if (e != mtlSuccess) return e;
     int i = 0;
     (void)i;
