@@ -759,7 +759,8 @@ static inline void k_td_body(
                 __syncthreads();
                 if (!active) continue;
                 for (uint32_t e = 0; e < cnt; e++) {
-                    const uint32_t m = tile[e].m, g = tile[e].g;
+                    const tdsmall_t te = tile[e];
+                    const uint32_t m = te.m, g = te.g;
                     /* Ordinary prime entries have g==1 and use slab-local j
                      * with cst pre-phased once per slab. g>1 implies m==1 for
                      * a prime modulus, so only its global-row condition remains. */
@@ -768,16 +769,16 @@ static inline void k_td_body(
                         if (jglobal % g) continue;
                         jp = jglobal / g;
                     }
-                    if (tile[e].magic) {
-                        uint32_t w = tile[e].rt * jp + hi;
-                        if (td_mod_magic(w, m, tile[e].magic, tile[e].sh) != tile[e].cst)
+                    if (te.magic) {
+                        uint32_t w = te.rt * jp + hi;
+                        if (td_mod_magic(w, m, te.magic, te.sh) != te.cst)
                             continue;
                     }
                     /* magic == 0 means m == 1: the row condition was the whole
                      * test, and it has already passed. */
                     hits++;
                     if (DIVIDE) {
-                        hitp[nh] = m * g; hitr[nh] = tile[e].recip; nh++;
+                        hitp[nh] = m * g; hitr[nh] = te.recip; nh++;
                         if (nh == TD_MAXHIT) {          /* drain and carry on */
                             for (uint32_t z = 0; z < TD_MAXHIT; z++)
                                 td_divide_out<RECORD>(&N, hitp[z], hitr[z],

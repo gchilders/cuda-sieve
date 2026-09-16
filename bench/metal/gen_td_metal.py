@@ -188,5 +188,31 @@ n_local = body.count('uint32_t *myfac =')
 body = body.replace('uint32_t *myfac =', 'device uint32_t *myfac =')
 if n_local: print('qualified %d local device-pointer alias(es)' % n_local)
 
+# ---- k_td's congruence test: one struct load, not six field loads ---------
+# Profiled against a GTX 1080 at the same q with identical work (17,625,929
+# hits): the small-prime congruence test is 324.2 ms on the M3 against 81.2,
+# a 3.99x gap and 80% of Metal's TD, while the division this port twice tried
+# to optimise is only 1.68x. The test is the whole story.
+#
+# Per prime the loop reads SIX fields of tile[e] separately -- m, g, magic, rt,
+# sh, cst -- from threadgroup memory, and every thread in the SIMD group reads
+# the same element, so these are broadcasts. Copy the 32-byte struct once and
+# let the compiler issue wide loads instead of six scalar ones.
+_old_m = "                    const uint32_t m = tile[e].m, g = tile[e].g;"
+_new_m = chr(10).join([
+    "                    const tdsmall_t te = tile[e];",
+    "                    const uint32_t m = te.m, g = te.g;"])
+assert _old_m in body, 'congruence-test tile read shape changed'
+body = body.replace(_old_m, _new_m, 1)
+for _a, _b in (("if (tile[e].magic) {", "if (te.magic) {"),
+               ("uint32_t w = tile[e].rt * jp + hi;", "uint32_t w = te.rt * jp + hi;"),
+               ("td_mod_magic(w, m, tile[e].magic, tile[e].sh) != tile[e].cst",
+                "td_mod_magic(w, m, te.magic, te.sh) != te.cst"),
+               ("hitp[nh] = m * g; hitr[nh] = tile[e].recip; nh++;",
+                "hitp[nh] = m * g; hitr[nh] = te.recip; nh++;")):
+    assert _a in body, 'tile field read not found: ' + _a
+    body = body.replace(_a, _b, 1)
+print('  k_td congruence test: tile[e] loaded once per prime, not six times')
+
 open(OUT, 'w').write(body + '\n')
 print('wrote %s (%d lines, %d heads qualified)' % (OUT, body.count('\n'), nq))
