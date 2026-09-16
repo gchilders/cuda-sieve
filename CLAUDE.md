@@ -1019,6 +1019,35 @@ BOINC suspend are both reset unconditionally, the dispatch matches
 is reported and reused. Carried minor: `mtlEventSynchronize` uses `e->cb` after
 unlocking — safe only because events are single-threaded here.
 
+## Third review, 2026-09-16 (plan 9z-f)
+
+**Fixed: the nil-mask had no width guard.** `mtl_launch` builds it with
+`1u << b`; past index 31 that is UB **and silent** — a null above 31 would
+report as *bound*, and the port would be back to 9z-c's bug. Widest kernel is
+`k_apply` at **29 bound args, max index 27**, so there was headroom but no
+protection. Now `static_assert(sizeof...(A) <= 32, ...)`.
+
+**Verified: validation is clean everywhere**, not just the pipeline —
+`phase5_test`, `scan_test`, `argbuf_test`, `classify_test`, `cofac_test` all
+exit 0 with zero assertions under `MTL_DEBUG_LAYER=1`.
+
+**Verified: MEMORY IS FLAT over a full 288-q band** (closes 9z-b's open
+question). RSS 362.8 → 368.1 MB in the first 80 s, then **+0.2 MB over the
+next 160 s**. The residual 9z-b could not attribute was the cross-q queue
+filling toward its first flush, as hypothesised — **no unbounded component**.
+Caveat: four minutes, not four hours; it rules out a per-q or per-flush leak,
+not something with a much longer period.
+
+**Verified, no findings:** `fbgen_gpu_metal.cpp` (1,518 lines, production
+path) IS generator-reproducible — "NOT wired into the build" is about the
+build, not drift. And no emulated 64-bit counter (`nlost`, `nhit`,
+`noverflow`, `ntested`, `ndiv`, `nproj`) feeds a host decision, so
+`atomicAdd64`'s torn-read hazard stays diagnostic-only as claimed.
+
+**Minor, open:** `argbuf_test.cpp` and `classify_test.cpp` ignore `mtlMalloc`'s
+return at six sites (production uses `MTL_OR_DIE`) — gate ergonomics, not a
+shipped defect.
+
 ## Drift ledger — CUDA-side changes made for this port
 
 **The ledger lives in `bench/METAL_PORT_PLAN.md` section 9, and only there.**
