@@ -550,7 +550,9 @@ src = src.replace(_t_old, chr(10).join([
     " * one, and explicitly worth throughput to hold. CUDA keeps 250 ms against",
     " * a whole-side sum; this is 750 against a measured launch, so the two",
     " * numbers are not comparable. See gen_cofac_host.py. */",
-    "#define COF_CHUNK_TARGET_MS   750.0f"]), 1)
+    "#ifndef COF_CHUNK_TARGET_MS",
+    "#define COF_CHUNK_TARGET_MS   750.0f",
+    "#endif"]), 1)
 
 # The floor stops being the policy and becomes a sanity bound: one grid's
 # worth of records, so a slice never has fewer records than the grid can hold
@@ -594,6 +596,69 @@ _fl_new = chr(10).join([
 assert _fl_old in src, 'chunk floor shape changed'
 src = src.replace(_fl_old, _fl_new, 1)
 print('  target 750 ms on a measured launch; floor lowered; no-progress guard added')
+
+# ---- proportional steering, because the response is LINEAR ----------------
+# Measured at a FULL CQ_FLUSH batch (plan 9z-h), which is the regime every
+# earlier measurement missed -- 8h and 8i both sampled single-q runs of ~1,852
+# records, where the grid is so oversubscribed that the launch is chain-bound
+# and the chunk does nothing. At a real 130k-record flush the launch is
+# RECORD-bound and very nearly linear in the chunk:
+#
+#     15,360 -> 242 ms    30,720 -> 483 ms
+#     61,440 -> 976 ms   131,072 -> 1713 ms      (~15.8 us/record, this M3)
+#
+# Against a linear response, halving is the wrong step. It overshoots to half
+# the bound or less, the `stage < target/4` branch below then doubles straight
+# back, and the controller oscillates instead of converging -- which is
+# exactly what the M4 Max field log shows: 61440 -> 30720 -> 61440 within
+# three flushes, having measured 4802 ms once.
+#
+# A proportional step lands in ONE flush and cannot flip-flop: aim at 0.8x the
+# bound, so the result sits inside the dead band rather than on its edge.
+# The no-progress guard above is untouched and still catches the case the
+# proportional model cannot see -- a bound below one ECM chain, where the
+# launch does not shrink with the chunk at all.
+_ps_old = chr(10).join([
+    "            } else {",
+    "                const uint32_t half = Q->chunk_cur / 2;",
+    "                Q->ms_launch_prev = stage; Q->chunk_prev = Q->chunk_cur;",
+    "                Q->chunk_cur = (half > floor_ch) ? half : floor_ch;",
+    "            }"])
+_ps_new = chr(10).join([
+    "            } else {",
+    "                /* Proportional, not halved: the response is linear in the",
+    "                 * chunk at a full flush, so aim straight at 0.8x the bound",
+    "                 * and land inside the dead band. Halving overshoots and the",
+    "                 * doubling branch below flips it back (plan 9z-h). */",
+    "                double want = (double)Q->chunk_cur",
+    "                            * ((double)COF_CHUNK_TARGET_MS * 0.8) / (double)stage;",
+    "                uint32_t next = want < 1.0 ? 1u : (uint32_t)want;",
+    "                /* Always make progress downward, however bad the estimate. */",
+    "                if (next >= Q->chunk_cur) next = Q->chunk_cur / 2;",
+    "                if (next < floor_ch) next = floor_ch;",
+    "                Q->ms_launch_prev = stage; Q->chunk_prev = Q->chunk_cur;",
+    "                Q->chunk_cur = next;",
+    "            }"])
+assert _ps_old in src, 'halving branch shape changed'
+src = src.replace(_ps_old, _ps_new, 1)
+
+_pu_old = chr(10).join([
+    "            Q->chunk_cur = (Q->chunk_cur > Q->cap / 2) ? Q->cap",
+    "                                                       : Q->chunk_cur * 2;"])
+_pu_new = chr(10).join([
+    "            /* Same reasoning upward, and the same 0.8x aim point, so a",
+    "             * flush that comes in far under the bound climbs to the right",
+    "             * size in one step instead of doubling toward it. */",
+    "            double want = (double)Q->chunk_cur",
+    "                        * ((double)COF_CHUNK_TARGET_MS * 0.8) / (double)stage;",
+    "            uint64_t next = want < 1.0 ? 1ull : (uint64_t)want;",
+    "            if (next <= Q->chunk_cur) next = (uint64_t)Q->chunk_cur * 2ull;",
+    "            if (next > Q->cap) next = Q->cap;",
+    "            Q->chunk_cur = (uint32_t)next;"])
+assert _pu_old in src, 'doubling branch shape changed'
+src = src.replace(_pu_old, _pu_new, 1)
+print('  chunk steering is proportional, not halve/double')
+
 
 # ---- refuse a launch this port cannot bound -------------------------------
 # The block above warns when stage 2 grows past what --cof-chunk can divide,

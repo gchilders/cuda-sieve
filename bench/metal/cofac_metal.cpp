@@ -1295,7 +1295,9 @@ static int cf_run_rounds_dyn(int L, const uint32_t *d_n, uint64_t lim,
  * one, and explicitly worth throughput to hold. CUDA keeps 250 ms against
  * a whole-side sum; this is 750 against a measured launch, so the two
  * numbers are not comparable. See gen_cofac_host.py. */
+#ifndef COF_CHUNK_TARGET_MS
 #define COF_CHUNK_TARGET_MS   750.0f
+#endif
 
 /* Giant steps per curve above which cofq_init warns that record chunking can
  * no longer bound a launch. ~40x the derived default's ~500 and ~16x below the
@@ -2058,9 +2060,18 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
                 Q->chunk_cur = Q->chunk_prev;
                 Q->chunk_parked = 1;
             } else {
-                const uint32_t half = Q->chunk_cur / 2;
+                /* Proportional, not halved: the response is linear in the
+                 * chunk at a full flush, so aim straight at 0.8x the bound
+                 * and land inside the dead band. Halving overshoots and the
+                 * doubling branch below flips it back (plan 9z-h). */
+                double want = (double)Q->chunk_cur
+                            * ((double)COF_CHUNK_TARGET_MS * 0.8) / (double)stage;
+                uint32_t next = want < 1.0 ? 1u : (uint32_t)want;
+                /* Always make progress downward, however bad the estimate. */
+                if (next >= Q->chunk_cur) next = Q->chunk_cur / 2;
+                if (next < floor_ch) next = floor_ch;
                 Q->ms_launch_prev = stage; Q->chunk_prev = Q->chunk_cur;
-                Q->chunk_cur = (half > floor_ch) ? half : floor_ch;
+                Q->chunk_cur = next;
             }
         } else if (stage < COF_CHUNK_TARGET_MS / 4.0f && Q->chunk_cur < Q->cap) {
             /* Capped at the QUEUE CAPACITY, not at this flush's n. Several of
@@ -2074,8 +2085,15 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
              * avoid. cap is the real ceiling: n <= Q->cap always, and a stored
              * value above n costs nothing because cf_run_rounds treats any
              * chunk >= n as the single-slice case. */
-            Q->chunk_cur = (Q->chunk_cur > Q->cap / 2) ? Q->cap
-                                                       : Q->chunk_cur * 2;
+            /* Same reasoning upward, and the same 0.8x aim point, so a
+             * flush that comes in far under the bound climbs to the right
+             * size in one step instead of doubling toward it. */
+            double want = (double)Q->chunk_cur
+                        * ((double)COF_CHUNK_TARGET_MS * 0.8) / (double)stage;
+            uint64_t next = want < 1.0 ? 1ull : (uint64_t)want;
+            if (next <= Q->chunk_cur) next = (uint64_t)Q->chunk_cur * 2ull;
+            if (next > Q->cap) next = Q->cap;
+            Q->chunk_cur = (uint32_t)next;
         }
         if (Q->chunk_cur != was) cof_report_chunk(Q->chunk_cur, n, 0);
     }

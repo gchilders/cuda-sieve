@@ -1088,11 +1088,37 @@ the usual ~3m35s; re-run immediately, **3m39s with identical relations**. It
 had started straight after the full gate suite. This is a fanless MacBook Air —
 a number taken right after a long GPU burn is not a measurement.
 
-**Still open from the field log:** `cofactor: kernel launch 4802 ms is over
-this build's 750 ms bound` on the M4 Max, with the chunker halving and then
-going back up. Every measurement behind that bound came from single-q runs of
-~1,852 records; the field flush is **130,944**. The 750 ms policy has never
-been tuned against a full `CQ_FLUSH` batch.
+**TUNED AGAINST A FULL FLUSH (plan 9z-h), and it retracts two earlier
+conclusions.** 8h ("halving the records leaves the launch unchanged") and
+8i/8j ("chunking costs 25%") were both measured at **single-q, ~1,852
+records**, where a 131,072-thread grid is so oversubscribed the launch is
+chain-bound. **At a real 130k-record flush the launch is RECORD-bound and
+linear in the chunk** — 15.8 µs/record over an 8.5× range (242/483/976/1713 ms
+at 15,360/30,720/61,440/131,072). Linearity holds only in that regime: pushed
+below ~2k records the response flattens and reverses (1,996 → 94.0 ms, 1,792 →
+139.9), which is what the **no-progress guard** is for — it fired and parked.
+
+**Steering is now proportional, not halve/double**: aim at 0.8× the bound.
+From a 6× overshoot it converges in **one** flush (15,360 → 1,996) where
+halving needs three, each of those running ~67 q at a known-wrong chunk.
+`COF_CHUNK_TARGET_MS` is `#ifndef`-guarded so the controller can be exercised
+at other bounds without faking hardware.
+
+**Two things this does NOT establish.** (1) **The throughput cost of meeting
+the bound is unknown** — wall/q against chunk came back non-monotone (825,
+1501, 1658, 1208, 916 ms/q), a 2× spread with no ordering; run-to-run variance
+on this fanless box swamps the effect. Relations were identical throughout, so
+nothing is wrong — the timing just cannot be read here. (2) **The field
+oscillation is NOT a control-law artifact**, contrary to what I first assumed:
+for a linear response halving lands at ≥0.5× the bound and can never fall
+below the `target/4` doubling threshold, so `61440 → 30720 → 61440` requires a
+**25× measurement swing at 2× fewer records** — variance on that host.
+Proportional steering does not fix it; that needs hysteresis or averaging, and
+there is no data from that host to tune either.
+
+**On this M3 nothing changes** — the opening chunk measures ~240 ms, inside the
+dead band, so the controller never steers. The change earns its place on
+larger GPUs (an M4 Max opens at 61,440) and at tighter bounds.
 
 ## Drift ledger — CUDA-side changes made for this port
 
