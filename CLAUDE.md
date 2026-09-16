@@ -588,7 +588,43 @@ call site cannot do one and forget the other.
   so a lifted copy would override a `-D` of the same name; both now wrap every
   lifted define in `#ifndef`.
 
-- Phase 9: not started (packaging).
+- **Phase 9 (packaging): STARTED. The arm64 BOINC library builds and links
+  (plan 9a).** BOINC master `55a5644` / 8.3.0, built here to
+  `~/code/boinc-install`. Prereqs came from Homebrew (`autoconf automake
+  libtool pkg-config`); `_autosetup` needs
+  **`LIBTOOLIZE=/opt/homebrew/bin/glibtoolize`** because Homebrew `g`-prefixes
+  GNU libtool and BOINC's checker looks only for `libtoolize`.
+
+  **The bare `--disable-server --disable-client --disable-manager` produces a
+  library this port CANNOT SHIP. Three additions are load-bearing, and every
+  one of the four configurations builds and links with exit 0 — these were
+  found by inspecting the artifact, not by a failure.**
+  1. **`--disable-shared`.** Otherwise libtool installs
+     `libboinc_api.8.dylib`, `-lboinc_api` prefers it, and the binary carries
+     an **absolute build-machine path** to it. Check with `otool -L`: it must
+     name only `libSystem.B.dylib` and `libc++.1.dylib`.
+  2. **`-mmacosx-version-min=13.0` in CFLAGS/CXXFLAGS.** A default build
+     stamps every object `minos 26.0` against this port's macOS 13 floor —
+     the support floor silently becoming "whatever this laptop runs".
+     Verified 13.0 on all 46 objects in both archives.
+  3. **`BOINC_HOST_STATIC=` (empty) on any macOS link.** The Makefile's
+     default `-static-libgcc` is **`error: unsupported option`** with Apple
+     clang (`-static-libstdc++` is merely ignored). It is also pointless here:
+     macOS ships libc++ and libSystem.
+
+  **Verified:** `boinc_support.cpp` compiles against the real 8.3.0 headers
+  with `-Wall -Wextra` and zero warnings; `metal/boinc_link_probe.cpp` links
+  the whole `bench_boinc_*` surface statically and runs. The probe gates its
+  `bench_boinc_init` call on `argc`, **not `if (0)`** — at -O2 a dead call is
+  deleted and `boinc_api.o` never gets pulled from the archive, giving a link
+  that resolved nothing and looked identical. `bench_boinc_finish` **does not
+  return** (`boinc_finish` exits), and the BOINC runtime **redirects stderr to
+  `stderr.txt` in cwd** — which Phase 9 must reconcile with `runlog`.
+
+  **NOT established:** nothing ran under a real client or `init_data.xml`, so
+  slot filename resolution, GPU device assignment and checkpointing are
+  unexercised. And **`Makefile.metal` has no `HAVE_BOINC` path at all** yet —
+  only `Makefile` does. That wiring is the next Phase 9 step.
 
 **Candidate counts do not compare across sievers; relation sets do.** Our 1,845
 cofactorisation candidates against the oracle's 1,851 is not a defect: the 7
