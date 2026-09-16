@@ -1147,6 +1147,30 @@ device-removed and stack-overflow. A failure is fatal anyway.
 `timeout` → the watchdog, argues for splitting the root finder's grid; `out of
 memory`/victim → the rest of the volunteer's machine.
 
+**MORE FIELD DATA: FAMILY-CORRELATED AND NON-DETERMINISTIC.** Several
+failures, **all M1 and M2**; **a different M2 succeeded**; M3/M4 Max succeed.
+The log **positively excludes** timeout and OOM (those map to their own
+strings), leaving page fault / internal / invalid resource / device removed /
+stack overflow. The root finder is statically clean — grid-stride `t < n`,
+`rootbuf` indexed by **prime** not thread (so the machine-dependent grid width,
+56 blocks on an M1 vs 320 on an M4 Max, cannot overrun it), and
+`fp_split_linear` ≤ `CAP` with one extra root against a 9-element array.
+
+**This is the Phase 0 gap finally showing up.** Every probe, gate and
+measurement in this port ran on **one Apple9 device**. M1 is Apple7, M2 is
+Apple8, and CLAUDE.md has said since 2026-09-14 that family-gated things
+(`mulhi(ulong,ulong)`, argument buffers) "should be re-verified the first time
+an M1 or M2 is available". Non-determinism argues against wrong arithmetic
+(fbgen depends only on poly and `lim`, so that would kill every M2 at the same
+segment) and toward a marginal fault — a spill or a race sensitive to
+scheduling or contention.
+
+**The bottleneck is DATA, not analysis.** (1) Deploy 9z-i so the next failure
+names its code. (2) **Get `make -f Makefile.metal metalcheck` run on an M1 or
+M2** — the Phase 2 gate, 6.6M results against the host, no job data, seconds to
+run, and exactly the instrument for the family-gated arithmetic this port has
+never verified off Apple9.
+
 **The deployed binary is old** — its stderr still says "this is a CUDA
 application", so it pre-dates 9z-g and therefore also the leak fix (9z), the
 autorelease fix (9z-b) and the nil-binding fix (9z-e).
