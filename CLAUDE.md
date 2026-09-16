@@ -485,7 +485,27 @@ call site cannot do one and forget the other.
   thing. **The next attempt needs a profile of the real kernel, not another
   plausible primitive.**
 
-  **What remains:** `d` is uint32 and `rem < d`, so
+  **PROFILED AGAINST A GTX 1080 (plan 8q) — and it is neither thing I tried.**
+  `--td` decomposes the stage on both platforms for free. Identical work
+  (17,625,929 hits): norm 13.6 vs 27.8 ms (2.05x), **congruence test 81.2 vs
+  324.2 (3.99x, 80% of Metal's TD)**, **division 31.4 vs 52.9 (1.68x — the
+  BEST part, and the one this port tried twice to optimise)**. Had the test
+  matched CUDA, TD would be 1.28x rather than 3.21x.
+
+  **FIXED, partly: one struct load instead of six.** The test read six fields
+  of `tile[e]` separately from threadgroup memory per prime, all same-address
+  broadcasts. Copying the 32-byte `tdsmall_t` once cut the test **324.2 → 223.4
+  ms (-31%)**, TD **404.9 → 306.3 standalone (-24%)** and **130.3 → 106.2 ms/q
+  in the pipeline (-18%)**, with identical hits and relations. Test is now
+  2.75x CUDA, TD 2.43x. **The remaining 2.75x is unexplained** and is the whole
+  of TD's gap.
+
+  **Correction:** an earlier note read `bigint.cuh`'s "30 ms division vs 13 ms
+  congruence tests" as meaning CUDA's shape was Metal's mirror. It is not — on
+  this card the test dominates CUDA too (64% vs 25%). That comment describes a
+  different configuration.
+
+  **What remains on the division:** `d` is uint32 and `rem < d`, so
   quotient and remainder both fit in 32 bits — only `cur` is 64-bit. The
   standard 2-word-by-1-word division needs only 32x32→64 products, would live
   in `bigint_msl.h` (Metal-only, no CUDA change), and the gates to verify it
