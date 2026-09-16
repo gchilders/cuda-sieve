@@ -1650,6 +1650,64 @@ Gates after the `metal_rt.mm` change -- it is linked by all of them:
 `rtcheck`, `scancheck`, `fbcheck`, `sievecheck`, `argbufcheck`,
 `classifycheck`, `cofaccheck`, `cofcheck.sh` 54 PASS / 0 FAIL,
 `boinccheck`, `boinclinkcheck` 8/8, `metallibcheck` with its control.
+### 9e. The packaged binary validated over 288 special-q
+
+The packaged build differs from the stock one in three ways that all touch the
+executable: BOINC linked in, the shaders moved inside it, and the CPU objects
+rebuilt under `-DHAVE_BOINC`. None of that should move a relation. Measured
+rather than assumed, over the same 288-q band Phase 7 used:
+
+| | stock | packaged |
+|---|---|---|
+| build | `HAVE_BOINC=0` | `HAVE_BOINC=1 BOINC_DIR=…` |
+| size | 1,462,664 B | **1,726,104 B** |
+| `_boinc_*` symbols | 0 | **46** |
+| `__DATA,__metallib` | 987,730 B | 987,730 B |
+| **relations** | **13,485** | **13,485** |
+| records enqueued | 564,696 | 564,696 |
+| `sha256(relations)` | `8e79762c…dafbc002` | `8e79762c…dafbc002` |
+
+**`cmp` clean, byte for byte**, and 13,485 / 564,696 are exactly Phase 7's
+numbers against real CUDA on a GTX 1080 Ti. The packaged binary ran **in a
+directory containing nothing but itself**, with `CUDA_SIEVE_METALLIB` unset.
+
+Wall: 258 s stock, 280 s packaged. The ~8% is the BOINC build's own work plus
+this fanless box between two back-to-back 4-minute runs; it is not a
+measurement of packaging overhead and should not be quoted as one.
+
+**A false start worth recording.** The first pair of runs omitted `--cofactor`
+and produced 2,381 relations -- also byte-identical between the two builds,
+and also useless as a validation, because without the cofactoriser the band
+emits only the relations that need no splitting. **A comparison that agrees
+can still be measuring almost nothing.** The tell was in the output the whole
+time: `records enqueued 564696 (of which 2381 needed no splitting)`.
+
+#### What still has to ship beside it: nothing, and the job data
+
+`otool -L` on the packaged binary lists seven libraries and **every one is
+part of macOS**: Metal, Foundation, IOKit and CoreFoundation from
+`/System/Library/Frameworks`, and `libSystem.B.dylib`, `libc++.1.dylib`,
+`libobjc.A.dylib` from `/usr/lib`. There is one `dlopen` in the tree,
+`libnvidia-ml.so.1` for optional NVML telemetry; it cannot exist on macOS,
+`runlog_gpu_bind` returns -1, and the caller carries on without it. So the
+**application** is one file.
+
+The **job** is not, and never was: `--poly` (462 B) and the factor base
+(110 MB for c183) are workunit inputs, downloaded per task into the slot,
+which is what `bench_boinc_resolve_path` is for.
+
+**Three things a project needs to know, none of them a missing file.**
+
+- **arm64 only, non-fat.** An Intel Mac cannot run this at all -- Rosetta
+  translates x86_64 to arm64, not the reverse -- and the port refuses
+  non-Apple GPUs by name anyway (`MTLGPUFamilyApple7`). The app version's
+  platform must say arm64.
+- **`minos 13.0`**, so macOS 13 or later. That excludes no Apple silicon Mac
+  in practice.
+- **The signature is ad-hoc** (`flags=0x20002(adhoc,linker-signed)`) -- what
+  ld puts there, not a Developer ID. **Whether BOINC distribution on macOS
+  needs a real signature or notarization is untested here** and is a question
+  for the project, not a claim this port can make either way.
 ---
 
 ## 10. Open questions for the CUDA side
