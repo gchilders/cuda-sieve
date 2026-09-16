@@ -497,8 +497,18 @@ call site cannot do one and forget the other.
   broadcasts. Copying the 32-byte `tdsmall_t` once cut the test **324.2 → 223.4
   ms (-31%)**, TD **404.9 → 306.3 standalone (-24%)** and **130.3 → 106.2 ms/q
   in the pipeline (-18%)**, with identical hits and relations. Test is now
-  2.75x CUDA, TD 2.43x. **The remaining 2.75x is unexplained** and is the whole
-  of TD's gap.
+  2.75x CUDA, TD 2.43x; same copy applied to `k_td_record_warp`.
+
+  **A smaller tile does NOT help — it is load COUNT, not bytes.** Staging only
+  the 24 hot bytes (`recip`, 8 of 32, is read on 0.2% of iterations) and
+  fetching `recip` from device memory on a hit gave 221.7/219.9/222.2 ms
+  against 223.4 — about 1%, inside noise, and was reverted. Cutting a quarter
+  of the bytes changed nothing while cutting six loads to one saved 31%. **So
+  pack the six fields into ONE 16-byte load next, not a smaller struct** —
+  `m`, `rt`, `cst` are under the 2^15 small-prime bound and `g`, `sh` are tiny.
+  That changes the host-built table, so it is a bigger change.
+
+  **The remaining 2.75x is unexplained** and is the whole of TD's gap.
 
   **Correction:** an earlier note read `bigint.cuh`'s "30 ms division vs 13 ms
   congruence tests" as meaning CUDA's shape was Metal's mirror. It is not — on

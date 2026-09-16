@@ -2595,9 +2595,36 @@ instead of six scalar ones:
 +/-11 ms band -- real but small, because TD is ~11% of wall.
 
 That takes the test from 3.99x to **2.75x** CUDA and TD from 3.21x to 2.43x.
-**The remaining 2.75x is still unexplained** and is now the whole of TD's gap;
-the loop that carries it is six threadgroup broadcasts, a multiply and
-`td_mod_magic` per prime, 3,633 primes per candidate.
+The same copy was applied to `k_td_record_warp`, which stages the same tile and
+read it field-by-field too.
+
+#### A different tile layout: tried, and it is load COUNT, not bytes
+
+If the test were limited by threadgroup *bandwidth*, shrinking the tile entry
+should help. `tdsmall_t` is 32 bytes and `recip` is 8 of them, read only when a
+prime actually divides -- 7.28 times in 3,633 primes, **0.2% of iterations**.
+So the tile was rebuilt to stage only the six hot fields (24 bytes) with
+`recip` fetched from device memory on the rare hit: 25% less threadgroup
+traffic and 25% less footprint, at the cost of a second struct type and two
+code paths for `recip`.
+
+| | test, ms |
+|---|---|
+| six field reads (original) | 324.2 |
+| one 32-byte struct copy | 223.4 |
+| **24-byte hot-only tile** | **221.7 / 219.9 / 222.2** |
+
+**About 1%, inside the noise.** Reverted -- the extra type and the split
+`recip` path were not earning. And the negative is informative: cutting a
+quarter of the bytes changed nothing while cutting six loads to one saved 31%,
+so **this loop is limited by the number of threadgroup accesses, not by their
+width**. A layout that packs the six fields into a single 16-byte load is
+therefore the shape worth trying next, not a smaller one -- `m`, `rt` and `cst`
+are all below the 2^15 small-prime bound and `g`, `sh` are tiny, so six fields
+plausibly fit in four words. That changes the table the host builds, so it is a
+larger change than anything above and is left as the next step.
+
+**The remaining 2.75x is still unexplained** and is now the whole of TD's gap.
 
 #### A correction to this section's own earlier reasoning
 
