@@ -214,5 +214,21 @@ for _a, _b in (("if (tile[e].magic) {", "if (te.magic) {"),
     body = body.replace(_a, _b, 1)
 print('  k_td congruence test: tile[e] loaded once per prime, not six times')
 
+# The scan loop's tile[e] is copied once (see the note above); k_td_record_warp
+# reads the same tile field-by-field, so give it the same treatment.
+_te = body.count("const tdsmall_t te = tile[e];")
+_wf_old = "                        const uint32_t m = tile[e].m, g = tile[e].g;"
+if _wf_old in body:
+    body = body.replace(_wf_old, chr(10).join([
+        "                        const tdsmall_t te = tile[e];",
+        "                        const uint32_t m = te.m, g = te.g;"]), 1)
+    for _a, _b in (("if (tile[e].magic) {", "if (te.magic) {"),
+                   ("uint32_t w = tile[e].rt * jp + hi;", "uint32_t w = te.rt * jp + hi;"),
+                   ("td_mod_magic(w, m, tile[e].magic, tile[e].sh) != tile[e].cst",
+                    "td_mod_magic(w, m, te.magic, te.sh) != te.cst")):
+        if _a in body: body = body.replace(_a, _b, 1)
+    _te += 1
+print('  k_td: tile[e] copied once per prime in both variants (%d sites)' % _te)
+
 open(OUT, 'w').write(body + '\n')
 print('wrote %s (%d lines, %d heads qualified)' % (OUT, body.count('\n'), nq))
