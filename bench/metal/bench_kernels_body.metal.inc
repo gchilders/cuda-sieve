@@ -1,3 +1,17 @@
+/* Optional buffer arguments: see metal/gen_bench_kernels.py.
+ * metal_rt supplies bit i = "kernel argument i is bound". */
+constant uint mtl_bound_mask [[function_constant(0)]];
+constant bool mtl_bound_2 = (mtl_bound_mask & (1u << 2)) != 0;
+constant bool mtl_bound_9 = (mtl_bound_mask & (1u << 9)) != 0;
+constant bool mtl_bound_10 = (mtl_bound_mask & (1u << 10)) != 0;
+constant bool mtl_bound_11 = (mtl_bound_mask & (1u << 11)) != 0;
+constant bool mtl_bound_12 = (mtl_bound_mask & (1u << 12)) != 0;
+constant bool mtl_bound_13 = (mtl_bound_mask & (1u << 13)) != 0;
+constant bool mtl_bound_14 = (mtl_bound_mask & (1u << 14)) != 0;
+constant bool mtl_bound_16 = (mtl_bound_mask & (1u << 16)) != 0;
+constant bool mtl_bound_24 = (mtl_bound_mask & (1u << 24)) != 0;
+constant bool mtl_bound_25 = (mtl_bound_mask & (1u << 25)) != 0;
+
 template <bool SLABBED>
 static inline void k_transform_body(
     device const uint32_t * primes,
@@ -55,7 +69,7 @@ kernel void k_transform_0(
     constant int64_t &b1 [[buffer(9)]],
     device uint32_t * nproj [[buffer(10)]],
     device uint32_t * nlost [[buffer(11)]],
-    device uint64_t * walk_cur [[buffer(12)]],
+    device uint64_t * walk_cur [[buffer(12), function_constant(mtl_bound_12)]],
     uint _tid [[thread_position_in_grid]],
     uint _ntid [[threads_per_grid]],
     uint _bid [[threadgroup_position_in_grid]],
@@ -63,7 +77,9 @@ kernel void k_transform_0(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_transform_body<false>(primes, roots, out, n, logI, J, a0, a1, b0, b1, nproj, nlost, walk_cur, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device uint64_t * walk_cur_opt = nullptr;
+    if (mtl_bound_12) walk_cur_opt = walk_cur;
+    k_transform_body<false>(primes, roots, out, n, logI, J, a0, a1, b0, b1, nproj, nlost, walk_cur_opt, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_transform_1(
@@ -79,7 +95,7 @@ kernel void k_transform_1(
     constant int64_t &b1 [[buffer(9)]],
     device uint32_t * nproj [[buffer(10)]],
     device uint32_t * nlost [[buffer(11)]],
-    device uint64_t * walk_cur [[buffer(12)]],
+    device uint64_t * walk_cur [[buffer(12), function_constant(mtl_bound_12)]],
     uint _tid [[thread_position_in_grid]],
     uint _ntid [[threads_per_grid]],
     uint _bid [[threadgroup_position_in_grid]],
@@ -87,7 +103,9 @@ kernel void k_transform_1(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_transform_body<true>(primes, roots, out, n, logI, J, a0, a1, b0, b1, nproj, nlost, walk_cur, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device uint64_t * walk_cur_opt = nullptr;
+    if (mtl_bound_12) walk_cur_opt = walk_cur;
+    k_transform_body<true>(primes, roots, out, n, logI, J, a0, a1, b0, b1, nproj, nlost, walk_cur_opt, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 
@@ -196,8 +214,8 @@ kernel void k_fill_atomic_2_0(
     device uint8_t * out [[buffer(7)]],
     constant uint32_t &cap [[buffer(8)]],
     device uint32_t * overflow [[buffer(9)]],
-    device const uint64_t * walk_cur [[buffer(10)]],
-    device uint64_t * walk_next [[buffer(11)]],
+    device const uint64_t * walk_cur [[buffer(10), function_constant(mtl_bound_10)]],
+    device uint64_t * walk_next [[buffer(11), function_constant(mtl_bound_11)]],
     uint _tid [[thread_position_in_grid]],
     uint _ntid [[threads_per_grid]],
     uint _bid [[threadgroup_position_in_grid]],
@@ -205,7 +223,11 @@ kernel void k_fill_atomic_2_0(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_fill_atomic_body<2, false>(plat, slice, n, xmax, logI, log_region, cursor, out, cap, overflow, walk_cur, walk_next, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device const uint64_t * walk_cur_opt = nullptr;
+    if (mtl_bound_10) walk_cur_opt = walk_cur;
+    device uint64_t * walk_next_opt = nullptr;
+    if (mtl_bound_11) walk_next_opt = walk_next;
+    k_fill_atomic_body<2, false>(plat, slice, n, xmax, logI, log_region, cursor, out, cap, overflow, walk_cur_opt, walk_next_opt, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_fill_atomic_4_0(
@@ -219,8 +241,8 @@ kernel void k_fill_atomic_4_0(
     device uint8_t * out [[buffer(7)]],
     constant uint32_t &cap [[buffer(8)]],
     device uint32_t * overflow [[buffer(9)]],
-    device const uint64_t * walk_cur [[buffer(10)]],
-    device uint64_t * walk_next [[buffer(11)]],
+    device const uint64_t * walk_cur [[buffer(10), function_constant(mtl_bound_10)]],
+    device uint64_t * walk_next [[buffer(11), function_constant(mtl_bound_11)]],
     uint _tid [[thread_position_in_grid]],
     uint _ntid [[threads_per_grid]],
     uint _bid [[threadgroup_position_in_grid]],
@@ -228,7 +250,11 @@ kernel void k_fill_atomic_4_0(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_fill_atomic_body<4, false>(plat, slice, n, xmax, logI, log_region, cursor, out, cap, overflow, walk_cur, walk_next, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device const uint64_t * walk_cur_opt = nullptr;
+    if (mtl_bound_10) walk_cur_opt = walk_cur;
+    device uint64_t * walk_next_opt = nullptr;
+    if (mtl_bound_11) walk_next_opt = walk_next;
+    k_fill_atomic_body<4, false>(plat, slice, n, xmax, logI, log_region, cursor, out, cap, overflow, walk_cur_opt, walk_next_opt, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_fill_atomic_8_0(
@@ -242,8 +268,8 @@ kernel void k_fill_atomic_8_0(
     device uint8_t * out [[buffer(7)]],
     constant uint32_t &cap [[buffer(8)]],
     device uint32_t * overflow [[buffer(9)]],
-    device const uint64_t * walk_cur [[buffer(10)]],
-    device uint64_t * walk_next [[buffer(11)]],
+    device const uint64_t * walk_cur [[buffer(10), function_constant(mtl_bound_10)]],
+    device uint64_t * walk_next [[buffer(11), function_constant(mtl_bound_11)]],
     uint _tid [[thread_position_in_grid]],
     uint _ntid [[threads_per_grid]],
     uint _bid [[threadgroup_position_in_grid]],
@@ -251,7 +277,11 @@ kernel void k_fill_atomic_8_0(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_fill_atomic_body<8, false>(plat, slice, n, xmax, logI, log_region, cursor, out, cap, overflow, walk_cur, walk_next, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device const uint64_t * walk_cur_opt = nullptr;
+    if (mtl_bound_10) walk_cur_opt = walk_cur;
+    device uint64_t * walk_next_opt = nullptr;
+    if (mtl_bound_11) walk_next_opt = walk_next;
+    k_fill_atomic_body<8, false>(plat, slice, n, xmax, logI, log_region, cursor, out, cap, overflow, walk_cur_opt, walk_next_opt, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_fill_atomic_4_1(
@@ -265,8 +295,8 @@ kernel void k_fill_atomic_4_1(
     device uint8_t * out [[buffer(7)]],
     constant uint32_t &cap [[buffer(8)]],
     device uint32_t * overflow [[buffer(9)]],
-    device const uint64_t * walk_cur [[buffer(10)]],
-    device uint64_t * walk_next [[buffer(11)]],
+    device const uint64_t * walk_cur [[buffer(10), function_constant(mtl_bound_10)]],
+    device uint64_t * walk_next [[buffer(11), function_constant(mtl_bound_11)]],
     uint _tid [[thread_position_in_grid]],
     uint _ntid [[threads_per_grid]],
     uint _bid [[threadgroup_position_in_grid]],
@@ -274,7 +304,11 @@ kernel void k_fill_atomic_4_1(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_fill_atomic_body<4, true>(plat, slice, n, xmax, logI, log_region, cursor, out, cap, overflow, walk_cur, walk_next, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device const uint64_t * walk_cur_opt = nullptr;
+    if (mtl_bound_10) walk_cur_opt = walk_cur;
+    device uint64_t * walk_next_opt = nullptr;
+    if (mtl_bound_11) walk_next_opt = walk_next;
+    k_fill_atomic_body<4, true>(plat, slice, n, xmax, logI, log_region, cursor, out, cap, overflow, walk_cur_opt, walk_next_opt, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 
@@ -775,9 +809,9 @@ kernel void k_apply_16_0_0_0(
     constant uint32_t &CINIT [[buffer(8)]],
     constant uint32_t &THRESH [[buffer(9)]],
     constant uint32_t &tconst [[buffer(10)]],
-    device uint8_t * dump [[buffer(11)]],
+    device uint8_t * dump [[buffer(11), function_constant(mtl_bound_11)]],
     device uint32_t * nsurv [[buffer(12)]],
-    device uint16_t * dbg_cells [[buffer(13)]],
+    device uint16_t * dbg_cells [[buffer(13), function_constant(mtl_bound_13)]],
     constant uint32_t &dbg_region [[buffer(14)]],
     device const uint32_t * sp [[buffer(15)]],
     device const uint32_t * srt [[buffer(16)]],
@@ -788,8 +822,8 @@ kernel void k_apply_16_0_0_0(
     constant uint32_t &nblk [[buffer(21)]],
     constant uint32_t &nwrp [[buffer(22)]],
     constant uint32_t &probe_x [[buffer(23)]],
-    device uint32_t * probe_out [[buffer(24)]],
-    device uint32_t * survbits [[buffer(25)]],
+    device uint32_t * probe_out [[buffer(24), function_constant(mtl_bound_24)]],
+    device uint32_t * survbits [[buffer(25), function_constant(mtl_bound_25)]],
     constant int &not_both_even [[buffer(26)]],
     constant uint32_t &j_base [[buffer(27)]],
     threadgroup uint32_t *sm [[threadgroup(0)]],
@@ -800,7 +834,15 @@ kernel void k_apply_16_0_0_0(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_apply_body<16, 0, 0, false>(buckets, cnt, cap, logI, log_region, slice_logp, nslice, N, CINIT, THRESH, tconst, dump, nsurv, dbg_cells, dbg_region, sp, srt, sg, slp, smag, nsmall, nblk, nwrp, probe_x, probe_out, survbits, not_both_even, j_base, sm, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device uint8_t * dump_opt = nullptr;
+    if (mtl_bound_11) dump_opt = dump;
+    device uint16_t * dbg_cells_opt = nullptr;
+    if (mtl_bound_13) dbg_cells_opt = dbg_cells;
+    device uint32_t * probe_out_opt = nullptr;
+    if (mtl_bound_24) probe_out_opt = probe_out;
+    device uint32_t * survbits_opt = nullptr;
+    if (mtl_bound_25) survbits_opt = survbits;
+    k_apply_body<16, 0, 0, false>(buckets, cnt, cap, logI, log_region, slice_logp, nslice, N, CINIT, THRESH, tconst, dump_opt, nsurv, dbg_cells_opt, dbg_region, sp, srt, sg, slp, smag, nsmall, nblk, nwrp, probe_x, probe_out_opt, survbits_opt, not_both_even, j_base, sm, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_apply_16_0_1_0(
@@ -815,9 +857,9 @@ kernel void k_apply_16_0_1_0(
     constant uint32_t &CINIT [[buffer(8)]],
     constant uint32_t &THRESH [[buffer(9)]],
     constant uint32_t &tconst [[buffer(10)]],
-    device uint8_t * dump [[buffer(11)]],
+    device uint8_t * dump [[buffer(11), function_constant(mtl_bound_11)]],
     device uint32_t * nsurv [[buffer(12)]],
-    device uint16_t * dbg_cells [[buffer(13)]],
+    device uint16_t * dbg_cells [[buffer(13), function_constant(mtl_bound_13)]],
     constant uint32_t &dbg_region [[buffer(14)]],
     device const uint32_t * sp [[buffer(15)]],
     device const uint32_t * srt [[buffer(16)]],
@@ -828,8 +870,8 @@ kernel void k_apply_16_0_1_0(
     constant uint32_t &nblk [[buffer(21)]],
     constant uint32_t &nwrp [[buffer(22)]],
     constant uint32_t &probe_x [[buffer(23)]],
-    device uint32_t * probe_out [[buffer(24)]],
-    device uint32_t * survbits [[buffer(25)]],
+    device uint32_t * probe_out [[buffer(24), function_constant(mtl_bound_24)]],
+    device uint32_t * survbits [[buffer(25), function_constant(mtl_bound_25)]],
     constant int &not_both_even [[buffer(26)]],
     constant uint32_t &j_base [[buffer(27)]],
     threadgroup uint32_t *sm [[threadgroup(0)]],
@@ -840,7 +882,15 @@ kernel void k_apply_16_0_1_0(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_apply_body<16, 0, 1, false>(buckets, cnt, cap, logI, log_region, slice_logp, nslice, N, CINIT, THRESH, tconst, dump, nsurv, dbg_cells, dbg_region, sp, srt, sg, slp, smag, nsmall, nblk, nwrp, probe_x, probe_out, survbits, not_both_even, j_base, sm, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device uint8_t * dump_opt = nullptr;
+    if (mtl_bound_11) dump_opt = dump;
+    device uint16_t * dbg_cells_opt = nullptr;
+    if (mtl_bound_13) dbg_cells_opt = dbg_cells;
+    device uint32_t * probe_out_opt = nullptr;
+    if (mtl_bound_24) probe_out_opt = probe_out;
+    device uint32_t * survbits_opt = nullptr;
+    if (mtl_bound_25) survbits_opt = survbits;
+    k_apply_body<16, 0, 1, false>(buckets, cnt, cap, logI, log_region, slice_logp, nslice, N, CINIT, THRESH, tconst, dump_opt, nsurv, dbg_cells_opt, dbg_region, sp, srt, sg, slp, smag, nsmall, nblk, nwrp, probe_x, probe_out_opt, survbits_opt, not_both_even, j_base, sm, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_apply_16_1_0_0(
@@ -855,9 +905,9 @@ kernel void k_apply_16_1_0_0(
     constant uint32_t &CINIT [[buffer(8)]],
     constant uint32_t &THRESH [[buffer(9)]],
     constant uint32_t &tconst [[buffer(10)]],
-    device uint8_t * dump [[buffer(11)]],
+    device uint8_t * dump [[buffer(11), function_constant(mtl_bound_11)]],
     device uint32_t * nsurv [[buffer(12)]],
-    device uint16_t * dbg_cells [[buffer(13)]],
+    device uint16_t * dbg_cells [[buffer(13), function_constant(mtl_bound_13)]],
     constant uint32_t &dbg_region [[buffer(14)]],
     device const uint32_t * sp [[buffer(15)]],
     device const uint32_t * srt [[buffer(16)]],
@@ -868,8 +918,8 @@ kernel void k_apply_16_1_0_0(
     constant uint32_t &nblk [[buffer(21)]],
     constant uint32_t &nwrp [[buffer(22)]],
     constant uint32_t &probe_x [[buffer(23)]],
-    device uint32_t * probe_out [[buffer(24)]],
-    device uint32_t * survbits [[buffer(25)]],
+    device uint32_t * probe_out [[buffer(24), function_constant(mtl_bound_24)]],
+    device uint32_t * survbits [[buffer(25), function_constant(mtl_bound_25)]],
     constant int &not_both_even [[buffer(26)]],
     constant uint32_t &j_base [[buffer(27)]],
     threadgroup uint32_t *sm [[threadgroup(0)]],
@@ -880,7 +930,15 @@ kernel void k_apply_16_1_0_0(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_apply_body<16, 1, 0, false>(buckets, cnt, cap, logI, log_region, slice_logp, nslice, N, CINIT, THRESH, tconst, dump, nsurv, dbg_cells, dbg_region, sp, srt, sg, slp, smag, nsmall, nblk, nwrp, probe_x, probe_out, survbits, not_both_even, j_base, sm, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device uint8_t * dump_opt = nullptr;
+    if (mtl_bound_11) dump_opt = dump;
+    device uint16_t * dbg_cells_opt = nullptr;
+    if (mtl_bound_13) dbg_cells_opt = dbg_cells;
+    device uint32_t * probe_out_opt = nullptr;
+    if (mtl_bound_24) probe_out_opt = probe_out;
+    device uint32_t * survbits_opt = nullptr;
+    if (mtl_bound_25) survbits_opt = survbits;
+    k_apply_body<16, 1, 0, false>(buckets, cnt, cap, logI, log_region, slice_logp, nslice, N, CINIT, THRESH, tconst, dump_opt, nsurv, dbg_cells_opt, dbg_region, sp, srt, sg, slp, smag, nsmall, nblk, nwrp, probe_x, probe_out_opt, survbits_opt, not_both_even, j_base, sm, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_apply_16_1_1_0(
@@ -895,9 +953,9 @@ kernel void k_apply_16_1_1_0(
     constant uint32_t &CINIT [[buffer(8)]],
     constant uint32_t &THRESH [[buffer(9)]],
     constant uint32_t &tconst [[buffer(10)]],
-    device uint8_t * dump [[buffer(11)]],
+    device uint8_t * dump [[buffer(11), function_constant(mtl_bound_11)]],
     device uint32_t * nsurv [[buffer(12)]],
-    device uint16_t * dbg_cells [[buffer(13)]],
+    device uint16_t * dbg_cells [[buffer(13), function_constant(mtl_bound_13)]],
     constant uint32_t &dbg_region [[buffer(14)]],
     device const uint32_t * sp [[buffer(15)]],
     device const uint32_t * srt [[buffer(16)]],
@@ -908,8 +966,8 @@ kernel void k_apply_16_1_1_0(
     constant uint32_t &nblk [[buffer(21)]],
     constant uint32_t &nwrp [[buffer(22)]],
     constant uint32_t &probe_x [[buffer(23)]],
-    device uint32_t * probe_out [[buffer(24)]],
-    device uint32_t * survbits [[buffer(25)]],
+    device uint32_t * probe_out [[buffer(24), function_constant(mtl_bound_24)]],
+    device uint32_t * survbits [[buffer(25), function_constant(mtl_bound_25)]],
     constant int &not_both_even [[buffer(26)]],
     constant uint32_t &j_base [[buffer(27)]],
     threadgroup uint32_t *sm [[threadgroup(0)]],
@@ -920,7 +978,15 @@ kernel void k_apply_16_1_1_0(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_apply_body<16, 1, 1, false>(buckets, cnt, cap, logI, log_region, slice_logp, nslice, N, CINIT, THRESH, tconst, dump, nsurv, dbg_cells, dbg_region, sp, srt, sg, slp, smag, nsmall, nblk, nwrp, probe_x, probe_out, survbits, not_both_even, j_base, sm, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device uint8_t * dump_opt = nullptr;
+    if (mtl_bound_11) dump_opt = dump;
+    device uint16_t * dbg_cells_opt = nullptr;
+    if (mtl_bound_13) dbg_cells_opt = dbg_cells;
+    device uint32_t * probe_out_opt = nullptr;
+    if (mtl_bound_24) probe_out_opt = probe_out;
+    device uint32_t * survbits_opt = nullptr;
+    if (mtl_bound_25) survbits_opt = survbits;
+    k_apply_body<16, 1, 1, false>(buckets, cnt, cap, logI, log_region, slice_logp, nslice, N, CINIT, THRESH, tconst, dump_opt, nsurv, dbg_cells_opt, dbg_region, sp, srt, sg, slp, smag, nsmall, nblk, nwrp, probe_x, probe_out_opt, survbits_opt, not_both_even, j_base, sm, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_apply_8_0_0_0(
@@ -935,9 +1001,9 @@ kernel void k_apply_8_0_0_0(
     constant uint32_t &CINIT [[buffer(8)]],
     constant uint32_t &THRESH [[buffer(9)]],
     constant uint32_t &tconst [[buffer(10)]],
-    device uint8_t * dump [[buffer(11)]],
+    device uint8_t * dump [[buffer(11), function_constant(mtl_bound_11)]],
     device uint32_t * nsurv [[buffer(12)]],
-    device uint16_t * dbg_cells [[buffer(13)]],
+    device uint16_t * dbg_cells [[buffer(13), function_constant(mtl_bound_13)]],
     constant uint32_t &dbg_region [[buffer(14)]],
     device const uint32_t * sp [[buffer(15)]],
     device const uint32_t * srt [[buffer(16)]],
@@ -948,8 +1014,8 @@ kernel void k_apply_8_0_0_0(
     constant uint32_t &nblk [[buffer(21)]],
     constant uint32_t &nwrp [[buffer(22)]],
     constant uint32_t &probe_x [[buffer(23)]],
-    device uint32_t * probe_out [[buffer(24)]],
-    device uint32_t * survbits [[buffer(25)]],
+    device uint32_t * probe_out [[buffer(24), function_constant(mtl_bound_24)]],
+    device uint32_t * survbits [[buffer(25), function_constant(mtl_bound_25)]],
     constant int &not_both_even [[buffer(26)]],
     constant uint32_t &j_base [[buffer(27)]],
     threadgroup uint32_t *sm [[threadgroup(0)]],
@@ -960,7 +1026,15 @@ kernel void k_apply_8_0_0_0(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_apply_body<8, 0, 0, false>(buckets, cnt, cap, logI, log_region, slice_logp, nslice, N, CINIT, THRESH, tconst, dump, nsurv, dbg_cells, dbg_region, sp, srt, sg, slp, smag, nsmall, nblk, nwrp, probe_x, probe_out, survbits, not_both_even, j_base, sm, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device uint8_t * dump_opt = nullptr;
+    if (mtl_bound_11) dump_opt = dump;
+    device uint16_t * dbg_cells_opt = nullptr;
+    if (mtl_bound_13) dbg_cells_opt = dbg_cells;
+    device uint32_t * probe_out_opt = nullptr;
+    if (mtl_bound_24) probe_out_opt = probe_out;
+    device uint32_t * survbits_opt = nullptr;
+    if (mtl_bound_25) survbits_opt = survbits;
+    k_apply_body<8, 0, 0, false>(buckets, cnt, cap, logI, log_region, slice_logp, nslice, N, CINIT, THRESH, tconst, dump_opt, nsurv, dbg_cells_opt, dbg_region, sp, srt, sg, slp, smag, nsmall, nblk, nwrp, probe_x, probe_out_opt, survbits_opt, not_both_even, j_base, sm, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_apply_8_0_1_0(
@@ -975,9 +1049,9 @@ kernel void k_apply_8_0_1_0(
     constant uint32_t &CINIT [[buffer(8)]],
     constant uint32_t &THRESH [[buffer(9)]],
     constant uint32_t &tconst [[buffer(10)]],
-    device uint8_t * dump [[buffer(11)]],
+    device uint8_t * dump [[buffer(11), function_constant(mtl_bound_11)]],
     device uint32_t * nsurv [[buffer(12)]],
-    device uint16_t * dbg_cells [[buffer(13)]],
+    device uint16_t * dbg_cells [[buffer(13), function_constant(mtl_bound_13)]],
     constant uint32_t &dbg_region [[buffer(14)]],
     device const uint32_t * sp [[buffer(15)]],
     device const uint32_t * srt [[buffer(16)]],
@@ -988,8 +1062,8 @@ kernel void k_apply_8_0_1_0(
     constant uint32_t &nblk [[buffer(21)]],
     constant uint32_t &nwrp [[buffer(22)]],
     constant uint32_t &probe_x [[buffer(23)]],
-    device uint32_t * probe_out [[buffer(24)]],
-    device uint32_t * survbits [[buffer(25)]],
+    device uint32_t * probe_out [[buffer(24), function_constant(mtl_bound_24)]],
+    device uint32_t * survbits [[buffer(25), function_constant(mtl_bound_25)]],
     constant int &not_both_even [[buffer(26)]],
     constant uint32_t &j_base [[buffer(27)]],
     threadgroup uint32_t *sm [[threadgroup(0)]],
@@ -1000,7 +1074,15 @@ kernel void k_apply_8_0_1_0(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_apply_body<8, 0, 1, false>(buckets, cnt, cap, logI, log_region, slice_logp, nslice, N, CINIT, THRESH, tconst, dump, nsurv, dbg_cells, dbg_region, sp, srt, sg, slp, smag, nsmall, nblk, nwrp, probe_x, probe_out, survbits, not_both_even, j_base, sm, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device uint8_t * dump_opt = nullptr;
+    if (mtl_bound_11) dump_opt = dump;
+    device uint16_t * dbg_cells_opt = nullptr;
+    if (mtl_bound_13) dbg_cells_opt = dbg_cells;
+    device uint32_t * probe_out_opt = nullptr;
+    if (mtl_bound_24) probe_out_opt = probe_out;
+    device uint32_t * survbits_opt = nullptr;
+    if (mtl_bound_25) survbits_opt = survbits;
+    k_apply_body<8, 0, 1, false>(buckets, cnt, cap, logI, log_region, slice_logp, nslice, N, CINIT, THRESH, tconst, dump_opt, nsurv, dbg_cells_opt, dbg_region, sp, srt, sg, slp, smag, nsmall, nblk, nwrp, probe_x, probe_out_opt, survbits_opt, not_both_even, j_base, sm, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_apply_8_1_0_0(
@@ -1015,9 +1097,9 @@ kernel void k_apply_8_1_0_0(
     constant uint32_t &CINIT [[buffer(8)]],
     constant uint32_t &THRESH [[buffer(9)]],
     constant uint32_t &tconst [[buffer(10)]],
-    device uint8_t * dump [[buffer(11)]],
+    device uint8_t * dump [[buffer(11), function_constant(mtl_bound_11)]],
     device uint32_t * nsurv [[buffer(12)]],
-    device uint16_t * dbg_cells [[buffer(13)]],
+    device uint16_t * dbg_cells [[buffer(13), function_constant(mtl_bound_13)]],
     constant uint32_t &dbg_region [[buffer(14)]],
     device const uint32_t * sp [[buffer(15)]],
     device const uint32_t * srt [[buffer(16)]],
@@ -1028,8 +1110,8 @@ kernel void k_apply_8_1_0_0(
     constant uint32_t &nblk [[buffer(21)]],
     constant uint32_t &nwrp [[buffer(22)]],
     constant uint32_t &probe_x [[buffer(23)]],
-    device uint32_t * probe_out [[buffer(24)]],
-    device uint32_t * survbits [[buffer(25)]],
+    device uint32_t * probe_out [[buffer(24), function_constant(mtl_bound_24)]],
+    device uint32_t * survbits [[buffer(25), function_constant(mtl_bound_25)]],
     constant int &not_both_even [[buffer(26)]],
     constant uint32_t &j_base [[buffer(27)]],
     threadgroup uint32_t *sm [[threadgroup(0)]],
@@ -1040,7 +1122,15 @@ kernel void k_apply_8_1_0_0(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_apply_body<8, 1, 0, false>(buckets, cnt, cap, logI, log_region, slice_logp, nslice, N, CINIT, THRESH, tconst, dump, nsurv, dbg_cells, dbg_region, sp, srt, sg, slp, smag, nsmall, nblk, nwrp, probe_x, probe_out, survbits, not_both_even, j_base, sm, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device uint8_t * dump_opt = nullptr;
+    if (mtl_bound_11) dump_opt = dump;
+    device uint16_t * dbg_cells_opt = nullptr;
+    if (mtl_bound_13) dbg_cells_opt = dbg_cells;
+    device uint32_t * probe_out_opt = nullptr;
+    if (mtl_bound_24) probe_out_opt = probe_out;
+    device uint32_t * survbits_opt = nullptr;
+    if (mtl_bound_25) survbits_opt = survbits;
+    k_apply_body<8, 1, 0, false>(buckets, cnt, cap, logI, log_region, slice_logp, nslice, N, CINIT, THRESH, tconst, dump_opt, nsurv, dbg_cells_opt, dbg_region, sp, srt, sg, slp, smag, nsmall, nblk, nwrp, probe_x, probe_out_opt, survbits_opt, not_both_even, j_base, sm, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_apply_8_1_1_0(
@@ -1055,9 +1145,9 @@ kernel void k_apply_8_1_1_0(
     constant uint32_t &CINIT [[buffer(8)]],
     constant uint32_t &THRESH [[buffer(9)]],
     constant uint32_t &tconst [[buffer(10)]],
-    device uint8_t * dump [[buffer(11)]],
+    device uint8_t * dump [[buffer(11), function_constant(mtl_bound_11)]],
     device uint32_t * nsurv [[buffer(12)]],
-    device uint16_t * dbg_cells [[buffer(13)]],
+    device uint16_t * dbg_cells [[buffer(13), function_constant(mtl_bound_13)]],
     constant uint32_t &dbg_region [[buffer(14)]],
     device const uint32_t * sp [[buffer(15)]],
     device const uint32_t * srt [[buffer(16)]],
@@ -1068,8 +1158,8 @@ kernel void k_apply_8_1_1_0(
     constant uint32_t &nblk [[buffer(21)]],
     constant uint32_t &nwrp [[buffer(22)]],
     constant uint32_t &probe_x [[buffer(23)]],
-    device uint32_t * probe_out [[buffer(24)]],
-    device uint32_t * survbits [[buffer(25)]],
+    device uint32_t * probe_out [[buffer(24), function_constant(mtl_bound_24)]],
+    device uint32_t * survbits [[buffer(25), function_constant(mtl_bound_25)]],
     constant int &not_both_even [[buffer(26)]],
     constant uint32_t &j_base [[buffer(27)]],
     threadgroup uint32_t *sm [[threadgroup(0)]],
@@ -1080,7 +1170,15 @@ kernel void k_apply_8_1_1_0(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_apply_body<8, 1, 1, false>(buckets, cnt, cap, logI, log_region, slice_logp, nslice, N, CINIT, THRESH, tconst, dump, nsurv, dbg_cells, dbg_region, sp, srt, sg, slp, smag, nsmall, nblk, nwrp, probe_x, probe_out, survbits, not_both_even, j_base, sm, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device uint8_t * dump_opt = nullptr;
+    if (mtl_bound_11) dump_opt = dump;
+    device uint16_t * dbg_cells_opt = nullptr;
+    if (mtl_bound_13) dbg_cells_opt = dbg_cells;
+    device uint32_t * probe_out_opt = nullptr;
+    if (mtl_bound_24) probe_out_opt = probe_out;
+    device uint32_t * survbits_opt = nullptr;
+    if (mtl_bound_25) survbits_opt = survbits;
+    k_apply_body<8, 1, 1, false>(buckets, cnt, cap, logI, log_region, slice_logp, nslice, N, CINIT, THRESH, tconst, dump_opt, nsurv, dbg_cells_opt, dbg_region, sp, srt, sg, slp, smag, nsmall, nblk, nwrp, probe_x, probe_out_opt, survbits_opt, not_both_even, j_base, sm, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_apply_16_1_1_1(
@@ -1095,9 +1193,9 @@ kernel void k_apply_16_1_1_1(
     constant uint32_t &CINIT [[buffer(8)]],
     constant uint32_t &THRESH [[buffer(9)]],
     constant uint32_t &tconst [[buffer(10)]],
-    device uint8_t * dump [[buffer(11)]],
+    device uint8_t * dump [[buffer(11), function_constant(mtl_bound_11)]],
     device uint32_t * nsurv [[buffer(12)]],
-    device uint16_t * dbg_cells [[buffer(13)]],
+    device uint16_t * dbg_cells [[buffer(13), function_constant(mtl_bound_13)]],
     constant uint32_t &dbg_region [[buffer(14)]],
     device const uint32_t * sp [[buffer(15)]],
     device const uint32_t * srt [[buffer(16)]],
@@ -1108,8 +1206,8 @@ kernel void k_apply_16_1_1_1(
     constant uint32_t &nblk [[buffer(21)]],
     constant uint32_t &nwrp [[buffer(22)]],
     constant uint32_t &probe_x [[buffer(23)]],
-    device uint32_t * probe_out [[buffer(24)]],
-    device uint32_t * survbits [[buffer(25)]],
+    device uint32_t * probe_out [[buffer(24), function_constant(mtl_bound_24)]],
+    device uint32_t * survbits [[buffer(25), function_constant(mtl_bound_25)]],
     constant int &not_both_even [[buffer(26)]],
     constant uint32_t &j_base [[buffer(27)]],
     threadgroup uint32_t *sm [[threadgroup(0)]],
@@ -1120,7 +1218,15 @@ kernel void k_apply_16_1_1_1(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_apply_body<16, 1, 1, true>(buckets, cnt, cap, logI, log_region, slice_logp, nslice, N, CINIT, THRESH, tconst, dump, nsurv, dbg_cells, dbg_region, sp, srt, sg, slp, smag, nsmall, nblk, nwrp, probe_x, probe_out, survbits, not_both_even, j_base, sm, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device uint8_t * dump_opt = nullptr;
+    if (mtl_bound_11) dump_opt = dump;
+    device uint16_t * dbg_cells_opt = nullptr;
+    if (mtl_bound_13) dbg_cells_opt = dbg_cells;
+    device uint32_t * probe_out_opt = nullptr;
+    if (mtl_bound_24) probe_out_opt = probe_out;
+    device uint32_t * survbits_opt = nullptr;
+    if (mtl_bound_25) survbits_opt = survbits;
+    k_apply_body<16, 1, 1, true>(buckets, cnt, cap, logI, log_region, slice_logp, nslice, N, CINIT, THRESH, tconst, dump_opt, nsurv, dbg_cells_opt, dbg_region, sp, srt, sg, slp, smag, nsmall, nblk, nwrp, probe_x, probe_out_opt, survbits_opt, not_both_even, j_base, sm, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 
@@ -1858,14 +1964,14 @@ kernel void k_intersect_compact_1_0(
     constant int64_t &b0 [[buffer(6)]],
     constant int64_t &b1 [[buffer(7)]],
     constant int64_t &q [[buffer(8)]],
-    device uint32_t * out_x [[buffer(9)]],
-    device int64_t  * out_a [[buffer(10)]],
-    device int64_t  * out_b [[buffer(11)]],
+    device uint32_t * out_x [[buffer(9), function_constant(mtl_bound_9)]],
+    device int64_t  * out_a [[buffer(10), function_constant(mtl_bound_10)]],
+    device int64_t  * out_b [[buffer(11), function_constant(mtl_bound_11)]],
     constant uint32_t &cap [[buffer(12)]],
     device uint32_t * nout [[buffer(13)]],
     device uint32_t * npre [[buffer(14)]],
     device uint32_t * twosided [[buffer(15)]],
-    device uint32_t * nqb [[buffer(16)]],
+    device uint32_t * nqb [[buffer(16), function_constant(mtl_bound_16)]],
     constant uint32_t &j_base [[buffer(17)]],
     uint _tid [[thread_position_in_grid]],
     uint _ntid [[threads_per_grid]],
@@ -1874,7 +1980,15 @@ kernel void k_intersect_compact_1_0(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_intersect_compact_body<1, false>(A, B, nword, logI, a0, a1, b0, b1, q, out_x, out_a, out_b, cap, nout, npre, twosided, nqb, j_base, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device uint32_t * out_x_opt = nullptr;
+    if (mtl_bound_9) out_x_opt = out_x;
+    device int64_t  * out_a_opt = nullptr;
+    if (mtl_bound_10) out_a_opt = out_a;
+    device int64_t  * out_b_opt = nullptr;
+    if (mtl_bound_11) out_b_opt = out_b;
+    device uint32_t * nqb_opt = nullptr;
+    if (mtl_bound_16) nqb_opt = nqb;
+    k_intersect_compact_body<1, false>(A, B, nword, logI, a0, a1, b0, b1, q, out_x_opt, out_a_opt, out_b_opt, cap, nout, npre, twosided, nqb_opt, j_base, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_intersect_compact_1_1(
@@ -1887,14 +2001,14 @@ kernel void k_intersect_compact_1_1(
     constant int64_t &b0 [[buffer(6)]],
     constant int64_t &b1 [[buffer(7)]],
     constant int64_t &q [[buffer(8)]],
-    device uint32_t * out_x [[buffer(9)]],
-    device int64_t  * out_a [[buffer(10)]],
-    device int64_t  * out_b [[buffer(11)]],
+    device uint32_t * out_x [[buffer(9), function_constant(mtl_bound_9)]],
+    device int64_t  * out_a [[buffer(10), function_constant(mtl_bound_10)]],
+    device int64_t  * out_b [[buffer(11), function_constant(mtl_bound_11)]],
     constant uint32_t &cap [[buffer(12)]],
     device uint32_t * nout [[buffer(13)]],
     device uint32_t * npre [[buffer(14)]],
     device uint32_t * twosided [[buffer(15)]],
-    device uint32_t * nqb [[buffer(16)]],
+    device uint32_t * nqb [[buffer(16), function_constant(mtl_bound_16)]],
     constant uint32_t &j_base [[buffer(17)]],
     uint _tid [[thread_position_in_grid]],
     uint _ntid [[threads_per_grid]],
@@ -1903,7 +2017,15 @@ kernel void k_intersect_compact_1_1(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_intersect_compact_body<1, true>(A, B, nword, logI, a0, a1, b0, b1, q, out_x, out_a, out_b, cap, nout, npre, twosided, nqb, j_base, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device uint32_t * out_x_opt = nullptr;
+    if (mtl_bound_9) out_x_opt = out_x;
+    device int64_t  * out_a_opt = nullptr;
+    if (mtl_bound_10) out_a_opt = out_a;
+    device int64_t  * out_b_opt = nullptr;
+    if (mtl_bound_11) out_b_opt = out_b;
+    device uint32_t * nqb_opt = nullptr;
+    if (mtl_bound_16) nqb_opt = nqb;
+    k_intersect_compact_body<1, true>(A, B, nword, logI, a0, a1, b0, b1, q, out_x_opt, out_a_opt, out_b_opt, cap, nout, npre, twosided, nqb_opt, j_base, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 
