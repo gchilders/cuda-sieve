@@ -360,7 +360,9 @@ metallibcheck: ../oracle/c183.fb1
 # measured that until a shipped "fix" (9z-j) turned out to have changed only
 # the dispatch count. The control builds with the fbgen slicing defeated and
 # must FAIL; without that, a gate that passes proves nothing.
-COF_BOUND_MS ?= 750
+# Tracks COF_CHUNK_TARGET_MS in metal/gen_cofac_host.py: the gate should
+# enforce the policy the build actually holds, not an older, looser one.
+COF_BOUND_MS ?= 400
 .PHONY: cbtimecheck
 cbtimecheck:
 	@echo "== control: fbgen root finder UNSLICED (must exceed the bound) =="

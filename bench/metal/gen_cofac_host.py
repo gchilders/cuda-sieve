@@ -556,12 +556,21 @@ src = src.replace(_f_old, _f_new, 1)
 _t_old = "#define COF_CHUNK_TARGET_MS   250.0f"
 assert _t_old in src, 'target shape changed'
 src = src.replace(_t_old, chr(10).join([
-    "/* 750 ms on ONE launch: a UI-responsiveness bound as much as a watchdog",
+    "/* 400 ms on ONE launch: a UI-responsiveness bound as much as a watchdog",
     " * one, and explicitly worth throughput to hold. CUDA keeps 250 ms against",
-    " * a whole-side sum; this is 750 against a measured launch, so the two",
-    " * numbers are not comparable. See gen_cofac_host.py. */",
+    " * a whole-side sum; this is 400 against a measured launch, so the two",
+    " * numbers are not comparable. See gen_cofac_host.py.",
+    " *",
+    " * WAS 750, lowered 2026-09-16 after 9z-k. 750 was set (8k) against what",
+    " * was believed to be a launch bound but was in fact a bound on one",
+    " * DISPATCH, while macOS kills a COMMAND BUFFER -- and the observed kills",
+    " * on M1/M2 were command buffers of roughly 800 ms. 9z-k makes one launch",
+    " * one command buffer, so this number is now the real thing the watchdog",
+    " * sees, and 400 puts it at half the shortest duration anyone has been",
+    " * killed at rather than a hair under it. The true threshold is still",
+    " * undocumented and unmeasured. */",
     "#ifndef COF_CHUNK_TARGET_MS",
-    "#define COF_CHUNK_TARGET_MS   750.0f",
+    "#define COF_CHUNK_TARGET_MS   400.0f",
     "#endif"]), 1)
 
 # The floor stops being the policy and becomes a sanity bound: one grid's
@@ -605,7 +614,7 @@ _fl_new = chr(10).join([
     "    const int fb = fbb > 8 ? fbb / 8 : 1;"])
 assert _fl_old in src, 'chunk floor shape changed'
 src = src.replace(_fl_old, _fl_new, 1)
-print('  target 750 ms on a measured launch; floor lowered; no-progress guard added')
+print('  target 400 ms on a measured launch; floor lowered; no-progress guard added')
 
 # ---- proportional steering, because the response is LINEAR ----------------
 # Measured at a FULL CQ_FLUSH batch (plan 9z-h), which is the regime every
