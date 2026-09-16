@@ -119,45 +119,96 @@ Stream *resolve(mtlStream_t s)
 
 /* ---- encoder lifecycle -------------------------------------------------- */
 
+/* OWNERSHIP, because this file is compiled WITHOUT -fobjc-arc.
+ *
+ * commandBuffer, computeCommandEncoder and blitCommandEncoder all return
+ * AUTORELEASED objects, and a Stream holds them across calls. Previously they
+ * were stored unretained, which worked only because there is no autorelease
+ * pool anywhere in this process: nothing ever drained, so nothing ever died.
+ * That is a leak standing in for a lifetime -- and it made adding a pool
+ * (below) a use-after-free rather than a fix. Every one of them is now
+ * retained on store and released on replace or teardown, which is what lets
+ * the pools exist at all.
+ *
+ * It is not a small leak. A command buffer retains every resource it
+ * references, so each leaked one pinned its share of the sieve's buffers too;
+ * the port commits one per event record, and cofac.cuh alone records 78. */
 void close_encoder(Stream *st)
 {
-    if (st->kind == ENC_COMPUTE && st->cenc) { [st->cenc endEncoding]; st->cenc = nil; }
-    if (st->kind == ENC_BLIT    && st->benc) { [st->benc endEncoding]; st->benc = nil; }
+    if (st->kind == ENC_COMPUTE && st->cenc) { [st->cenc endEncoding]; [st->cenc release]; st->cenc = nil; }
+    if (st->kind == ENC_BLIT    && st->benc) { [st->benc endEncoding]; [st->benc release]; st->benc = nil; }
     st->kind = ENC_NONE;
 }
 
+/* THE POOL GOES AROUND THE CREATION SITE, and it has to.
+ *
+ * These three factory methods return autoreleased objects: balancing our own
+ * retain with a release is NOT enough, because the pending autorelease also
+ * has to fire, and this process has no pool anywhere else -- a plain C++
+ * main(), no Cocoa run loop. Without one the object is immortal however
+ * carefully we balance our own reference.
+ *
+ * Creating inside the pool and retaining before it drains is the whole fix,
+ * and it is local: nothing outside these functions has to know. The wider
+ * alternative -- a pool around each entry point -- would be correct too, but
+ * only AFTER the ownership work above, and it would put the pool boundary far
+ * from the thing it governs. */
 void ensure_cb(Stream *st)
-{ if (!st->cb) st->cb = [st->q commandBuffer]; }
+{
+    if (st->cb) return;
+    @autoreleasepool { st->cb = [[st->q commandBuffer] retain]; }
+}
 
 id<MTLComputeCommandEncoder> ensure_compute(Stream *st)
 {
     if (st->kind != ENC_COMPUTE) { close_encoder(st); ensure_cb(st);
-        st->cenc = [st->cb computeCommandEncoder]; st->kind = ENC_COMPUTE; }
+        @autoreleasepool { st->cenc = [[st->cb computeCommandEncoder] retain]; }
+        st->kind = ENC_COMPUTE; }
     return st->cenc;
 }
 
 id<MTLBlitCommandEncoder> ensure_blit(Stream *st)
 {
     if (st->kind != ENC_BLIT) { close_encoder(st); ensure_cb(st);
-        st->benc = [st->cb blitCommandEncoder]; st->kind = ENC_BLIT; }
+        @autoreleasepool { st->benc = [[st->cb blitCommandEncoder] retain]; }
+        st->kind = ENC_BLIT; }
     return st->benc;
 }
 
 /* Close and commit whatever is open. Returns the committed buffer, or the
- * previously committed one if there was nothing new. */
+ * previously committed one if there was nothing new. The stream keeps exactly
+ * one committed buffer alive, because sync() and the event queries read it
+ * after the fact; `last` takes over cb's reference rather than adding one. */
 id<MTLCommandBuffer> commit(Stream *st)
 {
     close_encoder(st);
-    if (st->cb) { [st->cb commit]; st->last = st->cb; st->cb = nil; }
+    if (st->cb) {
+        [st->cb commit];
+        if (st->last != st->cb) [st->last release];
+        st->last = st->cb;              /* takes cb's +1 */
+        st->cb = nil;
+    }
     return st->last;
+}
+
+/* Release everything a Stream owns. Used by stream destruction and shutdown;
+ * both used to drop the queue on the floor as well. */
+void stream_teardown(Stream *st)
+{
+    close_encoder(st);
+    [st->cb release];   st->cb = nil;
+    [st->last release]; st->last = nil;
+    [st->q release];    st->q = nil;
 }
 
 mtlError_t cb_status(id<MTLCommandBuffer> cb)
 {
     if (!cb || !cb.error) return mtlSuccess;
     if (tracing())
-        fprintf(stderr, "metal_rt: [trace] command buffer failed: %s\n",
-                cb.error.localizedDescription.UTF8String);
+        @autoreleasepool {
+            fprintf(stderr, "metal_rt: [trace] command buffer failed: %s\n",
+                    cb.error.localizedDescription.UTF8String);
+        }
     if (cb.error.code == MTLCommandBufferErrorTimeout) return mtlErrorLaunchTimeout;
     if (cb.error.code == MTLCommandBufferErrorOutOfMemory) return mtlErrorLaunchOutOfResources;
     return mtlErrorLaunchFailure;
@@ -258,14 +309,17 @@ id<MTLComputePipelineState> pso_for(const char *name)
 {
     auto it = g_psos.find(name);
     if (it != g_psos.end()) return it->second;
-    id<MTLFunction> f = [g_lib newFunctionWithName:[NSString stringWithUTF8String:name]];
-    if (!f) { g_psos[name] = nil; return nil; }
-    NSError *err = nil;
-    id<MTLComputePipelineState> p = [g_dev newComputePipelineStateWithFunction:f error:&err];
-    [f release];   /* +1 from newFunctionWithName:; the PSO holds what it needs */
-    if (!p) fprintf(stderr, "metal_rt: pipeline for '%s' failed: %s\n",
-                    name, err.description.UTF8String);
-    g_psos[name] = p;
+    id<MTLComputePipelineState> p = nil;
+    @autoreleasepool {
+        id<MTLFunction> f = [g_lib newFunctionWithName:[NSString stringWithUTF8String:name]];
+        if (!f) { g_psos[name] = nil; return nil; }
+        NSError *err = nil;
+        p = [g_dev newComputePipelineStateWithFunction:f error:&err];
+        [f release];   /* +1 from newFunctionWithName:; the PSO holds what it needs */
+        if (!p) fprintf(stderr, "metal_rt: pipeline for '%s' failed: %s\n",
+                        name, err.description.UTF8String);
+    }
+    g_psos[name] = p;   /* +1 from newComputePipelineState...; released at shutdown */
     return p;
 }
 
@@ -395,6 +449,7 @@ extern "C" void mtlShutdown(void)
     for (auto &kv : g_psos) [kv.second release];
     g_psos.clear();
     g_symbols.clear();
+    stream_teardown(&g_default);
     g_default = Stream();
     g_lib = nil; g_dev = nil;
 }
@@ -586,6 +641,7 @@ extern "C" mtlError_t mtlStreamDestroy(mtlStream_t s)
     std::lock_guard<std::mutex> lk(g_lock);
     Stream *st = (Stream *)s;
     sync(st);
+    stream_teardown(st);
     delete st;
     return mtlSuccess;
 }
@@ -621,6 +677,8 @@ extern "C" mtlError_t mtlEventDestroy(mtlEvent_t e)
 {
     if (!e) return mtlSuccess;
     std::lock_guard<std::mutex> lk(g_lock);
+    [e->ev release];   /* +1 from newEvent */
+    [e->cb release];   /* retained in mtlEventRecordOn */
     delete e;
     return mtlSuccess;
 }
@@ -641,10 +699,14 @@ extern "C" mtlError_t mtlEventRecordOn(mtlEvent_t e, mtlStream_t s)
     ensure_cb(st);
     e->value++;
     [st->cb encodeSignalEvent:e->ev value:e->value];
-    e->cb = st->cb;
-    [st->cb commit];
-    st->last = st->cb;
-    st->cb = nil;
+    /* commit() transfers cb's reference to st->last; the event needs its OWN,
+     * because it outlives the stream's next commit and is read afterwards by
+     * mtlEventSynchronize/Query/ElapsedTime. Retain before release, in case
+     * this event is being re-recorded onto the same buffer. */
+    id<MTLCommandBuffer> cb = commit(st);
+    [cb retain];
+    [e->cb release];
+    e->cb = cb;
     return mtlSuccess;
 }
 
