@@ -547,10 +547,19 @@ call site cannot do one and forget the other.
   NEGATIVE component time. And `nhit=nullptr` makes the congruence loop dead
   code, so the compiler deletes it; the probe must pass a real sink.
 
-  **Unresolved:** the two runs disagree on candidates processed (CUDA 1,078,042
-  / 8 launches vs Metal 3,772,546 / 88) on the same band, so per-candidate
-  normalisation from this probe is NOT trustworthy — only the within-platform
-  shares, plus the per-q stage timers (23.6 vs 106.5 ms).
+  **The candidate-count discrepancy is EXPLAINED (two causes, neither a
+  disagreement about work).** (1) **Slab auto-calibration**: 8g runs three
+  throwaway single-q bands before the real one, each a full TD pass — 88
+  launches with it on, **8 with `--slab-j`**, matching CUDA. (2) **The builds
+  slab differently** at the same `--region 13` because `SLAB_PERF_REGIONS` is
+  8192 here and 32768 on CUDA — CUDA gets 2 slabs (n=134,755/launch), Metal
+  forced to 1 (n=269,360). Exactly the 2x. **The totals agree: two-sided
+  survivors/q 269,360 CUDA vs 269,611 Metal, 0.09% apart.**
+
+  **RULE: pin `--slab-j` on BOTH sides before normalising anything per launch
+  or per candidate.** Otherwise you are comparing different slab
+  decompositions of identical work, against a build that also calibrates where
+  Metal does not — and neither difference shows up in the number you compare.
 
   **`UNROLL` is flat on Metal** (48.7/50.0/51.0/49.9/49.8 at 1/2/4/8/16), so
   this kernel is NOT latency-bound here the way `td.cuh` says it is on NVIDIA.

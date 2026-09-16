@@ -2860,13 +2860,53 @@ recording because both looked like success:
    congruence loop is dead code and the compiler removes it. The probe has to
    pass a real counter or it measures the norm twice.
 
-**One thing it still gets wrong.** The two runs disagree about how many
-candidates they processed -- CUDA 1,078,042 over 8 launches, Metal 3,772,546
-over 88, on the same `--nq 4` band, where the two-sided survivor totals should
-match. Until that is explained, **per-candidate normalisation from this probe
-is not trustworthy** and only the within-platform shares above are. The
-per-q stage timers (23.6 vs 106.5 ms, 4.49x) remain the sound cross-platform
-number.
+#### The candidate-count discrepancy, explained
+
+The probe's two runs disagreed about how much they processed -- CUDA 1,078,042
+over 8 launches, Metal 3,772,546 over 88, on the same `--nq 4` band. **Two
+independent causes, and neither is a disagreement about the work.**
+
+**The launch count is slab auto-calibration.** 8g's calibration runs three
+throwaway single-q bands before the real one, and each is a full pipeline pass
+with its own TD launches. Disabling it with `--slab-j` collapses the count
+exactly:
+
+| | launches |
+|---|---|
+| Metal, calibration on (default) | 88 |
+| Metal, `--slab-j 16384` (calibration off) | **8** |
+| CUDA | **8** |
+
+So 80 of the 88 were calibration probes, not the band. Anything that counts
+per-launch work on the Metal build **must** pin `--slab-j`, or it is measuring
+the calibrator as well as the job.
+
+**The per-launch `n` is the two builds slabbing differently.** At the same
+`--region 13` they disagree about the slab plan, because `SLAB_PERF_REGIONS`
+is 8192 here (8c) and 32768 on CUDA:
+
+| | slabs | n per launch |
+|---|---|---|
+| CUDA | **2** | 134,755 |
+| Metal, forced to 1 slab | **1** | 269,360 |
+
+Exactly the 2x observed. And the totals agree:
+
+| two-sided primitive survivors/q | CUDA | Metal |
+|---|---|---|
+| | 269,360 | 269,611 |
+
+**0.09% apart.** The probe was comparing two different slab decompositions of
+identical work, which is why per-candidate normalisation from it was
+meaningless -- not because the builds disagree about anything. The
+within-platform shares stand, and the per-q stage timers (23.6 vs 106.5 ms,
+4.49x) remain the sound cross-platform number.
+
+**The general lesson for this port's measurement, and it has now bitten
+twice.** A Metal-side per-launch or per-candidate measurement is comparing
+against a CUDA build that slabs differently and calibrates where Metal does
+not. Neither difference is visible in the number being compared. Pin
+`--slab-j` on both sides before normalising anything by launch or candidate.
 
 **Measured on a 10-core M3 in a fanless MacBook Air that also drives the
 display, against a GTX 1080 in an NRP k8s pod.**
