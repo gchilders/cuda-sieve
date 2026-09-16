@@ -29,6 +29,9 @@
 #import <Foundation/Foundation.h>
 #import <IOKit/IOKitLib.h>
 #include <mach-o/dyld.h>
+/* getsectiondata + _mh_execute_header: the embedded metallib, below. */
+#include <mach-o/getsect.h>
+#include <mach-o/ldsyms.h>
 
 #include "metal_rt.h"
 
@@ -265,23 +268,68 @@ static mtlError_t init_locked(const char *metallib_path)
     g_dev = MTLCreateSystemDefaultDevice();
     if (!g_dev) return fail(mtlErrorInitialization);
 
+    /* Four places, in this order:
+     *
+     *   1. the explicit argument,
+     *   2. $CUDA_SIEVE_METALLIB,
+     *   3. a metallib EMBEDDED in this executable's __DATA,__metallib,
+     *   4. bench.metallib next to the executable.
+     *
+     * 1 and 2 come before the embedded copy so a developer can still point a
+     * shipped binary at a rebuilt library -- every gate here drives the build
+     * through $CUDA_SIEVE_METALLIB and must keep doing so. 3 comes before 4
+     * because a binary that carries its own shaders should trust itself over
+     * whatever file happens to sit beside it; a stale bench.metallib in the
+     * working directory is exactly the kind of thing a BOINC slot accumulates.
+     *
+     * Embedding is what makes the application ONE FILE. A BOINC project ships
+     * an executable, and a second file that must land beside it and match it
+     * is a class of failure (missing, stale, mismatched) that simply does not
+     * exist if the shaders are inside. */
     NSError *err = nil;
-    NSString *path;
+    NSString *path = nil;
     if (metallib_path) {
         path = [NSString stringWithUTF8String:metallib_path];
     } else if (const char *env = getenv("CUDA_SIEVE_METALLIB")) {
         path = [NSString stringWithUTF8String:env];
-    } else {
-        char buf[4096]; uint32_t sz = sizeof buf;
-        if (_NSGetExecutablePath(buf, &sz) != 0) buf[0] = 0;
-        NSString *dir = [[NSString stringWithUTF8String:buf] stringByDeletingLastPathComponent];
-        path = [dir stringByAppendingPathComponent:@"bench.metallib"];
     }
-    g_lib = [g_dev newLibraryWithURL:[NSURL fileURLWithPath:path] error:&err];
+
+    if (!path) {
+        unsigned long n = 0;
+        const uint8_t *p = getsectiondata(&_mh_execute_header,
+                                          "__DATA", "__metallib", &n);
+        if (p && n) {
+            /* No copy and no free: the bytes are in our own __DATA and live
+             * as long as the process, so the destructor is a no-op block.
+             * DISPATCH_DATA_DESTRUCTOR_DEFAULT would copy all of it. */
+            dispatch_data_t d = dispatch_data_create(p, (size_t)n, nil, ^{});
+            g_lib = [g_dev newLibraryWithData:d error:&err];
+            dispatch_release(d);
+            if (!g_lib) {
+                fprintf(stderr,
+                        "metal_rt: the embedded shader library (%lu bytes) did"
+                        " not load: %s\n", n, err.description.UTF8String);
+                return fail(mtlErrorInitialization);
+            }
+        }
+    }
+
     if (!g_lib) {
-        fprintf(stderr, "metal_rt: cannot load shader library '%s': %s\n",
-                path.UTF8String, err.description.UTF8String);
-        return fail(mtlErrorInitialization);
+        if (!path) {
+            char buf[4096]; uint32_t sz = sizeof buf;
+            if (_NSGetExecutablePath(buf, &sz) != 0) buf[0] = 0;
+            NSString *dir = [[NSString stringWithUTF8String:buf]
+                             stringByDeletingLastPathComponent];
+            path = [dir stringByAppendingPathComponent:@"bench.metallib"];
+        }
+        g_lib = [g_dev newLibraryWithURL:[NSURL fileURLWithPath:path] error:&err];
+        if (!g_lib) {
+            fprintf(stderr, "metal_rt: cannot load shader library '%s': %s\n",
+                    path.UTF8String, err.description.UTF8String);
+            fprintf(stderr, "metal_rt: and this binary carries no embedded"
+                    " library (build with EMBED_METALLIB=1)\n");
+            return fail(mtlErrorInitialization);
+        }
     }
     /* FAIL CLOSED ON UNSUPPORTED HARDWARE.
      *

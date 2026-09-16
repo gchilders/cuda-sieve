@@ -41,7 +41,17 @@ else
     bad "minos $got, want $WANT_MINOS -- build BOINC with -mmacosx-version-min=$WANT_MINOS"
 fi
 
-# 4. The BOINC client API is really in there. A link that resolved nothing
+# 4. The shaders are inside the executable. A BOINC project ships ONE file;
+#    a bench.metallib that has to land beside it and match it is a failure
+#    mode (missing, stale, mismatched) that embedding removes outright.
+sec=$(otool -l "$BIN" | grep -A4 'sectname __metallib' | awk '/size/{print $2; exit}')
+if [ -n "${sec:-}" ]; then
+    pass "carries its own shaders in __DATA,__metallib ($((sec)) bytes)"
+else
+    bad "no embedded metallib -- this binary needs a bench.metallib beside it"
+fi
+
+# 5. The BOINC client API is really in there. A link that resolved nothing
 #    looks identical from the outside.
 for sym in _boinc_init_parallel _boinc_finish _boinc_fraction_done; do
     if nm "$BIN" 2>/dev/null | grep -q " T $sym\$"; then
@@ -51,7 +61,7 @@ for sym in _boinc_init_parallel _boinc_finish _boinc_fraction_done; do
     fi
 done
 
-# 5. cofcheck.sh classifies builds by this exact string, and a HAVE_BOINC
+# 6. cofcheck.sh classifies builds by this exact string, and a HAVE_BOINC
 #    build takes the OTHER branch of that #ifdef. Misclassified as CUDA, it
 #    runs the --ecm-b1 400000 case that crashed WindowServer twice (plan 8k).
 #
