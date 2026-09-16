@@ -503,10 +503,18 @@ call site cannot do one and forget the other.
   the 24 hot bytes (`recip`, 8 of 32, is read on 0.2% of iterations) and
   fetching `recip` from device memory on a hit gave 221.7/219.9/222.2 ms
   against 223.4 — about 1%, inside noise, and was reverted. Cutting a quarter
-  of the bytes changed nothing while cutting six loads to one saved 31%. **So
-  pack the six fields into ONE 16-byte load next, not a smaller struct** —
-  `m`, `rt`, `cst` are under the 2^15 small-prime bound and `g`, `sh` are tiny.
-  That changes the host-built table, so it is a bigger change.
+  of the bytes changed nothing while cutting six loads to one saved 31%. **The ONE-uint4 packing was then built and is a WASH.** Field
+  maxima measured over every entry: m<=32,749, rt<=32,382, cst<=16,384 (15
+  bits), g<=19, sh<=14 — so `magic | m,rt | cst,g | sh` fits one `uint4`. The
+  test drops 224.1 -> 200.5 ms, **exactly as the load-count theory predicted**,
+  and the division rises 54 -> 70.8 because `recip` no longer fits the tile —
+  a wash standalone (301 vs 301), and in the PIPELINE `norms + trial division`
+  went **106.9 -> 199.5 ms/q** on the RECORD=1 and warp variants the standalone
+  path never runs. Reverted.
+
+  **Next person: profile the RECORD=1 variant specifically.** It is what the
+  pipeline runs, it is what regressed, and nothing here has isolated it — every
+  measurement in 8q used the standalone `--td` path.
 
   **The remaining 2.75x is unexplained** and is the whole of TD's gap.
 
