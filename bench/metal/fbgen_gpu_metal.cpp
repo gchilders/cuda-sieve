@@ -45,6 +45,14 @@
 
 #define GPU_FB_BIG_LIMBS 20
 #define GPU_FB_MAX_ROOTS (BENCH_MAX_DEGREE + 1)
+
+/* Grid-strides per root-finder launch. 32 puts this M3's ~790 ms launch at
+ * ~250 ms, leaving room for a device that is slower per stride. Raise it
+ * only with a measurement; the failure mode for too-large is a workunit
+ * killed by macOS for impacting interactivity, not a slow one. */
+#ifndef FB_ROOTS_STRIDES_PER_LAUNCH
+#define FB_ROOTS_STRIDES_PER_LAUNCH 32u
+#endif
 #define GPU_FB_BRUTE_ROOT_LIMIT 67u
 #define GPU_FB_DEFAULT_SEG_ODDS (1u << 23)  /* 8M odds = ~16M integers */
 /* counts/offsets and the compact-root count are uint32_t.  A prime contributes
@@ -558,10 +566,21 @@ static int gpu_fb_generate_complete(const poly_t *P, uint32_t lim, int maxbits,
         {
             const uint32_t ablocks = std::min<uint32_t>((nprime + 127u) / 128u,
                                                         (uint32_t)prop.multiProcessorCount * 8u);
-            if (P->deg <= 6)
-                MTL_LAUNCH(k_alg_roots_fixed_mark_6_1, ablocks, 128, 0, 0, d_primes, nprime, d_rootbuf, d_counts, d_special, d_failures, (const gpu_big_t *)mtlGetSymbol("c_alg"), *(const int *)mtlGetSymbol("c_alg_deg"));
-            else
-                MTL_LAUNCH(k_alg_roots_fixed_mark_8_1, ablocks, 128, 0, 0, d_primes, nprime, d_rootbuf, d_counts, d_special, d_failures, (const gpu_big_t *)mtlGetSymbol("c_alg"), *(const int *)mtlGetSymbol("c_alg_deg"));
+            /* One grid-stride covers `wave` primes; cap each launch at
+             * FB_ROOTS_STRIDES_PER_LAUNCH of them so the command buffer stays
+             * short on every device. See metal/gen_fbgen_host.py. */
+            const uint32_t wave = ablocks * 128u;
+            const uint64_t step64 = (uint64_t)wave * FB_ROOTS_STRIDES_PER_LAUNCH;
+            const uint32_t step = step64 >= nprime ? nprime : (uint32_t)step64;
+            for (uint32_t off = 0; off < nprime; off += step) {
+                const uint32_t cnt = (nprime - off) < step ? (nprime - off) : step;
+                const uint32_t sb = std::min<uint32_t>((cnt + 127u) / 128u, ablocks);
+                uint32_t *r_off = d_rootbuf + (size_t)off * GPU_FB_MAX_ROOTS;
+                if (P->deg <= 6)
+                    MTL_LAUNCH(k_alg_roots_fixed_mark_6_1, sb, 128, 0, 0, d_primes + off, cnt, r_off, d_counts + off, d_special + off, d_failures, (const gpu_big_t *)mtlGetSymbol("c_alg"), *(const int *)mtlGetSymbol("c_alg_deg"));
+                else
+                    MTL_LAUNCH(k_alg_roots_fixed_mark_8_1, sb, 128, 0, 0, d_primes + off, cnt, r_off, d_counts + off, d_special + off, d_failures, (const gpu_big_t *)mtlGetSymbol("c_alg"), *(const int *)mtlGetSymbol("c_alg_deg"));
+            }
         }
         MTL_OR_DIE(mtlGetLastError());
         MTL_OR_DIE(mtlMemcpy(&failures, d_failures, sizeof(failures),

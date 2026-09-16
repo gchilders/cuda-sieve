@@ -1813,7 +1813,7 @@ file's existence.
 
 | | sha256 |
 |---|---|
-| `bench` | `961bdbc30c9882c70b0fe282661ffbeefb4a9ccb2ae6b23ddae59a9f2c58c19d` |
+| `bench` | `e5995826782879f725cc6cb84199ae88adc6e396192ede1226a9e5a4dd77236c` |
 | `bench.sig` | (re-made; verified with the one-bit-flip control) |
 
 **Re-staged and re-signed 2026-09-16 after 9z's leak fix.** Superseded artifacts, none of
@@ -2512,6 +2512,80 @@ application", so it pre-dates 9z-g -- and therefore also pre-dates the
 `mtlFree` leak fix (9z), the autorelease fix (9z-b) and the nil-binding fix
 (9z-e). Whatever this failure turns out to be, the current build is a better
 starting point for the next report.
+
+### 9z-j. ANSWERED: macOS was killing fbgen for impacting interactivity
+
+9z-i's error reporting paid for itself on the first failure after deployment.
+An **M1**, one segment in:
+
+```
+metal_rt: command buffer failed: internal (code 1): Impacting Interactivity
+  (0000000e:kIOGPUCommandBufferCallbackErrorImpactingInteractivity)
+fbgen_gpu: Metal mtlMemcpy(...) failed at fbgen_gpu_metal.cpp:568: kernel launch failed
+```
+
+**macOS killed the command buffer for hogging the GPU against the UI.** Not
+the hard `MTLCommandBufferErrorTimeout` -- a soft interactivity watchdog,
+which is why it reported as `internal` and why the old build could only say
+"kernel launch failed". (The same log also shows 9z-g working: `BOINC: client
+assigned Metal device 0`, the assignment finally accepted.)
+
+**And it explains the family correlation exactly.** The root finder's grid is
+`min((nprime + 127)/128, cores * 8)`, so **the smaller the GPU, the more
+primes each thread must loop over**:
+
+| device | blocks | primes/thread | launch |
+|---|---|---|---|
+| M4 Max (40 cores) | 320 | ~21 | short |
+| **M3 (10 cores)** | **80** | **~105** | **790 ms, measured** |
+| M1 (7-8 cores) | 56-64 | ~150-190 | seconds |
+
+790 ms on this M3 is **already past this build's own 750 ms interactivity
+policy** -- a policy that until now applied only to the cofactoriser. fbgen was
+never bounded at all. An M1 runs into the seconds, and whether that gets killed
+depends on what else the machine is doing, which is why **one M2 finished and
+others did not**.
+
+The root finder is also effectively all of fbgen: 790 ms of each 819 ms
+segment, so there is no second offender to find.
+
+#### The fix: slice by grid-strides, with no kernel change
+
+Each launch now covers at most `FB_ROOTS_STRIDES_PER_LAUNCH` (32) grid-strides,
+so **every device does the same number of iterations per launch** and only the
+per-stride cost varies with the hardware. Sliced by *iterations*, not by a
+fixed prime count, precisely because the problem was that a fixed prime count
+means more iterations on a smaller GPU.
+
+**No device-side change.** The slices are taken with pointer arithmetic --
+`d_primes + off`, `d_rootbuf + off * GPU_FB_MAX_ROOTS`, `d_counts + off`,
+`d_special + off` -- and the allocation registry resolves an interior pointer
+to (buffer, offset) at bind time. That is exactly what the registry exists for,
+so `fbgen_gpu.cu` is untouched and the kernel's `t < n` grid-stride is
+unchanged. `d_failures` is a shared atomic and accumulates across slices.
+
+**Measured on this M3:**
+
+| | per launch | fbgen total |
+|---|---|---|
+| before | **790 ms** (4 launches of 1 slice) | 6.550 s |
+| after | **238-279 ms** | 6.616 s |
+
+**~3x margin under the 750 ms policy, for 1% of wall time** across 4x the
+launches. An M1 at ~1.5-1.8x per stride lands near 400-500 ms, still inside.
+
+**Output identical**: 7,605,616 ideals, 207 prime-power, 7,605,407 ordinary GPU
+roots, 38 exact primes -- the same counts as before slicing -- and a 288-q band
+**run the field's own way, with no `--fb1` so the factor base is generated**,
+is `cmp`-identical at 13,485 relations.
+
+**Note `fbcheck` does NOT cover this path.** It exercises the standalone
+`fbgen_gpu` tool, which has its own copy of the launch (around line 1335); the
+field path is `afb_build_gpu`. The check that matters here is the no-`--fb1`
+band above.
+
+**Gates:** `fbcheck`, `sievecheck`, `cofaccheck`, `validationcheck`,
+`boinccheck`, `cofcheck.sh` 54 PASS / 0 FAIL, `boinclinkcheck` 8/8.
 
 Still open from earlier phases: `--mode twolevel` misplaces records and
 refuses (Phase 8), and nothing has run under a real BOINC client (9e).
