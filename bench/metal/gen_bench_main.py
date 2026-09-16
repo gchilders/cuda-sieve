@@ -221,6 +221,32 @@ assert _nv_old in src, 'BOINC assignment comment shape changed'
 src = src.replace(_nv_old, _nv_new, 1)
 print('  BOINC stderr lines name Metal, not CUDA')
 
+# ---- the rest of the device-facing messages ------------------------------
+# A field run on an M4 Max (plan 9z-g) showed the earlier pass had fixed only
+# the lines it had seen fire. These are the rest of the class in this file:
+# every message a volunteer or a project admin can read that names the wrong
+# API. Two of them (the "client assigned" pair) could not fire at all until
+# the assignment rejection in boinc_support.cpp was fixed, which is exactly
+# why grepping for what appears in a log is not the same as grepping for the
+# class.
+for _old, _new in [
+    ('" task CUDA device %d\\n", cuda_device, boinc_device);',
+     '" task Metal device %d\\n", cuda_device, boinc_device);'),
+    ('"BOINC: client assigned CUDA device %d\\n"',
+     '"BOINC: client assigned Metal device %d\\n"'),
+    ('"bench: cannot enumerate CUDA devices: %s\\n"',
+     '"bench: cannot enumerate Metal devices: %s\\n"'),
+    ('"bench: this process sees no CUDA device\\n"',
+     '"bench: this process sees no Metal device\\n"'),
+    ('"bench: CUDA device %d requested, but this process sees"',
+     '"bench: Metal device %d requested, but this process sees"'),
+    ('"bench: cannot query the CUDA device -- refusing to"',
+     '"bench: cannot query the Metal device -- refusing to"'),
+]:
+    assert _old in src, 'message shape changed: ' + _old[:48]
+    src = src.replace(_old, _new, 1)
+print('  six more device messages name Metal')
+
 # ---- drop the allowance advisory ------------------------------------------
 # Two stderr notes, emitted once per run, saying an --allowance is looser than
 # the derived value. Useful at a terminal, noise in a BOINC log: under

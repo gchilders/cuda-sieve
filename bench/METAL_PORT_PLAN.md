@@ -1813,7 +1813,7 @@ file's existence.
 
 | | sha256 |
 |---|---|
-| `bench` | `2e1a2d5f9e5f7c26f863d328867a6a2bbdfeb1b5e6d4093c848e11caebc1abc6` |
+| `bench` | `1e85fd5e4308d7bde19380e4a42a4bb0a53d069e2d1146ff5895afd7858079eb` |
 | `bench.sig` | (re-made; verified with the one-bit-flip control) |
 
 **Re-staged and re-signed 2026-09-16 after 9z's leak fix.** Superseded artifacts, neither of
@@ -2236,6 +2236,84 @@ like; it cannot rule out something with a much longer period.
 call sites. Production code uses `MTL_OR_DIE`. An allocation failure in those
 two gates would surface as a confusing fault rather than a message -- gate
 ergonomics, not a shipped defect.
+
+### 9z-g. A field run answers 9e's open question -- and finds a rejected GPU
+
+A **successful** workunit on an **M4 Max**, client 8.2.11. The first thing it
+ever ran under a real BOINC client, which is the item 9a-9f kept listing as
+not established. It worked: factor base generated on the GPU in **3.0 s**
+(6.5 s on this M3), slab plan auto-calibrated, `boinc_finish(0)`.
+
+And the very first line was wrong:
+
+```
+BOINC: this is a CUDA application but the client assigned a 'apple_gpu'
+device (index 0); ignoring the assignment. ...
+BOINC: no usable GPU assignment in init_data.xml; using the system default Metal device
+```
+
+**The client assigned correctly and the app threw it away.**
+`bench_boinc_gpu_device()` hardcoded `strncmp(aid.gpu_type, "NVIDIA", 6)`, so
+any non-NVIDIA coprocessor was refused -- including the `apple_gpu` this build
+exists to use. The second line then reports that no assignment arrived, which
+was **false**.
+
+**Severity, stated honestly: no wrong results, no wrong device.** Apple silicon
+exposes exactly one Metal device -- the log says `device 0 of 1` -- so the
+fallback IS the assigned device. What it costs is **diagnosis**: a project
+reading "this is a CUDA application" out of a Metal app version reasonably
+concludes the wrong binary was deployed, and the no-assignment line is exactly
+what someone would trust while debugging a real assignment problem on a
+multi-GPU host.
+
+**Fixed with the port's usual shape**, because `boinc_support.cpp` is shared
+CUDA-side code: one selector, `-DBENCH_BOINC_METAL_GPU`, picks
+`apple_gpu`/`Metal`/`an Apple` in place of `NVIDIA`/`CUDA`/`an NVIDIA`. The
+**CUDA build is byte-identical, message text included** -- which is why there
+are three macros rather than one, `KIND` carrying its own article so
+"is not an NVIDIA one" survives verbatim. Verified by compiling the same file
+both ways and diffing the strings.
+
+One selector flag rather than three quoted strings on the command line,
+because those have to survive make, a sub-make's `BOINC_CPPFLAGS` and two
+shells -- and they do not: the first attempt died with ``No rule to make
+target `Apple"'``.
+
+#### The message sweep, and why 9b's pass was incomplete
+
+9b fixed the CUDA-named messages it had **seen fire**. This log shows why that
+is not the same as fixing the class: the two "client assigned CUDA device"
+lines could not fire *at all* until the rejection above was fixed, and
+`boinc_support.cpp` was never grepped.
+
+A proper scan -- every `fprintf(stderr, ...)` whose literals mention CUDA or
+NVIDIA, across nine files, multiline-safe -- found **nine**. All now say Metal:
+
+| file | messages |
+|---|---|
+| `boinc_support.cpp` | 1 (the rejection, now macro-selected) |
+| `bench_main_metal.cpp` | 6 (device assignment, enumeration, ordinal range, grid query) |
+| `pipeline_host.inc` | 1 (memory diagnostic) |
+| `bench_host.cpp` | 1 (harness error macro) |
+| `fbgen_gpu_metal.cpp` | 4 (error macro, device query x2, timing events) |
+
+The `fbgen` four matter most after the first: **fbgen runs on every production
+task** that supplies no `--fb1`, which is this port's recommended shape (9e).
+
+The scan now reports **0 remaining**, with one deliberate exception that is not
+a defect: `CUDA_SIEVE_METAL_DEVICE`, an environment variable *name* belonging
+to this port.
+
+**Gates:** eleven green including `validationcheck`, `cofcheck.sh` 54 PASS /
+0 FAIL, 288-q band `cmp`-identical at 13,485 relations. Re-staged and
+re-signed.
+
+**A timing anomaly worth recording, because it is about the measuring rig and
+not the code.** The first post-sweep 288-q run took **17m48s** against the
+usual ~3m35s. Re-run immediately after: **3m39s, identical relations**. The
+slow run started straight after the full gate suite; this is a fanless
+MacBook Air and CLAUDE.md's warning about sustained load is not theoretical.
+A number from this box taken right after a long GPU burn is not a measurement.
 
 Still open from earlier phases: `--mode twolevel` misplaces records and
 refuses (Phase 8), and nothing has run under a real BOINC client (9e).
@@ -3954,4 +4032,5 @@ display, against a GTX 1080 in an NRP k8s pod.**
 | 2026-09-15 | `bench/runlog.c`, `bench/runlog.h` | added `int g_runlog_quiet` (default 0) and a `if (!g_runlog_quiet)` guard around `runlog_warn`'s **stderr half only**; the log-file half is untouched. Verbatim from `hip-port`. **No CUDA-side code sets it**, so the CUDA build sees an unconditional `0` and identical behaviour. | Compiles clean in the default build (`make runlog.o`, `-Wall -Wextra`). Behaviour unchanged by inspection of a one-line guard on a variable no CUDA translation unit writes; **not exercised on a CUDA build**, since there is no nvcc on this machine. |
 | 2026-09-15 | `bench/boinc_support.cpp`, `bench/bench.h` | added `bench_boinc_progress_suspend(int)` and a `if (progress_suspended) return;` early-out in `bench_boinc_fraction_done`, placed **before** the monotonic high-water mark. Verbatim from `hip-port`. Nothing in the CUDA build calls the setter, so `progress_suspended` is permanently 0 there and the early-out never fires. | `make -f Makefile.metal boinccheck`: compiles `boinc_support.cpp` with `-DHAVE_BOINC` against a stub client API and drives both cases in separate processes. The control, run first, reproduces the HIP port's field bug (task pinned at 99%); the gate shows the suspend prevents it while preserving monotonicity. Also compiles clean both with and without `HAVE_BOINC` (`-Wall -Wextra`). **Updated 2026-09-15 (plan 9a): the real BOINC SDK is now built here** (8.3.0, arm64, static, `minos 13.0`) and `boinc_support.cpp` compiles against its real headers with zero warnings and links against its real archives. That is a stronger check than the stub for the *link*, but still not a client: no `init_data.xml`, so the stub remains the only thing exercising the progress logic. |
 | 2026-09-15 | `bench/cofcheck.sh` | build detection from `--help` (`select Metal device` vs `select CUDA device`, refusing to guess if neither), and the `--ecm-b1 400000` case inverted on Metal to assert a refusal instead of an acceptance. **CUDA's path is unchanged**: `IS_METAL=0` takes the original branch verbatim. | Ran on Metal: 54 PASS / 0 FAIL / exit 0, with `large B1 with derived B2 -> refused, as Metal must`. The case it replaces crashed WindowServer twice on this machine. **Not run on a CUDA build** -- the CUDA branch is unchanged by inspection of a two-way `if`, not by execution. The HIP port skips this case for the same underlying reason (`cofac.cuh`'s own warning block says so). |
+| 2026-09-16 | `bench/boinc_support.cpp` | the accepted BOINC coprocessor type, and the two names in its rejection message, became macros selected by `BENCH_BOINC_METAL_GPU`. **Without the flag the CUDA build is byte-identical, message text included** -- `NVIDIA` / `CUDA` / `an NVIDIA`, so `"...is not an NVIDIA one."` survives verbatim. Only the Metal build defines the flag, to accept `apple_gpu`. Fixes a real rejection seen in a field log (plan 9z-g): the client assigned `apple_gpu` and the app refused it as non-NVIDIA, then reported that nothing had been assigned. | Compiled `boinc_support.cpp` both ways and compared the emitted strings: without the flag, `NVIDIA` and the original message; with it, `apple_gpu` and the Metal wording. Twelve Metal gates green. **Not compiled by nvcc** -- the CUDA branch is unchanged by inspection of an `#ifdef` whose `#else` holds the original literals. |
 | 2026-09-15 | `bench/td.cuh` | wrapped `#define TD_TILE 512` in `#ifndef`/`#endif`. **Default unchanged**, so a build passing no `-D` sees the identical token; only the Metal build overrides it, and 8q measured that override to be worth nothing, so it does not. | `make slabcheck` passes; six Metal gates green including `sievecheck` (4,194,304 cells) and `cofcheck.sh` (54 cases). Behaviour change is nil by inspection of an `#ifndef` around an unchanged value. **Not compiled by nvcc** — no CUDA build was run against this edit. |

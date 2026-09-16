@@ -90,7 +90,7 @@ extern "C" int fbgen_write_prime_entries(FILE *out,
 #define MTL_OR_DIE(x) do {                                                     \
     mtlError_t _e = (x);                                                       \
     if (_e != mtlSuccess) {                                                    \
-        fprintf(stderr, "fbgen_gpu: CUDA %s failed at %s:%d: %s\n",           \
+        fprintf(stderr, "fbgen_gpu: Metal %s failed at %s:%d: %s\n",           \
                 #x, __FILE__, __LINE__, mtlGetErrorString(_e));                \
         goto fail;                                                              \
     }                                                                           \
@@ -474,11 +474,11 @@ static int gpu_fb_generate_complete(const poly_t *P, uint32_t lim, int maxbits,
             return -1;
         }
     } else if (mtlGetDevice(&dev) != mtlSuccess) {
-        fprintf(stderr, "%s: cannot query current CUDA device\n", who);
+        fprintf(stderr, "%s: cannot query the current Metal device\n", who);
         return -1;
     }
     if (mtlGetDeviceProperties(&prop, dev) != mtlSuccess) {
-        fprintf(stderr, "%s: cannot query CUDA device %d\n", who, dev);
+        fprintf(stderr, "%s: cannot query Metal device %d\n", who, dev);
         return -1;
     }
     MTL_OR_DIE(mtlMemcpyToSymbol("c_alg", h_alg, sizeof(h_alg), 0));
@@ -1187,7 +1187,7 @@ int main(int argc, char **argv)
 
     MTL_OR_DIE(mtlSetDevice(dev));
     MTL_OR_DIE(mtlGetDeviceProperties(&prop, dev));
-    if (timer_init(&T)) { fprintf(stderr, "fbgen_gpu: cannot create CUDA events\n"); goto fail; }
+    if (timer_init(&T)) { fprintf(stderr, "fbgen_gpu: cannot create Metal timing events\n"); goto fail; }
     MTL_OR_DIE(mtlMemcpyToSymbol("c_alg", h_alg, sizeof(h_alg), 0));
     MTL_OR_DIE(mtlMemcpyToSymbol("c_alg_deg", &P.deg, sizeof(P.deg), 0));
     MTL_OR_DIE(mtlMemcpyToSymbol("c_y0", &h_y0, sizeof(h_y0), 0));

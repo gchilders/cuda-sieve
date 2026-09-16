@@ -167,6 +167,14 @@ assert _smem_old in src, 'harness apply smem shape changed'
 src = src.replace(_smem_old, _smem_new, 1)
 print('  apply threadgroup length via mtl_apply_smem')
 
+# The harness's own error macro prints "CUDA <expr>: <error>". Benchmark-only,
+# but it is the same class and costs one line.
+_eh_old = '"CUDA %s: %s at %s:%d\\n"'
+_eh_new = '"Metal %s: %s at %s:%d\\n"'
+assert _eh_old in src, 'harness error message shape changed'
+src = src.replace(_eh_old, _eh_new, 1)
+print('  harness error message names Metal')
+
 open(OUT, 'w').write(src)
 print('wrote %s (%d lines, %d launches rewritten)' % (OUT, src.count('\n'), nl))
 left = sorted(set(re.findall(r'\bcuda[A-Z]\w*', src)))

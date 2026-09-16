@@ -219,5 +219,24 @@ for a, b in [('LAUNCH_FIXED(6, false)', 'LAUNCH_FIXED(6, 0)'), ('LAUNCH_FIXED(6,
 
 print('wrote %s (%d lines); %d launches rewritten' % (OUT, s.count('\n'), nl))
 
+# ---- device-facing messages name Metal, not CUDA -------------------------
+# fbgen runs on EVERY production task -- a workunit that supplies no --fb1
+# generates the factor base here -- so these reach volunteers' stderr.txt.
+# Found by the plan 9z-g sweep, after a field log showed the earlier pass had
+# only fixed the lines it had seen fire.
+for _o, _n in [
+    ('"fbgen_gpu: CUDA %s failed at %s:%d: %s\\n"',
+     '"fbgen_gpu: Metal %s failed at %s:%d: %s\\n"'),
+    ('"%s: cannot query current CUDA device\\n"',
+     '"%s: cannot query the current Metal device\\n"'),
+    ('"%s: cannot query CUDA device %d\\n"',
+     '"%s: cannot query Metal device %d\\n"'),
+    ('"fbgen_gpu: cannot create CUDA events\\n"',
+     '"fbgen_gpu: cannot create Metal timing events\\n"'),
+]:
+    assert _o in s, 'fbgen message shape changed: ' + _o[:44]
+    s = s.replace(_o, _n, 1)
+print('  fbgen device messages name Metal')
+
 open(OUT, 'w').write(s)
 print('re-wrote %s with macro dispatch fixed' % OUT)
