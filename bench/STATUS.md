@@ -746,6 +746,65 @@ misled at least one reader into the opposite conclusion as well.)*
 been priced at an over-large budget rather than swept from below — the same
 one-sided-tuning error the finding was written to expose. Corrected in place.)*
 
+**Finding 70's sweep rows and its applied table disagree, and the gap is
+unexplained (noted 2026-09-15).** The sweep prices c183 `lpb 32 / mfb 93`
+ECM-best at 19.71 ms/q; the applied table ~40 lines BELOW it (RESULTS.md:4289,
+not above — an earlier version of this note misdirected the reader) records the
+shipped c183 config (`lpb 31/32`, `mfb 60/92`) at 14.30 ms/q stage on the same
+date. Finding 98 re-measured the shipped config at **14.60 ms/q** (two-side
+total; algebraic side alone 11.71), i.e. 2% slower than the applied table and
+consistent with it — so the applied table, not the sweep row, is the number to
+compare a current build against. Finding 98's first draft read the sweep row as
+the comparator and claimed a 26% improvement from `3e15fec`..`2bc1c6e`; that
+claim is withdrawn, and no ECM speedup is demonstrated there.
+
+Part of the residual 19.71-vs-14.30 gap is a third mismatch neither doc named
+at first: the sweep row is `mfb 93` (finding 70's `3*lpb-3` convention) while
+the shipped c183 algebraic side is `mfb 92` (`3*lpb-4`, per `oracle/input.job`).
+Finding 98 measures ~3% of relations and 62-72% of cofactor-stage time per bit
+of `mfb`, so one bit bounds a real share of it.
+
+Finding 98's saturation gate also does NOT re-confirm the `B1` ladder, contrary
+to what an earlier version of this paragraph said: it held `B1` at its derived
+value and varied only curves and rounds (24/6 against 12/4), which found
+relation counts *identical* to the default on all four matched arms. That
+proves the default is not under-provisioned; it is silent on `B1` itself.
+
+**Finding 98's LEVEL ranking was superseded by finding 99 and is now
+REINSTATED (2026-09-16).** 98 took the per-step growth in required relations on
+trust at 1.75x. 99 measured it, first controlling on digits — which gave GNFS
+1.52 against SNFS 1.79 and made the level a coin flip — and then, after Kyle
+pointed out that digits means nothing for SNFS, controlling both arms on
+**Murphy-E**, where they agree at **1.62-1.74x**. c183 flips at 1.632 and C194
+at 1.612, both at the bottom edge, so the lower rung wins across essentially
+the whole range and 98's direction stands. The margin does not: it runs from
+under 1% at the bottom to 9% at the top. Kyle's 1.75-1.80 rule sits just above
+the range and is mildly conservative. The ideal-count model's 1.94x — which
+98 argued for — remains an upper bound a real job never approaches.
+
+AS276 is a separate story: with the raw-vs-unique correction applied uniformly
+most of its configs had no admissible window, and the earlier claim that the
+shipped gap-2 `33/35` beat the gap-1 `34/35` by 7.8% is withdrawn. **The job
+then finished (2026-09-16), and it says the target was the problem:** it
+factored at `33/35`, A=32, on 1.671B raw relations over q = 80-427M — 0.913x
+the target this project carried — and at that count `33/35` has an ordinary
+117M-692M window. A=31 would have needed span 7.84x from the same floor,
+breaking the duplicate rule, which confirms 98's area argument from outside the
+harness. What survives 98 untouched either way is the BALANCE asymmetry and the
+`mfb`-96 cap — neither has a relation target in it, so R cancels.
+
+**The absolute GPU-day figures in finding 98 are optimistic and always were.**
+The harness counts raw relations per q; the targets are unique relations. The
+two sources in finding 99 disagree on the level of that correction (Kyle's
+dedup sheet says ~59% unique on a 6x span, msieve's own duplicate line says
+~78% on the same 40 jobs, most likely because NFS@Home dedups server-side
+first) and the disagreement is unresolved. They agree on the *slope* — for
+GNFS, ~1 pt per `lpb` and ~9.8 pt from a 3x to a 6x span — and only the slope
+enters a ranking, so the comparisons are safe and the absolute day counts are
+not. (An earlier version of this paragraph quoted ~2 pt per `lpb` from a fit
+that pooled GNFS and SNFS; the SNFS points are 6 of 40 and carry a slope four
+times steeper, and the targets they correct are GNFS jobs.)
+
 **`k_cofac` carries `__launch_bounds__(256, 2)` since 2026-09-14 -- finding 97.**
 At 256 threads per block, 128 registers per thread is exactly two blocks per
 SM, and where the stage-2 kernel lands depends on the toolkit and the target,

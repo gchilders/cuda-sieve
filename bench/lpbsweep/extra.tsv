@@ -1,0 +1,11 @@
+arm	job	lpb	mfb	flags	wall_ms_q	cof_ms_q	rel_q	width
+sat	c183	31/32	60/92	--ecm-curves 24 --cof-rounds 6	99.11	21.47	47.18	side 0 3 limbs (96 bits), side 1 3 limbs (96 bits); this build carries 3..4
+sat	c183	32/33	62/95	--ecm-curves 24 --cof-rounds 6	135.42	52.13	97.92	side 0 3 limbs (96 bits), side 1 3 limbs (96 bits); this build carries 3..4
+sat	c194	32/33	63/95	--ecm-curves 24 --cof-rounds 6	358.65	62.74	101.03	side 0 3 limbs (96 bits), side 1 3 limbs (96 bits); this build carries 3..4
+sat	c194	33/34	65/98	--ecm-curves 24 --cof-rounds 6	762.00	427.85	206.68	side 0 3 limbs (96 bits), side 1 4 limbs (128 bits); this build carries 3..4
+sat	as276	33/34	64/98	--ecm-curves 24 --cof-rounds 6	441.22	131.86	56.33	side 0 3 limbs (96 bits), side 1 4 limbs (128 bits); this build carries 3..4
+sat	as276	34/35	66/101	--ecm-curves 24 --cof-rounds 6	605.30	277.15	112.93	side 0 3 limbs (96 bits), side 1 4 limbs (128 bits); this build carries 3..4
+sat	as276	35/36	68/104	--ecm-curves 24 --cof-rounds 6	1064.63	697.49	213.45	side 0 3 limbs (96 bits), side 1 4 limbs (128 bits); this build carries 3..4
+cap96	c194	33/34	65/96	default	412.89	104.96	195.60	side 0 3 limbs (96 bits), side 1 3 limbs (96 bits); this build carries 3..4
+cap96	as276	33/34	64/96	default	317.19	22.03	52.58	side 0 3 limbs (96 bits), side 1 3 limbs (96 bits); this build carries 3..4
+cap96	as276	34/35	66/96	default	347.48	45.51	93.35	side 0 3 limbs (96 bits), side 1 3 limbs (96 bits); this build carries 3..4
