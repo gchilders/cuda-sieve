@@ -19,6 +19,22 @@
  * serialises dispatches within a compute encoder and tracks buffer hazards
  * automatically, so this reproduces a CUDA stream's in-order semantics.
  *
+ * COMMAND BUFFER DURATION IS A SHIPPING CONSTRAINT, NOT A PERFORMANCE ONE.
+ * macOS kills a command buffer that holds the GPU too long against the UI --
+ * kIOGPUCommandBufferCallbackErrorImpactingInteractivity, a soft watchdog that
+ * arrives as a plain "internal" error. It judges a COMMAND BUFFER. Because
+ * dispatches batch into one buffer until something demands ordering, the unit
+ * this port spent two rounds bounding -- the dispatch -- is not the unit that
+ * gets killed: 50 cofactor rounds of a 244 ms launch, each comfortably inside
+ * the 750 ms policy, were one 3,180 ms submission. Anything that issues a long
+ * run of expensive dispatches must call mtlStreamFlush between them.
+ *
+ * CUDA_SIEVE_METAL_CBTIME=1 prints GPUEndTime - GPUStartTime and the contents
+ * of every command buffer at each sync. It is here permanently because its
+ * absence is exactly how 9z-j came to be measured, committed and signed while
+ * changing nothing the watchdog could see. `make -f Makefile.metal cbtimecheck`
+ * is the gate built on it.
+ *
  * EVENTS. Recording an event closes and commits the stream's command buffer,
  * because a command buffer's GPUEndTime is the only timestamp available
  * without counter sample buffers. That makes every cudaEventRecord a
@@ -58,6 +74,16 @@ struct Stream {
     id<MTLBlitCommandEncoder>    benc = nil;
     EncKind                      kind = ENC_NONE;
     id<MTLCommandBuffer>         last = nil;   /* last committed, for waiting */
+    /* Every command buffer committed since the last sync. `last` alone was
+     * enough while a sync followed every commit, but mtlStreamFlush breaks
+     * that: buffers 1..n-1 would be replaced and released UNCHECKED, so a
+     * failure in an early slice would vanish and the run would carry on with
+     * garbage. Drained and checked by sync(). */
+    std::vector<id<MTLCommandBuffer> > pending;
+    /* What went into the command buffer now open, for the CBTIME report. */
+    int         ndisp = 0;
+    std::string first_k, last_k;
+    std::vector<std::string> plabel;   /* one per pending buffer */
 };
 
 id<MTLDevice>        g_dev = nil;
@@ -184,6 +210,13 @@ id<MTLCommandBuffer> commit(Stream *st)
     close_encoder(st);
     if (st->cb) {
         [st->cb commit];
+        { char lb[256];
+          snprintf(lb, sizeof lb, "%d dispatches %s..%s", st->ndisp,
+                   st->first_k.empty() ? "-" : st->first_k.c_str(),
+                   st->last_k.empty() ? "-" : st->last_k.c_str());
+          st->plabel.push_back(lb); }
+        st->ndisp = 0; st->first_k.clear(); st->last_k.clear();
+        st->pending.push_back([st->cb retain]);   /* pending holds its own */
         if (st->last != st->cb) [st->last release];
         st->last = st->cb;              /* takes cb's +1 */
         st->cb = nil;
@@ -196,6 +229,9 @@ id<MTLCommandBuffer> commit(Stream *st)
 void stream_teardown(Stream *st)
 {
     close_encoder(st);
+    for (size_t i = 0; i < st->pending.size(); i++) [st->pending[i] release];
+    st->pending.clear();
+    st->plabel.clear();
     [st->cb release];   st->cb = nil;
     [st->last release]; st->last = nil;
     [st->q release];    st->q = nil;
@@ -251,7 +287,24 @@ mtlError_t sync(Stream *st)
     id<MTLCommandBuffer> cb = commit(st);
     if (!cb) return mtlSuccess;
     [cb waitUntilCompleted];
-    mtlError_t e = cb_status(cb);
+    { static int cbt = -1;
+      if (cbt < 0) { const char *e = getenv("CUDA_SIEVE_METAL_CBTIME"); cbt = (e && *e && *e != '0') ? 1 : 0; }
+      if (cbt) for (size_t i = 0; i < st->pending.size(); i++)
+          fprintf(stderr, "CBTIME %.2f ms [%s]\n",
+                  (st->pending[i].GPUEndTime - st->pending[i].GPUStartTime) * 1000.0,
+                  i < st->plabel.size() ? st->plabel[i].c_str() : "?"); }
+    /* Command buffers on one queue complete in commit order, so waiting for
+     * the last one means every earlier one is done and its status is final.
+     * Report the FIRST failure: a later buffer's error is usually a
+     * consequence of the first, and the first is the one worth diagnosing. */
+    mtlError_t e = mtlSuccess;
+    for (size_t i = 0; i < st->pending.size(); i++) {
+        mtlError_t ei = cb_status(st->pending[i]);
+        if (ei != mtlSuccess && e == mtlSuccess) e = ei;
+        [st->pending[i] release];
+    }
+    st->pending.clear();
+    st->plabel.clear();
     return e == mtlSuccess ? mtlSuccess : fail(e);
 }
 
@@ -725,6 +778,19 @@ extern "C" mtlError_t mtlStreamDestroy(mtlStream_t s)
 extern "C" mtlError_t mtlStreamSynchronize(mtlStream_t s)
 { std::lock_guard<std::mutex> lk(g_lock); return sync(resolve(s)); }
 
+/* Submit without waiting. Command buffers on one MTLCommandQueue execute in
+ * commit order, so splitting a run of dispatches across several changes
+ * nothing about ordering or hazard tracking -- only how long any single
+ * submission occupies the GPU, which is what the watchdog measures. The CPU
+ * keeps running ahead, so this is not a pipeline stall the way an event
+ * record is. */
+extern "C" mtlError_t mtlStreamFlush(mtlStream_t s)
+{
+    std::lock_guard<std::mutex> lk(g_lock);
+    commit(resolve(s));
+    return mtlSuccess;
+}
+
 extern "C" mtlError_t mtlDeviceSynchronize(void)
 { std::lock_guard<std::mutex> lk(g_lock); return sync(&g_default); }
 
@@ -908,6 +974,11 @@ extern "C" mtlError_t mtl_launch_begin(const char *kernel, mtlStream_t s,
                            kernel, grid, block, smem);
     Stream *st = resolve(s);
     id<MTLComputeCommandEncoder> enc = ensure_compute(st);
+    /* Accounting for the CBTIME report: which dispatches share this command
+     * buffer. ensure_compute may have opened a fresh one, so record after. */
+    if (st->ndisp == 0) st->first_k = kernel ? kernel : "?";
+    st->last_k = kernel ? kernel : "?";
+    st->ndisp++;
     [enc setComputePipelineState:pso];
     if (smem) [enc setThreadgroupMemoryLength:smem atIndex:0];
     g_bind_enc = enc; g_bind_stream = st; g_bind_grid = grid; g_bind_block = block;
