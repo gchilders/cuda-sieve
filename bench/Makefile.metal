@@ -90,6 +90,25 @@ CPUOBJ_TUNE := -mcpu=apple-m1 -mmacosx-version-min=$(METAL_MIN_MACOS)
 #   -mmacosx-version-min=13.0   in the BOINC CFLAGS/CXXFLAGS, or its objects
 #                               are stamped with the build host's SDK and the
 #                               METAL_MIN_MACOS floor below becomes a fiction.
+# ---- embed the shader library in the executable ---------------------------
+#
+# ONE FILE. A BOINC project ships an executable; a second file that has to
+# land beside it and match it is a class of failure (missing, stale,
+# mismatched) that does not exist if the shaders are inside. ld puts the
+# metallib in __DATA,__metallib and metal_rt reads it back with
+# getsectiondata(), ahead of the bench.metallib-next-to-the-binary path but
+# behind $CUDA_SIEVE_METALLIB, so every gate here still drives the library it
+# just built.
+#
+# Costs ~1 MB on a 718 KB binary. EMBED_METALLIB=0 opts out; `metallibcheck`
+# uses that as its control.
+EMBED_METALLIB ?= 1
+ifeq ($(EMBED_METALLIB),1)
+METALLIB_EMBED = -sectcreate __DATA __metallib $(BUILD)/bench.metallib
+else
+METALLIB_EMBED =
+endif
+
 HAVE_BOINC     ?= 0
 BOINC_DIR      ?=
 ifneq ($(BOINC_DIR),)
@@ -152,6 +171,8 @@ HOSTFLAGS := $(HOSTFLAGS_BASE) $(BOINC_DEFS) $(BOINC_CPPFLAGS)
 CPUOBJ_MAKEVARS := HOST_TUNE='$(CPUOBJ_TUNE)' HAVE_BOINC=$(HAVE_BOINC) \
                    BOINC_CPPFLAGS='$(BOINC_CPPFLAGS)' BOINC_HOST_STATIC=
 
+BUILD := .metal-build
+
 # Unlike the CUDA Makefile, nothing here tracked a flag change, so flipping
 # HAVE_BOINC left a $(BUILD) full of objects compiled the other way -- and a
 # bench_main.o built without the define simply never calls bench_boinc_init(),
@@ -159,11 +180,13 @@ CPUOBJ_MAKEVARS := HOST_TUNE='$(CPUOBJ_TUNE)' HAVE_BOINC=$(HAVE_BOINC) \
 # the same trap costing a TD measurement (8q). Stamp the whole signature, not
 # just HAVE_BOINC: every Metal-side object and the metallib depends on it, so
 # changing ANY tunable above rebuilds what it affects.
+#
+# AFTER `BUILD`, because METALLIB_EMBED names a path under it and this
+# assignment is immediate: computed above, the signature would carry
+# "/bench.metallib" and read as nonsense in a stamp file people will inspect.
 METAL_STAMP := .metalflags.stamp
-METAL_SIGNATURE := $(HOSTFLAGS)|$(MSLFLAGS)|$(BOINC_LINK)|$(CPUOBJ_TUNE)
+METAL_SIGNATURE := $(HOSTFLAGS)|$(MSLFLAGS)|$(BOINC_LINK)|$(CPUOBJ_TUNE)|$(METALLIB_EMBED)
 $(shell [ "$$(cat $(METAL_STAMP) 2>/dev/null)" = '$(METAL_SIGNATURE)' ] || printf '%s' '$(METAL_SIGNATURE)' > $(METAL_STAMP))
-
-BUILD := .metal-build
 
 $(BUILD):
 	@mkdir -p $(BUILD)
@@ -301,6 +324,24 @@ else
 	@sh metal/boinclinkcheck.sh $(BUILD)/bench $(METAL_MIN_MACOS)
 endif
 
+# ---- metallib embedding gate: one file, and it runs on its own ----------
+# Control FIRST and in its own build, because the positive case is only
+# meaningful if a non-embedded binary demonstrably cannot run the same way.
+# Both runs happen in a temporary directory with no bench.metallib and with
+# $CUDA_SIEVE_METALLIB unset -- every other gate here exports it, so none of
+# them would notice embedding being broken.
+.PHONY: metallibcheck
+metallibcheck: ../oracle/c183.fb1
+	@echo "== control: the same binary built WITHOUT embedding =="
+	@$(MAKE) -f Makefile.metal $(BUILD)/bench EMBED_METALLIB=0 >/dev/null
+	@sh metal/metallibcheck.sh $(CURDIR)/$(BUILD)/bench \
+	    $(CURDIR)/../oracle/c183.poly $(CURDIR)/../oracle/c183.fb1 control
+	@echo
+	@echo "== gate: WITH embedding =="
+	@$(MAKE) -f Makefile.metal $(BUILD)/bench EMBED_METALLIB=1 >/dev/null
+	@sh metal/metallibcheck.sh $(CURDIR)/$(BUILD)/bench \
+	    $(CURDIR)/../oracle/c183.poly $(CURDIR)/../oracle/c183.fb1
+
 # ---- Phase 5 gate: the sieve against the tree's own CPU ground truth -----
 
 SIEVE_CPUOBJ := verify_cpu.o fbgen_lib.o fb_load.o fb_cado.o poly.o primes.o \
@@ -407,6 +448,7 @@ $(BUILD)/fbgen_gpu_lib.o: metal/fbgen_gpu_metal.cpp $(METAL_STAMP) | $(BUILD)
 $(BUILD)/bench: $(METAL_TU) $(BUILD)/bench.metallib $(METAL_STAMP)
 	$(MAKE) $(CPUOBJ_MAKEVARS) $(BENCH_CPUOBJ)
 	$(CXX) $(HOSTFLAGS) $(METAL_TU) $(BENCH_CPUOBJ) $(BOINC_LINK) \
+	    $(METALLIB_EMBED) \
 	    -framework Metal -framework Foundation -framework IOKit \
 	    -lm -ldl -lpthread -o $@
 
