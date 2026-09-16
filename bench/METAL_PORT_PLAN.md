@@ -1988,6 +1988,98 @@ wrong answer rather than a leak: twelve gates green, `cofcheck.sh` 54 PASS /
 0 FAIL, and the 288-q band **byte-identical** at 13,485 relations,
 `sha256 8e79762c…dafbc002`, `cmp` clean.
 
+### 9z-c. Second review: the Metal validation layer cannot run on this port
+
+The first review's leak came from a lifetime assumption nobody had tested, so
+the second pass led with the instruments rather than with reading.
+
+#### My own new code, cleared
+
+The retain/release work in 9z-b is where a fresh bug would be most damaging, so
+it was checked dynamically, not by inspection:
+
+| instrument | result |
+|---|---|
+| `OBJC_DEBUG_MISSING_POOLS=YES` | **0** "autoreleased with no pool" |
+| `NSZombieEnabled=YES` | **0** messages to a deallocated object |
+| static audit of all 17 ownership sites | balanced |
+
+The first confirms the pools actually cover every autorelease; the second that
+nothing is over-released. Both on a real 4-q band, relations correct.
+
+#### THE FINDING: `MTL_DEBUG_LAYER=1` aborts, and the cause is systemic
+
+Turning on Metal API validation kills the sieve with SIGABRT. The stack names
+it exactly:
+
+```
+-[MTLDebugComputeCommandEncoder validateComputeFunctionArgumentsCommon]
+  <- dispatchThreadgroups:threadsPerThreadgroup:
+  <- mtl_launch_end
+  <- scan_rec()            [3 recursive frames]
+  <- mtlSelectFlaggedU32
+  <- afb_build_gpu
+```
+
+**The port binds `nil` for optional buffer arguments, and Metal requires every
+declared buffer argument to be bound.** `scan.metal` declares
+
+```metal
+kernel void k_scan_block(device uint *out  [[buffer(0)]],
+                         device uint *bsum [[buffer(1)]], ...)
+```
+
+and `metal_scan.cpp`'s `scan_rec` passes `(uint32_t *)nullptr` for `bsum` at
+the deepest recursion level, where there is no next level to accumulate into.
+The kernel guards with `if (lid == SCAN_BLK - 1 && bsum)`, so it never
+dereferences -- which is why it has always worked.
+
+**It is not one call site.** Twenty launches pass `nullptr`: 14 in
+`bench_host.cpp`, 6 in `pipeline_host.inc` -- including the **production**
+`k_apply` launch, which passes three (`dump`, `dbg_cells`, `probe_out`) -- and
+1 in `metal_scan.cpp`. The idiom is deliberate and documented: `metal_rt.h`'s
+`mtl_bind_one(std::nullptr_t)` overload exists precisely to route these to
+`setBuffer:nil`, and CLAUDE.md calls that overload load-bearing (it is -- it
+is what stops `NULL` being bound as eight bytes of integer zero).
+
+**What it costs.** Not correctness today: Apple's driver tolerates the nil
+binding and every such kernel guards the pointer. What it costs is **the
+single best tool for catching binding bugs, in the port most exposed to
+them** -- 84 kernels reached by *string name*, arguments bound *positionally*
+by index, and templated variants reached through mangled `[[host_name]]`
+strings. The validation layer is exactly what would catch a wrong index or a
+missing argument, and it cannot be switched on.
+
+**A partial fix is worthless**: fixing `scan_rec` alone would move the abort to
+the next `nullptr` launch. It is all-or-nothing, and the options are
+- **templated variants** per optional argument (`k_scan_block<HAS_BSUM>`), which
+  fits how this port already specialises kernels, but multiplies instantiations
+  where a kernel has three optional pointers (`k_apply` -> 8); or
+- a **sentinel buffer** plus an explicit present-flag argument, which changes
+  every affected kernel signature but not their count.
+
+**Deliberately NOT fixed in this pass.** It is an architectural change across
+~20 call sites and their kernel signatures, in a port that is validated,
+signed and staged; and the defect is invisible to every gate because the gates
+do not run under validation. It belongs in its own change, with the validation
+layer as its acceptance test -- which is the point of doing it.
+
+**Recorded as a hazard, not a bug:** a future driver, OS, or Apple GPU
+generation may stop tolerating it, and the failure mode would be a kernel
+reading address zero rather than a clean refusal.
+
+#### Reviewed with no findings
+
+`metal/slab_calib.inc` (184 hand-written lines, production path, ported from
+the HIP port -- the source of the BOINC progress bug). It is careful:
+`g_runlog_quiet` and `bench_boinc_progress_suspend` are both reset
+unconditionally after the throwaway pass, the dispatch matches `run_pipeline`'s
+own `cplan.enabled` branch rather than forcing `<true>`, and `cplan.jmax` --
+the post-clamp value -- is what gets reported and reused.
+
+Carried, minor: `mtlEventSynchronize` reads `e->cb` under the lock and then
+uses it after unlocking. Safe only because events are single-threaded here.
+
 Still open from earlier phases: `--mode twolevel` misplaces records and
 refuses (Phase 8), and nothing has run under a real BOINC client (9e).
 

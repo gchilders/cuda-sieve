@@ -975,6 +975,47 @@ Lesser, open: a zero-sized launch is silently skipped where CUDA returns
 while binding" warning its sibling has; `pso_for` caches `nil` so the
 missing-kernel diagnostic repeats per attempt.
 
+## Second review, 2026-09-16 (plan 9z-c)
+
+**`MTL_DEBUG_LAYER=1` ABORTS THE SIEVE — the Metal validation layer cannot be
+used on this port.** Stack:
+`validateComputeFunctionArgumentsCommon` ← `dispatchThreadgroups` ←
+`mtl_launch_end` ← `scan_rec` ← `mtlSelectFlaggedU32` ← `afb_build_gpu`.
+
+**Cause: the port binds `nil` for optional buffer arguments, and Metal requires
+every declared buffer argument to be bound.** `k_scan_block` declares
+`device uint *bsum [[buffer(1)]]`; `scan_rec` passes `nullptr` at the deepest
+recursion level, and the kernel guards `if (... && bsum)` — which is why it has
+always worked. Apple's driver tolerates it.
+
+**Systemic, not one site: 20 launches pass `nullptr`** — 14 `bench_host.cpp`,
+6 `pipeline_host.inc` (including the **production** `k_apply`, which passes
+three), 1 `metal_scan.cpp`. The idiom is deliberate: `mtl_bind_one(nullptr_t)`
+exists to route them to `setBuffer:nil`.
+
+**What it costs is the best tool for catching binding bugs, in the port most
+exposed to them** — 84 kernels reached by *string name*, arguments bound
+*positionally*, templated variants via mangled `[[host_name]]`. **A partial fix
+is worthless** (the abort just moves to the next `nullptr` launch). Options:
+templated variants per optional argument (fits the port's existing style, but
+`k_apply` → 8 instantiations), or a sentinel buffer plus a present-flag.
+**NOT fixed deliberately** — architectural, ~20 sites plus kernel signatures,
+in a validated/signed/staged port, and invisible to every gate because no gate
+runs under validation. It should be its own change **with the validation layer
+as its acceptance test**.
+
+**My 9z-b retain/release work was cleared dynamically, not by reading:**
+`OBJC_DEBUG_MISSING_POOLS=YES` → **0** "autoreleased with no pool" (the pools
+really do cover every autorelease); `NSZombieEnabled=YES` → **0** messages to a
+deallocated object (nothing over-released). Plus a static audit of all 17
+ownership sites.
+
+**Reviewed, no findings:** `metal/slab_calib.inc` — `g_runlog_quiet` and the
+BOINC suspend are both reset unconditionally, the dispatch matches
+`run_pipeline`'s own `cplan.enabled` branch, and post-clamp `cplan.jmax` is what
+is reported and reused. Carried minor: `mtlEventSynchronize` uses `e->cb` after
+unlocking — safe only because events are single-threaded here.
+
 ## Drift ledger — CUDA-side changes made for this port
 
 **The ledger lives in `bench/METAL_PORT_PLAN.md` section 9, and only there.**
