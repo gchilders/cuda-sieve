@@ -4,7 +4,8 @@ Porting the CUDA NFS lattice sieve in `bench/` to Metal Shading Language for
 Apple Silicon. The plan of record is **`bench/METAL_PORT_PLAN.md`** — read it
 first; it also carries the drift ledger. This file carries the rules.
 
-**Rebased onto `main` at `75d4cf7` on 2026-09-16** (was branched at `3e15fec`).
+**Rebased onto `main` at `8b62c81` on 2026-09-17** (branched at `3e15fec`,
+rebased onto `75d4cf7` the day before).
 `hip-port` is a reference for method, not a base: it is well behind `main`.
 
 **Rebasing means REGENERATING, and the generators' asserts are what tell you
@@ -1669,6 +1670,36 @@ the STAGE is not, because more launches means more per-launch overhead --
 **fbgen's 0.205 s is per PROCESS, not per q** -- 0.09% of a 288-q band and
 immaterial against a workunit measured in hours, though a host that restarts
 repeatedly pays it again each time (the field M1 Max restarted six times).
+
+## Rebase, 2026-09-17: the peak-launch mechanism went UPSTREAM
+
+A field **980 Ti** hit the same class of failure on CUDA -- it parked at
+`cof_chunk_floor()` (22 SMs x 6 x 256 = exactly the 33,792 in its log) and the
+launch exceeded the Windows 2 s TDR. Fixed in `cofac.cuh` itself (`8b62c81`),
+so **`cof_peak_t`, `g_cof_peak`, the round-0/slice-0 bracket and the pk0/pk1
+arming are now shared code** and this port inherits them through portlib's
+renames. `gen_cofac_host.py` shed **three whole steps** -- 122 lines removed
+against 41 added.
+
+**Two things stay Metal-only, and the second is the subtle one:**
+
+1. The **per-launch `mtlStreamFlush`**, because the watchdog here judges a
+   command buffer (9z-k). CUDA has no such object, so upstream needs nothing.
+2. **Steering the chunk on the measured launch rather than on `stage`.**
+   Upstream added a one-way VALVE at `COF_LAUNCH_TARGET_MS` (1000 ms) and
+   **deliberately left its `stage` test alone**, so that test is still
+   always-true; inherited unchanged it would park this build at the floor
+   exactly as before. So the substitution still has to happen in the generator.
+   Upstream's valve then sits below Metal's own steering as a backstop and, at
+   1000 ms against Metal's 400, should never fire.
+
+The one adaptation: upstream computes `launch_ms` inside its valve's own block,
+so the generator hoists it to function scope.
+
+**Validated:** eleven gates green (including `cbtimecheck` and the new
+`fbretrycheck`), `cofcheck.sh` **54 PASS / 0 FAIL**, worst command buffer
+**253.73 ms `[1 dispatches]`** -- the 9z-k property survives -- and the 288-q
+band `cmp`-identical at **13,485 relations / `8e79762c…`**.
 
 ## Rebase, 2026-09-16: upstream's ECM occupancy fix, and a silent kernel leak
 

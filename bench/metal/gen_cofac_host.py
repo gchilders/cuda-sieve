@@ -354,118 +354,66 @@ print('  CQ_FLUSH exposed for grid sizing')
 # larger of the two. The events are read after cofq_flush's EXISTING
 # mtlDeviceSynchronize(), so this adds no synchronisation -- only two event
 # records on one launch per side per flush.
-_peak_decl = (
-    "/* Bracket for the longest launch in a flush: round 0, slice 0, where every" + chr(10) +
-    " * record is still live. cf_run_rounds records it; cofq_flush reads it after" + chr(10) +
-    " * the device sync it already performs, so no extra stall is introduced." + chr(10) +
-    " * A file-scope pointer rather than another parameter on the template and its" + chr(10) +
-    " * dispatcher, both of which are threaded through by width. */" + chr(10) +
-    "typedef struct { mtlEvent_t a, b; int armed, fired; } cof_peak_t;" + chr(10) +
-    "static cof_peak_t *g_cof_peak;" + chr(10) + chr(10) +
-    "template <int L>" + chr(10) +
-    "static void cf_run_rounds(")
-assert src.count("template <int L>" + chr(10) + "static void cf_run_rounds(") == 1, 'cf_run_rounds shape changed'
-src = src.replace("template <int L>" + chr(10) + "static void cf_run_rounds(", _peak_decl, 1)
+# ---- the peak-launch mechanism is UPSTREAM now ---------------------------
+# cofac.cuh carries cof_peak_t, g_cof_peak, the round-0/slice-0 bracket in
+# cf_run_rounds and the pk0/pk1 arming in cofq_flush, because the same field
+# failure reached CUDA: a 980 Ti parked at cof_chunk_floor() and its launches
+# exceeded the Windows TDR. This generator used to inject all of that and now
+# inherits it -- portlib's cuda*->mtl* renames carry it across unchanged.
+#
+# What is still Metal-only, and stays here:
+#   - the per-launch mtlStreamFlush, because the watchdog here judges a COMMAND
+#     BUFFER and the stream would batch every round's launch into one (9z-k);
+#   - steering the chunk on the measured launch rather than on `stage`. Upstream
+#     added a one-way VALVE at COF_LAUNCH_TARGET_MS (1000 ms) and deliberately
+#     left its `stage` test alone, so on Metal that test would still be
+#     always-true and still park at the floor. Metal keeps its own proportional
+#     bidirectional steering at COF_CHUNK_TARGET_MS; upstream's valve sits below
+#     it as a backstop and, at 1000 ms against Metal's 400, should never fire.
 
 _lines = src.split(chr(10))
-_open = "            const uint32_t e = (n - b > step) ? b + step : n;"
-_i = [k for k, l in enumerate(_lines) if l == _open]
-assert len(_i) == 1, 'slice-loop head not unique'
-_lines.insert(_i[0] + 1,
-    "            /* The flush's worst-case launch; see g_cof_peak. */" + chr(10) +
-    "            const int _peak = (r == 0 && b == 0 && g_cof_peak" + chr(10) +
-    "                               && g_cof_peak->armed);" + chr(10) +
-    "            if (_peak) mtlEventRecord(g_cof_peak->a);")
-
 _j = [k for k, l in enumerate(_lines) if 'cf_kname(L, 0, 0)' in l]
 assert len(_j) == 1, 'rho launch not unique'
 assert _lines[_j[0] + 1].strip() == '}', 'slice-loop else-branch shape changed'
 _lines.insert(_j[0] + 2,
-    "            if (_peak) {" + chr(10) +
-    "                mtlEventRecord(g_cof_peak->b);" + chr(10) +
-    "                g_cof_peak->armed = 0; g_cof_peak->fired = 1;" + chr(10) +
-    "            }" + chr(10) +
     "            /* ONE cofactor launch per command buffer. The chunker bounds a" + chr(10) +
     "             * LAUNCH at COF_CHUNK_TARGET_MS, but macOS's interactivity" + chr(10) +
     "             * watchdog judges a COMMAND BUFFER, and the stream batches" + chr(10) +
     "             * every round's launch into one: measured here, 50 rounds of a" + chr(10) +
     "             * 244 ms launch became a single 3,180 ms submission, 4x the" + chr(10) +
-    "             * bound the chunker thought it was holding. The _peak bracket" + chr(10) +
-    "             * above hid it -- an event record commits, so the one launch" + chr(10) +
+    "             * bound the chunker thought it was holding. Upstream's _peak" + chr(10) +
+    "             * bracket hid it -- an event record commits, so the one launch" + chr(10) +
     "             * being MEASURED was the one launch not batched. See 9z-k." + chr(10) +
     "             */" + chr(10) +
     "            mtlStreamFlush(0);   /* cannot fail; sync() reports the work */")
 src = chr(10).join(_lines)
-print('  per-launch bracket added to cf_run_rounds')
+print('  per-launch flush added to cf_run_rounds')
 
-# cofq_flush: own the peak events, arm one per side, steer on the larger.
-_d_old = "    mtlEvent_t e0 = NULL, e1 = NULL, e2 = NULL;" + chr(10) + "    float t0 = 0, t1 = 0;"
-_d_new = ("    mtlEvent_t e0 = NULL, e1 = NULL, e2 = NULL;" + chr(10) +
-          "    cof_peak_t pk0 = {NULL, NULL, 0, 0}, pk1 = {NULL, NULL, 0, 0};" + chr(10) +
-          "    float t0 = 0, t1 = 0, launch_ms = 0;")
-assert _d_old in src, 'cofq_flush declarations changed'
-src = src.replace(_d_old, _d_new, 1)
+# Hoist upstream's launch_ms to function scope so the steering below can read
+# it: upstream computes it inside its valve's own block.
+_h_old = "    float t0 = 0, t1 = 0;"
+_h_new = "    float t0 = 0, t1 = 0, launch_ms = 0;"
+assert src.count(_h_old) == 1, 'cofq_flush declarations changed'
+src = src.replace(_h_old, _h_new, 1)
 
-_c_old = ("    COF_FLUSH_CK(mtlEventCreate(&e0));" + chr(10) +
-          "    COF_FLUSH_CK(mtlEventCreate(&e1));" + chr(10) +
-          "    COF_FLUSH_CK(mtlEventCreate(&e2));" + chr(10) +
-          "    COF_FLUSH_CK(mtlEventRecord(e0));")
-_c_new = ("    COF_FLUSH_CK(mtlEventCreate(&e0));" + chr(10) +
-          "    COF_FLUSH_CK(mtlEventCreate(&e1));" + chr(10) +
-          "    COF_FLUSH_CK(mtlEventCreate(&e2));" + chr(10) +
-          "    COF_FLUSH_CK(mtlEventCreate(&pk0.a)); COF_FLUSH_CK(mtlEventCreate(&pk0.b));" + chr(10) +
-          "    COF_FLUSH_CK(mtlEventCreate(&pk1.a)); COF_FLUSH_CK(mtlEventCreate(&pk1.b));" + chr(10) +
-          "    COF_FLUSH_CK(mtlEventRecord(e0));" + chr(10) +
-          "    pk0.armed = 1; g_cof_peak = &pk0;")
-assert _c_old in src, 'cofq_flush event creation changed'
-src = src.replace(_c_old, _c_new, 1)
-
-_a_old = "    MTL_LAUNCH(k_cof_gate, blocks, threads, 0, 0, n, Q->d_st0, Q->d_st1);"
-_a_new = ("    g_cof_peak = NULL;" + chr(10) + _a_old + chr(10) +
-          "    pk1.armed = 1; g_cof_peak = &pk1;")
-assert src.count(_a_old) == 1, 'k_cof_gate launch not unique'
-src = src.replace(_a_old, _a_new, 1)
-
-_r_old = ("    COF_FLUSH_CK(mtlEventElapsedTime(&t0, e0, e1));" + chr(10) +
-          "    COF_FLUSH_CK(mtlEventElapsedTime(&t1, e1, e2));")
-_r_new = (_r_old + chr(10) +
-          "    g_cof_peak = NULL;" + chr(10) +
-          "    /* The longest single launch this flush actually ran, which is what" + chr(10) +
-          "     * COF_CHUNK_TARGET_MS is about. A side with no live records never" + chr(10) +
-          "     * fires, and contributes nothing. */" + chr(10) +
-          "    {" + chr(10) +
-          "        float p = 0;" + chr(10) +
-          "        if (pk0.fired && !mtlEventElapsedTime(&p, pk0.a, pk0.b)" + chr(10) +
-          "            && p > launch_ms) launch_ms = p;" + chr(10) +
-          "        if (pk1.fired && !mtlEventElapsedTime(&p, pk1.a, pk1.b)" + chr(10) +
-          "            && p > launch_ms) launch_ms = p;" + chr(10) +
-          "    }")
-assert _r_old in src, 'elapsed-time reads changed'
-src = src.replace(_r_old, _r_new, 1)
+_v_old = "        const float launch_ms = pm0 > pm1 ? pm0 : pm1;"
+_v_new = "        launch_ms = pm0 > pm1 ? pm0 : pm1;"
+assert src.count(_v_old) == 1, "upstream's valve no longer computes launch_ms"
+src = src.replace(_v_old, _v_new, 1)
 
 _s_old = "        const float stage = t0 + t1;"
 _s_new = ("        /* The MEASURED longest launch, not t0+t1. The sum over every round" + chr(10) +
           "         * and slice of a side is not what a watchdog kills and, on a" + chr(10) +
           "         * 10-core Apple GPU, exceeds the target at every reachable chunk" + chr(10) +
           "         * size -- which made this loop park at its floor unconditionally." + chr(10) +
-          "         * Falls back to the old sum if no launch was timed, so a flush" + chr(10) +
-          "         * that never fired steers exactly as it used to. */" + chr(10) +
+          "         * Upstream left this test alone on purpose (its valve is a" + chr(10) +
+          "         * separate one-way path at a looser bound), so the substitution" + chr(10) +
+          "         * still has to happen here. Falls back to the old sum if no" + chr(10) +
+          "         * launch was timed, so a flush that never fired steers as before. */" + chr(10) +
           "        const float stage = launch_ms > 0.0f ? launch_ms : (t0 + t1);")
 assert _s_old in src, 'steering input changed'
 src = src.replace(_s_old, _s_new, 1)
-
-# cofq_flush's OWN cleanup label -- the first "done:" in the file belongs to a
-# different function, and destroying pk0/pk1 there does not compile.
-_k = src.index("const float stage = launch_ms > 0.0f")
-_d = src.index(chr(10) + "done:", _k)
-src = (src[:_d] + chr(10) + "done:" + chr(10) +
-       "    g_cof_peak = NULL;" + chr(10) +
-       "    if (pk0.a) mtlEventDestroy(pk0.a);" + chr(10) +
-       "    if (pk0.b) mtlEventDestroy(pk0.b);" + chr(10) +
-       "    if (pk1.a) mtlEventDestroy(pk1.a);" + chr(10) +
-       "    if (pk1.b) mtlEventDestroy(pk1.b);" +
-       src[_d + len(chr(10) + "done:"):])
-print('  auto chunker now steers on a measured launch duration')
+print('  auto chunker steers on the measured launch, not the side sum')
 
 # Report a launch only when it EXCEEDS the bound. The first version of this
 # printed every new maximum, which in a healthy run is a stream of lines saying

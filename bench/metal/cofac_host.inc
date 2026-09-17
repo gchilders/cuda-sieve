@@ -1030,11 +1030,49 @@ typedef struct {
  * remain CF_INCOMPLETE are requeued into the next round with a different rho
  * constant (or a fresh band of ECM sigmas) and, for rho, twice the budget --
  * so an exhausted budget is never turned into a proof of anything. */
-/* Bracket for the longest launch in a flush: round 0, slice 0, where every
- * record is still live. cf_run_rounds records it; cofq_flush reads it after
- * the device sync it already performs, so no extra stall is introduced.
- * A file-scope pointer rather than another parameter on the template and its
- * dispatcher, both of which are threaded through by width. */
+/* A LAUNCH-DURATION SAFETY VALVE (2026-09-17).
+ *
+ * COF_CHUNK_TARGET_MS is compared against `stage` -- a whole side's device
+ * time summed over every round and slice -- which is tens of times the target
+ * at ANY chunk size, so the descent test is always true and the chunk simply
+ * parks at cof_chunk_floor(). That was believed harmless because the floor is
+ * one record per thread, i.e. a full grid.
+ *
+ * It is not harmless on a slow GPU. A field 980 Ti (22 SMs) parked at exactly
+ * 22*6*256 = 33,792 records and the launch exceeded Windows' 2 s TDR:
+ *
+ *   cofactor chunk: 33792 records/launch, 4 launches per round
+ *   CUDA mtlDeviceSynchronize(): the launch timed out and was terminated
+ *
+ * The controller was already trying to save itself; its own floor stopped it.
+ * A TDR reset then destroys the context -- every later call reports the same
+ * error -- so there is no recovering in process, and prevention has to be
+ * complete.
+ *
+ * So the floor stops being an absolute clamp and becomes a preference: it
+ * still holds when nothing is wrong, and an over-bound LAUNCH may descend past
+ * it to COF_CHUNK_HARD_FLOOR. Descent is driven by a measured launch, never by
+ * `stage`, because an always-true test cannot tell a slow device from a fast
+ * one.
+ *
+ * THIS IS ONE-WAY, AND DELIBERATELY SO. A host whose launches are already
+ * under the bound never steers and behaves exactly as before -- the growth
+ * path is untouched. The authoritative build does not get a new opinion about
+ * healthy hardware out of a bug fix for sick hardware.
+ *
+ * 1000 ms is chosen against the 2 s Windows TDR default with 2x margin, not
+ * measured: nobody has established where any particular driver gives up.
+ * Metal's own bound is a different number for a different watchdog. */
+#ifndef COF_LAUNCH_TARGET_MS
+#define COF_LAUNCH_TARGET_MS  1000.0f
+#endif
+#ifndef COF_CHUNK_HARD_FLOOR
+#define COF_CHUNK_HARD_FLOOR  1024u
+#endif
+
+/* One launch, bracketed, so the valve above has something real to read. An
+ * event record forces ordering, so this measures the FIRST slice of the first
+ * round and nothing else; the rest of the flush is untouched. */
 typedef struct { mtlEvent_t a, b; int armed, fired; } cof_peak_t;
 static cof_peak_t *g_cof_peak;
 
@@ -1069,7 +1107,7 @@ static void cf_run_rounds(const mz<L> *d_n, mz<L> lim2, uint32_t lpb, uint32_t n
         const int kth = (threads < COFAC_THREADS_MAX) ? threads : COFAC_THREADS_MAX;
         for (uint32_t b = 0; b < n; b += step) {
             const uint32_t e = (n - b > step) ? b + step : n;
-            /* The flush's worst-case launch; see g_cof_peak. */
+            /* The flush's worst-case launch; see the safety valve above. */
             const int _peak = (r == 0 && b == 0 && g_cof_peak
                                && g_cof_peak->armed);
             if (_peak) mtlEventRecord(g_cof_peak->a);
@@ -1081,20 +1119,20 @@ static void cf_run_rounds(const mz<L> *d_n, mz<L> lim2, uint32_t lpb, uint32_t n
             } else {
                 MTL_LAUNCH_NAMED(cf_kname(L, 0, 0), blocks, kth, 0, 0, d_n, lim2, lpb, (uint32_t)(r + 1), S->budget << r, W->d_sel, W->d_nsel, d_status, d_fac, d_nfac, d_iters, NULL, 0, NULL, 0, 0, b, e);
             }
-            if (_peak) {
-                mtlEventRecord(g_cof_peak->b);
-                g_cof_peak->armed = 0; g_cof_peak->fired = 1;
-            }
             /* ONE cofactor launch per command buffer. The chunker bounds a
              * LAUNCH at COF_CHUNK_TARGET_MS, but macOS's interactivity
              * watchdog judges a COMMAND BUFFER, and the stream batches
              * every round's launch into one: measured here, 50 rounds of a
              * 244 ms launch became a single 3,180 ms submission, 4x the
-             * bound the chunker thought it was holding. The _peak bracket
-             * above hid it -- an event record commits, so the one launch
+             * bound the chunker thought it was holding. Upstream's _peak
+             * bracket hid it -- an event record commits, so the one launch
              * being MEASURED was the one launch not batched. See 9z-k.
              */
             mtlStreamFlush(0);   /* cannot fail; sync() reports the work */
+            if (_peak) {
+                mtlEventRecord(g_cof_peak->b);
+                g_cof_peak->armed = 0; g_cof_peak->fired = 1;
+            }
         }
     }
 }
@@ -1835,6 +1873,7 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     uint32_t nr = 0, novf = 0;
     mtlEvent_t e0 = NULL, e1 = NULL, e2 = NULL;
     cof_peak_t pk0 = {NULL, NULL, 0, 0}, pk1 = {NULL, NULL, 0, 0};
+    int valve_acted = 0;   /* declared here: COF_FLUSH_CK hides a goto done */
     float t0 = 0, t1 = 0, launch_ms = 0;
     double h0;
     int rc = -1;
@@ -1902,11 +1941,12 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
      * whatever the algebraic side does, so its side-1 job is never started. */
     g_cof_peak = NULL;
     MTL_LAUNCH(k_cof_gate, blocks, threads, 0, 0, n, Q->d_st0, Q->d_st1);
-    pk1.armed = 1; g_cof_peak = &pk1;
     COF_FLUSH_CK(mtlEventRecord(e1));
+    pk1.armed = 1; g_cof_peak = &pk1;
     if (cf_run_rounds_dyn(Q->L1, Q->d_c1, lim1, lpb1, n, Q->d_st1,
                           Q->d_sp1, Q->d_nsp1, &S1, &W, NULL, blocks, threads))
         goto done;
+    g_cof_peak = NULL;
     COF_FLUSH_CK(mtlEventRecord(e2));
 
     /* Instrumentation, not accounting: recorded after e2 so it cannot land in
@@ -1921,17 +1961,6 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     COF_FLUSH_CK(mtlDeviceSynchronize()); COF_FLUSH_CK(mtlGetLastError());
     COF_FLUSH_CK(mtlEventElapsedTime(&t0, e0, e1));
     COF_FLUSH_CK(mtlEventElapsedTime(&t1, e1, e2));
-    g_cof_peak = NULL;
-    /* The longest single launch this flush actually ran, which is what
-     * COF_CHUNK_TARGET_MS is about. A side with no live records never
-     * fires, and contributes nothing. */
-    {
-        float p = 0;
-        if (pk0.fired && !mtlEventElapsedTime(&p, pk0.a, pk0.b)
-            && p > launch_ms) launch_ms = p;
-        if (pk1.fired && !mtlEventElapsedTime(&p, pk1.a, pk1.b)
-            && p > launch_ms) launch_ms = p;
-    }
     Q->ms_rat += t0; Q->ms_alg += t1;
     if (launch_ms > COF_CHUNK_TARGET_MS && launch_ms > Q->ms_launch_max) {
         Q->ms_launch_max = launch_ms;
@@ -1942,6 +1971,43 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
                 Q->chunk_cur < n ? Q->chunk_cur : n, n);
     }
 
+    /* ---- the safety valve: an over-bound LAUNCH may descend past the floor -
+     *
+     * Ahead of the ordinary steering below, and independent of it: this is the
+     * only path that may go below cof_chunk_floor(), and it fires only on a
+     * measured launch that actually exceeded the bound. On hardware that never
+     * does, nothing here executes and the behaviour is bit-for-bit what it was.
+     */
+    if (!chunk) {
+        float pm0 = 0.0f, pm1 = 0.0f;
+        if (pk0.fired) COF_FLUSH_CK(mtlEventElapsedTime(&pm0, pk0.a, pk0.b));
+        if (pk1.fired) COF_FLUSH_CK(mtlEventElapsedTime(&pm1, pk1.a, pk1.b));
+        launch_ms = pm0 > pm1 ? pm0 : pm1;
+        if (launch_ms > COF_LAUNCH_TARGET_MS) {
+            /* Proportional, at 0.8x the bound: from a large overshoot this
+             * lands in one flush where halving needs several, and every flush
+             * spent descending is a flush run at a size already known to be
+             * dangerous. */
+            const double want = (double)Q->chunk_cur
+                              * ((double)COF_LAUNCH_TARGET_MS * 0.8)
+                              / (double)launch_ms;
+            uint32_t next = want < (double)COF_CHUNK_HARD_FLOOR
+                          ? COF_CHUNK_HARD_FLOOR : (uint32_t)want;
+            if (next >= Q->chunk_cur) next = Q->chunk_cur / 2;   /* always move */
+            if (next < COF_CHUNK_HARD_FLOOR) next = COF_CHUNK_HARD_FLOOR;
+            if (next != Q->chunk_cur) {
+                fprintf(stderr,
+                        "  cofactor: kernel launch %.0f ms is over this build's"
+                        " %.0f ms bound; %u -> %u records/launch\n",
+                        (double)launch_ms, (double)COF_LAUNCH_TARGET_MS,
+                        Q->chunk_cur, next);
+                Q->chunk_cur = next;
+                S.chunk = Q->chunk_cur;
+                valve_acted = 1;
+            }
+        }
+    }
+
     /* Steer the NEXT flush. Only in auto mode, and only ever between flushes,
      * so the slice is fixed for the whole of the one just measured.
      *
@@ -1950,15 +2016,17 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
      * band runs many of them. The floor is the real protection -- a device slow
      * enough to stay over budget simply parks there, which is the free point
      * for it, and a device fast enough grows to one slice and stops. */
-    if (!chunk) {
+    if (!chunk && !valve_acted) {
         const uint32_t floor_ch = cof_chunk_floor(blocks, threads);
         const uint32_t was = Q->chunk_cur;
         /* The MEASURED longest launch, not t0+t1. The sum over every round
          * and slice of a side is not what a watchdog kills and, on a
          * 10-core Apple GPU, exceeds the target at every reachable chunk
          * size -- which made this loop park at its floor unconditionally.
-         * Falls back to the old sum if no launch was timed, so a flush
-         * that never fired steers exactly as it used to. */
+         * Upstream left this test alone on purpose (its valve is a
+         * separate one-way path at a looser bound), so the substitution
+         * still has to happen here. Falls back to the old sum if no
+         * launch was timed, so a flush that never fired steers as before. */
         const float stage = launch_ms > 0.0f ? launch_ms : (t0 + t1);
         if (Q->chunk_parked) {
             /* Descent already proved useless at this size; see below. */
@@ -2078,11 +2146,11 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     rc = 0;
 
 done:
-    g_cof_peak = NULL;
     if (pk0.a) mtlEventDestroy(pk0.a);
     if (pk0.b) mtlEventDestroy(pk0.b);
     if (pk1.a) mtlEventDestroy(pk1.a);
     if (pk1.b) mtlEventDestroy(pk1.b);
+    g_cof_peak = NULL;
     if (e0 && CUDA_CHECKED(mtlEventDestroy(e0)) && rc == 0) rc = -1;
     if (e1 && CUDA_CHECKED(mtlEventDestroy(e1)) && rc == 0) rc = -1;
     if (e2 && CUDA_CHECKED(mtlEventDestroy(e2)) && rc == 0) rc = -1;
