@@ -262,144 +262,58 @@ print('  fbgen device messages name Metal')
 # allocation registry -- an interior pointer resolves to (buffer, offset) at
 # bind time, which is exactly what the registry is for -- so the device side
 # is untouched and fbgen_gpu.cu stays as it is.
-_rf_old = chr(10).join([
-    "        {",
-    "            const uint32_t ablocks = std::min<uint32_t>((nprime + 127u) / 128u,",
-    "                                                        (uint32_t)prop.multiProcessorCount * 8u);",
-    "            if (P->deg <= 6)",
-    "                MTL_LAUNCH(k_alg_roots_fixed_mark_6_1, ablocks, 128, 0, 0, d_primes, nprime, d_rootbuf, d_counts, d_special, d_failures, (const gpu_big_t *)mtlGetSymbol(\"c_alg\"), *(const int *)mtlGetSymbol(\"c_alg_deg\"));",
-    "            else",
-    "                MTL_LAUNCH(k_alg_roots_fixed_mark_8_1, ablocks, 128, 0, 0, d_primes, nprime, d_rootbuf, d_counts, d_special, d_failures, (const gpu_big_t *)mtlGetSymbol(\"c_alg\"), *(const int *)mtlGetSymbol(\"c_alg_deg\"));",
-    "        }"])
-_rf_new = chr(10).join([
-    "        {",
-    "            const uint32_t ablocks = std::min<uint32_t>((nprime + 127u) / 128u,",
-    "                                                        (uint32_t)prop.multiProcessorCount * 8u);",
-    "            /* SLICED AND STEERED. macOS's interactivity watchdog judges a",
-    "             * COMMAND BUFFER, so each slice is flushed; the flush is half",
-    "             * the mechanism and the slice SIZE is the other half.",
-    "             *",
-    "             * The size is MEASURED, not chosen. A fixed grid-stride count",
-    "             * does not transfer between devices: one stride covers `wave`",
-    "             * primes and wave scales with core count, so 16 strides was",
-    "             * 130 ms on this 10-core M3 and an estimated 560-840 ms across",
-    "             * the M1 family -- over the bound, and near the ~800 ms at",
-    "             * which field tasks were actually killed. That is 9z-j's error",
-    "             * one level up: 9z-j replaced a fixed prime count with a fixed",
-    "             * stride count and assumed strides were the device-independent",
-    "             * unit. They are not. Nothing here is.",
-    "             *",
-    "             * So start at a size safe on the slowest device there is field",
-    "             * data for, and let the measurement move it -- exactly as",
-    "             * cofq_flush steers the cofactor chunk. See plan 9z-o. */",
-    "            const uint32_t wave = ablocks * 128u;",
-    "            for (uint32_t off = 0; off < nprime; ) {",
-    "                const uint64_t step64 = (uint64_t)wave * g_fb_strides;",
-    "                const uint32_t step = step64 >= nprime ? nprime : (uint32_t)step64;",
-    "                const uint32_t cnt = (nprime - off) < step ? (nprime - off) : step;",
-    "                const uint32_t sb = std::min<uint32_t>((cnt + 127u) / 128u, ablocks);",
-    "                uint32_t *r_off = d_rootbuf + (size_t)off * GPU_FB_MAX_ROOTS;",
-    "                if (P->deg <= 6)",
-    "                    MTL_LAUNCH(k_alg_roots_fixed_mark_6_1, sb, 128, 0, 0, d_primes + off, cnt, r_off, d_counts + off, d_special + off, d_failures, (const gpu_big_t *)mtlGetSymbol(\"c_alg\"), *(const int *)mtlGetSymbol(\"c_alg_deg\"));",
-    "                else",
-    "                    MTL_LAUNCH(k_alg_roots_fixed_mark_8_1, sb, 128, 0, 0, d_primes + off, cnt, r_off, d_counts + off, d_special + off, d_failures, (const gpu_big_t *)mtlGetSymbol(\"c_alg\"), *(const int *)mtlGetSymbol(\"c_alg_deg\"));",
-    "                MTL_OR_DIE(mtlStreamFlush(0));",
-    "                off += cnt;",
-    "            }",
-    "        }"])
+# ---- the root-finder slicing is UPSTREAM now -----------------------------
+# fbgen_gpu.cu slices the root finder itself and steers the slice from a
+# measured launch, because the same problem reached CUDA: one launch per
+# segment makes a display-driving card stutter for the whole of factor-base
+# generation. So FB_ROOTS_STRIDES_START/MAX, FB_LAUNCH_TARGET_MS, g_fb_strides,
+# fb_steer_strides() and the event bracket all arrive through portlib's
+# renames, and this generator inherits them.
+#
+# Upstream's event bracket works here without adaptation, and is arguably a
+# better fit than the drain query it replaces: on Metal an event record COMMITS
+# the stream's command buffer, so bracketing slice 0 puts that slice in a
+# buffer of its own and mtlEventElapsedTime measures exactly its GPU duration.
+#
+# TWO THINGS REMAIN METAL-ONLY:
 
-assert _rf_old in s, 'root-finder launch shape changed'
-s = s.replace(_rf_old, _rf_new, 1)
+_f_old = "                if (tm) { mtlEventRecord(fb_ev_b); sliced = 1; }"
+_f_new = (_f_old + chr(10) +
+    "                /* ONE slice per command buffer. CUDA needs nothing here:" + chr(10) +
+    "                 * a kernel launch is already the unit its watchdog sees." + chr(10) +
+    "                 * On Metal the watchdog judges a COMMAND BUFFER and the" + chr(10) +
+    "                 * stream batches every slice into one, so without this the" + chr(10) +
+    "                 * slicing bounds nothing at all -- measured, 9z-j/9z-k." + chr(10) +
+    "                 * The bracket above commits around slice 0 by itself; the" + chr(10) +
+    "                 * rest need this. */" + chr(10) +
+    "                MTL_OR_DIE(mtlStreamFlush(0));")
+assert s.count(_f_old) == 1, 'upstream slice loop shape changed'
+s = s.replace(_f_old, _f_new, 1)
+print('  one command buffer per root-finder slice')
 
-_k_old = "#define GPU_FB_MAX_ROOTS (BENCH_MAX_DEGREE + 1)"
+# A killed segment is REDONE. CUDA cannot do this -- a TDR reset destroys the
+# context -- but macOS's interactivity kill leaves the device usable, and the
+# root finder is idempotent: d_rootbuf, d_counts and d_special are indexed by
+# prime and simply rewritten, d_failures is re-zeroed, and nothing has reached
+# the sink yet. A field M2 lost a whole workunit to two killed buffers at 60%
+# of a 250M factor base.
+_k_old = "#ifndef FB_ROOTS_STRIDES_START"
 _k_new = chr(10).join([
-    "#define GPU_FB_MAX_ROOTS (BENCH_MAX_DEGREE + 1)",
-    "",
-    "/* Grid-strides per root-finder SUBMISSION -- a STARTING POINT, not a",
-    " * constant. 4 is safe on the slowest device this port has field data for:",
-    " * an estimated 140-210 ms across the M1 family, where 16 strides measured",
-    " * 560-840 ms. A faster part is raised by the controller within one or two",
-    " * submissions, so starting low costs almost nothing. */",
-    "#ifndef FB_ROOTS_STRIDES_START",
-    "#define FB_ROOTS_STRIDES_START 4u",
-    "#endif",
-    "/* A ceiling, so a mismeasurement cannot run away. ~8x what a 10-core M3",
-    " * settles at. */",
-    "#ifndef FB_ROOTS_STRIDES_MAX",
-    "#define FB_ROOTS_STRIDES_MAX 256u",
-    "#endif",
     "/* Attempts at one segment before giving up. The watchdog that motivates",
     " * the retry is contention-dependent, so a couple of halvings is normally",
-    " * enough; a bound that is NOT transient (a page fault, say) then costs",
-    " * four quick attempts instead of hanging. */",
+    " * enough; a bound that is NOT transient then costs four quick attempts",
+    " * instead of hanging. Metal-only: see the note in gen_fbgen_host.py. */",
     "#ifndef FB_ROOTS_MAX_ATTEMPTS",
     "#define FB_ROOTS_MAX_ATTEMPTS 4",
     "#endif",
     "",
-    "static uint32_t g_fb_strides = FB_ROOTS_STRIDES_START;",
-    "static float    g_fb_launch_max;          /* worst over-bound launch reported */",
-    "static unsigned long long g_fb_seen_seq;  /* last submission steered on */",
-    "",
-    "/* Steer the slice size from the last COMPLETED submission. Proportional,",
-    " * aiming at 0.8x the bound, with the dead band cofq_flush uses: act when",
-    " * the measurement is over target or under a quarter of it, else leave it.",
-    " *",
-    " * THE seq TEST IS NOT OPTIONAL. The reading is one or two submissions",
-    " * stale, so steering twice on the same measurement applies the same",
-    " * correction twice: a 4 -> 38 grow would become 4 -> 38 -> 256, a",
-    " * multi-second command buffer, which is exactly what the bound exists to",
-    " * prevent. One measurement, one adjustment. */",
-    "static void fb_steer_strides(const char *who)",
-    "{",
-    "    const float bound  = MTL_INTERACTIVITY_BOUND_MS;",
-    "    const float target = bound * 0.8f;",
-    "    float ms = 0.0f;",
-    "    unsigned long long seq = 0;",
-    "    if (mtlStreamWorstMs(0, &ms, &seq) != mtlSuccess) return;",
-    "    if (ms <= 0.0f || seq <= g_fb_seen_seq) return;   /* nothing new */",
-    "    g_fb_seen_seq = seq;",
-    "    if (ms > bound && ms > g_fb_launch_max) {",
-    "        g_fb_launch_max = ms;",
-    "        fprintf(stderr,",
-    "                \"%s: root-finder launch %.0f ms is over this build's %.0f ms\"",
-    "                \" bound (%u grid-strides)\\n\",",
-    "                who, (double)ms, (double)bound, g_fb_strides);",
-    "    }",
-    "    if (ms <= target && ms >= target * 0.25f) return;  /* dead band */",
-    "    double want = (double)g_fb_strides * ((double)target / (double)ms);",
-    "    if (want < 1.0) want = 1.0;",
-    "    if (want > (double)FB_ROOTS_STRIDES_MAX) want = (double)FB_ROOTS_STRIDES_MAX;",
-    "    g_fb_strides = (uint32_t)want;",
-    "}"])
-
-assert _k_old in s, 'GPU_FB_MAX_ROOTS define not found'
+    "#ifndef FB_ROOTS_STRIDES_START"])
+assert s.count(_k_old) == 1, 'upstream stride knobs not found'
 s = s.replace(_k_old, _k_new, 1)
-print('  root finder sliced to bound its launch duration')
 
-# ---- steer the root finder once per segment ------------------------------
-_st_old = '        MTL_OR_DIE(mtlMemcpy(&failures, d_failures, sizeof(failures),\n                               mtlMemcpyDeviceToHost));'
-_st_new = "        MTL_OR_DIE(mtlMemcpy(&failures, d_failures, sizeof(failures),\n                               mtlMemcpyDeviceToHost));\n        /* ONE adjustment per segment, here and nowhere else: that memcpy is\n         * the sync that drains this segment's submissions, so it is the only\n         * moment their durations exist. Steering inside the slice loop reads\n         * whatever OTHER stage last drained -- the odds sieve, the select, the\n         * scan -- and each of those is a fresh measurement by the seq test's\n         * reckoning, so the controller grows on every one of them. Measured:\n         * it ran to the 256-stride ceiling inside the first segment and put\n         * the whole segment in one 788 ms command buffer, which is worse than\n         * the fixed size it replaced. */\n        fb_steer_strides(who);"
-assert _st_old in s, 'segment sync shape changed'
-s = s.replace(_st_old, _st_new, 1)
-print('  root finder steers on the segment drain')
-
-# ---- an interactivity kill is TRANSIENT: halve and redo the segment -------
-# The watchdog that kills these buffers is contention-dependent -- it fires
-# when the GPU is wanted elsewhere -- so no slice size, measured or chosen, can
-# guarantee it never fires. A field M2 lost a whole workunit to two killed
-# buffers at 60% of a 250M factor base. Recovery has to exist alongside sizing.
-#
-# The root finder is IDEMPOTENT, which is what makes this safe: d_rootbuf,
-# d_counts and d_special are indexed by prime and simply rewritten, d_failures
-# is re-zeroed, and nothing has reached the sink yet -- the scan, k_total_roots
-# and every sink->  call are still below. So re-running the loop re-derives the
-# same segment from the same inputs.
-#
-# Halving on each attempt makes the kill itself the controller's strongest
-# input: it is the one measurement that says "too long" without needing a
-# timer.
 _ra = s.index("        MTL_OR_DIE(mtlMemset(d_failures, 0, sizeof(*d_failures)));")
-_rz = s.index("        fb_steer_strides(who);", _ra) + len("        fb_steer_strides(who);")
+_rz_anchor = "            fb_timed = 0;" + chr(10) + "        }"
+_rz = s.index(_rz_anchor, _ra) + len(_rz_anchor)
 _region = s[_ra:_rz]
 
 _tail_old = ("        MTL_OR_DIE(mtlGetLastError());" + chr(10) +
@@ -409,32 +323,33 @@ _tail_new = ("        mtlError_t fb_rc = mtlGetLastError();" + chr(10) +
              "        if (fb_rc == mtlSuccess)" + chr(10) +
              "            fb_rc = mtlMemcpy(&failures, d_failures, sizeof(failures)," + chr(10) +
              "                              mtlMemcpyDeviceToHost);")
-assert _tail_old in _region, 'segment sync shape changed (retry wrap)'
+assert _tail_old in _region, 'segment sync shape changed'
 _region = _region.replace(_tail_old, _tail_new, 1)
 
-# indent the whole region one level, then wrap it in the attempt loop
-_region = chr(10).join(("    " + l) if l.strip() else l for l in _region.split(chr(10)))
-# The steer must not run on a FAILED attempt: it reads the drain that just
-# died, measures the surviving short buffers as cheap, and grows the slice
-# straight back over the halving. Measured: 34 -> halve to 17 -> steer to 256
-# -> "halve" to 128, i.e. the recovery made the next attempt four times worse.
-assert _region.rstrip().endswith("fb_steer_strides(who);"), 'steer call moved'
-_region = _region.rstrip()[:-len("fb_steer_strides(who);")].rstrip(chr(10) + " ")
+# Steer only on a SUCCESSFUL attempt: on a failed one the surviving short
+# buffers measure as cheap and the controller grows the slice straight back
+# over the halving -- measured, 34 -> 17 -> 256 -> "halve" to 128.
+_st_old = ("        if (fb_timed) {" + chr(10) +
+           "            float ms = 0.0f;" + chr(10) +
+           "            if (mtlEventElapsedTime(&ms, fb_ev_a, fb_ev_b) == mtlSuccess)" + chr(10) +
+           "                fb_steer_strides(ms);" + chr(10) +
+           "            fb_timed = 0;" + chr(10) +
+           "        }")
+assert _st_old in _region, 'upstream steer call shape changed'
+_region = _region.replace(_st_old, "        FB_STEER_PLACEHOLDER", 1)
 
-_wrapped = (
-    "        for (int fb_try = 0; ; fb_try++) {" + chr(10) +
-    "            /* Consume any error left by the previous attempt. mtlMemcpy's"
-    + chr(10) +
-    "             * failure also sets the sticky last-error, so without this the"
-    + chr(10) +
-    "             * next attempt reads it back and 'fails' again having done"
-    + chr(10) +
-    "             * nothing wrong -- measured: every injected fault produced"
-    + chr(10) +
-    "             * exactly two retries. */" + chr(10) +
-    "            (void)mtlGetLastError();" + chr(10) +
-    _region + chr(10) +
-    "            if (fb_rc == mtlSuccess) { fb_steer_strides(who); break; }" + chr(10) +
+_region = chr(10).join(("    " + l) if l.strip() else l for l in _region.split(chr(10)))
+_steer = (
+    "            if (fb_rc == mtlSuccess) {" + chr(10) +
+    "                if (fb_timed) {" + chr(10) +
+    "                    float ms = 0.0f;" + chr(10) +
+    "                    if (mtlEventElapsedTime(&ms, fb_ev_a, fb_ev_b) == mtlSuccess)" + chr(10) +
+    "                        fb_steer_strides(ms);" + chr(10) +
+    "                    fb_timed = 0;" + chr(10) +
+    "                }" + chr(10) +
+    "                break;" + chr(10) +
+    "            }" + chr(10) +
+    "            fb_timed = 0;" + chr(10) +
     "            if (fb_try + 1 >= FB_ROOTS_MAX_ATTEMPTS) {" + chr(10) +
     "                fprintf(stderr, \"%s: root finder in [%u,%u] failed %d times: %s\\n\"," + chr(10) +
     "                        who, lo, (uint32_t)hi64, fb_try + 1," + chr(10) +
@@ -445,10 +360,20 @@ _wrapped = (
     "            fprintf(stderr, \"%s: root finder in [%u,%u] did not complete (%s);\"" + chr(10) +
     "                    \" retrying at %u grid-strides\\n\"," + chr(10) +
     "                    who, lo, (uint32_t)hi64, mtlGetErrorString(fb_rc)," + chr(10) +
-    "                    g_fb_strides);" + chr(10) +
+    "                    g_fb_strides);")
+_region = _region.replace("            FB_STEER_PLACEHOLDER", "")
+_wrapped = (
+    "        for (int fb_try = 0; ; fb_try++) {" + chr(10) +
+    "            /* Consume any error left by the previous attempt: mtlMemcpy's" + chr(10) +
+    "             * failure also sets the sticky last-error, so without this the" + chr(10) +
+    "             * next attempt reads it back and 'fails' having done nothing" + chr(10) +
+    "             * wrong -- measured, every injected fault gave two retries. */" + chr(10) +
+    "            (void)mtlGetLastError();" + chr(10) +
+    _region.rstrip(chr(10)) + chr(10) +
+    _steer + chr(10) +
     "        }")
 s = s[:_ra] + _wrapped + s[_rz:]
-print('  root finder retries a killed segment at half the slice size')
+print('  killed segments are redone at half the slice size')
 
 open(OUT, 'w').write(s)
 print('re-wrote %s with macro dispatch fixed' % OUT)
