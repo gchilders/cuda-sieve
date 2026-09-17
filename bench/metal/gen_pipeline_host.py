@@ -184,6 +184,141 @@ assert _md_old in src, 'memory-diagnostic warning shape changed'
 src = src.replace(_md_old, _md_new, 1)
 print('  memory-diagnostic warning names Metal')
 
+# ---- RESUME: the progress estimator was never told about earlier sessions --
+#
+# On a restart the percent bar went back to 0 and climbed again. Everything
+# ELSE in run_pipeline_impl knows about resume -- the --target-rels stop test
+# adds base_rel ("counting only this session's would make a resumed run sieve
+# the whole target again from scratch"), the checkpoint writer and every
+# console count add base_nq -- but pipe_progress_fraction is handed neither,
+# and its own declaration comment claims base_rel/base_nq "are added to the
+# goal tests and the progress line". They reach the console line's RELATION
+# count and nothing else.
+#
+# Three of its four branches are wrong on a resumed run, for two reasons:
+#
+#   target_rels   the two BOINC call sites pass this session's relations only.
+#                 (The console call site already passes base_rel + mine, which
+#                 is why this one branch looks right from a terminal.)
+#   nq_max / nq   bench_main REDUCES cfg->nq_max by the completed count
+#                 ("--nq counts this session's q"), and nqdone restarts at 0,
+#                 so the ratio is progress through the REMAINDER.
+#   q range       bench_main overwrites cfg->qmin with the checkpoint's
+#                 next_q, so the span shrinks to what is left.
+#
+# Fixed by giving the estimator the totals. Metal-side only: pipeline.cuh and
+# bench_main.cu are untouched, so CUDA and HIP keep the behaviour they have.
+_pf_old = chr(10).join([
+    "static double pipe_progress_fraction(const bench_cfg_t *cfg, int streaming,",
+    "                                     uint32_t nq, uint32_t nqdone,",
+    "                                     uint64_t current_q,",
+    "                                     unsigned long long relations)",
+    "{",
+    "    double fraction = 0.0;",
+    "",
+    "    if (cfg->target_rels) {",
+    "        fraction = (double)relations / (double)cfg->target_rels;",
+    "    } else if (streaming && cfg->nq_max) {",
+    "        fraction = (double)nqdone / (double)cfg->nq_max;",
+    "    } else if (streaming && cfg->qmax && cfg->qmax >= cfg->qmin &&",
+    "               current_q >= cfg->qmin) {",
+    "        const double span = (double)(cfg->qmax - cfg->qmin) + 1.0;",
+    "        fraction = ((double)(current_q - cfg->qmin) + 1.0) / span;",
+    "    } else if (nq) {",
+    "        fraction = (double)nqdone / (double)nq;",
+    "    }"])
+_pf_new = chr(10).join([
+    "/* `base_nq` is what earlier sessions completed, and `relations` must be a",
+    " * total across sessions too -- every caller adds base_rel. Without both,",
+    " * a resumed run restarts the bar at 0 and climbs again, because",
+    " * bench_main has already SHRUNK the denominators: --nq is reduced by the",
+    " * completed count and qmin is moved to the checkpoint's next_q. The band",
+    " * this reports on is the operator's whole band, not this session. */",
+    "static double pipe_progress_fraction(const bench_cfg_t *cfg, int streaming,",
+    "                                     uint32_t nq, uint32_t nqdone,",
+    "                                     uint64_t current_q,",
+    "                                     unsigned long long relations,",
+    "                                     unsigned long long base_nq)",
+    "{",
+    "    double fraction = 0.0;",
+    "#ifdef PIPE_PROGRESS_IGNORE_RESUME",
+    "    /* progresscheck's control: the pre-9z-m behaviour exactly -- count",
+    "     * only this session and use the shrunken denominators. A gate whose",
+    "     * control cannot fail proves nothing. Never defined in a real build. */",
+    "    base_nq = 0;",
+    "#endif",
+    "    /* The band's original lower bound. cfg->qmin is the RESUMED one; the",
+    "     * original is kept aside by bench_main because nothing else needed",
+    "     * it, and 0 means this band never resumed. */",
+    "#ifdef PIPE_PROGRESS_IGNORE_RESUME",
+    "    const uint64_t q0 = cfg->qmin;",
+    "#else",
+    "    const uint64_t q0 = cfg->resume_qmin ? cfg->resume_qmin : cfg->qmin;",
+    "#endif",
+    "    const double done_q = (double)base_nq + (double)nqdone;",
+    "",
+    "    if (cfg->target_rels) {",
+    "        fraction = (double)relations / (double)cfg->target_rels;",
+    "    } else if (streaming && cfg->nq_max) {",
+    "        fraction = done_q / ((double)base_nq + (double)cfg->nq_max);",
+    "    } else if (streaming && cfg->qmax && cfg->qmax >= q0 &&",
+    "               current_q >= q0) {",
+    "        const double span = (double)(cfg->qmax - q0) + 1.0;",
+    "        fraction = ((double)(current_q - q0) + 1.0) / span;",
+    "    } else if (nq || base_nq) {",
+    "        fraction = done_q / ((double)base_nq + (double)nq);",
+    "    }"])
+assert _pf_old in src, 'pipe_progress_fraction shape changed'
+src = src.replace(_pf_old, _pf_new, 1)
+
+# The per-second BOINC report: this session's relations only, and no base_nq.
+_b1_old = chr(10).join([
+    "            const unsigned long long progress_rels = cfg->cofactor",
+    "                ? Q.nrel : (unsigned long long)acc_rel;"])
+_b1_new = chr(10).join([
+    "            /* base_rel, exactly as the --target-rels stop test does it a",
+    "             * few lines below. Without it a resumed run reports progress",
+    "             * towards the target as though it had produced nothing. */",
+    "            const unsigned long long progress_rels = base_rel + (cfg->cofactor",
+    "                ? Q.nrel : (unsigned long long)acc_rel);"])
+assert _b1_old in src, 'BOINC progress_rels shape changed'
+src = src.replace(_b1_old, _b1_new, 1)
+
+_c1_old = chr(10).join([
+    "                double fraction = pipe_progress_fraction(",
+    "                    cfg, qgen != NULL, nq, nqdone, cur->q, progress_rels);"])
+_c1_new = chr(10).join([
+    "                double fraction = pipe_progress_fraction(",
+    "                    cfg, qgen != NULL, nq, nqdone, cur->q, progress_rels,",
+    "                    base_nq);"])
+assert _c1_old in src, 'BOINC per-second call shape changed'
+src = src.replace(_c1_old, _c1_new, 1)
+
+# The console line already totals relations; it was missing base_nq only.
+_c2_old = chr(10).join([
+    "            frac = pipe_progress_fraction(cfg, qgen != NULL, nq, nqdone,",
+    "                                             cur->q, rels);"])
+_c2_new = chr(10).join([
+    "            frac = pipe_progress_fraction(cfg, qgen != NULL, nq, nqdone,",
+    "                                             cur->q, rels, base_nq);"])
+assert _c2_old in src, 'console progress call shape changed'
+src = src.replace(_c2_old, _c2_new, 1)
+
+# End-of-band BOINC report: same two omissions as the per-second one.
+_c3_old = chr(10).join([
+    "        const unsigned long long rels = cfg->cofactor",
+    "            ? Q.nrel : (unsigned long long)acc_rel;",
+    "        double fraction = pipe_progress_fraction(",
+    "            cfg, qgen != NULL, nq, nqdone, last_q.q, rels);"])
+_c3_new = chr(10).join([
+    "        const unsigned long long rels = base_rel + (cfg->cofactor",
+    "            ? Q.nrel : (unsigned long long)acc_rel);",
+    "        double fraction = pipe_progress_fraction(",
+    "            cfg, qgen != NULL, nq, nqdone, last_q.q, rels, base_nq);"])
+assert _c3_old in src, 'end-of-band BOINC call shape changed'
+src = src.replace(_c3_old, _c3_new, 1)
+print('  progress estimator now counts earlier sessions (resume)')
+
 open(OUT, 'w').write(src)
 print('wrote %s (%d lines, %d launches rewritten)' % (OUT, src.count('\n'), nl))
 left = sorted(set(re.findall(r'\bcuda[A-Z]\w*', src)))
