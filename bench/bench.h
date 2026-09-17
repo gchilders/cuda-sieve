@@ -716,6 +716,12 @@ typedef struct {
     uint64_t resume_q, resume_rho;
     unsigned long long resume_rel_bytes, resume_cand_bytes;
     unsigned long long resume_nrel, resume_nq;
+    /* The band's ORIGINAL --qrange lower bound, before resume overwrote
+     * cfg.qmin with the checkpoint's next_q. Kept because the progress
+     * estimator needs the whole band's span to report a resumed run's
+     * position in it, and nothing else did. 0 = this band never resumed, so
+     * cfg.qmin is already the original. */
+    uint64_t resume_qmin;
 } bench_cfg_t;
 
 #define FILL_ATOMIC   0     /* (a) direct global atomicAdd per record   */
@@ -873,6 +879,16 @@ typedef struct {
  * on that side. */
 #define APPLY_THREADS_DEFAULT 512
 #define APPLY_THREADS_MAX     512
+
+/* k_cofac's block-size ceiling. Same rule as APPLY_THREADS_MAX: it is the first
+ * argument of k_cofac's __launch_bounds__(256, 2) in cofac.cuh, and a launch
+ * with more threads per block fails outright (measured: --threads 512 died with
+ * "invalid argument" at the first cofactor flush). Unlike apply there is no
+ * separate flag -- k_cofac launches at --threads -- so cf_run_rounds and
+ * cof_chunk_floor CLAMP to this rather than refusing a wider --threads, which
+ * every other kernel may still use. Keep in step with the annotation
+ * (finding 97). */
+#define COFAC_THREADS_MAX     256
 
 /* k_td_record_warp's block size. Must be a multiple of 32 -- the kernel maps
  * one warp to one candidate -- and is a compile-time constant because the grid

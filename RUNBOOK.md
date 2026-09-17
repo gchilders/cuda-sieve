@@ -491,6 +491,159 @@ time to a filterable matrix rather than raw relations/s, see [Current size
 limits and
 j-slabbing](bench/STATUS.md#current-size-limits-and-j-slabbing).
 
+### Choosing `lpb`, `mfb` and the area — MEASURED 2026-09-15
+
+Full measurement, error bars and what is extrapolated: RESULTS findings 98 and
+**99** (99 measures the relation-growth factor that 98 had to assume — read it
+first; it briefly downgraded 98's level ranking to a tie and, after the
+difficulty control was corrected on 2026-09-16, **reinstated it**). Read those
+before acting on a margin under ~10%; several of these are inside their own
+uncertainty. Operational summary:
+
+**Get the BALANCE right before touching the level.** GNFS wants
+`lpba = lpbr + 1` or so, because the algebraic norms dominate (~252 bits against
+the rational side's ~151 on a C206) and the gap plus the third large prime on
+the algebraic side is how that is paid for. The two half-steps are not
+symmetric — measured on AS276 at q=120M:
+
+| step | what moves | wall | yield |
+|---|---|---:|---:|
+| `33/34` -> `33/35` | algebraic only | **+4.7%** | **+50.9%** |
+| `33/35` -> `34/35` | rational only | +19.4% | +31.8% |
+
+**Raising `lpba` costs a quarter of the wall of raising `lpbr` and returns more.**
+So if a job is at gap 0, fix that before anything else: a C206 test sieve going
+`33/33` -> `33/34` at fixed `mfba 96` bought +46% yield for +1.4% wall. Gap 2 is
+also fine — AS276 shipped `33/35` and **completed on it** (2026-09-16, 1.671B raw
+relations, A=32), which is the strongest evidence available that a gap-2 sizing
+is sound.
+This is the one result here that needs no relation-target assumption.
+
+**Then prefer the LOWER level, but do not pay much for it.** Moving both
+sides up one step multiplies relations/q by almost exactly **2x** (measured
+2.08 / 2.05 / 1.99 / 1.89). If a step multiplies the relations you *need* by
+`R`, time to a matrix scales as `wall_ratio * R / yield_ratio`.
+
+`R` is measured, not assumed — RESULTS finding 99 reads it off 4432 completed
+NFS@Home jobs:
+
+| | R per +1 lockstep step |
+|---|---|
+| **GNFS**, controlled on Murphy-E | **1.62-1.74x** (OLS 1.739, within-band 1.623) |
+| **SNFS**, controlled on Murphy-E | **1.65-1.70x** (OLS 1.696, within-band 1.651) |
+| either arm controlled on *digits* | 1.52 / 1.79 — **do not use**, see below |
+| ideal-count `N(lpbr)+N(lpba)` | 1.94x — an upper bound, do not use it |
+
+**Control on Murphy-E, not digits.** Digits is a proxy for difficulty, not
+difficulty. For SNFS it carries no information at all (an SNFS number's digit
+count says nothing about how hard its polynomial is) and for GNFS it is 0.832
+collinear with `lpb`, so it absorbs the effect being measured. Control both
+arms on E and they agree at **1.62-1.74**; control on digits and they split
+into GNFS 1.52 against SNFS 1.79, which is an artifact.
+
+**Carry R = 1.67.** Kyle's 75-80% rule of thumb sits just above the top of the
+range, so it is mildly conservative — the safe direction for sizing. At 1.67
+against a 2.0x yield:
+
+> **A step up pays if wall/q grows by less than ~20%** (~18% once the
+> duplicate differential below is carried). At the 1.62 and 1.74 ends the same
+> threshold is ~23% and ~15%.
+
+**The LOWER rung wins across almost the whole range.** c183 flips at R = 1.632
+and C194 at 1.612, both at the very bottom of 1.62-1.74, so above those points
+the lower rung wins by 1-2% rising to 7-9% at the top. The direction is
+settled; the size is not, and at the bottom end it is inside this harness's
+noise. **Prefer the lower rung, but do not spend effort defending a 1% margin**
+— get the balance right, cap `mfb` at 96, and check the q-span rule below,
+which is what actually rules configs out.
+
+Two smaller effects, both from finding 99, both pushing the *other* way from
+the folklore:
+
+- The **matrix** grows only ~1.13x per rung at fixed N (relations grow 1.57x).
+  Post-processing cost is not a reason to stay low; the big matrices in the
+  NFS@Home corpus track digits, not `lpb`.
+- The **unique fraction** (GNFS) falls ~1 pt per rung and ~9.8 pt going from a
+  3x to a 6x q-span, so a higher rung needs ~1.7% more RAW relations per rung
+  for the same unique count, and a wide span costs real yield.
+
+**Consider capping `mfb` at 96 to stay three-limb, at `lpb >= 32`.** 96 bits is
+`mz<3>` at any `lpb`, but the large-prime count is not `lpb`-independent:
+`ceil(96/34) = 3` so the side still runs 3LP/ECM, while `ceil(96/31) = 4`
+exceeds `CF_MAXFAC` and is refused outright. The rule is `ceil(mfb/lpb) <= 3`,
+which at `mfb 96` means `lpb >= 32`. For a side just over the boundary the cap
+declines the fourth limb. Matched bands, q=120M:
+
+| | uncapped | capped | wall | cofactor | relations |
+|---|---|---|---:|---:|---:|
+| C194 `lpba 34` | `mfba 98` | `mfba 96` | **-31%** | -62% | -5.4% |
+| AS276 `lpba 34` | `mfba 98` | `mfba 96` | -14% | -71% | -6.7% |
+| AS276 `lpba 35` | `mfba 101` | `mfba 96` | -27% | -72% | -17.2% |
+
+Roughly **3% of relations per bit of `mfb` given up.** On C194 it takes the
+`33/34` rung from 55% worse to **8% worse** — there the four-limb crossing, not
+the `lpb` increment, was carrying nearly the whole cost.
+
+**The cap is worth it only where the q-range has headroom.** It trades
+relations/q for cheaper q, which only pays if the extra q is cheap. C194 needs
+q to ~101M against `alim` 240M and the cap wins big; AS276 is already sieving
+past 600M and it is worth 3%.
+
+**A smaller area is cheaper per relation.** On AS276, doubling the area from
+`2^16 x 2^15` to NFS@Home's own `2^17 x 2^15` (8 slabs) buys ~1.5x relations
+for ~1.9x time, so **A=32 costs 19-34% more per relation** (matched 30-q bands
+on an idle box, three configs). Measure this on your own job before trusting
+the range — the three configs span 15 points.
+
+**But duplicate control caps the window, and that is what forces the area up.**
+Keep `qmax <= ~6 * qmin`. Inside AS276's real window at A=31 only `35/36`
+reaches target at all, and only at the low end of the `R` range (101% at
+R = 1.53, 77% at R = 1.75); `34/35` gets 83%/72% and everything else 60-74%. **The span limit, not
+per-relation efficiency, is what pushes you to a bigger area.** Stay small as
+long as the window is slack — which on a GPU is much longer than on a CPU,
+because our per-q transform is ~1% of wall against GGNFS's ~12% (finding 57).
+
+**Sequence for a new job.** Treat area and `lpb` as one joint choice, not a
+ladder to walk in order:
+
+1. Fix the balance first (`lpba ~ lpbr + 1`); it is nearly free and nothing
+   below is meaningful on a starved algebraic side.
+2. Fix the window you can actually queue (`qmax <= ~6 * qmin`).
+3. Of the (area, `lpb`, `mfb`) combinations that reach the relation target
+   *inside that window*, take the cheapest. Do not pick the lowest `lpb` first
+   — if a low rung only fits by sieving further than the window allows, it is
+   not a candidate, and the next step is a bigger area rather than a higher
+   `lpb`.
+4. Cap `mfb` at 96 if the capped config still reaches target; re-check, because
+   the cap costs relations and can push a marginal config out of the window —
+   on AS276 at its revised sizings both capped variants fall outside the
+   measured q-extent.
+5. Verify with `testsieve.sh` and a short band against a known corpus.
+
+**Your relation targets decide this, so get them first, and a 10% error is
+enough to change the answer.** Worked example with a known ending: AS276 was
+sized here at 1.80B unique for `33/35`, the projection said no feasible window
+existed, and the job then **completed on 1.671B raw — 0.913x that target —
+with a perfectly ordinary 6x window.** The config was never the problem; the
+sizing was. Treat a `NO WINDOW` or `INFEASIBLE` verdict as a prompt to re-check
+the target before you believe it. **Do not
+size by the ideal-count model `N(lpbr)+N(lpba)`** — finding 99 shows it counts
+the whole large-prime universe, which a real job never saturates, so it
+overstates required relations; its 1% agreement with one AS276 target was a
+coincidence. Anchor on a target you trust and step it by **1.67x** (the same for GNFS and
+SNFS), then re-check at 1.62 and 1.74: if the answer changes across that band,
+the level is a tie and you should be choosing on balance, `mfb` and window fit
+instead.
+
+Worked counter-example, so the trap is on the page: applying "lowest `lpb`
+first" to AS276 in an 80-480M window at A=31 selects `35/36`, the only config
+that reaches target there at all — and `35/36` is the **most expensive** row
+on the board at 155.5 GPU-days, against 75-103 for every other config over the
+same window (`bench/lpbsweep/window.py`). The window, not the rung, was
+binding, so the right response was a bigger area, not a higher rung. (A=32 costs 19-34% more per relation at matched extent, so a
+bigger area is not free either; what it costs in GPU-days over a whole window
+is unquantified — no A=32 bands were integrated.)
+
 ### Will it fit? VRAM sizing
 
 **`testsieve.sh` reports measured memory per geometry** (see [Sizing a job
@@ -1220,6 +1373,12 @@ all tuned at 256. At a constant 576 blocks the 5090 measures 2.711 ms at 128
 threads against 3.147 at 256 — **16%** — so tuning fill through `--threads`
 would have cost five other stages to buy one.
 
+**`--threads` above 256 does not reach the cofactor kernel.** `k_cofac` carries
+`__launch_bounds__(256, 2)`, a hard ceiling (a wider launch fails outright), so
+the cofactor rounds clamp to 256 whatever `--threads` says while every other
+kernel takes the full width. Nothing to set; just do not read a `--threads 512`
+experiment as having widened cofactorisation (RESULTS.md finding 97).
+
 Don't expect a faster card to fix a slow fill: a 5090 with 3.5× the 5070's
 hardware still returns far less than that ratio on this stage. The geometry was
 measured at one job shape (8192 buckets, 77.4M records) and plausibly moves
@@ -1248,10 +1407,15 @@ findings 48–53):
   `cudaEvent`, so they are blind to host contention: saturating this box's 16
   cores left `fill` and `apply` flat within 1% while wall clock went **24.30 →
   31.27 ms/q**. As throughput that is a **22.3% relation-rate loss**, and half
-  the cores already costs **18.4%**, so there is no safe headroom. A busy box therefore reports *perfect* kernel numbers and a
+  the cores already costs **18.4%**. A busy box therefore reports *perfect* kernel numbers and a
   bad ETA — which is exactly what a card looks like when it is fine and the
   host is not. Never compare a wall-clock or ETA figure across boxes without
   knowing the host load on both; rented and shared boxes are the risk.
+  (Those are c147 figures from August. Finding 96 measured contention on
+  c183 at `2^29` at a few percent with competing work kept to `nproc - 1`;
+  larger sieve area explains part of that drop and the rest is unexplained.
+  Treat any host load as a real, nonzero cost that the kernel timers cannot
+  see.)
 
   **The pipeline** prints `GPU-accounted / wall (excl cofac)` for this — the
   standalone does not, so a wall-clock or ETA claim has to come from a pipeline

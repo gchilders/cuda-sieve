@@ -709,3 +709,54 @@ via Event Viewer to NOT be a system crash, and it belongs to the same
 already-flagged, separate `cofac_hip.cuh`/ECM-kernel issue, not to this
 item's slab-calibration code. Flagged here for whoever eventually looks at
 that kernel, not addressed by this item.
+
+## Deliberate NON-port: `k_cofac`'s `__launch_bounds__(256, 2)` (main, 2026-09-14)
+
+main's `2bc1c6e` added `__global__ __launch_bounds__(256, 2)` to `k_cofac`,
+plus `COFAC_THREADS_MAX` (bench.h) and clamps in `cf_run_rounds` and
+`cof_chunk_floor`. **hip-port takes the bench.h macro (shared file) but NOT
+the annotation and NOT the clamps.** Recorded here rather than in CLAUDE.md's
+drift ledger because that ledger tracks what the CUDA build is MISSING, and
+this is the inverse: something the CUDA build has that this one declines.
+
+**Why it does not transfer.** Ground rule 3 -- the second argument means
+`minBlocksPerMultiprocessor` on CUDA and `MIN_WARPS_PER_EXECUTION_UNIT` on
+HIP -- is the standing reason, but it is not the interesting one here. The
+CUDA change targets a REGISTER cliff: 256 x 128 x 2 = 65,536 is exactly two
+blocks per SM, so 128 registers is the budget and ECM stage 2's shared
+denominator pushed `<3,ECM,s2>` from 126 to 130 and halved the 5070's
+occupancy. On gfx1103 that cliff does not exist, because registers are not
+what limits this kernel. Re-measured 2026-09-16 via
+`BENCH_DUMP_KERNEL_ATTRS=1` on the current build:
+
+| `k_cofac<L,method,stage2>` | regs | static smem | spill/thread | blocks/CU |
+|---|---:|---:|---:|---:|
+| `<3,rho,->` | 71 | 61440 B | 0 | 1 |
+| `<4,rho,->` | 85 | 65536 B | 32 B | 1 |
+| `<3,ECM,no-s2>` | 88 | 61440 B | 0 | 1 |
+| `<4,ECM,no-s2>` | 109 | 65536 B | 32 B | 1 |
+| `<3,ECM,s2>` | 125 | 61440 B | 352 B | 1 |
+| `<4,ECM,s2>` | 128 | 16384 B | 640 B | 4 |
+
+Five of the six sit at **1 block/CU pinned by static shared memory** (61,440
+or 65,536 B against gfx1103's flat 64 KB/CU), not by register count. A bound
+that buys registers cannot buy a second block against that ceiling, so it is
+inert at best -- and four of the six already spill 32-640 B/thread, which a
+tighter register budget can only worsen. `<4,ECM,s2>` is the one exception at
+16 KB smem and 4 blocks/CU; whether a bound helps THAT instantiation alone is
+an open question and exactly the kind item 1's sweep exists for.
+
+**Why the clamps are not needed either.** On CUDA the 256 is a hard ceiling --
+the annotation makes `--threads 512` fail outright with "invalid argument" at
+the first cofactor flush -- and the clamps exist to keep a legitimately wider
+`--threads` from killing the run. Without the annotation there is no ceiling:
+the dump above reports `maxThreads/blk = 1024` for every instantiation, and
+`--threads 512 --cofactor` was run end to end on gfx1103 (exit 0, relations
+emitted, no device error). Clamping anyway would cap the cofactor kernel at
+256 threads for no safety benefit, which is a pessimisation rather than a
+port. If item 1's sweep ever adds a HIP bound to `k_cofac`, the clamps come
+with it -- keep all three in step then, as bench.h's comment says.
+
+**What a future measurement would need**: a discrete RDNA card, not this box
+(ground rules), and the shared-memory ceiling addressed first -- at 1 block/CU
+the occupancy question is `log_region`/smem (item 2), not registers.

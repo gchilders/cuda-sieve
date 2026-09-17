@@ -1031,6 +1031,21 @@ pure arithmetic with no platform API in it, put it in a shared header from the
 start rather than forking it. pipe_progress_fraction is the counter-example --
 host-side arithmetic, zero API, duplicated for no reason.
 
+### Deliberate non-ports (the other direction)
+
+This section's table lists what the CUDA build is MISSING. The inverse also
+exists -- CUDA-side changes hip-port declines on purpose -- and those are
+recorded where the measurement that justifies them lives, not here:
+
+- `k_cofac`'s `__launch_bounds__(256, 2)` and the `COFAC_THREADS_MAX` clamps
+  (main `2bc1c6e`). hip-port takes the bench.h macro, since bench.h is shared,
+  but neither the annotation nor the clamps. The CUDA change fixes a register
+  cliff; on gfx1103 five of the six `k_cofac` instantiations are pinned to
+  1 block/CU by static shared memory, not registers, so a register-targeted
+  bound cannot buy a second block -- and `maxThreads/blk` is 1024, so there is
+  no ceiling for the clamps to protect. See `bench/HIP_TUNING_PLAN.md`,
+  "Deliberate NON-port", for the measured table and what would change the call.
+
 ### The divergences
 
 | # | CUDA file | What it is missing | HIP commit |

@@ -215,24 +215,43 @@ static uint64_t pipe_est_records(const fb_t *fb, uint32_t xmax)
  * priority matches the user-visible progress line: a relation target is the
  * goal when present; otherwise use a bounded q count/range.  Open-ended work
  * is required by bench_main to have either --target-rels or --nq, so every
- * production band has a denominator. */
+ * production band has a denominator.
+ *
+ * IT REPORTS ON THE OPERATOR'S WHOLE BAND, NOT ON THIS SESSION. That is what
+ * `base_nq` is for, and why `relations` must be a cross-session total: on a
+ * resume this used to restart the bar at 0 and climb again. Everything else
+ * here already knew about resume -- the --target-rels stop test adds
+ * base_rel, the checkpoint writer and the console counts add base_nq -- and
+ * this one function was handed neither.
+ *
+ * The denominators are the half that is easy to miss, because bench_main has
+ * ALREADY shrunk them by the time they arrive: --nq is reduced by the
+ * completed count ("--nq counts this session's q") and qmin is moved to the
+ * checkpoint's next_q, which is why the band's original lower bound has to be
+ * kept aside in cfg->resume_qmin. Measured before the fix, one run-log record
+ * read `nq=141 ... pct=18.06` -- 141 of 200 special-q done, bar at 18%. */
 static double pipe_progress_fraction(const bench_cfg_t *cfg, int streaming,
                                      uint32_t nq, uint32_t nqdone,
                                      uint64_t current_q,
-                                     unsigned long long relations)
+                                     unsigned long long relations,
+                                     unsigned long long base_nq)
 {
     double fraction = 0.0;
+    /* The band's original lower bound; 0 means this band never resumed, so
+     * cfg->qmin is already it. */
+    const uint64_t q0 = cfg->resume_qmin ? cfg->resume_qmin : cfg->qmin;
+    const double done_q = (double)base_nq + (double)nqdone;
 
     if (cfg->target_rels) {
         fraction = (double)relations / (double)cfg->target_rels;
     } else if (streaming && cfg->nq_max) {
-        fraction = (double)nqdone / (double)cfg->nq_max;
-    } else if (streaming && cfg->qmax && cfg->qmax >= cfg->qmin &&
-               current_q >= cfg->qmin) {
-        const double span = (double)(cfg->qmax - cfg->qmin) + 1.0;
-        fraction = ((double)(current_q - cfg->qmin) + 1.0) / span;
-    } else if (nq) {
-        fraction = (double)nqdone / (double)nq;
+        fraction = done_q / ((double)base_nq + (double)cfg->nq_max);
+    } else if (streaming && cfg->qmax && cfg->qmax >= q0 &&
+               current_q >= q0) {
+        const double span = (double)(cfg->qmax - q0) + 1.0;
+        fraction = ((double)(current_q - q0) + 1.0) / span;
+    } else if (nq || base_nq) {
+        fraction = done_q / ((double)base_nq + (double)nq);
     }
 
     if (!isfinite(fraction) || fraction < 0.0) return 0.0;
@@ -2941,15 +2960,19 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         norm_verbose = 0;      /* the first q's setup is printed; the rest are not */
 #ifdef HAVE_BOINC
         {
-            const unsigned long long progress_rels = cfg->cofactor
-                ? Q.nrel : (unsigned long long)acc_rel;
+            /* base_rel, exactly as the --target-rels stop test does it a
+             * few lines below: without it a resumed run reports progress
+             * towards the target as though it had produced nothing. */
+            const unsigned long long progress_rels = base_rel + (cfg->cofactor
+                ? Q.nrel : (unsigned long long)acc_rel);
             const double now = host_ms();
             const int terminal_known =
                 (!qgen && nqdone == nq) ||
                 (cfg->target_rels && progress_rels >= cfg->target_rels);
             if (now - t_boinc_report >= 1000.0 || terminal_known) {
                 double fraction = pipe_progress_fraction(
-                    cfg, qgen != NULL, nq, nqdone, cur->q, progress_rels);
+                    cfg, qgen != NULL, nq, nqdone, cur->q, progress_rels,
+                    base_nq);
                 /* Leave the final one percent for the after-band cofactor flush,
                  * output close/rename, cleanup, and bench_boinc_finish(). A
                  * successful workunit reports exactly 1.0 only after main has
@@ -3047,7 +3070,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             double frac, eta;
             if (console_due) t_report = host_ms();
             frac = pipe_progress_fraction(cfg, qgen != NULL, nq, nqdone,
-                                             cur->q, rels);
+                                             cur->q, rels, base_nq);
             if (cfg->target_rels)
                 eta = rps > 0 ? ((double)cfg->target_rels - rels) / rps : 0.0;
             else
@@ -3191,10 +3214,10 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
 
 #ifdef HAVE_BOINC
     if (!rc && nqdone) {
-        const unsigned long long rels = cfg->cofactor
-            ? Q.nrel : (unsigned long long)acc_rel;
+        const unsigned long long rels = base_rel + (cfg->cofactor
+            ? Q.nrel : (unsigned long long)acc_rel);
         double fraction = pipe_progress_fraction(
-            cfg, qgen != NULL, nq, nqdone, last_q.q, rels);
+            cfg, qgen != NULL, nq, nqdone, last_q.q, rels, base_nq);
         if (fraction > 0.99) fraction = 0.99;
         bench_boinc_fraction_done(fraction);
     }

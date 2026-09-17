@@ -2101,6 +2101,13 @@ number from another session on this box** — rerun the control.
 
 ## Finding 53 — host contention costs 29% of wall clock and every GPU counter we have is blind to it
 
+> **Not the current magnitude -- see finding 96 (2026-09-13).** These are c147
+> figures from August. Finding 56 had already measured only +6.4% wall at 15
+> spinners on c147 itself, and finding 96 measures +2.8% on c183 at `2^29`, so
+> sieve area explains only part of the gap to the +28.7% below (16 spinners);
+> the rest is unexplained. That the GPU counters cannot see contention still
+> holds.
+
 Reported by the 3090 tester: a saturated CPU leaves the CUDA timings untouched
 but moves wall clock. Reproduced here on the 5070, c147 band, 1340 q, same
 binary, load applied with N spinning shells:
@@ -2476,6 +2483,12 @@ likely difference is the competitor: pure-ALU spinners contend for scheduling
 slots and core resources, while finding 53's real workloads also contend for
 memory bandwidth and L3. Finding 53 remains canonical for the memory-bound
 case.
+
+> **This explanation does not fit finding 53's record (noted 2026-09-13,
+> finding 96).** Finding 53's load was spinning shells, not real workloads, so
+> competitor type cannot account for the gap, and finding 96 measured real
+> `I16e` sievers costing about what spinners do. Why finding 53 was so much
+> larger remains open.
 
 **`SCHED_FIFO` and `--blocking-sync` fail too, closing the list.** Run with
 root 2026-08-17, 15 spinners, four arms interleaved within each rep so the
@@ -8388,3 +8401,1325 @@ Leave `--cof-chunk` on auto. 0.72% of wall buys watchdog protection for the
 slower volunteer hardware the BOINC build targets, which is the entire point
 of the change. `--cof-chunk 131072` recovers the fraction on a dedicated run
 and is measured indistinguishable from the pre-merge single-launch path.
+
+## Finding 96 — CPU contention at c183 `2^29` costs ~3% at up to one busy thread per logical CPU and ~6% at 1.7x: about half of finding 56's c147 cost, while finding 53's size is not reproduced and stays unexplained
+
+**Date:** 2026-09-13, RTX 5070 + 9800X3D, commit `3e15fec`, rebuilt before the
+run. c183 `oracle/input.job`, area `2^29` (`--J` defaults to `2^(logI-1)`):
+
+    ./bench --pipeline --cofactor --poly ../oracle/input.job --fb1 ../oracle/c183.fb1 \
+            --logI 15 --qrange 130000000: --nq 200
+
+Findings 53 and 56 measured contention on c147 at `2^27` in August. Since
+then the job class moved up, finding 89 took the transforms off the blocking
+path, and nobody re-measured. The question was whether a busy desktop still
+costs the sieve enough to matter. **This is the canonical figure for current
+jobs; STATUS and RUNBOOK point here rather than copying the numbers.**
+
+### Arms
+
+- **I16e** -- the owner's live `ggnfs-sieve-client` queue: 12
+  `gnfs-lasieve4I16e` workers, i.e. 13 runnable threads on 16 with the feeder
+  (**below** 1:1), load average ~14.4. Three reps run back to back **before**
+  the other arms, not interleaved with them.
+- **idle, s15, s26** -- after the queue drained and a 60 s settle, interleaved
+  idle / 15 spinners / 26 spinners within each of three reps. 15 spinners plus
+  the feeder is one runnable thread per logical CPU; 26 is 1.7x subscribed.
+  (Finding 56's 1.7x arm was a different load -- 12 real sievers plus 15
+  spinners -- so only the 1:1 arm is a like-for-like comparison with it.)
+- **"Idle" was not perfectly idle.** An unrelated single-threaded `ecm` held
+  one logical CPU at 100% during the idle and spinner arms. Its CPU time at
+  09:09 (5:36 at 100%) dates its start to ~09:03, after the I16e reps ended at
+  08:56, so it was **absent** from the I16e arm. The idle/spinner penalties are
+  therefore slightly understated, and the I16e arm had one fewer competitor
+  than the idle baseline it is compared against.
+
+### Result
+
+Relations were identical in every run: 9053 over the band, 45.27 rel/q.
+"Wall" is `wall clock per q` (`acc_wall / N`, which already includes the
+in-loop cofactor flushes); percentages are against the idle mean.
+
+| arm | wall ms/q (reps) | mean | range/mean | vs idle | **rel-rate loss** | acc/wall |
+|---|---|---:|---:|---:|---:|---:|
+| idle | 81.88 / 82.09 / 82.54 | 82.17 | 0.8% | -- | -- | 0.950 |
+| 12 x `I16e` (13 on 16) | 83.60 / 85.83 / 85.17 | 84.87 | 2.6% | +3.3% | **3.2%** | 0.931 |
+| 15 spinners (1:1) | 84.22 / 84.82 / 84.47 | 84.50 | 0.7% | +2.8% | **2.8%** | 0.924 |
+| 26 spinners (1.7x) | 86.94 / 88.99 / 87.57 | 87.83 | 2.3% | +6.9% | **6.4%** | 0.886 |
+
+**Do not quote the COMPLETE wall for this.** It adds the band's final cofactor
+flush, 5.17 ms/q in every arm at 200 q, which amortises to nothing on a
+production band and dilutes the penalty (on it the losses read 3.0 / 2.6 /
+6.1%). Idle GPU utilisation was a steady 98%; the spinner arms settled at ~96%
+and ~92%. Within the interleaved arms, idle < s15 < s26 in every rep.
+
+### What it means
+
+- **At 1:1, the penalty is about half of c147's.** Finding 56's 15-spinner
+  arm on c147 at `2^27` was +6.4% wall, a 6.0% rate loss; here it is 2.8%
+  (0.46x). That is the direction finding 56's area table predicts, since host
+  work per q is fixed while GPU work scales with area. It still rises steeply
+  past one thread per CPU (2.8% -> 6.4%, ~2.3x); finding 56's c147 1.7x arm
+  (6.0% -> 12.1%, ~2.0x) used a mixed load, so the ratios are not directly
+  comparable. A C195 at `2^30` should be lower again; small jobs remain the
+  exposed case.
+- **Real `I16e` sievers are not obviously worse than spinners.** 13 runnable
+  threads of memory-heavy work cost 3.2% against 15 spinners' 2.8%, but that
+  0.4 pp difference is inside the I16e arm's own 2.6% range, that arm was not
+  interleaved, and it was compared against a baseline carrying one extra
+  competitor. Read it as "similar", not "the same".
+- **Finding 53's size is not explained.** Finding 56 attributed finding 53's
+  much larger figure to real workloads contending for memory, but **finding
+  53's loads were spinning shells too**, and finding 56 had already measured
+  only +6.4% at 15 spinners on the same c147 job. Area accounts for the step
+  from ~6% to ~3%; nothing here accounts for finding 53's +28.7%. Do not quote
+  it as the worst case for current jobs, and do not attribute it to area.
+- **`acc/wall` tracks contention coarsely, not precisely.** It orders the
+  interleaved arms (0.950 / 0.924 / 0.886), but the I16e arm reads 0.931,
+  above s15, while losing slightly more rate. Good enough to flag a contended
+  run; not good enough to rank two similar loads.
+- **Nothing here bears on item 19's environmental regression.** This run's
+  idle `acc/wall` (0.950) sits between the unregressed 0.967 and regressed
+  0.878 that finding 87 recorded (the drop finding 88 traced to the
+  environment), on newer code at a different band length, so it neither shows
+  the regression nor rules it out.
+- **Operationally:** co-scheduling ordinary NFS work at up to one thread per
+  logical CPU costs roughly 3% of relation rate on c183-class jobs. `nproc - 1`
+  remains the right rule; oversubscribing to 1.7x costs ~6%. Item 4's host
+  work is correspondingly less urgent.
+
+## Finding 97 — the cofactor queue's rise since September was a 128-register CLIFF: ECM stage 2's shared denominator crossed it on CUDA 13.4 and halved `k_cofac`'s blocks per SM. `__launch_bounds__(256, 2)` keeps the arithmetic win and the occupancy: it wins on both sm_120 cards, is neutral on an sm_86 card that had no cliff, and is md5-identical on all three
+
+**Date:** 2026-09-14. RTX 5070 (sm_120, CUDA 13.4) on base commit `39a9298`;
+rented RTX 5090 (sm_120, CUDA 13.2) and RTX 3060 (sm_86, CUDA 12.1) via
+`bench/rentalcof.sh`. Idle box for every timed arm here (load <= ~1). The
+fix is `__launch_bounds__(256, 2)` on `k_cofac` in `cofac.cuh`, plus a clamp of
+the cofactor launch to `COFAC_THREADS_MAX` so `--threads` above 256 keeps working
+(see the last bullet under "What it means").
+
+### It started as a stage breakdown
+
+Findings 90/91 were the last idle per-stage profile (2026-09-03), and several
+merges since then (`ss_first`, ECM stage 2 on a shared denominator, cofactor
+chunking) were measured only on a 4090. Three reps, `--qspan`, spread <= 0.6%:
+
+| stage, ms/q | c183 I15e (1 slab) | % wall | C194 I16/J32768 (4 slabs) | % wall |
+|---|---:|---:|---:|---:|
+| **wall** | **82.53** | | **325.51** | |
+| apply | 27.18 | 32.9% | 111.25 | 34.2% |
+| fill | 24.12 | 29.2% | 92.03 | 28.3% |
+| cofactorisation, in-loop flushes | 10.73 | 13.0% | 46.87 | 14.4% |
+| resieve + scatter | 8.50 | 10.3% | 32.30 | 9.9% |
+| transform | 3.06 | 3.7% | 6.08 | 1.9% |
+| norms + trial division | 2.95 | 3.6% | 14.81 | 4.5% |
+| host, nothing in flight | 2.88 | 3.5% | 11.51 | 3.5% |
+| `acc/wall` | 0.945 | | 0.948 | |
+
+Against finding 90's rep on the same c183 command, wall fell 92.39 -> 82.53
+(-10.7%): sieve 63.49 -> 54.36, TD device 14.49 -> 13.06 -- and **cofactor
+ROSE, 9.27 -> 10.73 ms/q (+16%)**, although the one cofactor change that
+landed was supposed to make it cheaper. That is what this finding runs down.
+(C194 dense TD 10.39 -> 14.81 against finding 78 is the 256 -> 384-bit norm
+widening, which measured +40% on `k_td` at the time; accounted for.)
+
+### Attribution: chunking ~0.4 ms, the rest ECM stage 2
+
+**Chunking** (`--cof-chunk` auto against 131072, three interleaved pairs,
+relations identical): cofactor device time 15.31 vs 14.73 (+3.9%), algebraic
+queue +5.2%, rational flat, in-loop flush +0.38 ms/q. About twice finding 95's
++1.86%, but on a different band, so this is not a regression claim. It leaves
+~1.1 ms unexplained. (The watchdog's markers were also checked and cleared:
+`wd_phase` and friends are plain stores behind an `armed` test.)
+
+**ECM stage 2** (4ae5308) has no switch, so `mz_ecm_stage2_pass` was spliced
+back to its `4ae5308^` form into an otherwise-HEAD `cofac.cuh` ("old s2"; the
+only later edits inside that function were comment-only). Both built
+identically, `GPU_ARCH=120`, ABBA:
+
+| mean ms/q | c183 HEAD | c183 old s2 | C194 HEAD | C194 old s2 |
+|---|---:|---:|---:|---:|
+| algebraic queue | 12.89 | **11.80 (-8.5%)** | 38.52 | **35.21 (-8.6%)** |
+| rational queue (control) | 2.47 | 2.46 | 12.90 | 12.90 |
+| cofactor device time | 15.43 | **14.32** | 51.60 | **48.29** |
+| wall | 83.24 | 82.44 | 328.68 | 323.49 |
+
+Four c183 pairs and two C194 pairs, arms non-overlapping, relation files
+md5-identical in every run. **On this card the "optimisation" was a net loss
+of 1.1 ms/q (c183) and 3.3 ms/q (C194)** -- exactly the unexplained residue.
+
+### The mechanism: registers, and a cliff at exactly 128
+
+`-Xptxas -v`, sm_120, CUDA 13.4:
+
+| `k_cofac<L, method, stage2>` | HEAD | old s2 |
+|---|---|---|
+| `<3,ECM,s2>` (c183 algebraic, production) | **130 reg**, 288 B stack | **126 reg**, 368 B stack |
+| `<4,ECM,s2>` (AS276 shape) | 154, 352 B | 160, 448 B |
+| every other instantiation | identical | identical |
+
+Registers are charged in 8s, so 130 costs 136 and 126 costs 128. The pipeline
+launches `k_cofac` at `cfg->threads` = 256 per block (the same grid the
+selection kernels use), and **256 x 128 x 2 = 65,536 is exactly two blocks per
+SM.** `ncu` on the production kernel confirms it is the binding limit:
+
+| `k_cofac<3,ECM,s2>`, one launch | HEAD | old s2 |
+|---|---:|---:|
+| Block Limit Registers | **1** | **2** |
+| theoretical / achieved occupancy | **16.67% / 14.11%** | 33.33% / 24.68% |
+| SM throughput | 32.23% | 33.14% |
+| launch duration | 119.62 ms | 117.70 ms |
+
+The shared denominator saves ~4.5% of instructions (4ae5308's own gfx1103
+figure; its 4090 measurement said -4.46%) and costs half the warps. On a single
+launch the two nearly cancel, which is why nobody saw it; across a band the
+occupancy loss wins.
+
+A `--threads 128` signal run was tried first and is **confounded, do not
+quote**: the grid is a fixed `SMs*6` blocks, so halving threads per block also
+halves total threads.
+
+### The fix: `__launch_bounds__(256, 2)`
+
+The same lever finding 75 used on `k_apply`. It covers all six instantiations,
+so it was priced for spill first. sm_120, CUDA 13.4: `<3,ECM,s2>` 128 reg with
+**8 B** spill; `<4,ECM,s2>` 128 reg with **88 B stores / 144 B loads**; the
+others gain registers and do not spill (rho<3> 72 -> 80, ECM<3> 82 -> 88). The
+fat build's other targets (sm_75/80/86/89/90) compile both stage-2 kernels to
+122-124 registers with **zero spill**. Timed on the 5070, three arms, ABC/CBA:
+
+| c183 mean ms/q | HEAD | old s2 | **bound** | bound vs HEAD |
+|---|---:|---:|---:|---:|
+| algebraic queue | 12.83 | 11.78 | **11.25** | **-12.3%** |
+| rational queue | 2.48 | 2.47 | 2.47 | flat |
+| cofactor device time | 15.38 | 14.32 | **13.79** | **-1.59 ms (-10.3%)** |
+| wall | 84.33 | 83.08 | **82.33** | -2.4% |
+| COMPLETE | 89.54 | 87.97 | **87.02** | -2.8% |
+
+Four rounds, wall ranges non-overlapping (bound max 82.46 < old s2 min 82.71 <
+HEAD min 83.54; HEAD drifted up after round 1, so read the device-time row).
+**Bound beats old s2 by 4.5% on the algebraic queue: it keeps the arithmetic
+win AND the second block.** With side 1 forced to 4 limbs (`--cof-limbs 4`, two
+rounds) the algebraic queue reads HEAD 20.12 / old s2 20.98 / **bound 18.47
+(-8.2%)** -- the 88/144 B spill is cheaper than the block it buys. On C194 (two
+rounds) bound's algebraic queue is 34.59 against HEAD's 38.53 (-10.2%) and
+cofactor device time 48.25 against 52.21; that session's round 2 moved wall by
+~7% in both arms from an unidentified source, so its wall is not quoted. **All
+18 c183 relation files and all 4 C194 files are md5-identical.**
+
+### Three cards, three toolkits
+
+`rentalcof.sh` built HEAD / bound / old s2 on each card's own target, gated
+identity (c183 130M, 200 q), and timed the arms interleaved at NQ 500:
+
+| card | toolkit | `<3,ECM,s2>` reg: HEAD / old s2 / bound | cofactor device, bound vs HEAD | old s2 vs HEAD |
+|---|---|---|---:|---:|
+| RTX 5070 | CUDA 13.4 | 130 / 126 / 128 (8 B spill) | **-10.3%** | -6.9% |
+| RTX 5090 | CUDA 13.2 | 150 / 122 / 128 (no spill) | **-5.2%** | -1.4% |
+| RTX 3060 | CUDA 12.1 | 118 / 116 / 109 (no spill) | **-1.0%** | **+4.6%** |
+
+5090 detail: algebraic queue 4.923 / 4.837 / **4.593**, cofactor device 6.540 /
+6.447 / **6.203**, arms non-overlapping; 4-limb algebraic queue 7.705 / 8.020 /
+**7.595** (bound's 4-limb kernel spills 60/132 B on 13.2 and still wins). One
+bound round had a 40.52 ms wall outlier with normal device times -- host noise;
+wall otherwise ~-0.9%.
+
+3060 detail: algebraic queue 15.590 / 16.547 / **15.543**, and bound's
+**rational** queue 5.243 against 5.400 (-2.9%, non-overlapping) -- unexplained;
+`ptxas` gave rho<3> 62 registers under the bound against 56 without. 4-limb
+algebraic queue 27.03 / 29.33 / 27.05. Wall is flat at 274 ms/q, where
+cofactorisation is ~7.7% of it.
+
+Every arm on every card was md5-identical, and the identity gate's hash
+(`a6545ecf84f411a7192dc30514d57f89`, 9053 relations) matched across all three
+cards -- **cross-card, cross-toolkit relation identity on sm_86 and sm_120.**
+
+### What it means
+
+- **Keep 4ae5308 and keep the bound.** Where registers do not interfere (the
+  3060, and every 4-limb case) the old stage 2 is 4-9% slower on the algebraic
+  queue, so the shared denominator is a real win. What lost on sm_120 was the
+  cliff, not the arithmetic.
+- **Where the cliff falls depends on the toolkit and the target, not on the
+  source alone.** On sm_120 the same `k_cofac<3,ECM,s2>` is 130 registers on
+  13.4, 150 on 13.2 and 168 on 12.8 (local build; the 12.8 bound gives 128 with
+  36/40 B spill) -- that is the toolkit by itself. The 3060's 118 is sm_86 on
+  12.1, so it mixes target and toolkit; 13.4's fat build puts the bounded sm_86
+  kernel at 122-124.
+  A local 13.2 build reproduced the 5090's table row for row. A hand trim to 126
+  on one toolkit could be 150 on the next; the annotation holds on all of them.
+- **The win shrinks on the wide card** (5090 -5.2% against 5070 -10.3%; old s2's
+  gain -1.4% against -6.9%). Consistent with a 5090 grid that already exceeds the
+  cofactor batch, so halved occupancy idles fewer real jobs -- inferred, not
+  measured.
+- **Check `Block Limit Registers` on every kernel launched at a fixed block
+  size**, not only `k_apply` (finding 75's lesson, again). A kernel that lands
+  one register over a power-of-two budget loses half its warps with no warning.
+- **The bound is a hard 256-thread ceiling, and the first version of this fix
+  broke `--threads` above 256** (caught in code review, reproduced: `--threads
+  512 --cofactor` died with `invalid argument` at the first cofactor flush,
+  exit 255). `k_cofac` launches at `--threads`, which accepts up to 1024, so the
+  shipped form clamps the launch to `COFAC_THREADS_MAX` (256, `bench.h`) in
+  `cf_run_rounds` and applies the same width to `cof_chunk_floor`. Every other
+  kernel still takes the full `--threads`. Same class of rule as
+  `APPLY_THREADS_MAX`, clamped rather than refused because there is no separate
+  cofactor flag.
+
+### Measured on the way, and recorded here so nobody repeats it
+
+- **`2^29` stands.** C194 slab sweep at fixed area, two reps: wall 420.4 / 362.4
+  / **331.4** / 334.4 ms/q at 1 / 2 / 4 / 8 slabs; one rep's apparent 4-8 tie
+  did not repeat.
+- **"Host, nothing in flight" does not scale per slab** (13.9-15.0 / 12.3-12.7 /
+  11.7-12.0 / 12.2-12.5 ms at 1 / 2 / 4 / 8 slabs). It tracks the job (c183 2.9,
+  C194 ~12); the per-slab lead from the stage table is dead.
+- **`ss_first` did not break `k_apply`'s register budget**: `ncu` reads 40
+  registers, Block Limit Registers 3, occupancy 99.63%, SM throughput 85.86%,
+  DRAM 10.45%, L2 6.03% -- compute-bound, not memory-bound. **The pipe mix has
+  flipped since finding 60:** Shared FMA Heavy is now 67.7% of elapsed cycles
+  (finding 60: FMA 19% of a balanced mix). `ncu`'s other estimates (52.9%
+  uncoalesced shared accesses, 39/30% global store/load strides, 7% bank
+  conflicts) point at the random scatter into the region and the thread stride
+  -- mostly inherent -- and 6.4% at non-fused FP32 in norm init.
+- **Norm init is ~25% of apply** (standalone `--stage apply --reps 100`, c183
+  algebraic side, GGNFS `.afb.0`, four rounds ABCD/DCBA): HEAD 13.41 ms (median
+  13.33), no `|.|` Horner chain and no fp64 guard 12.73 (-5.0%), `NORM_FAST_LOG2`
+  12.85 (-4.2%), `--norm const` 10.05 (-25%). Both middle arms are pricing
+  builds that change cells and cannot ship. Note `NORM_CANCEL_TOL=0.0f` does
+  NOT price the `|.|` chain -- without fast-math `0*aabs` cannot fold, so the
+  chain still runs; that is likely why finding 60 priced the guard at 1.8%. The
+  shippable form is a guard with identical decisions from a cheaper bound,
+  worth at most ~5% of apply on the algebraic side. Not built.
+
+### Method notes
+
+- **`git apply` inside a repository silently skips paths outside the cwd.** The
+  first 5090 and 3060 runs wrote their variant trees under `bench/`, `git apply`
+  resolved `bench/cofac.cuh` against the clone's root, exited 0, passed
+  `--check`, and patched nothing: three copies of HEAD, identical register tables,
+  timings equal to 0.01 ms. The tell was the register table, not the timings.
+  Fixed with `GIT_CEILING_DIRECTORIES` plus a check that every patched file
+  differs from HEAD; the local smoke run had written to `/tmp` and could not
+  see it.
+- A background runner that waited on `pgrep -f "make GPU_ARCH=120"` matched its
+  own command line and deadlocked for ~14 minutes. Wait on PIDs or sentinel
+  files, never on a pattern the waiter itself contains.
+- `bench/rentalcof.sh`, `bench/rentalcof/*.patch` (the bound and old-s2
+  variants, and the `|.|`-chain pricing patch) and `bench/rental5090.sh` were removed after
+  this finding; they live at `e47f205`. **`rentalcof.sh` predates the fix and
+  does not run against it as-is**: it exports HEAD, which is now already
+  bounded, so `cofbound.patch` no longer applies and there is no un-bounded arm.
+  Reusing it on a new card means restoring the patch directory as well and
+  replacing the bound arm with a patch that REMOVES the bound.
+
+> **RECOVERY NOTE (2026-09-16).** While editing finding 99 I truncated this
+> file with a bad string index and lost ~4,600 lines. Findings 1-97 and 99
+> were restored exactly, from git HEAD and from the current working state.
+> **This finding could not be**: it was never committed, so the only copy was
+> in a session transcript, and the newest revision there is the one below.
+> Amendments made to it on 2026-09-15/16 are NOT in this text — the BALANCE
+> section, the AS276 ranking table, the R = 1.53/1.75 chart, and the
+> level-ranking supersession. **Every one of those is restated in finding 99**,
+> which is intact, and finding 99's numbers are the current ones wherever the
+> two disagree. Treat this finding as historical until it is re-verified.
+
+## Finding 98 — moving `lpb` in lockstep is a 2x yield law, so a step up pays only where wall/q grows under ~14%: the LOWER rung wins on all three jobs. Capping `mfb` at 96 to stay three-limb recovers three quarters of the four-limb penalty where the q-range has headroom — and the q-span rule, not efficiency, is what forces the area up
+
+**Date:** 2026-09-15. RTX 5070, idle box. c183 (`oracle/input.job`) at
+`logI 15 / J 16384`; C194 and AS276 (`oracle/AS276.job`, copied in from
+`~/code/ggnfs-distributed` which is not a durable location) at
+`logI 16 / J 32768`, plus an A=32 arm at `logI 17 / J 32768`. Both sides moved
+in lockstep, each side keeping its own `mfb` offset from the job file
+(algebraic `3*lpb - 4` on all three, rational `2*lpb - 2`/`-1`).
+
+Relation targets and the 1.75x-per-step growth in required relations were
+supplied by Kyle and are an INPUT, not a measurement: 350M at c183 `31/32`,
+650M at C194 `32/33`, 1.85B at AS276 `34/35`. Filtering and linear algebra are
+outside this finding entirely.
+
+Bands measured per config: c183 20/60/120M, C194 40/120/240M, AS276
+40/120/240/400M. The AS276 400M band was added specifically to test the
+extrapolation and IS included in every AS276 fit below.
+
+**Raw data is in `work/lpbsweep/`, which is gitignored (`.gitignore:59`) and
+therefore not committed.** `results.tsv` (single-band, 100 q), `bands.tsv`
+(multi-band, 60 q), `extra.tsv` (saturation + caps, 60 q), `a32.tsv` (A=32,
+30 q) and 55 run logs. Anyone reproducing this needs to re-run; the tables
+below are the only committed record.
+
+### Band sizes differ between tables — read the methodology note first
+
+`results.tsv` is 100 q per config; every other arm is 60 q (30 q for A=32).
+Wall/q falls as a band extends upward, so **rows from different arms are not
+directly comparable** and the tables below state which arm each number is from.
+An earlier draft of this finding compared across arms in three places and drew
+wrong conclusions from all three; those are corrected in line.
+
+### The saturation gate — forcing curves and rounds changes NOTHING, exactly
+
+Every config rerun at `--ecm-curves 24 --cof-rounds 6` against the 12/4
+default, matched 60-q bands on both sides:
+
+| config | rel/q default (60 q) | rel/q forced (60 q) | delta |
+|---|---:|---:|---:|
+| c183 `31/32` | 47.18 | 47.18 | **0.00%** |
+| c183 `32/33` | 97.92 | 97.92 | **0.00%** |
+| C194 `32/33` | 101.03 | 101.03 | **0.00%** |
+| C194 `33/34` | 206.68 | 206.68 | **0.00%** |
+
+The relation counts are *identical*, not merely close. The default schedule is
+not under-provisioned on any of these, so finding 69's failure mode is absent
+and the relation counts in this finding are trustworthy. The AS276 arms have no
+matched 60-q default and so are not quoted here; their forced 60-q values are
+56.33 / 112.93 / 213.45.
+
+Two limits on what this proves, both of which an earlier draft overstated:
+
+- **It only swept upward.** Showing that more curves buy nothing proves the
+  default is not too small. It says nothing about whether it is too *large* —
+  the one-sided-tuning error finding 70 exists to expose. Whether 12/4 is above
+  saturation is UNMEASURED.
+- **It does not validate the `B1` ladder.** `B1` was left at its derived value
+  in every arm; only curves and rounds moved. A `B1` too small for the factor
+  size is precisely the failure that more curves at the same `B1` cannot
+  recover, so this is silent on the `lpb`-derived ladder.
+
+### The yield law, and the rule that falls out of it
+
+Per one-step lockstep increment, relations/q went **2.081x** (c183), **2.051x**
+(C194), **1.990x** (AS276 `33/34`->`34/35`) and **1.887x** (AS276
+`34/35`->`35/36`). Against a growth factor `R` in required relations, time to a
+filterable matrix scales as `wall_ratio * R / yield_ratio`. At `R = 1.75` and a
+2.0x yield ratio:
+
+> **A step up in `lpb` pays only if wall/q grows by less than ~14%.**
+
+Measured wall growth was +29%, +77%, +27% and +63%, so no step qualified. Note
+the threshold is not a constant: at AS276's second step the yield ratio is
+1.887, which moves it to ~7.8%. Use the ratio you measure.
+
+### The chart — cheapest feasible 6x q-window, decay integrated
+
+Each config integrated as `∫ rel(q)/ln(q) dq` over a log-linear fit to its
+bands, with the window constrained to `qmax <= 6*qmin` (Kyle's duplicate-control
+rule) and `qmax <= 2 x` the deepest measured band.
+
+| job | config | mfb | limbs | qmin -> qmax | GPU-days | vs base |
+|---|---|---|:-:|---|---:|---:|
+| c183 | **`31/32`** * | 60/92 | 3 | 24M -> 146M | **7.7** | 1.000x |
+| c183 | `32/33` | 62/95 | 3 | 20M -> 117M | 8.1 | 1.060x |
+| C194 | **`32/33`** * | 63/95 | 3 | 20M -> 117M | **22.2** | 1.000x |
+| C194 | `33/34` @96 | 65/96 | 3 | 17M -> 101M | 24.1 | 1.082x |
+| C194 | `33/34` | 65/98 | 4 | 16M -> 93M | 34.4 | 1.548x |
+| AS276 | **`33/34` @96** | 64/96 | 3 | 120M -> 705M | **105.1** | 0.942x |
+| AS276 | `33/34` | 64/98 | 4 | 111M -> 647M | 108.3 | 0.970x |
+| AS276 | `34/35` @96 | 66/96 | 3 | 120M -> 706M | 111.2 | 0.997x |
+| AS276 | `34/35` * | 66/101 | 4 | 91M -> 532M | 111.6 | 1.000x |
+| AS276 | `35/36` | 68/104 | 4 | 81M -> 473M | 152.7 | 1.368x |
+
+`*` marks the baseline the target relation count was pinned to. **For AS276
+that baseline is NOT the shipped config**: `oracle/AS276.job` ships
+`lpbr 33 / lpba 35`, a two-bit gap, and the lockstep design (33/34, 34/35,
+35/36) never sits on it. `34/35` raises `lpbr` 33->34; `33/34` lowers `lpba`
+35->34. Every AS276 `vs base` ratio is against a configuration the job has
+never run.
+
+Lower rung against higher, like for like: c183 **-6%**, C194 **-3.1%**
+uncapped (`33/34` 34.4 vs `32/33` 22.2 is -55% but that row also crosses to
+four limbs), AS276 **-3.0%** uncapped (108.3 vs 111.6). The larger margins
+quoted elsewhere fold in the `mfb` cap, which is a separate change.
+
+### `mfb` capped at 96 — NEW, and the largest single effect measured here
+
+`mfb <= 96` is three limbs regardless of `lpb` (`ceil(96/34) = 3` still runs
+ECM), so a side just over the boundary can decline the fourth limb for the
+price of the cofactors it refuses. **Matched 60-q bands at q=120M on both
+sides:**
+
+| config | wall | cofactor | rel/q | ms/rel |
+|---|---:|---:|---:|---:|
+| C194 `33/34` mfb 98 | 594.67 | 269.41 | 206.68 | 2.877 |
+| C194 `33/34` mfb **96** | 409.87 | **103.75** | 195.60 | **2.095** |
+| AS276 `33/34` mfb 98 | 373.44 | 71.87 | 50.85 | 7.344 |
+| AS276 `33/34` mfb **96** | 320.31 | **20.90** | 47.45 | **6.750** |
+| AS276 `34/35` mfb 101 | 467.16 | 155.46 | 101.13 | 4.619 |
+| AS276 `34/35` mfb **96** | 342.62 | **44.08** | 83.73 | **4.092** |
+
+Wall -31.1% / -14.2% / -26.7%; cofactor -61.5% / -70.9% / -71.6%; relations
+-5.4% / -6.7% / -17.2%. So the cap costs about **3% of relations per bit of
+`mfb` surrendered** and returns 62-72% of the cofactor stage. On C194 it takes
+the `33/34` rung from 55% worse to **8% worse** — on that job the four-limb
+crossing, not the `lpb` increment, was carrying essentially the entire cost.
+
+**Its value is set by q-range headroom, not by the width saving.** C194 needs q
+only to ~101M against `alim` 240M, so the relations the cap gives up are bought
+back cheaply. AS276 is already sieving past 600M, deep in the decay, so buying
+them back costs about what the cap saves and it is worth only 3%.
+
+### A=31 beats A=32 by 23-30% per relation on the real C208
+
+Finding 57 inferred "the GPU should prefer smaller areas than the CPU does"
+from a c183 J-doubling. Measured here on the actual target job at NFS@Home's
+own `2^17 x 2^15` shape, through the slabbed path (8 slabs), q=80M:
+
+| AS276 config | A=31 ms/rel | A=32 ms/rel | A=32 penalty |
+|---|---:|---:|---:|
+| `33/34` mfb 96 | 6.032 | 7.870 | **+30%** |
+| `33/34` mfb 98 | 6.624 | 8.288 | **+25%** |
+| `34/35` mfb 101 | 4.213 | 5.196 | **+23%** |
+
+Doubling the area buys 1.51-1.54x the relations for 1.86-2.01x the time. The
+ordering between `lpb` configs is unchanged, so the conclusions above survive
+at the production geometry.
+
+**These three ratios are the weakest numbers in the finding.** The A=32 arms
+are 30-q bands divided by 60-q and 100-q A=31 bands — mismatched extent, and
+a 30-q mean carries roughly 1.8x the sampling error of its comparator. No error
+bar is available. They are nonetheless the sole basis for the A=32 rows in the
+span discussion below.
+
+### The q-span rule is what forces the area up — not efficiency
+
+This is the part that reframes finding 57. Kyle reports AS276 was queued at
+**80-480M**; the corpus note in this repo records the swept range as
+**80,000,023-363,364,957** (4.54x). The two do not agree and the discrepancy is
+unresolved — 480M may be the queued span and 363M what came back. The
+conclusion below is stated for 80-480M and is *stronger*, not weaker, over the
+narrower recorded range.
+
+At A=31 inside 80M-480M, modelled relations as a fraction of target:
+`33/34` 82%, `33/34`@96 77%, `34/35` **94%**, `34/35`@96 78%, `35/36` 102%.
+
+The honest reading is **borderline, not categorical.** `35/36` clears by 1.6%
+and `34/35` misses by 6.2%, both inside this model's own stated bias: the
+log-linear fit under-predicted the measured 400M band by 5.74%, and these
+windows run 1.2x past it. Correcting for that flattening puts `34/35` at ~99%
+of target — feasible or nearly so at A=31, where it costs 102.8 GPU-days
+against A=32's projected best of 118.5.
+
+So the *mechanism* is real and is the answer to finding 57's open condition —
+**the duplicate-control span limit, not per-relation efficiency, is what forces
+the area up** — but the specific claim that AS276 at A=31 cannot fill its
+window is not established at the precision available here. It needs a measured
+band at 500-700M to settle.
+
+Where A=31 *is* feasible it is 11% cheaper (best 105.1 days against A=32's
+projected best 118.5), but that requires shifting the window up to 120M-705M
+rather than 80M-480M, which an externally queued job is not free to do.
+
+### What is extrapolated
+
+- **AS276 high-q.** Deepest measured band 400M; the chart's windows run to
+  647-706M. The 400M band was measured to check this: log-linear extrapolation
+  from the 120M/240M pair predicted 34.66 rel/q, measured **36.77**, so decay
+  flattens and the model is ~5.7% pessimistic — conservative, but still 1.8x
+  past the last point.
+- **C194 low-q, which an earlier draft failed to disclose.** C194's lowest band
+  is 40M but its chart windows start at 16-20M, so **25% (`32/33`), 33%
+  (`33/34`@96) and 37% (`33/34`) of the modelled relations come from below the
+  measured range**, where the fit extrapolates upward into rising yield. The
+  deeper-starting window belongs to the higher rung, so the error is not
+  symmetric between the two rows being compared, and C194 is the source of the
+  headline 55% margin.
+- **c183 high-q.** 18% of `31/32`'s modelled relations come from above its
+  deepest band (120M -> 146M).
+- **The A=32 span rows are projected** from the single-band q=80M ratios above,
+  not integrated from A=32 bands.
+
+### What is not modelled
+
+- **Duplicates, at all.** Every relation count is raw; within a 100-q band there
+  are none. Duplicate rate rises with `lpb`, so this biases toward the higher
+  rungs and the lower-rung advantage is if anything understated.
+- **Run-to-run variance.** Nine genuine repeat pairs exist (the capped configs
+  were run twice): wall spread **up to 1.65%, mean 0.86%**. Relation counts are
+  **identical** across every repeat, so rel/q is deterministic and only wall
+  varies. An earlier draft cited "0.7% with one 6% thermal outlier" from c183
+  `31/32` at q=120M reading 90.93 and 96.52 — those are a 100-q and a 60-q
+  band, not a repeat, and the gap is band extent, not thermals.
+
+### A correction to this finding's own first draft, on finding 70
+
+The first draft claimed finding 70's c183 numbers were 26% stale, comparing
+today's 14.60 ms/q against finding 70's `lpb 32 / mfb 93` sweep row of 19.71.
+**That comparison was wrong twice.** 14.60 is the TWO-side cofactor total
+(rational 2.78 + algebraic 11.71 + readback); the algebraic side alone is
+11.71. And the like-for-like historical comparator is not the sweep row but
+finding 70's own applied table, which records the shipped c183 config at
+**14.30 ms/q stage** on 2026-08-19 — so today's 14.60 is 2% *slower*, not 26%
+faster, and no improvement from `3e15fec`..`2bc1c6e` is demonstrated here. The
+19.71-vs-14.30 gap within finding 70 itself is unexplained and was not chased.
+
+## Finding 99 — the required-relation multiplier for a lockstep `lpb` step is MEASURABLE from NFS@Home's own history, and once BOTH arms are controlled on Murphy-E rather than digits they AGREE: GNFS 1.62-1.74x, SNFS 1.65-1.70x. Digits is the wrong control for SNFS (its coefficient is 1.0000, t=-0.1) and over-controls for GNFS (corr 0.832 with lpb); controlling on digits is what produced the GNFS-1.52-vs-SNFS-1.79 split that earlier revisions called the strongest reason for doubt. Carry R = 1.62-1.74, centred ~1.67; Kyle's 1.75-1.80 rule of thumb sits just above it and is mildly conservative, which is the safe direction. The ideal-count model's 1.94x is an upper bound a real job never approaches. Across that range the LOWER rung wins on both c183 and C194, so finding 98's level ranking is reinstated. Side results: the matrix grows only 1.13x per rung against relations' 1.57x; the GNFS unique fraction falls ~1 pt per rung and ~9.8 pt from a 3x to a 6x q-span; filtering the real AS276 corpus down one lockstep rung keeps 50.8% (1.97x yield) and the mfba 101->96 cap costs 16.2% against finding 98's independently timed 17.2%. AS276 COMPLETED on 2026-09-16 at 33/35, A=32, on 1.671B raw relations over q=80-427M — 0.913x the target published here, so its NO WINDOW verdict was a 9% sizing error, and A=31 would have needed span 7.84x from the same floor, confirming finding 98's area argument from outside the harness
+
+**Date:** 2026-09-15. No sieving was run for this finding. Two external
+sources, both supplied by Kyle:
+
+- `~/code/paste-scraper/data/` — 4773 scraped NFS@Home msieve post-processing
+  logs, parsed into `parsed_results.json` (relation counts, filtering, matrix,
+  Lanczos) and joined to the NFS@Home page metadata in `results.csv`.
+  **4432 rows carry a large-prime bound**, of which **1437 GNFS / 2995 SNFS**.
+- A Google Sheet of Kyle's own dedup measurements: 55 jobs, each sieved at the
+  bottom and the top of its q-range, with the unique fraction of each band.
+
+The join key is the metadata column `bits`, which Kyle confirms is
+`max(lpba, lpbr)`. So a step in `bits` is a step in BOTH sides with the gap
+preserved — exactly the "full step up" the rule of thumb is about — and this
+corpus is a 1437-point lockstep experiment that was already sitting there.
+
+### Relations collected are a fair stand-in for relations required
+
+The question is about relations *required to comfortably complete LA*, but the
+logs only record relations *collected*. They are usable as a proxy only if
+every operator stopped at the same tightness. They did:
+
+Median `final_rels / final_ideals` by rung — both columns are that same
+excess ratio, one per sieve type, **not** a GNFS:SNFS ratio:
+
+| `lpb` | GNFS n | GNFS median | SNFS n | SNFS median |
+|---|---|---|---|---|
+| 29 | 158 | 1.0252 | 159 | 1.0271 |
+| 30 | 320 | 1.0338 | 605 | 1.0256 |
+| 31 | 337 | 1.0357 | 1217 | 1.0234 |
+| 32 | 464 | 1.0332 | 702 | 1.0279 |
+| 33 | 145 | 1.0270 | 263 | 1.0377 |
+| 34 | 11 | 1.0265 | 36 | 1.0349 |
+| 35 | 2 | 1.0152 | 8 | **1.0575** |
+
+Post-singleton excess is flat at **1.03 across every rung and both sieve
+types**, with one exception: SNFS at `lpb` 35 sits at 1.0575. That is 8 jobs at
+the top rung the corpus reaches, so it is thin rather than informative — but it
+is shown rather than trimmed, because trimming the one row that disagrees with
+a flatness claim is how such a claim stops meaning anything. Below `lpb` 35
+everyone stopped when filtering had just enough, so the *ratio* of collected
+relations between rungs is the ratio of required relations.
+
+### The headline
+
+**Everything turns on which difficulty control goes into the regression, and
+the answer (Kyle, 2026-09-16) is Murphy-E for both sieve types.** Digits is a
+proxy for difficulty, not difficulty itself. For GNFS it is a decent proxy —
+`corr(digits, lnE)` = −0.68 — so controlling on it mostly works. **For SNFS it
+carries no information at all**: an SNFS number's digit count says nothing
+about how hard its polynomial is, and `x^6 + 18x^3 − 10` at 301 digits is
+easier than plenty of 240-digit jobs. The regression agrees: put both controls
+in an SNFS fit and the digits coefficient is **1.0000 (t = −0.1)** while
+ln(E) carries **t = −11.5**.
+
+| control | GNFS OLS | GNFS within-band | SNFS OLS | SNFS within-band |
+|---|---:|---:|---:|---:|
+| on **digits** | 1.523x | 1.588x | 1.791x | 1.803x |
+| on **ln(Murphy-E)** | **1.739x** | **1.623x** | **1.696x** | **1.651x** |
+
+Both rows are the same jobs: **every one of the 4432** carries a `murphy_e`, so
+swapping the control changes the control and nothing else. (`ols()` drops rows
+with a missing regressor, which would have made this a population change as
+well as a control change; it does not here, and the script prints `n` per fit
+so it stays checkable.) The OLS columns are n = 1437 GNFS / 2995 SNFS; the
+within-band columns pool 17 and 15 adjacent-`lpb` steps.
+
+> **Control both arms on digits and they disagree wildly — GNFS 1.52 against
+> SNFS 1.79. Control both on Murphy-E and they agree: 1.62-1.74 against
+> 1.65-1.70.** The SNFS/GNFS discrepancy that earlier versions of this finding
+> called "the strongest reason for doubt" was not physics. It was the control.
+
+That also explains the direction of each bias. `corr(lpb, digits)` is **+0.832**
+for GNFS, so digits is nearly a stand-in for `lpb` there and the regression
+hands it too much of the effect, pushing R down to 1.52. For SNFS
+`corr(lpb, digits)` is only +0.483 but digits explains nothing, so it
+under-controls and leaves R too high at 1.79. Murphy-E is the better-identified
+control for GNFS (`corr(lpb, lnE)` = −0.563) and the worse one for SNFS
+(−0.880), which is why the nonparametric within-band figures matter: they never
+have to split a coefficient with a collinear control, and they agree with the
+regressions at **1.62** and **1.65**.
+
+> **Carry R as ~1.62-1.74, the same for GNFS and SNFS, centred near 1.67.**
+> Kyle's 75-80% rule of thumb sits just above the top of that, so it is mildly
+> conservative — which is the safe direction for sizing a job. The ideal-count
+> model's 1.94x remains an upper bound a real job never approaches.
+
+The quoted intervals are still sampling error only, and this corpus has two
+systematic wobbles that land directly on a step ratio:
+
+| `lpb` | 29 | 30 | 31 | 32 | 33 | 34 | 35 |
+|---|---|---|---|---|---|---|---|
+| median `uniq/start_ideals` | 1.072 | 1.190 | 1.191 | 1.070 | 1.099 | 1.114 | — |
+| median target density | 118 | 128 | 120 | 120 | 120 | 110 | **90*** |
+
+`*` AS276, outside the NFS@Home corpus: Kyle's own completed `lpb`-35 run built
+its matrix at **TD 90** (the completion section below). It is one job, not a
+median, but it extends the corpus trend rather than breaking it.
+
+Oversieve margin swings ±10% between adjacent rungs with no trend, and target
+density is not held constant either — a job filtered at TD 128 needs more
+relations than one at TD 110. **The TD column is not noise, it is a trend:
+operators loosen filtering as `lpb` rises**, so a step in `lpb` is not a step
+at constant filtering tightness, and the collected-relations ratio absorbs part
+of that, biasing measured R low. **A single measured step is good to about
+±10%**, which is roughly the width of the 1.62-1.74 band itself — so treat that
+band as the resolution of this corpus, not as four significant figures.
+
+A third estimator, fitting `ideals ~ rels^alpha` inside each band and solving
+for the crossover where relations equal ideals — an estimate of relations
+*required* rather than collected — gives **1.79x** (30→31) and **1.74x**
+(31→32) before degenerating at `lpb` 33 (alpha → 1.0, crossover → 0). It is not
+reliable enough to quote as a result, but it sits at the top of the band.
+
+Two things make the GNFS arm harder to measure and worth stating:
+
+**Collinearity.** `corr(lpb, digits)` is **+0.832** for GNFS and only **+0.483**
+for SNFS, because NFS@Home picks GNFS `lpb` almost deterministically from the
+digit count. Regressing `log(rels) ~ lpb + digits` over all GNFS therefore
+splits one effect across two nearly-parallel regressors and returns a
+meaningless 1.523x with a large 1.0188x/digit partner. Restricting to
+`digits >= 175` — where the operators actually did vary `lpb` at a fixed size —
+breaks the collinearity, and the digit coefficient collapses to **1.0079/digit**
+while `lpb` rises to 1.629x. The SNFS arm needs no such surgery, and it lands
+at **1.0003x per difficulty digit**: at fixed `lpb`, the size of the number has
+essentially NO effect on how many relations you need. That is the theoretically
+expected result and it is a good check on the whole method.
+
+**The model is an upper bound, not a target.** `N(lpbr)+N(lpba)` counts the
+large-prime *universe*. A real job never comes close to saturating it — most
+ideals below `2^lpb` are never seen twice and are dropped as singletons — so
+doubling the universe does not double the relations you need. Every measured
+estimator is below 1.94 and none approaches it. **Finding 98's suggestion that
+R "may be low" at 1.75 and should be 1.94 is withdrawn: the error is in the
+other direction.**
+
+### The matrix barely notices
+
+Same within-digit-band GNFS estimator, per +1 lockstep step:
+
+| quantity | 29→30 | 30→31 | 31→32 | 32→33 | 33→34 | pooled |
+|---|---|---|---|---|---|---|
+| bands contributing | 1 | 4 | 5 | 3 | 1 | 14 |
+| unique relations | 1.93x | 1.57x | 1.46x | 1.62x | 1.61x | **1.567x** |
+| matrix rows | 1.04x | 1.13x | 1.21x | 1.07x | 1.01x | **1.127x** |
+| Lanczos wall seconds | 0.67x | 0.83x | 0.82x | 0.53x | 1.19x | 0.760x |
+
+Every cell is a geometric mean, and the pooled column is taken over all 14
+individual step observations rather than over the five printed here, so it is
+weighted by the band counts in the first row and will not equal a naive average
+of the columns. (An earlier version printed arithmetic per-step means against a
+geometric pooled figure, so the columns did not reconcile with their own
+summary at all.) The estimator uses fixed 5-digit bands from 150 to 205
+digits, which holds **1425 of the 1437 GNFS jobs** — but only 1091 of 2995 SNFS
+ones, which is why the SNFS figures quoted above come from Murphy-E bands
+instead.
+
+At fixed N, a rung costs **+57% relations but only +12% matrix rows**, and the
+Lanczos column is pure noise across heterogeneous hardware and should not be
+read as a result. The matrix-size scare about moving up a rung is a *size*
+effect, not an `lpb` effect: across the corpus the median matrix goes
+5.0M → 7.6M → 13.1M → 35.2M rows for `lpb` 30→33, but those bands are also
+160 → 195 digits, and the regression assigns **1.046x per digit** against
+1.142x per `lpb`. **Post-processing cost is not an argument against the higher
+rung.** This is a by-product, not something this finding set out to test.
+
+### Duplicates: the unique fraction falls with q-span AND with `lpb`
+
+From Kyle's sheet, the fraction of sieved relations that survive dedup:
+
+| | at `qmin` | at `qmax` | rise |
+|---|---|---|---|
+| GNFS (n=40) | 48.9% | 68.0% | +19.0 pt |
+| SNFS (n=15) | 53.8% | 71.7% | +17.9 pt |
+
+The mechanism is visible in the fit. Fit the two sieve types **separately** —
+this whole finding turns on GNFS and SNFS behaving differently, so pooling them
+here would contradict it, and the GNFS row is the one the harness consumes:
+
+| fit | intercept | ln(span) | `lpb` | R² | n |
+|---|---:|---:|---:|---:|---:|
+| **GNFS** | 114.0 | −14.19 | **−0.98** | 0.631 | 34 |
+| SNFS | 228.0 | −17.17 | −4.29 | 0.876 | 6 |
+| pooled | 142.9 | −12.32 | −1.96 | 0.593 | 40 |
+
+Low-q relations are the *more* duplicated ones because the cofactor left after
+dividing out a small q is larger, so it more often contains a second prime
+inside the q-range and the relation gets found again there. Two consequences,
+both quoted off the GNFS row:
+
+- **span** — going from a 3x to a 6x q-span costs **9.8 pt** of unique yield.
+  This sharpens finding 98's q-span reframing: widening the range to satisfy
+  the duplicate rule is not free even in relations, let alone in wall.
+- **`lpb`** — each rung costs a further **~1 pt**, i.e. a rung needs about
+  **1.7% more RAW relations** for the same unique count. Small, but it is a
+  real bias against the higher rung that finding 98's model did not carry.
+
+> **Corrected.** An earlier version of this section fitted GNFS and SNFS
+> together and reported −1.96 pt per rung, which became `DUP_PER_RUNG` = 1.035
+> in `integrate.py`. SNFS is 6 of those 40 points carrying a slope four times
+> steeper, and every target in `integrate.py` is a GNFS job. The GNFS-only
+> slope is **−0.98 pt**, so the constant is **1.017** — half what was published.
+> The 6-point SNFS fit is far too thin to quote on its own; it is shown to make
+> clear what was dragging the pooled number, not as an SNFS result.
+
+**The two sources disagree on the LEVEL and agree on the SLOPE.** On the same
+40 jobs the sheet averages 59.3% unique while msieve's own duplicate line
+averages 78.2% — a near-constant ~19 pt apart, most likely because NFS@Home
+deduplicates server-side before msieve ever sees the files, so the sheet
+measures raw sieve output and msieve measures what is left. Both fall with
+`lpb` at a similar rate (msieve's GNFS medians run 82.0% / 79.3% / 75.3% at
+`lpb` 31 / 32 / 33). **Only the slope enters the rankings, so they are safe;
+the level does not, and it is the reason the absolute GPU-day figures in
+finding 98 should still be read as optimistic.** Which source gives the right
+absolute unique fraction is unresolved and was not chased.
+
+### What this does to finding 98
+
+`bench/lpbsweep/integrate.py` runs every job at both ends of the measured `R`
+range. The duplicate differential is folded in as `DUP_PER_RUNG` = **1.017**,
+applied to each config by its own `lpb_max` rather than by its position on a
+ladder — which matters, because AS276's gap-2 `33/35` and the whole
+ideal-count column are merged into the target set rather than generated by the
+ladder, and keying on position let them escape the correction entirely.
+
+Sweeping R — winner, its GPU-days on the 5070, and how far behind the
+runner-up is:
+
+| R | c183 | C194 | AS276 |
+|---|---|---|---|
+| 1.53 (digits-controlled, superseded) | `32/33` 7.2d, +7.3% | `33/34@96` 22.7d, +5.9% | `34/35` 130.9d, +17.8% |
+| **1.62** (bottom of the E-controlled range) | `32/33` 7.6d, +0.8% | `32/33` 24.0d, +0.5% | `34/35` 140.8d, +25.9% |
+| 1.65 | `31/32` 7.7d, +1.2% | `32/33` 24.0d, +2.6% | `34/35` 144.3d, +28.5% |
+| 1.70 | `31/32` 7.7d, +4.5% | `32/33` 24.0d, +6.0% | `35/36` 199.8d |
+| **1.74** (top of the E-controlled range) | `31/32` 7.7d, +7.2% | `32/33` 24.0d, +8.7% | `35/36` 211.5d |
+| 1.75 (the supplied rule) | `31/32` 7.7d, +7.9% | `32/33` 24.0d, +9.4% | `35/36` 214.5d |
+
+Edge-pinned rows are excluded from the ranking, per `cheapest()`'s own contract
+that a pinned cost is a lower bound and must not be ranked on. That is why
+AS276's winner jumps to `35/36` above R = 1.65: `34/35` still has the lower
+number there, but it is pinned, so it is a lower bound rather than a
+measurement. Reproduce the middle rows by editing `R_LOW`/`R_RULE` in
+`integrate.py`, which ships 1.62 and 1.74.
+
+c183 flips at **R = 1.632** and C194 at **R = 1.612**. Both sit at the very
+bottom of the 1.62-1.74 range, so **across essentially all of it the LOWER rung
+wins**, by 1-2% at the bottom and 7-9% at the top.
+
+> **Finding 98's level ranking is REINSTATED.** An earlier revision of this
+> section withdrew it, on the grounds that the measured GNFS R of 1.53-1.63
+> straddled the flip points and made the verdict a coin flip. That R came from
+> controlling GNFS on digits, which is 0.832 collinear with `lpb` and absorbs
+> much of the effect being measured. Controlled on Murphy-E, both arms give
+> 1.62-1.74, the flip points fall at the bottom edge, and the lower rung wins
+> throughout. **The withdrawal was itself the artifact.**
+>
+> What does *not* come back is the size of the margin. At the bottom of the
+> range it is under 1%, which is inside this harness's noise. The defensible
+> claim is "the lower rung wins, by somewhere between nothing and 9%" — not
+> the clean win the original finding stated.
+>
+> **The balance and `mfb`-96 results were never affected** — balance is a pure
+> ratio of wall to yield with no relation target in it, and the cap arms share
+> a target, so R cancels out of both exactly.
+
+AS276 does not participate in the flip: once the raw-vs-unique correction is
+applied uniformly its gap-2 `33/35` and its whole lower rung fall outside the
+measured q-extent, so that column reports which config still has a window
+rather than which is cheapest, and its `!` rows are edge-pinned lower bounds.
+The completed job settles it instead — see the completion section below.
+
+### How to settle this directly — filter-down from one oversieved run
+
+Kyle's idea, 2026-09-15, and it is better than any regression on this corpus:
+**sieve once at the HIGHER config, then synthesise the lower one by discarding
+relations whose large primes exceed the lower bounds.** Same polynomial, same
+q-range, same sieve area, same code — every confounder above disappears,
+because both arms are the same relations.
+
+It is sound in one direction only. A run at the higher `lpb`/`mfb` examines a
+**superset** of the survivors a lower run would examine, so filtering down is
+exact and simulating upward is not. Four things to get right:
+
+1. **Filter on `mfb` too, not just `lpb`.** Dropping relations with a prime
+   above `2^lpb` leaves a superset of a true lower run, because the higher run
+   carried a larger `mfb` and admits cofactors the lower one would reject. Also
+   drop relations whose per-side *cofactor* exceeds the lower config's `mfb`.
+   Doing both and differencing measures the `mfb` knob for free.
+
+   **The cofactor is not the product of the line.** A GGNFS relation line
+   carries the *full* factorisation of each norm, factor-base primes included;
+   `mfb` bounds only what is left after the factor base is divided out. So the
+   cofactor is the product of the primes **above `lim`**, and the relation line
+   does not say where the factor base ended — that has to come from the job
+   file. `filterdown.py` therefore requires `--lim RLIM,ALIM` whenever `--mfb`
+   is given. Multiplying every prime on the line instead puts the rational side
+   at 128-145 bits and the algebraic at 173-199, which exceeds any real `mfb`,
+   so every relation is rejected.
+2. **Subset by truncating the q-range, never by sampling relations at random.**
+   A shorter real job sieves a narrower range; random thinning keeps the wide
+   span and destroys the duplicate and ideal-coverage structure.
+3. **Keep `rlambda`/`alambda` fixed**, or the survivor sets stop corresponding.
+4. **Oversieve the upper config by the yield/requirement ratio**, ~`2.0/R` ≈
+   **1.25x per rung**. Sieving only enough for the upper config leaves the
+   filtered set short: one rung down keeps ~50% of the relations but needs
+   ~62%. You can only find a crossover by coming DOWN through it.
+
+**The pass/fail bar, calibrated on the corpus.** Post-singleton excess
+`final_rels/final_ideals` at which 1437 GNFS jobs were accepted: p10 **1.015**,
+p50 **1.03**, p90 **1.05**, flat across every rung. That is necessary, not
+sufficient — merging still has to yield cycles at a workable density — but it
+is cheap, and it means the curve can be traced without msieve: filter, run
+iterative singleton removal, count. Minutes per config instead of hours, with a
+few real msieve runs to calibrate. What an accepted GNFS matrix looks like:
+
+| `lpb` | n | rows p10 | p50 | p90 | wt/col | target density | GB |
+|---|---|---|---|---|---|---|---|
+| 31 | 338 | 5.0M | 7.7M | 11.6M | 116 | 120 | 3.3 |
+| 32 | 464 | 7.5M | 13.0M | 22.8M | 111 | 120 | 5.4 |
+| 33 | 145 | 19.6M | 35.2M | 45.0M | 120 | 120 | 15.5 |
+| 34 | 11 | 39.0M | 41.8M | 65.8M | 134 | 110 | 17.9 |
+
+**What the AS276 corpus can and cannot do.** `~/code/ggnfs-distributed/AS276/rels/`
+is 346,775 work units, 100 GB, **1,671,198,113 relations** at `33/35` over
+q = 80-426.9M — already filtered and known-good, with an exact per-work-unit
+ledger in `AS276/incoming/2026-08-26T09-26-38Z/job.db` (see the census section
+above). Sampling 12 work units spread over that range and re-deriving
+each relation's true large-prime bit lengths gives the survival rates:
+
+| filtered to | `lpb` only (superset) | + `mfb` 64/98 against `lim` 181.6M/268.4M |
+|---|---|---|
+| `33/35` (the corpus itself, `mfb` 64/101) | 100% | 92.7% |
+| `33/34` | 68.2% | 66.6% |
+| `32/35` | 76.6% | 71.0% |
+| `32/34` (one lockstep rung) | 52.1% | **50.8%** |
+| `31/33` (two rungs) | 23.9% | 23.9% |
+
+**One lockstep rung down, `33/35` at its shipped `mfb` 64/101 against a `32/34`
+run at 64/98, keeps 50.8%** — a yield ratio of **1.97x**, within 2% of the flat
+2.0x finding 98 assumed. The `lpb`-only column gives 1.92x but is a superset on
+the lower config, so 1.97x is the better number. This is an independent
+confirmation of the yield law from real GGNFS relations rather than bench
+counters.
+
+> **Corrected 2026-09-16.** The first version of this table read 55.4% and
+> 1.81x, and its `33/35` row showed 77.1% at `mfb` 64/98 — a config keeping
+> only three-quarters of its own relations, which should have been caught on
+> sight. **`filterdown.py` was multiplying the special-q into the cofactor.**
+> AS276 sieves algebraic-side special-q (`lss: 0`) and its `alim` is 268.4M
+> while the corpus runs to 427M, so above q = 268.4M the special-q is itself a
+> prime above `lim`, adding ~28 bits to the algebraic cofactor and rejecting
+> relations as false `mfb` violations. The special-q is divided out of the norm
+> and is not part of what `mfb` bounds. `filterdown.py` now requires
+> `--sqside r|a` and removes it, and the shipped config correctly keeps ~100%
+> of its own relations.
+
+It also measures the `mfb` knob on its own. Tightening `mfba` on the shipped
+`33/35` costs **7.3%** of its relations at 98 and **16.2%** at 96, against
+finding 98's matched-band measurement of **−17.2%** in `rel/q` for the same
+101→96 cap at `34/35`. **16.2% against 17.2% by two completely independent
+methods** — counting survivors in a real relation set, and timing matched
+bands on the GPU. That agreement is the best evidence the `mfb`-96 result is
+real.
+
+> Also corrected: the pre-fix numbers were 22.9% and 29.1%, and the gap against
+> finding 98's 17.2% was explained away here as the shipped job's `alambda` 3.8
+> admitting cofactors a real `mfba` 96 run would not have queued. That
+> explanation was rationalising the special-q bug. With the bug fixed the two
+> methods agree to 1 point and no explanation is needed.
+
+But one rung down leaves ~810M relations against a requirement near 1.1B, so
+**the corpus cannot reach a `32/34` matrix** — it is uniformly ~1.5x short of
+every crossover it could test. It is good for the BALANCE half-steps and for
+validating the method; it cannot measure R.
+
+    bench/lpbsweep/filterdown.py --n 12
+    bench/lpbsweep/filterdown.py --n 12 --mfb 64,98 --lim 181600000,268400000 --sqside a
+
+**Sizing the real thing.** c183 at `32/33` is the cheap vehicle: sieve to ~800M
+unique relations (about **1.25x** what `32/33` itself needs), filter down to
+`31/32`, and bracket both crossovers from above. Roughly **12-20 GPU-days** on
+the 5070 — the width of that range is exactly the raw-vs-unique ambiguity
+above, which the run would also settle as a by-product, since it would measure
+a real duplicate rate over a real q-span.
+
+### The decay model, checked against a real 1.67-billion-relation run
+
+Added 2026-09-16 (Kyle). `~/code/ggnfs-distributed/AS276/incoming/2026-08-26T09-26-38Z/job.db`
+is the complete work-unit ledger for Kyle's own distributed GGNFS run of AS276:
+**346,859 verified work units, q = 80,000,000 to 426,902,000, 1,671,198,113
+relations**, each work unit a contiguous 1000-wide q block with its exact
+relation count and its `sieve_seconds`. Work units out to 510M are queued but
+not yet returned. (The smaller `AS276/job.db` alongside the corpus covers only
+the first 7,595 work units, q = 80-87.6M; use the `incoming` copy.) Per-work-unit
+counts match a line count of the corresponding `.zst` exactly, checked on five
+files.
+
+This is a census, not a sample, and it is the only direct check anywhere in
+findings 98-99 of the thing every GPU-day figure rests on: **how yield decays
+with q, out past where the bands stop.**
+
+**The real curve is not a power law.** `rel/q` *rises* slightly to ~125M, sits
+flat to ~250M, and only then begins to fall:
+
+| q (M) | 85 | 125 | 205 | 265 | 305 | 355 | 415 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| rel/q | 95.40 | 97.92 | 96.51 | 94.90 | 90.95 | 87.23 | 82.89 |
+| local `d ln(rel/q) / d ln q` | — | +0.01 | −0.02 | −0.20 | −0.36 | −0.36 | — |
+
+Fit a single power law and the exponent depends entirely on the range chosen:
+**q^−0.099** over 80-427M, **q^−0.287** over 240-427M, **q^−0.306** over
+300-427M. This harness's log-linear fit to its own A=31 bands gives
+**q^−0.270 to −0.282** across all four AS276 configs.
+
+> **Corrected.** A first pass at this used a 91-work-unit sample, fitted one
+> power law over the whole range, got q^−0.165, and concluded that
+> `integrate.py`'s extrapolation was pessimistic by a factor of ~1.7 and that
+> AS276's `NO WINDOW` verdicts were largely an artifact of it. **That was
+> wrong in both magnitude and direction.** The single-power-law fit averages
+> the flat region below 250M into a slope that describes neither region. In
+> the deep region where extrapolation actually happens, the real job decays at
+> q^−0.29 to −0.31 and this harness assumes q^−0.27 to −0.28, so the model is
+> well calibrated and **if anything slightly optimistic**.
+
+Two consequences, both against pushing the window deeper:
+
+- **Raising `EXTRAP` is not free.** The real slope is still steepening at the
+  top of the measured range, not flattening. A fixed log-linear extrapolation
+  therefore drifts optimistic the further it is pushed, so the `EXTRAP` = 2.5
+  and 3.0 columns below should be read as upper bounds on what deep q delivers,
+  not as the corrected answer.
+- **`NO WINDOW` is conservative in the right direction.** It refuses to
+  extrapolate rather than extrapolating a curve that is known to be bending
+  away from the model.
+
+**End-to-end, the integrator holds up.** Integrating the committed A=31 bands
+over the real run's own q-range projects **1,167M** relations for `33/35`,
+against the real **1,671M** at A=32 — a ratio of **1.432**, where finding 98
+independently measures A=32 buying **~1.5x** the relations of A=31. Decay
+model, interpolation and window integration together land within ~5% of a real
+1.67-billion-relation job once the known area factor is applied. That is the
+strongest validation this harness has.
+
+**And it sizes the real job.** Kyle's run produced 1.671B raw relations over
+q = 80-427M, a span of **5.34x**, and **finished there** — matrix built,
+factors out (next section). The work units queued to 510M were never needed.
+Against the 1.80B unique this finding assumed for `33/35`, that is a completed
+job coming in *under* the target, which is the strongest possible statement
+about the sizing and is dealt with below.
+
+What this does not resolve: the run is A=32 (`I16e -J 16`) and the bands are
+A=31, so the decay comparison mixes the area difference into the residual. The
+areas cannot be separated here, because the A=32 arm (`a32.tsv`) is a single
+band at q=80M.
+
+#### AS276 is FINISHED, and it is now ground truth rather than a projection
+
+Kyle, 2026-09-16: the job built a matrix and produced factors. It completed at
+the shipped `lpbr 33 / lpba 35`, A=32 (`I16e -J 16`), on **1,671,198,113 raw
+relations over q = 80.0-426.9M, a span of 5.34x**. The work units queued out to
+510M were never needed. Three things follow, and the first two are corrections
+to this finding.
+
+**1. The published AS276 relation target was too high by ~9%.** This finding
+carried 1.80B unique for `33/35`, which the raw-vs-unique correction turns into
+a 1.831B raw target. The job factored on **1.671B raw = 0.913x of it**. And
+that is an upper bound on the requirement, not the requirement: the run stopped
+when someone decided it had enough, so the true figure is at most 1.671B.
+
+**2. `NO WINDOW` for `33/35` was mostly the target, not the extent.** Re-run
+that config against the count it actually finished on and a 6x window appears
+immediately, inside the existing `EXTRAP` guard and not edge-pinned:
+
+| target for `33/35` | cheapest 6x window at A=31 | GPU-days |
+|---|---|---:|
+| 1.831B (this finding's, published) | none | NO WINDOW |
+| **1.671B (what the job actually took)** | **117M -> 692M** | **126.1** |
+
+So the previous section's reading — that AS276 is measurement-limited — was
+half right. The extent guard is real, but the binding constraint on `33/35`
+was a sizing input inflated by 9%, and a 9% error should not decide
+feasibility. It did.
+
+**3. The area conclusion is confirmed outright, by the job itself.** Holding
+the real run's own 80M floor, A=31 needs **qmax = 628M, a span of 7.84x**, to
+deliver the same 1.671B relations. That breaks the `qmax <= 6*qmin` duplicate
+rule. The real job cleared it comfortably at A=32 in 5.34x. Integrating the
+A=31 bands over the real window gives 1.167B against the real 1.671B, the
+1.432x already reported above.
+
+> **AS276 at A=31 does not fit inside the duplicate rule from an 80M floor.
+> The completed job is the proof.** It fits only by starting higher and running
+> wider (117M-692M, span 5.91x), which is a different job from the one that was
+> actually run, or by taking the area up — which is what Kyle did. This is the
+> single cleanest vindication of finding 98's area argument, and it arrived
+> from outside the harness.
+
+What this does **not** settle is the ladder. `33/35` is gap-2 and the lockstep
+rungs (`33/34`, `34/35`, `35/36`) are not pinned to it without a gap-2-to-gap-1
+conversion this project has not measured, so the AS276 ranking table above is
+left as it stands rather than re-anchored on one real number. And the raw count
+alone cannot separate the two competing unique fractions (59% vs 78%): that
+needs the filtering output.
+
+> **The AS276 filtering output does not exist.** Kyle verified that filtering
+> succeeded and that a matrix could be built **at target density 90**, then
+> handed the relations to another contributor who ran the linear algebra. It
+> was a forum sieve, not NFS@Home, so there is no msieve log to mine. It can be
+> regenerated later from the corpus given the disk space, which is the only
+> thing standing in the way.
+>
+> The one number that did survive is worth keeping: **TD = 90**. Every NFS@Home
+> job in the finding-99 corpus ran 110-128, and the corpus median already falls
+> with `lpb` (128 at 30, 120 at 31-33, 110 at 34). AS276 at `lpb` 35 landing on
+> 90 continues that slope. This matters because target density is one of the
+> two systematic wobbles that widened the GNFS R interval: **operators lower TD
+> as `lpb` rises**, so a step in `lpb` is not a step at constant filtering
+> tightness, and the collected-relations ratio absorbs some of that. It is a
+> real bias and its sign is now clearer, even if its size is not.
+
+#### snfs301 — the live chance to measure R directly, and it is nearly free
+
+Kyle is sieving **snfs301** (`~/code/ggnfs-distributed/snfs301/`): degree 6,
+`x^6 + 18x^3 - 10` at `m = 10^50`, i.e. `10^300 + 18*10^150 - 10`, rational-side
+special-q, `gnfs-lasieve4I16e`, **a mix of GGNFS and cuda-sieve output**. As of
+2026-09-16 the ledger has **722,830,434 relations** over q = 60-450M. He plans
+to test filtering for the first time at ~1B and has offered the results.
+
+This is the best opportunity this project has had, for two reasons. It is
+**SNFS**, the arm with 2995 jobs behind it — though "clean" is the wrong word:
+under the Murphy-E control SNFS has this corpus's *worst* collinearity,
+`corr(lpb, lnE)` = −0.880, which is exactly why a direct one-job measurement is
+worth more here than any further regression. And it is a job whose **exact raw count and
+q-span are known from the ledger**, which is precisely what the NFS@Home corpus
+could never supply.
+
+**Its parameters make it the right job.** `snfs301.job`, in the root of
+`~/code/ggnfs-distributed/` rather than inside `snfs301/`:
+
+    rlim 225000000   alim 225000000
+    lpbr 33          lpba 34          <- gap 1, an exact lockstep rung
+    mfbr 65          mfba 98
+    rlambda 2.45     alambda 3.6      special-q on the RATIONAL side
+
+`33/34` against `32/33` is a clean lockstep step, and it is **the same pair
+c194 is built on** (`32/33` -> `33/34`, `mfb` 63/95 -> 65/98), so the result
+transfers directly to the one GNFS job in this project whose level verdict is
+still a coin flip.
+
+Kyle chose the **sieve side to carry the lower `lpb`** (rational, 33, against
+algebraic 34): "norms must have been quite even for me to do the thing where
+the sieve side has lower `lpb` than the other side. That usually is best in
+that case." That is consistent with finding 98's balance result and sharpens
+it: the special-q divides out of the sieve side's norm, so that side arrives at
+cofactoring already smaller and can afford the tighter bound. Finding 98
+measured the asymmetry on AS276 (algebraic-heavy, so relieve the algebraic
+side); this is the even-norm case, where the rule is instead **put the lower
+`lpb` on whichever side you sieve**.
+
+**Measured on snfs301's own relations** (`filterdown.py`, 16 files, 193,041
+relations, special-q handled):
+
+| filtered to | share of the shipped `33/34` set |
+|---|---|
+| `33/34` at its own `mfb` 65/98 (sanity check) | 99.9% |
+| `32/33` at `mfb` 65/98 | 49.9% |
+| **`32/33` at its own `mfb` 63/95** | **47.9%** |
+
+So `s` = **0.479**, a lockstep yield ratio of **2.09x** — a third independent
+confirmation of the 2.0x law, now on an SNFS job and on a relation set that is
+part cuda-sieve output.
+
+**What that says about how far to oversieve.** The down-filtered set reaches
+the lower rung's requirement iff `s*f >= 1/R`, where `f` is how far past its
+own requirement the `33/34` run is sieved. Inverting, the experiment measures
+
+> **R = 1 / (`s` * `f_crit`)** = **1 / (0.479 * `f_crit`)**
+
+| `f` (oversieve past the `33/34` requirement) | 1.00 | 1.10 | **1.20** | **1.23** | **1.27** | 1.35 | 1.45 |
+|---|---|---|---|---|---|---|---|
+| R it distinguishes | 2.09 | 1.90 | **1.74** | **1.70** | **1.64** | 1.55 | 1.44 |
+
+The bold columns are finding 99's own measured range. **Sieving to ~1.35x the
+`33/34` requirement brackets all of it**, and the interesting region is narrow:
+`f` = 1.20 to 1.29 spans R = 1.74 down to 1.62. At `f` = 1.0 the down-filtered
+set should fail outright.
+
+> An earlier version of this section sized the experiment at `f` = 1.17,
+> from R = 1.791 — the digits-controlled SNFS figure this finding rejects.
+> Under the Murphy-E control the critical point is `f` = **1.20 to 1.29**, so
+> stopping at 1.17 would have landed below the whole range and returned only
+> "R is above 1.79", which is the one answer the corpus already doubts.
+
+The protocol needs no survival estimate at all, which is better still:
+
+1. Filter at increasing raw counts until it just succeeds at `33/34`. That is
+   `N_X`.
+2. Filter the same sets down to `32/33` (`lpb` 32/33, `mfb` 63/95, `lim`
+   225M/225M, `--sqside r`) and find where those just succeed. That is
+   `N_{X-1}`.
+3. **R = `N_X` / `N_{X-1}`**, measured end to end on one job, with no
+   regression, no cross-job confounder and no operator-selection effect.
+
+Disk is the constraint Kyle raised, and it falls the right way: the
+down-filtered sets are under half the size, so the extra passes are the cheap
+ones.
+
+**One caution specific to this corpus.** It mixes GGNFS work units (`wu-*`,
+~3.7k relations each) with cuda-sieve blocks (`blk-*`, 134-206k each, ~45x
+bigger). The first three cuda-sieve blocks were run at the top of the q range
+(~450M) before the work assignment was corrected; everything from block ~250 on
+is spread across the same 139-259M the CPU clients were covering. Any sampling
+of this corpus should either take whole files at random or exclude those first
+blocks, or it will over-weight the deep end where yield is lowest.
+
+**What one filtering run answers.** Capture these from the msieve log:
+
+| what | why it matters |
+|---|---|
+| unique / duplicate split after dedup | resolves the 59%-vs-78% disagreement on a job with an exactly known raw count and span — this alone repairs every absolute GPU-day figure in findings 98 and 99 |
+| `final_rels` / `final_ideals` after singleton removal | tests the 1.03 acceptance bar, calibrated on 1437 GNFS jobs, against an SNFS job |
+| matrix rows, weight/col, the TD used | extends the "what a good matrix looks like" table past `lpb` 34 |
+| the raw count it was run at | converts all of the above into a *required*-relation number |
+
+Four conditions from the design section above still apply: filter on `mfb` as
+well as `lpb` (and pass `--lim`, since the relation line carries the full
+factorisation), subset by truncating the q-range rather than sampling
+relations, keep the lambdas fixed, and remember the direction — down is exact,
+up is not.
+
+#### A pre-registered prediction for snfs301, made 2026-09-16 at 732M relations
+
+Kyle's own estimate: a matrix of reasonable size at **1.1-1.15B** raw relations,
+with an NFS@Home-style goal of **1.25-1.28B**. This section commits to a number
+before the fact so the job can score it.
+
+**The corpus answers this directly**, because finding 99's SNFS size
+coefficient is 1.0003 per digit — required relations track `lpb`, not N. So the
+right reference class is simply *SNFS jobs at `bits` 34*, of which NFS@Home
+completed 36:
+
+| | p25 | median | p75 |
+|---|---:|---:|---:|
+| unique relations | 792M | 869M | 1051M |
+| / 0.78 unique fraction | 1013M | 1119M | 1344M |
+| x1.05 for snfs301's wider q-span | **1.06B** | **1.17B** | **1.41B** |
+
+> **Prediction: first matrix around 1.05-1.10B raw, comfortable at 1.15-1.25B,
+> safe at 1.4B.** Kyle's 1.1-1.15B is a touch optimistic but inside the band;
+> his 1.25-1.28B goal sits between the median and p75, which is where a goal
+> should sit. Filtering at 800M should fail, and usefully — it puts the data on
+> disk and gives the first real unique/duplicate ratio for this job.
+
+**The 0.78 in that table is not a free parameter — AS276's completion picked
+it.** Findings 98-99 carry an unresolved factor-of-1.3 disagreement about the
+unique fraction: Kyle's dedup sheet says ~59% of raw relations survive dedup on
+a 6x span, msieve's own duplicate line says ~78% on the same 40 jobs. AS276
+finishing settles which applies to a ledger raw count:
+
+| | AS276's 1.671B raw becomes | vs what a 33/35 job should need |
+|---|---:|---:|
+| at the sheet's 59% | 991M unique | **0.81x** |
+| at msieve's 78% | 1307M unique | **1.07x** |
+
+(The reference is the SNFS `bits`-35 median of 1461M unique, scaled by 0.835
+for AS276 being gap-2 `33/35` rather than gap-1 `34/35` — an ideal-count
+adjustment.) A completed job should land at or just above 1.0x. **The 59%
+figure would require AS276 to have factored on 19% fewer relations than a
+comparable job, with no reason offered; 78% puts it at 1.07x, exactly where a
+job that stopped when it had enough belongs.** So for converting a raw sieve
+ledger into unique relations, use **~0.78**, and the sheet's 59% is measuring
+something else — most likely an instantaneous per-batch rate rather than the
+cumulative fraction over a whole run.
+
+That is not a clean experiment and it does not retire the question; snfs301's
+first filtering run will measure the ratio directly and should be believed over
+this. But it breaks the tie in one direction, and it is the direction that
+makes the absolute GPU-day figures in finding 98 **less** pessimistic than the
+STATUS note currently warns.
+
+**When.** From the ledger's own arrival rate, 732M relations at 2026-09-16:
+
+| | 800M | 1.10B | 1.15B | 1.25B | 1.35B |
+|---|---|---|---|---|---|
+| at the recent 3-day rate (52.8M/day) | +1.3d | +7.0d | +7.9d | +9.8d | +11.7d |
+| at the 12-day mean (32.5M/day) | +2.1d | +11.3d | +12.9d | +15.9d | +19.0d |
+
+The rate is not stationary — it ran 20-26M/day over 2026-09-08 to 09-12 and
+38-61M/day over 09-13 to 09-15, so the recent column assumes the higher rate
+holds. Kyle's own "one or two days" to 800M matches the recent rate, which is
+the reason to prefer it. **Call it 2026-09-23 to 09-27 for the first serious
+attempt and the first week of October for a comfortable margin.**
+
+Two caveats on the reference class. Those 36 jobs run 200-262 digits against
+snfs301's 301, which is an extrapolation in difficulty — defensible only
+because the SNFS size coefficient is ~1.000, meaning a harder job at the same
+`lpb` needs the same relations and merely sieves them more slowly. And target
+density is not recorded for any of them in the scrape, so the table cannot say
+what TD they were filtered at; AS276 built its matrix at **TD 90**, and a
+looser TD reaches a matrix on fewer relations, so the p25 end is more
+attainable if a sparser matrix is acceptable.
+
+#### AS276 under a relaxed extrapolation guard
+
+`EXTRAP=2.5 python3 integrate.py`, read off the `R = 1.74` scenario the script
+ships:
+
+| config | `EXTRAP` 2.0 (published) | 2.5 | 3.0 |
+|---|---|---|---|
+| `33/34` | NO WINDOW | 148.8 | 148.8 |
+| **`33/35` shipped** | NO WINDOW | **142.6** | **142.6** |
+| `33/34` @96 | NO WINDOW | 143.9 ! | 143.9 |
+| `34/35` | 154.5 ! | 154.5 | 154.5 |
+| `34/35` @96 | NO WINDOW | NO WINDOW | 158.4 |
+| `35/36` | **211.5** | 211.5 | 211.5 |
+
+The shipped `33/35` comes back as the winner as soon as the guard is relaxed at
+all, at 142.6 against `34/35`'s 154.5 — an 8.4% margin, close to the 7.8% the
+withdrawn version of this table claimed. (At `EXTRAP` 2.0 the bolded winner is
+`35/36` at 211.5 only because `34/35`'s cheaper 154.5 is edge-pinned and so is
+not ranked.) **That is still not a reinstatement**,
+because it is reached by assuming an extrapolation shown above to drift
+optimistic with distance, and `33/35` has the deepest window so it gains most
+from the assumption.
+
+But the completed job reaches the same place by a better route. At the count it
+actually finished on, `33/35` needs no relaxed guard at all: it takes a
+117M-692M window inside `EXTRAP` = 2.0 for 126.1 GPU-days. **The config was
+never the problem. A 9% error in one relation target was.**
+
+### Not measured, and the honest caveats
+
+- **Relations collected, not required.** The 1.03 excess table argues the
+  stopping rule was uniform; it does not prove any single job was sized right.
+- **Gap mixing, and it is worse than generic variance (Kyle, 2026-09-15).**
+  `bits` is `max(lpba, lpbr)`, so a band pools gap-0 and gap-1 jobs. **15e
+  cannot run `lpb` 34 at all — it crashes** — so jobs at the top of 15e's range
+  were held at `bits` 33 when they wanted 34, and some of those are `33/33`
+  rather than `32/33`. A `33/33` job needs ~1.47x fewer relations than a
+  `33/34` one by universe count, so any such pollution of the 33 band drags the
+  32→33 step DOWN and biases R low — in the direction that makes 1.6 suspect.
+
+  The corpus confirms the ceiling exactly:
+
+  | GNFS queue | lpb 29 | 30 | 31 | 32 | 33 | 34 | 35 |
+  |---|---|---|---|---|---|---|---|
+  | 14e | 158 | 294 | 204 | 231 | 0 | 0 | 0 |
+  | 15e + 15small | 0 | 26 | 131 | 229 | 115 | 0 | 0 |
+  | 16small | 0 | 0 | 2 | 4 | 30 | 11 | 2 |
+
+  Every job above `bits` 33 is 16e. Two partial checks: inside `bits` 33 the
+  16e jobs need only **1.054x** what the 15e jobs need (and are 8 digits
+  bigger), which is far short of the ~1.47x a gap-0/gap-1 split would predict —
+  so most 15e `bits` 33 jobs are probably `32/33`, not `33/33`. And restricting
+  to one queue, where the policy is at least self-consistent, moves nothing:
+  **14e 1.521x, 15e 1.583x, 16e 1.613x**. Neither check is decisive, because
+  `lpbr`, `lpba` and the factor-base bounds are simply not in the data.
+  **This is where the corpus runs out.** Cleaning it means recovering per-job
+  parameters that were never scraped, and guessing at the `lim`s.
+- **Operator selection.** Within a digit band the choice of `lpb` was a human
+  one and may correlate with something unobserved. Adding Murphy-E as a control
+  moves R by +0.009x, which rules out poly quality specifically, not everything.
+- **`lpb` 34-35 is thin.** 11-12 GNFS jobs at 34, 1 at 35. The `33→34` step
+  rests on one digit band. AS276 sits at the edge of the evidence.
+- **No SNFS/GNFS explanation, and this is the strongest reason for doubt.** The
+  SNFS arm is the clean one — 2995 jobs, `corr(lpb,digits)` 0.48, interval ±1%
+  — and it recovers the rule of thumb exactly. The GNFS arm is the one with the
+  0.832 collinearity, a sixth as many jobs, and two estimators that disagree.
+  No mechanism is offered for why GNFS would need *less* per rung than SNFS.
+  When the clean arm and the compromised arm disagree and there is no story for
+  the difference, the compromised arm is the suspect.
+- **The 1.94x model is not refuted as a model** of the ideal universe — it is
+  refuted only as an estimate of required relations.
