@@ -2482,7 +2482,11 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
                         (unsigned long long)ck.next_q);
                     return 1;
                 }
-                if (qrange_set) cfg.qmin = ck.next_q;
+                if (qrange_set) {
+                    /* Before the overwrite, not after. */
+                    cfg.resume_qmin = cfg.qmin;
+                    cfg.qmin = ck.next_q;
+                }
                 /* --nq counts this session's q, so a resumed run must not be
                  * handed the whole original budget again. */
                 if (cfg.nq_max) {
