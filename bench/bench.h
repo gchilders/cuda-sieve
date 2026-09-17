@@ -706,6 +706,12 @@ typedef struct {
     uint64_t resume_q, resume_rho;
     unsigned long long resume_rel_bytes, resume_cand_bytes;
     unsigned long long resume_nrel, resume_nq;
+    /* The band's ORIGINAL --qrange lower bound, before resume overwrote
+     * cfg.qmin with the checkpoint's next_q. Kept because the progress
+     * estimator needs the whole band's span to report a resumed run's
+     * position in it, and nothing else did. 0 = this band never resumed, so
+     * cfg.qmin is already the original. */
+    uint64_t resume_qmin;
 } bench_cfg_t;
 
 #define FILL_ATOMIC   0     /* (a) direct global atomicAdd per record   */
