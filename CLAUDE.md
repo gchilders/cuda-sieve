@@ -1635,6 +1635,41 @@ looping -- not the counter.
 Eleven gates green, `cofcheck.sh` 54/0, 288-q band `cmp`-identical at 13,485
 relations / `8e79762c…`.
 
+## What the interactivity work COSTS a fast, successful machine (measured)
+
+Everything since 9z-j buys not losing workunits. Priced on this 10-core M3,
+against the pre-9z-j build (`cbddd0c`) built from a worktree and run
+alternately to cancel thermal drift:
+
+| component | cost |
+|---|---|
+| **fbgen slicing + flush** | 6.479 -> **6.684 s**, +0.205 s, **+3.2% of fbgen** (3 runs each, spread ±0.04) |
+| **cofactor per-launch flush** | **below noise** -- 52.89 vs 52.97 ms/q algebraic queue, 733.6 vs 736.3 ms/q wall, against a 12 ms within-variant spread |
+| **the 400 ms bound forcing a smaller chunk** | **+23% of the algebraic queue stage, ~1.5% of wall** |
+| CBTIME accounting, steering, retry | zero -- gated off, 8 measurements, and nothing unless a kill happens |
+
+**The bound is the only real cost, and it is only paid where the bound
+BINDS.** Not on this M3: it opens at 15,360 records/launch, measures ~240 ms,
+and never steers. It binds on the fast parts -- the field M1 Max opens at
+36,864, measures 768 ms and settles near 11,930 -- so those pay it. Measured by
+pinning both chunks here with `--cof-chunk`:
+
+```
+chunk 36864   algebraic queue 46.96, 47.21 ms/q
+chunk 11930   algebraic queue 57.61, 58.05 ms/q
+```
+
+**This retires 9z-h's "the throughput cost of meeting the bound is unknown".**
+It was unreadable then because it was measured as WALL, where 10.7 ms/q hides
+inside a ±12 ms spread. Measured on the STAGE it resolves cleanly. It also
+qualifies 9z-h's linearity result: a single launch is linear in the chunk, but
+the STAGE is not, because more launches means more per-launch overhead --
+~2 ms each, from 4 launches/round to 11.
+
+**fbgen's 0.205 s is per PROCESS, not per q** -- 0.09% of a 288-q band and
+immaterial against a workunit measured in hours, though a host that restarts
+repeatedly pays it again each time (the field M1 Max restarted six times).
+
 ## Rebase, 2026-09-16: upstream's ECM occupancy fix, and a silent kernel leak
 
 `metal-port` was 6 commits behind `main` and is now rebased onto `75d4cf7`
