@@ -16,7 +16,14 @@ src = open(SRC).read()
 def strip_kernels(text):
     out, i, n = [], 0, 0
     while True:
-        m = re.search(r'(?:template\s*<[^>]*>\s*)?__global__\s+void\s+\w+\s*\(', text[i:])
+        # `__global__ __launch_bounds__(N, M)` then `void` on the NEXT line is
+        # a shape upstream introduced (2bc1c6e). Without the optional group
+        # this pattern silently stopped matching k_cofac, the kernel count went
+        # 9 -> 8, and its whole device definition was left sitting in the HOST
+        # file. Nothing asserted the count, so the only signal was the number
+        # in the generator's own output line.
+        m = re.search(r'(?:template\s*<[^>]*>\s*)?__global__\s+'
+                      r'(?:__launch_bounds__\([^)]*\)\s*)?void\s+\w+\s*\(', text[i:])
         if not m:
             out.append(text[i:]); break
         s0 = i + m.start()
@@ -293,6 +300,10 @@ src = (hdr
 _floor_old = (
     "static uint32_t cof_chunk_floor(int blocks, int threads)" + chr(10) +
     "{" + chr(10) +
+    "    /* The width k_cofac actually launches at (cf_run_rounds clamps it to" + chr(10) +
+    "     * COFAC_THREADS_MAX), or the floor would promise one record per thread on" + chr(10) +
+    "     * threads that never run. */" + chr(10) +
+    "    if (threads > COFAC_THREADS_MAX) threads = COFAC_THREADS_MAX;" + chr(10) +
     "    const uint64_t f = (uint64_t)(blocks > 0 ? blocks : 1)" + chr(10) +
     "                     * (uint64_t)(threads > 0 ? threads : 1);" + chr(10) +
     "    return f > 0xffffffffull ? 0xffffffffu : (uint32_t)f;" + chr(10) +
@@ -308,6 +319,10 @@ _floor_new = (
     chr(10) +
     "static uint32_t cof_chunk_floor(int blocks, int threads)" + chr(10) +
     "{" + chr(10) +
+    "    /* Upstream's clamp, kept: k_cofac launches at COFAC_THREADS_MAX or" + chr(10) +
+    "     * narrower, so a floor computed from a wider --threads would promise" + chr(10) +
+    "     * records to threads that never run. */" + chr(10) +
+    "    if (threads > COFAC_THREADS_MAX) threads = COFAC_THREADS_MAX;" + chr(10) +
     "    const int fb = g_cof_floor_blocks ? g_cof_floor_blocks : blocks;" + chr(10) +
     "    const uint64_t f = (uint64_t)(fb > 0 ? fb : 1)" + chr(10) +
     "                     * (uint64_t)(threads > 0 ? threads : 1);" + chr(10) +
@@ -860,6 +875,8 @@ src = src.replace(_rc_old, _rc_new, 1)
 print('  chunk report de-duplicated on rendered content')
 
 open(OUT, 'w').write(src)
+assert nk == 9, ('removed %d __global__ definitions, expected 9 -- a kernel '
+                 'shape changed upstream and one was left in the HOST file' % nk)
 print('wrote %s: %d kernels removed, %d launches rewritten' % (OUT, nk, nl))
 if skipped:
     print('  launches of kernels NOT yet in metal/cofac.metal:', ' '.join(sorted(skipped)))
