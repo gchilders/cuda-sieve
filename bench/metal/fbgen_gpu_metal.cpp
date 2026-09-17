@@ -46,57 +46,58 @@
 #define GPU_FB_BIG_LIMBS 20
 #define GPU_FB_MAX_ROOTS (BENCH_MAX_DEGREE + 1)
 
-/* Grid-strides per root-finder SUBMISSION -- a STARTING POINT, not a
- * constant. 4 is safe on the slowest device this port has field data for:
- * an estimated 140-210 ms across the M1 family, where 16 strides measured
- * 560-840 ms. A faster part is raised by the controller within one or two
- * submissions, so starting low costs almost nothing. */
-#ifndef FB_ROOTS_STRIDES_START
-#define FB_ROOTS_STRIDES_START 4u
-#endif
-/* A ceiling, so a mismeasurement cannot run away. ~8x what a 10-core M3
- * settles at. */
-#ifndef FB_ROOTS_STRIDES_MAX
-#define FB_ROOTS_STRIDES_MAX 256u
-#endif
+/* THE ROOT FINDER IS SLICED, AND THE SLICE IS MEASURED (2026-09-17).
+ *
+ * One launch per segment makes the whole segment a single uninterruptible
+ * piece of GPU work. On a card that also drives a display that is felt
+ * directly: the desktop stutters for the length of factor-base generation,
+ * which is every workunit's first several seconds, and the field reported
+ * exactly that. It is a milder relative of the cofactor's TDR problem -- long
+ * enough to be noticed, not long enough to be killed.
+ *
+ * A FIXED SLICE SIZE DOES NOT TRANSFER. One grid-stride covers `wave` primes
+ * and `wave` scales with the SM count, while per-SM throughput does not scale
+ * with it the same way, so any constant chosen on one card is wrong on
+ * another. The Metal port learned this twice: first with a fixed prime count,
+ * then with a fixed stride count. So start at a size safe on slow hardware and
+ * let the measurement move it.
+ *
+ * Cost, measured on the Metal port (same algorithm, 10-core M3): factor-base
+ * generation 6.479 -> 6.684 s, +3.2%, once per PROCESS and not per q. Set
+ * FB_ROOTS_STRIDES_START very large to get the old single-launch behaviour. */
 /* Attempts at one segment before giving up. The watchdog that motivates
  * the retry is contention-dependent, so a couple of halvings is normally
- * enough; a bound that is NOT transient (a page fault, say) then costs
- * four quick attempts instead of hanging. */
+ * enough; a bound that is NOT transient then costs four quick attempts
+ * instead of hanging. Metal-only: see the note in gen_fbgen_host.py. */
 #ifndef FB_ROOTS_MAX_ATTEMPTS
 #define FB_ROOTS_MAX_ATTEMPTS 4
 #endif
 
-static uint32_t g_fb_strides = FB_ROOTS_STRIDES_START;
-static float    g_fb_launch_max;          /* worst over-bound launch reported */
-static unsigned long long g_fb_seen_seq;  /* last submission steered on */
+#ifndef FB_ROOTS_STRIDES_START
+#define FB_ROOTS_STRIDES_START 4u
+#endif
+#ifndef FB_ROOTS_STRIDES_MAX
+#define FB_ROOTS_STRIDES_MAX   256u
+#endif
+/* Tighter than the cofactor's TDR-derived bound because this is about a
+ * responsive desktop, not a surviving one. Chosen, not measured: nobody has
+ * established what a user actually notices. */
+#ifndef FB_LAUNCH_TARGET_MS
+#define FB_LAUNCH_TARGET_MS    250.0f
+#endif
 
-/* Steer the slice size from the last COMPLETED submission. Proportional,
- * aiming at 0.8x the bound, with the dead band cofq_flush uses: act when
- * the measurement is over target or under a quarter of it, else leave it.
- *
- * THE seq TEST IS NOT OPTIONAL. The reading is one or two submissions
- * stale, so steering twice on the same measurement applies the same
- * correction twice: a 4 -> 38 grow would become 4 -> 38 -> 256, a
- * multi-second command buffer, which is exactly what the bound exists to
- * prevent. One measurement, one adjustment. */
-static void fb_steer_strides(const char *who)
+static uint32_t g_fb_strides = FB_ROOTS_STRIDES_START;
+
+/* Steer from the segment just finished. Proportional, aiming at 0.8x the
+ * bound, with the dead band cofq_flush uses: act when the measurement is over
+ * target or under a quarter of it, otherwise leave it alone. The caller reads
+ * the events AFTER its own mtlMemcpy of d_failures, so no synchronisation is
+ * added -- only two event records on one slice per segment. */
+static void fb_steer_strides(float ms)
 {
-    const float bound  = MTL_INTERACTIVITY_BOUND_MS;
-    const float target = bound * 0.8f;
-    float ms = 0.0f;
-    unsigned long long seq = 0;
-    if (mtlStreamWorstMs(0, &ms, &seq) != mtlSuccess) return;
-    if (ms <= 0.0f || seq <= g_fb_seen_seq) return;   /* nothing new */
-    g_fb_seen_seq = seq;
-    if (ms > bound && ms > g_fb_launch_max) {
-        g_fb_launch_max = ms;
-        fprintf(stderr,
-                "%s: root-finder launch %.0f ms is over this build's %.0f ms"
-                " bound (%u grid-strides)\n",
-                who, (double)ms, (double)bound, g_fb_strides);
-    }
-    if (ms <= target && ms >= target * 0.25f) return;  /* dead band */
+    const float target = FB_LAUNCH_TARGET_MS * 0.8f;
+    if (ms <= 0.0f) return;
+    if (ms <= target && ms >= target * 0.25f) return;
     double want = (double)g_fb_strides * ((double)target / (double)ms);
     if (want < 1.0) want = 1.0;
     if (want > (double)FB_ROOTS_STRIDES_MAX) want = (double)FB_ROOTS_STRIDES_MAX;
@@ -493,6 +494,10 @@ static int gpu_fb_generate_complete(const poly_t *P, uint32_t lim, int maxbits,
     uint32_t *d_nprime = NULL, *d_counts = NULL, *d_offsets = NULL;
     uint32_t *d_failures = NULL, *d_total = NULL;
     uint32_t *d_rootbuf = NULL, *d_out_p = NULL, *d_out_r = NULL;
+    /* Declared with the rest: MTL_OR_DIE hides a goto fail, so anything
+     * the cleanup touches must exist before the first one. */
+    mtlEvent_t fb_ev_a = NULL, fb_ev_b = NULL;
+    int fb_timed = 0;
     uint8_t *d_out_special = NULL;
     void *d_temp = NULL;
     size_t select_temp = 0, scan_temp = 0, temp_bytes = 0;
@@ -578,6 +583,11 @@ static int gpu_fb_generate_complete(const poly_t *P, uint32_t lim, int maxbits,
     temp_bytes = std::max(select_temp, scan_temp);
     MTL_OR_DIE(mtlMalloc(&d_temp, temp_bytes));
 
+    /* Best-effort: if the events cannot be created the slicing still
+     * happens, it simply never re-sizes. A factor base must not fail to
+     * build because a timer was unavailable. */
+    if (mtlEventCreate(&fb_ev_a) != mtlSuccess) fb_ev_a = NULL;
+    if (mtlEventCreate(&fb_ev_b) != mtlSuccess) fb_ev_b = NULL;
     if (sink->begin()) goto fail;
 
     /* p=2 is always exact.  Besides powers, this preserves the native
@@ -612,62 +622,62 @@ static int gpu_fb_generate_complete(const poly_t *P, uint32_t lim, int maxbits,
         const size_t slots = (size_t)nprime * GPU_FB_MAX_ROOTS;
         MTL_OR_DIE(mtlMalloc((void **)&d_rootbuf, slots * sizeof(*d_rootbuf)));
         for (int fb_try = 0; ; fb_try++) {
-            /* Consume any error left by the previous attempt. mtlMemcpy's
+            /* Consume any error left by the previous attempt: mtlMemcpy's
              * failure also sets the sticky last-error, so without this the
-             * next attempt reads it back and 'fails' again having done
-             * nothing wrong -- measured: every injected fault produced
-             * exactly two retries. */
+             * next attempt reads it back and 'fails' having done nothing
+             * wrong -- measured, every injected fault gave two retries. */
             (void)mtlGetLastError();
             MTL_OR_DIE(mtlMemset(d_failures, 0, sizeof(*d_failures)));
             {
                 const uint32_t ablocks = std::min<uint32_t>((nprime + 127u) / 128u,
                                                             (uint32_t)prop.multiProcessorCount * 8u);
-                /* SLICED AND STEERED. macOS's interactivity watchdog judges a
-                 * COMMAND BUFFER, so each slice is flushed; the flush is half
-                 * the mechanism and the slice SIZE is the other half.
-                 *
-                 * The size is MEASURED, not chosen. A fixed grid-stride count
-                 * does not transfer between devices: one stride covers `wave`
-                 * primes and wave scales with core count, so 16 strides was
-                 * 130 ms on this 10-core M3 and an estimated 560-840 ms across
-                 * the M1 family -- over the bound, and near the ~800 ms at
-                 * which field tasks were actually killed. That is 9z-j's error
-                 * one level up: 9z-j replaced a fixed prime count with a fixed
-                 * stride count and assumed strides were the device-independent
-                 * unit. They are not. Nothing here is.
-                 *
-                 * So start at a size safe on the slowest device there is field
-                 * data for, and let the measurement move it -- exactly as
-                 * cofq_flush steers the cofactor chunk. See plan 9z-o. */
+                /* Slices of g_fb_strides grid-strides each, so no single launch
+                 * owns the GPU for the whole segment. d_rootbuf, d_counts and
+                 * d_special are indexed by PRIME, so a slice is just a base
+                 * pointer and a count; d_failures accumulates across them. */
                 const uint32_t wave = ablocks * 128u;
+                uint32_t sliced = 0;
                 for (uint32_t off = 0; off < nprime; ) {
                     const uint64_t step64 = (uint64_t)wave * g_fb_strides;
                     const uint32_t step = step64 >= nprime ? nprime : (uint32_t)step64;
                     const uint32_t cnt = (nprime - off) < step ? (nprime - off) : step;
                     const uint32_t sb = std::min<uint32_t>((cnt + 127u) / 128u, ablocks);
                     uint32_t *r_off = d_rootbuf + (size_t)off * GPU_FB_MAX_ROOTS;
+                    /* One slice per segment is bracketed; the events are read
+                     * after the d_failures copy below, which already syncs. */
+                    const int tm = (off == 0 && fb_ev_a && fb_ev_b);
+                    if (tm) mtlEventRecord(fb_ev_a);
                     if (P->deg <= 6)
                         MTL_LAUNCH(k_alg_roots_fixed_mark_6_1, sb, 128, 0, 0, d_primes + off, cnt, r_off, d_counts + off, d_special + off, d_failures, (const gpu_big_t *)mtlGetSymbol("c_alg"), *(const int *)mtlGetSymbol("c_alg_deg"));
                     else
                         MTL_LAUNCH(k_alg_roots_fixed_mark_8_1, sb, 128, 0, 0, d_primes + off, cnt, r_off, d_counts + off, d_special + off, d_failures, (const gpu_big_t *)mtlGetSymbol("c_alg"), *(const int *)mtlGetSymbol("c_alg_deg"));
+                    if (tm) { mtlEventRecord(fb_ev_b); sliced = 1; }
+                    /* ONE slice per command buffer. CUDA needs nothing here:
+                     * a kernel launch is already the unit its watchdog sees.
+                     * On Metal the watchdog judges a COMMAND BUFFER and the
+                     * stream batches every slice into one, so without this the
+                     * slicing bounds nothing at all -- measured, 9z-j/9z-k.
+                     * The bracket above commits around slice 0 by itself; the
+                     * rest need this. */
                     MTL_OR_DIE(mtlStreamFlush(0));
                     off += cnt;
                 }
+                fb_timed = sliced;
             }
             mtlError_t fb_rc = mtlGetLastError();
             if (fb_rc == mtlSuccess)
                 fb_rc = mtlMemcpy(&failures, d_failures, sizeof(failures),
                                   mtlMemcpyDeviceToHost);
-            /* ONE adjustment per segment, here and nowhere else: that memcpy is
-             * the sync that drains this segment's submissions, so it is the only
-             * moment their durations exist. Steering inside the slice loop reads
-             * whatever OTHER stage last drained -- the odds sieve, the select, the
-             * scan -- and each of those is a fresh measurement by the seq test's
-             * reckoning, so the controller grows on every one of them. Measured:
-             * it ran to the 256-stride ceiling inside the first segment and put
-             * the whole segment in one 788 ms command buffer, which is worse than
-             * the fixed size it replaced. */
-            if (fb_rc == mtlSuccess) { fb_steer_strides(who); break; }
+            if (fb_rc == mtlSuccess) {
+                if (fb_timed) {
+                    float ms = 0.0f;
+                    if (mtlEventElapsedTime(&ms, fb_ev_a, fb_ev_b) == mtlSuccess)
+                        fb_steer_strides(ms);
+                    fb_timed = 0;
+                }
+                break;
+            }
+            fb_timed = 0;
             if (fb_try + 1 >= FB_ROOTS_MAX_ATTEMPTS) {
                 fprintf(stderr, "%s: root finder in [%u,%u] failed %d times: %s\n",
                         who, lo, (uint32_t)hi64, fb_try + 1,
@@ -753,6 +763,8 @@ static int gpu_fb_generate_complete(const poly_t *P, uint32_t lim, int maxbits,
     rc = 0;
 
 fail:
+    if (fb_ev_a) mtlEventDestroy(fb_ev_a);
+    if (fb_ev_b) mtlEventDestroy(fb_ev_b);
     (void)gpu_fb_free(&d_out_special);
     (void)gpu_fb_free(&d_out_r);
     (void)gpu_fb_free(&d_out_p);
