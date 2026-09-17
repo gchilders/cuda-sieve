@@ -8,7 +8,30 @@
 import re
 
 OUT = 'bench/metal/cofac_body.metal.inc'
-cof = open('bench/cofac.cuh').read().split('\n')
+
+# __launch_bounds__ is a CUDA register-pressure directive with no MSL
+# equivalent, and upstream put one on k_cofac (2bc1c6e: 256 threads x 2 blocks
+# per SM is exactly the 128-register cliff, worth -10.3% of the cofactor stage
+# on a 5070). Strip it BEFORE parsing rather than teach every kernel pattern
+# about it -- otherwise `^__global__ void k_cofac` silently stops matching and
+# the generator loses a kernel. It did exactly that, and the assert caught it.
+#
+# MSL's nearest relative is [[max_total_threads_per_threadgroup(n)]], which is
+# a real and untried optimisation here; NOT adopted silently, because it is a
+# performance change that wants measuring on this box. The ceiling half of
+# upstream's fix -- COFAC_THREADS_MAX, which cf_run_rounds and cof_chunk_floor
+# clamp to -- is shared host code and carries over unchanged.
+_raw = open('bench/cofac.cuh').read()
+# Only the DECLARATION form. A blanket strip also edits the word where it
+# appears in cofac.cuh's own explanatory comment, which is both pointless and
+# the kind of silent text surgery that removed half of bigint.cuh once.
+_raw, _nlb = re.subn(r'__global__[ \t]+__launch_bounds__\([^)]*\)[ \t]*\n[ \t]*void',
+                     '__global__ void', _raw)
+if _nlb:
+    print('  stripped %d __launch_bounds__ declaration(s) (no MSL equivalent)' % _nlb)
+assert not re.search(r'__global__[^\n]*__launch_bounds__', _raw), \
+    'a __launch_bounds__ survives on a kernel declaration'
+cof = _raw.split('\n')
 td  = open('bench/td.cuh').read().split('\n')
 
 def upto_close(lines, start):

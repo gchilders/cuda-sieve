@@ -1064,7 +1064,32 @@ CF_FN int mz_split(const mz<L> *n0, const mz<L> *lim2, uint32_t lpb,
  * that back into 32 jobs per budget -- measured at 1.32x on the stage.
  *
  * `njp` is read on the device so the grid never has to be sized from a
- * host-visible count, which keeps the round loop free of synchronisation. */
+ * host-visible count, which keeps the round loop free of synchronisation.
+ *
+ * __launch_bounds__(256, 2): at 256 threads per block (the --threads default),
+ * 256 x 128 x 2 = 65,536 is exactly two blocks per SM -- so 128 registers is a
+ * CLIFF, and one register over it halves the kernel's warps. Where the count
+ * lands depends on the toolkit AND the target, not on this source alone:
+ * k_cofac<3,ECM,s2> is 130 registers on CUDA 13.4, 150 on 13.2 and 168 on 12.8
+ * for sm_120, and 118 on 12.1 for sm_86. ECM stage 2's shared denominator
+ * (4ae5308) took it from 126 to 130 on 13.4, which cost the 5070 half its
+ * occupancy (ncu 33% -> 17%) and turned a real arithmetic win into a net loss.
+ * The bound makes ptxas meet the budget on whichever toolkit builds the release.
+ * Measured, relations md5-identical everywhere (finding 97): cofactor device
+ * time -10.3% on a 5070, -5.2% on a 5090, and -1.0% (wall flat) on a 3060 that
+ * had no cliff to recover.
+ *
+ * The 256 is a HARD CEILING, not a hint: a launch with more threads per block
+ * fails outright ("invalid argument" at the first flush, measured at 512). The
+ * launch width comes from --threads, which may legitimately be wider for the
+ * other kernels, so cf_run_rounds clamps it to COFAC_THREADS_MAX (bench.h) and
+ * cof_chunk_floor does the same. Keep all three in step.
+ *
+ * The bound costs spill on sm_120: 8 B on k_cofac<3,ECM,s2> and 88 B stores /
+ * 144 B loads on k_cofac<4,ECM,s2> under 13.4 (36/40 B and 16/16 B under 12.8).
+ * The second block more than pays for both. Other targets in the fat build do
+ * not spill. Re-check `-Xptxas -v` if this kernel grows, and do not remove the
+ * bound to cure a spill. */
 /* kernel moved to metal/cofac.metal */
 
 
@@ -1182,6 +1207,10 @@ static void cf_run_rounds(const mz<L> *d_n, mz<L> lim2, uint32_t lpb, uint32_t n
          * because the count lives on the device; see k_cofac. */
         uint32_t step = (S->chunk < n) ? S->chunk : n;
         if (!step) step = n;   /* b += 0 would never terminate */
+        /* Clamped, not passed through: k_cofac's __launch_bounds__ makes
+         * COFAC_THREADS_MAX a hard ceiling, and --threads may be wider for the
+         * other kernels. The stride loop covers [ibeg, iend) at any width. */
+        const int kth = (threads < COFAC_THREADS_MAX) ? threads : COFAC_THREADS_MAX;
         for (uint32_t b = 0; b < n; b += step) {
             const uint32_t e = (n - b > step) ? b + step : n;
             /* The flush's worst-case launch; see g_cof_peak. */
@@ -1190,11 +1219,11 @@ static void cf_run_rounds(const mz<L> *d_n, mz<L> lim2, uint32_t lpb, uint32_t n
             if (_peak) mtlEventRecord(g_cof_peak->a);
             if (S->method) {
                 if (S->s2nv)
-                    MTL_LAUNCH_NAMED(cf_kname(L, 1, 1), blocks, threads, 0, 0, d_n, lim2, lpb, (uint32_t)(r + 1), S->curves, W->d_sel, W->d_nsel, d_status, d_fac, d_nfac, d_iters, S->d_s, S->ns, S->d_s2mask, S->s2vmin, S->s2nv, b, e);
+                    MTL_LAUNCH_NAMED(cf_kname(L, 1, 1), blocks, kth, 0, 0, d_n, lim2, lpb, (uint32_t)(r + 1), S->curves, W->d_sel, W->d_nsel, d_status, d_fac, d_nfac, d_iters, S->d_s, S->ns, S->d_s2mask, S->s2vmin, S->s2nv, b, e);
                 else
-                    MTL_LAUNCH_NAMED(cf_kname(L, 1, 0), blocks, threads, 0, 0, d_n, lim2, lpb, (uint32_t)(r + 1), S->curves, W->d_sel, W->d_nsel, d_status, d_fac, d_nfac, d_iters, S->d_s, S->ns, NULL, 0, 0, b, e);
+                    MTL_LAUNCH_NAMED(cf_kname(L, 1, 0), blocks, kth, 0, 0, d_n, lim2, lpb, (uint32_t)(r + 1), S->curves, W->d_sel, W->d_nsel, d_status, d_fac, d_nfac, d_iters, S->d_s, S->ns, NULL, 0, 0, b, e);
             } else {
-                MTL_LAUNCH_NAMED(cf_kname(L, 0, 0), blocks, threads, 0, 0, d_n, lim2, lpb, (uint32_t)(r + 1), S->budget << r, W->d_sel, W->d_nsel, d_status, d_fac, d_nfac, d_iters, NULL, 0, NULL, 0, 0, b, e);
+                MTL_LAUNCH_NAMED(cf_kname(L, 0, 0), blocks, kth, 0, 0, d_n, lim2, lpb, (uint32_t)(r + 1), S->budget << r, W->d_sel, W->d_nsel, d_status, d_fac, d_nfac, d_iters, NULL, 0, NULL, 0, 0, b, e);
             }
             if (_peak) {
                 mtlEventRecord(g_cof_peak->b);
@@ -1375,6 +1404,10 @@ static uint32_t cof_chunk_open(int blocks, int threads)
 
 static uint32_t cof_chunk_floor(int blocks, int threads)
 {
+    /* Upstream's clamp, kept: k_cofac launches at COFAC_THREADS_MAX or
+     * narrower, so a floor computed from a wider --threads would promise
+     * records to threads that never run. */
+    if (threads > COFAC_THREADS_MAX) threads = COFAC_THREADS_MAX;
     /* One WAVE, not one grid: the measurement decides how far to descend
      * (see the no-progress guard), and this only stops the controller
      * asking for fewer records than the device can run at once. */

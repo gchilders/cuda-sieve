@@ -4,8 +4,14 @@ Porting the CUDA NFS lattice sieve in `bench/` to Metal Shading Language for
 Apple Silicon. The plan of record is **`bench/METAL_PORT_PLAN.md`** — read it
 first; it also carries the drift ledger. This file carries the rules.
 
-Branched from `main` at `3e15fec`. `hip-port` is a reference for method, not
-a base: it is 23 commits behind `main`.
+**Rebased onto `main` at `75d4cf7` on 2026-09-16** (was branched at `3e15fec`).
+`hip-port` is a reference for method, not a base: it is well behind `main`.
+
+**Rebasing means REGENERATING, and the generators' asserts are what tell you
+so.** The rebase brought in upstream's ECM occupancy fix (`2bc1c6e`), which
+touches `cofac.cuh` -- a file this port generates from and never edits. Two
+generators failed immediately on their anchors, which is the system working;
+the dangerous one failed *quietly* underneath. See "Rebase, 2026-09-16" below.
 
 ## This machine
 - Apple M3 MacBook Air (fanless), 10-core GPU, `MTLGPUFamilyApple9`, 16 GB
@@ -1449,6 +1455,49 @@ would happily write relations** — exactly what the CUDA Makefile's own comment
 says must not happen ("anything that must stay shippable gets its own
 variable, never a DEFS value"). `CPUOBJ_MAKEVARS` now forwards it; verified by
 building with a `METAL_EXTRA_DEFS` and watching `--relations` get refused.
+
+## Rebase, 2026-09-16: upstream's ECM occupancy fix, and a silent kernel leak
+
+`metal-port` was 6 commits behind `main` and is now rebased onto `75d4cf7`
+(75 commits ahead, `main` an ancestor). The one that matters is **`2bc1c6e`,
+"Fixing a minor regression in some of the recent ECM code"** -- not a
+correctness fix but an **occupancy** one, in `cofac.cuh`, which this port
+GENERATES from and never edits:
+
+- `__launch_bounds__(256, 2)` on `k_cofac`. At 256 threads, 128 registers is a
+  cliff (two blocks per SM), and ECM stage 2's shared denominator had pushed
+  the kernel one register over it -- costing a 5070 half its occupancy. Worth
+  **-10.3%** of the cofactor stage there, relations md5-identical.
+- **`COFAC_THREADS_MAX` 256 as a HARD ceiling** (512 fails outright with
+  "invalid argument"), with `cf_run_rounds` and `cof_chunk_floor` clamping.
+
+**What carries to Metal: the clamp. What does not: the bound.**
+`__launch_bounds__` is a CUDA register directive with no MSL equivalent, so
+`gen_cofac_metal.py` strips it before parsing -- **only the declaration form**,
+because a blanket strip also edits the word inside `cofac.cuh`'s own comment.
+MSL's nearest relative is `[[max_total_threads_per_threadgroup(n)]]`, which is
+a real untried optimisation here and was **deliberately not adopted silently**:
+it is a performance change and wants measuring on this box. The clamp does not
+bind at this build's default `--threads 256`.
+
+**THE NEAR-MISS: a kernel count went 9 -> 8 and nothing failed.**
+`gen_cofac_host.py` strips `__global__` definitions out of the host file with
+`(?:template<...>)?__global__\s+void\s+\w+\s*\(`. Upstream's new shape puts
+`__launch_bounds__` between `__global__` and a `void` on the NEXT line, so the
+pattern stopped matching `k_cofac` and **its entire device definition was left
+sitting in the host translation unit**. The only signal was the number in the
+generator's own output line. Both fixed, and **the count is now asserted**
+(`assert nk == 9`), because an anchor that silently matches nothing is this
+port's most-repeated failure.
+
+The two generators that failed LOUDLY (`gen_cofac_metal.py` on its kernel
+pattern, `gen_cofac_host.py` on `cof_chunk_floor`) cost minutes. The one that
+failed quietly would have shipped.
+
+**Validated after the rebase:** fourteen gates green -- `metalcheck`,
+`rtcheck`, `scancheck`, `argbufcheck`, `classifycheck`, `fbcheck`,
+`sievecheck`, `cofaccheck`, `validationcheck`, `cbtimecheck`, `boinccheck`,
+`metallibcheck`, `progresscheck` -- plus `cofcheck.sh` **54 PASS / 0 FAIL**.
 
 ## Drift ledger — CUDA-side changes made for this port
 
