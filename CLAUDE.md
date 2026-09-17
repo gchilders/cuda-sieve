@@ -4,7 +4,7 @@ Porting the CUDA NFS lattice sieve in `bench/` to Metal Shading Language for
 Apple Silicon. The plan of record is **`bench/METAL_PORT_PLAN.md`** — read it
 first; it also carries the drift ledger. This file carries the rules.
 
-**Rebased onto `main` at `8b62c81` on 2026-09-17** (branched at `3e15fec`,
+**Rebased onto `main` at `0acfd8c` on 2026-09-17** (branched at `3e15fec`,
 rebased onto `75d4cf7` the day before).
 `hip-port` is a reference for method, not a base: it is well behind `main`.
 
@@ -1670,6 +1670,40 @@ the STAGE is not, because more launches means more per-launch overhead --
 **fbgen's 0.205 s is per PROCESS, not per q** -- 0.09% of a 288-q band and
 immaterial against a workunit measured in hours, though a host that restarts
 repeatedly pays it again each time (the field M1 Max restarted six times).
+
+## Rebase, 2026-09-17 (second): the root-finder SLICING went upstream too
+
+The field reported **interactive stutter at workunit start** on CUDA -- no
+crash, just an unresponsive desktop for the several seconds of factor-base
+generation, which is the milder relative of the cofactor's TDR problem and
+produces no error to diagnose from. Fixed in `fbgen_gpu.cu` itself
+(`0acfd8c`), so `FB_ROOTS_STRIDES_START/MAX`, `FB_LAUNCH_TARGET_MS`,
+`g_fb_strides`, `fb_steer_strides()` and the event bracket are shared code now.
+`gen_fbgen_host.py` shed **227 lines against 160 added**.
+
+**Two things stay Metal-only, for two DIFFERENT reasons:**
+- the **per-slice `mtlStreamFlush`** -- CUDA needs nothing, because a kernel
+  launch is already the unit its watchdog sees; here the stream batches every
+  slice into one command buffer, so without it the slicing bounds nothing;
+- the **retry** -- CUDA *cannot* do it, because a TDR reset destroys the
+  context. macOS's interactivity kill leaves the device usable.
+
+**Metal's drain-based measurement is gone, and upstream's event bracket suits
+it better.** On Metal an event record COMMITS the stream's command buffer, so
+bracketing slice 0 puts that slice in a buffer of its own and
+`mtlEventElapsedTime` measures exactly its GPU duration -- no need for the
+"worst of the last drain" query the CPU/GPU race forced on 9z-o.
+**`mtlStreamWorstMs` is now unused in `metal_rt`** and should be removed or
+justified at the next review.
+
+Upstream's target is 250 ms against Metal's old 400, so this is MORE
+conservative than before: worst root-finder command buffer **311 -> 176 ms**,
+fbgen 6.68 -> 6.92 s (+3.6%). The right direction for the M1/M2 hosts this
+started with.
+
+**Validated:** eleven gates green including `cbtimecheck` and `fbretrycheck`,
+`cofcheck.sh` **54 PASS / 0 FAIL**, 288-q band `cmp`-identical at **13,485
+relations / `8e79762c…`**.
 
 ## Rebase, 2026-09-17: the peak-launch mechanism went UPSTREAM
 
