@@ -1575,6 +1575,66 @@ re-learning the cofactor chunk from 36864, paying another 744-790 ms
 over-bound launch each time. The learned chunk is not carried in the
 checkpoint.
 
+## 9z-p: a killed segment is REDONE, not lost -- and the alim was the tell
+
+The persistent M2's log named its own cause in its FIRST line:
+
+```
+generating algebraic factor base on GPU through 250000000
+... 60% through prime range
+metal_rt: command buffer failed: internal (code 1): Impacting Interactivity
+metal_rt: command buffer failed: internal (code 1): Impacting Interactivity
+```
+
+**`alim` is 250,000,000 there and 134,000,000 in every log that succeeded.**
+Not a different device problem -- a bigger job: ~15 segments instead of 8, at
+primes up to 250M. 9z-o's measured slice size covers that, because it stops
+caring what the job or the device is.
+
+**But TWO buffers were killed in one drain, and that half is not a sizing
+problem at all.** The interactivity watchdog is **contention-dependent** -- it
+fires when the GPU is wanted elsewhere -- so no slice size, measured or
+chosen, can guarantee it never fires. A volunteer opening a game can kill a
+correctly-sized buffer. Sizing and recovery are different jobs and the port
+only had one of them.
+
+**The root finder is IDEMPOTENT, which is what makes recovery cheap:**
+`d_rootbuf`, `d_counts` and `d_special` are indexed by prime and simply
+rewritten, `d_failures` is re-zeroed, and **nothing has reached the sink** --
+the scan, `k_total_roots` and every `sink->` call are below the failure point.
+So a killed segment is re-derived from the same inputs. Up to
+`FB_ROOTS_MAX_ATTEMPTS` (4) tries, **halving the slice each time**: the kill is
+the controller's strongest input, the one measurement that says "too long"
+without a timer. Measured cost of a recovery: ~1 s, output identical.
+
+**FAULT INJECTION, because the watchdog cannot be provoked on demand.**
+`CUDA_SIEVE_METAL_FAULT_SYNC=N` fails the Nth sync (N<0: every sync from |N|
+on) **without corrupting anything** -- the work really ran, so a correct retry
+must produce the same factor base, and that is the property worth asserting.
+`make -f Makefile.metal fbretrycheck`: 6 checks, and its control is built in --
+a clean run must NOT retry, or the gate is vacuous.
+
+**IT IMMEDIATELY FOUND TWO BUGS IN MY OWN RETRY, both of which "worked":**
+
+1. **Every injected fault produced exactly TWO retries.** `mtlMemcpy`'s failure
+   also sets the sticky last-error, so the next attempt read it back and
+   "failed" having done nothing wrong. The attempt now consumes it first.
+2. **The second halving went UP -- 34 -> 17 -> 256 -> "halve" to 128.** The
+   steer ran on the FAILED attempt, measured the surviving short buffers as
+   cheap, and grew the slice straight back over the halving. **The recovery was
+   making the next attempt four times worse.** It now steers only on success.
+
+Neither would have been visible without executing the path. **A recovery path
+that has never run is not a recovery path.**
+
+**Still not exercised:** the 4-attempt exhaustion branch itself. An always-fail
+injection dies earlier, in an `MTL_OR_DIE` on the tiny memset, so what is
+verified is that an unrecoverable fault TERMINATES (2.1 s, exit 1) rather than
+looping -- not the counter.
+
+Eleven gates green, `cofcheck.sh` 54/0, 288-q band `cmp`-identical at 13,485
+relations / `8e79762c…`.
+
 ## Rebase, 2026-09-16: upstream's ECM occupancy fix, and a silent kernel leak
 
 `metal-port` was 6 commits behind `main` and is now rebased onto `75d4cf7`

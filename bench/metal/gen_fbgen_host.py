@@ -328,6 +328,13 @@ _k_new = chr(10).join([
     "#ifndef FB_ROOTS_STRIDES_MAX",
     "#define FB_ROOTS_STRIDES_MAX 256u",
     "#endif",
+    "/* Attempts at one segment before giving up. The watchdog that motivates",
+    " * the retry is contention-dependent, so a couple of halvings is normally",
+    " * enough; a bound that is NOT transient (a page fault, say) then costs",
+    " * four quick attempts instead of hanging. */",
+    "#ifndef FB_ROOTS_MAX_ATTEMPTS",
+    "#define FB_ROOTS_MAX_ATTEMPTS 4",
+    "#endif",
     "",
     "static uint32_t g_fb_strides = FB_ROOTS_STRIDES_START;",
     "static float    g_fb_launch_max;          /* worst over-bound launch reported */",
@@ -375,6 +382,73 @@ _st_new = "        MTL_OR_DIE(mtlMemcpy(&failures, d_failures, sizeof(failures),
 assert _st_old in s, 'segment sync shape changed'
 s = s.replace(_st_old, _st_new, 1)
 print('  root finder steers on the segment drain')
+
+# ---- an interactivity kill is TRANSIENT: halve and redo the segment -------
+# The watchdog that kills these buffers is contention-dependent -- it fires
+# when the GPU is wanted elsewhere -- so no slice size, measured or chosen, can
+# guarantee it never fires. A field M2 lost a whole workunit to two killed
+# buffers at 60% of a 250M factor base. Recovery has to exist alongside sizing.
+#
+# The root finder is IDEMPOTENT, which is what makes this safe: d_rootbuf,
+# d_counts and d_special are indexed by prime and simply rewritten, d_failures
+# is re-zeroed, and nothing has reached the sink yet -- the scan, k_total_roots
+# and every sink->  call are still below. So re-running the loop re-derives the
+# same segment from the same inputs.
+#
+# Halving on each attempt makes the kill itself the controller's strongest
+# input: it is the one measurement that says "too long" without needing a
+# timer.
+_ra = s.index("        MTL_OR_DIE(mtlMemset(d_failures, 0, sizeof(*d_failures)));")
+_rz = s.index("        fb_steer_strides(who);", _ra) + len("        fb_steer_strides(who);")
+_region = s[_ra:_rz]
+
+_tail_old = ("        MTL_OR_DIE(mtlGetLastError());" + chr(10) +
+             "        MTL_OR_DIE(mtlMemcpy(&failures, d_failures, sizeof(failures)," + chr(10) +
+             "                               mtlMemcpyDeviceToHost));")
+_tail_new = ("        mtlError_t fb_rc = mtlGetLastError();" + chr(10) +
+             "        if (fb_rc == mtlSuccess)" + chr(10) +
+             "            fb_rc = mtlMemcpy(&failures, d_failures, sizeof(failures)," + chr(10) +
+             "                              mtlMemcpyDeviceToHost);")
+assert _tail_old in _region, 'segment sync shape changed (retry wrap)'
+_region = _region.replace(_tail_old, _tail_new, 1)
+
+# indent the whole region one level, then wrap it in the attempt loop
+_region = chr(10).join(("    " + l) if l.strip() else l for l in _region.split(chr(10)))
+# The steer must not run on a FAILED attempt: it reads the drain that just
+# died, measures the surviving short buffers as cheap, and grows the slice
+# straight back over the halving. Measured: 34 -> halve to 17 -> steer to 256
+# -> "halve" to 128, i.e. the recovery made the next attempt four times worse.
+assert _region.rstrip().endswith("fb_steer_strides(who);"), 'steer call moved'
+_region = _region.rstrip()[:-len("fb_steer_strides(who);")].rstrip(chr(10) + " ")
+
+_wrapped = (
+    "        for (int fb_try = 0; ; fb_try++) {" + chr(10) +
+    "            /* Consume any error left by the previous attempt. mtlMemcpy's"
+    + chr(10) +
+    "             * failure also sets the sticky last-error, so without this the"
+    + chr(10) +
+    "             * next attempt reads it back and 'fails' again having done"
+    + chr(10) +
+    "             * nothing wrong -- measured: every injected fault produced"
+    + chr(10) +
+    "             * exactly two retries. */" + chr(10) +
+    "            (void)mtlGetLastError();" + chr(10) +
+    _region + chr(10) +
+    "            if (fb_rc == mtlSuccess) { fb_steer_strides(who); break; }" + chr(10) +
+    "            if (fb_try + 1 >= FB_ROOTS_MAX_ATTEMPTS) {" + chr(10) +
+    "                fprintf(stderr, \"%s: root finder in [%u,%u] failed %d times: %s\\n\"," + chr(10) +
+    "                        who, lo, (uint32_t)hi64, fb_try + 1," + chr(10) +
+    "                        mtlGetErrorString(fb_rc));" + chr(10) +
+    "                goto fail;" + chr(10) +
+    "            }" + chr(10) +
+    "            g_fb_strides = g_fb_strides > 1u ? g_fb_strides / 2u : 1u;" + chr(10) +
+    "            fprintf(stderr, \"%s: root finder in [%u,%u] did not complete (%s);\"" + chr(10) +
+    "                    \" retrying at %u grid-strides\\n\"," + chr(10) +
+    "                    who, lo, (uint32_t)hi64, mtlGetErrorString(fb_rc)," + chr(10) +
+    "                    g_fb_strides);" + chr(10) +
+    "        }")
+s = s[:_ra] + _wrapped + s[_rz:]
+print('  root finder retries a killed segment at half the slice size')
 
 open(OUT, 'w').write(s)
 print('re-wrote %s with macro dispatch fixed' % OUT)

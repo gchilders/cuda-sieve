@@ -364,6 +364,16 @@ metallibcheck: ../oracle/c183.fb1
 	@sh metal/metallibcheck.sh $(CURDIR)/$(BUILD)/bench \
 	    $(CURDIR)/../oracle/c183.poly $(CURDIR)/../oracle/c183.fb1
 
+# ---- fbgen recovery gate (9z-p) -----------------------------------------
+# The watchdog that kills these buffers cannot be provoked on demand, so the
+# recovery is driven by fault injection and checked against the property that
+# matters: the retried factor base must be identical to the clean one.
+.PHONY: fbretrycheck
+fbretrycheck:
+	@$(MAKE) -f Makefile.metal $(BUILD)/bench >/dev/null
+	@sh metal/fbretrycheck.sh $(CURDIR)/$(BUILD)/bench \
+	    $(CURDIR)/$(BUILD)/bench.metallib $(CURDIR)/../oracle/c183.poly
+
 # ---- resume progress gate (9z-m) ----------------------------------------
 # The bar restarted at 0 when a band resumed. There is no control BINARY: a
 # build with the fix compiled out cannot emit --relations, because any
