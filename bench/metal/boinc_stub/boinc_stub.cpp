@@ -5,6 +5,12 @@
 double stub_reported[256];
 int    stub_nreported;
 int    stub_fraction_rc;
+/* 1 by default, so every existing case keeps the standalone behaviour it was
+ * written against; the transient-exit case flips it to test the managed half. */
+int    stub_standalone = 1;
+int    stub_ntempexit;
+int    stub_tempexit_delay;
+const char *stub_tempexit_reason;
 
 int  boinc_init(void) { return 0; }
 int  boinc_init_options(BOINC_OPTIONS *) { return 0; }
@@ -16,7 +22,7 @@ int  boinc_get_init_data(APP_INIT_DATA &aid)
     aid.gpu_type[0] = '\0';
     return 0;
 }
-int  boinc_is_standalone(void) { return 1; }
+int  boinc_is_standalone(void) { return stub_standalone; }
 int  boinc_resolve_filename_s(const char *virt, std::string &phys)
 { phys = virt ? virt : ""; return 0; }
 int  boinc_fraction_done(double f)
@@ -26,4 +32,13 @@ int  boinc_fraction_done(double f)
 }
 int  boinc_finish(int) { return 0; }
 void boinc_exit(int) {}
-int  boinc_temporary_exit(int, const char *, bool) { return 0; }
+/* The real one does not return; this records the call so the test can assert
+ * it happened AND keep running. That difference is why the assertion below is
+ * about reaching this function, not about the process dying. */
+int  boinc_temporary_exit(int delay, const char *reason, bool)
+{
+    stub_ntempexit++;
+    stub_tempexit_delay = delay;
+    stub_tempexit_reason = reason;
+    return 0;
+}

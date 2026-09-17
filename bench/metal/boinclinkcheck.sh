@@ -61,6 +61,19 @@ for sym in _boinc_init_parallel _boinc_finish _boinc_fraction_done; do
     fi
 done
 
+#    boinc_temporary_exit is NOT extern "C" -- BOINC's own API is not uniform
+#    about this, and it carries default arguments -- so it appears as
+#    __Z20boinc_temporary_exitiPKcb. Demangle rather than hardcode that, and
+#    match the demangled name anchored at the start, because our own wrapper
+#    _bench_boinc_temporary_exit is always present and a loose substring match
+#    would pass whether or not the archive was ever pulled.
+if nm "$BIN" 2>/dev/null | awk '$2 == "T" { print $3 }' \
+     | c++filt | grep -qE '^boinc_temporary_exit\('; then
+    pass "boinc_temporary_exit linked in (C++-mangled, unlike the three above)"
+else
+    bad "boinc_temporary_exit missing -- a transient no-GPU failure would burn the workunit"
+fi
+
 # 6. cofcheck.sh classifies builds by this exact string, and a HAVE_BOINC
 #    build takes the OTHER branch of that #ifdef. Misclassified as CUDA, it
 #    runs the --ecm-b1 400000 case that crashed WindowServer twice (plan 8k).
