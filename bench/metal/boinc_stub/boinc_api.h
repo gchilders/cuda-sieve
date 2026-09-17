@@ -31,6 +31,10 @@ struct BOINC_OPTIONS {
 extern double stub_reported[256];
 extern int    stub_nreported;
 extern int    stub_fraction_rc;
+extern int    stub_standalone;          /* boinc_is_standalone()'s answer   */
+extern int    stub_ntempexit;           /* boinc_temporary_exit() call count */
+extern int    stub_tempexit_delay;
+extern const char *stub_tempexit_reason;
 
 int  boinc_init(void);
 int  boinc_init_options(BOINC_OPTIONS *opt);

@@ -246,6 +246,35 @@ extern "C" int bench_boinc_gpu_device(void)
 #endif
 }
 
+/* A TRANSIENT failure: ask the client to reschedule instead of erroring.
+ *
+ * Added 2026-09-16 for the Metal port. A field task exited 1 with "this
+ * process sees no Metal device" seconds after starting, on a host whose
+ * client had already assigned an apple_gpu -- so the GPU existed and the
+ * PROCESS could not reach it, which on macOS is what happens outside a GUI
+ * login session. boinc_finish(1) marks such a task permanently errored and
+ * charges the host with a failure; boinc_temporary_exit defers it, and a
+ * retry once somebody logs in simply works.
+ *
+ * Returns only if BOINC is not managing this run (standalone, or a non-BOINC
+ * build), so every caller must still handle its own failure afterwards.
+ * boinc_temporary_exit itself does not return. */
+extern "C" void bench_boinc_temporary_exit(int delay_seconds, const char *reason)
+{
+#ifdef HAVE_BOINC
+    if (boinc_state == BOINC_READY && !boinc_is_standalone()) {
+        fflush(stdout);
+        fflush(stderr);
+        /* is_notice = false: this is expected and self-healing, so it belongs
+         * in the task's stderr, not in a notice the volunteer must dismiss. */
+        boinc_temporary_exit(delay_seconds, reason, false);
+    }
+#else
+    (void)delay_seconds;
+    (void)reason;
+#endif
+}
+
 extern "C" int bench_boinc_is_managed(void)
 {
 #ifdef HAVE_BOINC

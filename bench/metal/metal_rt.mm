@@ -460,7 +460,21 @@ static mtlError_t init_locked(const char *metallib_path)
 {
     if (g_dev) return mtlSuccess;
     g_dev = MTLCreateSystemDefaultDevice();
-    if (!g_dev) return fail(mtlErrorInitialization);
+    if (!g_dev) {
+        /* EVERY OTHER FAILURE IN THIS FUNCTION PRINTS. This one did not, so a
+         * field log showed only the caller's generic "this process sees no
+         * Metal device" and could not be told apart from a refused GPU or an
+         * unloadable shader library -- both of which do print. Say it here,
+         * with the cause that is actually likely: on macOS a process with no
+         * GUI login session gets no Metal device even though the hardware is
+         * present and the BOINC client can see it. */
+        fprintf(stderr,
+                "metal_rt: MTLCreateSystemDefaultDevice() returned nil -- no GPU\n"
+                "          is available TO THIS PROCESS. The hardware may be fine:\n"
+                "          on macOS a process outside a GUI login session gets no\n"
+                "          Metal device, so this can mean nobody was logged in.\n");
+        return fail(mtlErrorNoDevice);
+    }
 
     /* Four places, in this order:
      *
@@ -609,7 +623,12 @@ extern "C" mtlError_t mtlGetDeviceCount(int *n)
     std::lock_guard<std::mutex> lk(g_lock);
     mtlError_t e = ensure_init_locked();
     if (n) *n = (e == mtlSuccess && g_dev) ? 1 : 0;
-    return mtlSuccess;
+    /* RETURN THE REASON. This used to `return mtlSuccess` unconditionally,
+     * which made the caller's "cannot enumerate Metal devices: %s" branch
+     * dead code and collapsed a nil device, a refused GPU and an unloadable
+     * shader library into the single line "this process sees no Metal
+     * device". Only one of those three is worth retrying. */
+    return e;
 }
 
 extern "C" mtlError_t mtlGetDeviceProperties(mtlDeviceProp *p, int dev)
@@ -920,6 +939,7 @@ extern "C" const char *mtlGetErrorString(mtlError_t e)
     case mtlErrorKernelNotFound:       return "kernel not found in shader library";
     case mtlErrorNotMapped:            return "pointer is not a device allocation";
     case mtlErrorUnsupported:          return "unsupported on Metal";
+    case mtlErrorNoDevice:             return "no Metal device is visible to this process";
     }
     return "unknown error";
 }

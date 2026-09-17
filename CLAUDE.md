@@ -1303,6 +1303,50 @@ failing (805 ms). **The bound binds on slower devices, which is its whole
 purpose** -- an M1 whose per-launch cost is 1.5-2x this one now gets steered
 down instead of sitting at 400-600 ms per submission forever.
 
+## 9z-l: "no Metal device" was three causes wearing one message
+
+A field task (client 8.2.9) exited 1 seconds after starting:
+
+```
+BOINC: client assigned Metal device 0
+bench: this process sees no Metal device
+```
+
+**The client had already assigned an `apple_gpu`, so the hardware was there and
+the PROCESS could not reach it.** On macOS that is what happens outside a GUI
+login session: `MTLCreateSystemDefaultDevice()` returns nil. It was diagnosable
+only by what the log did NOT contain -- the family gate names the GPU it
+refuses, and both metallib paths name the library, so their silence ruled them
+out. **The nil-device path was the only one in `init_locked` that printed
+nothing.** It now prints, and names the login-session cause.
+
+**`mtlGetDeviceCount` computed the real error and then `return mtlSuccess`
+unconditionally**, so `bench: cannot enumerate Metal devices: %s` was **dead
+code** and a nil device, a refused GPU and an unloadable shader library all
+arrived as the same line. New `mtlErrorNoDevice` distinguishes the transient
+one; the other two stay permanent and keep erroring out. The generic test had
+to be loosened to let the new code reach its own branch -- it sits first and
+would otherwise have made the new handler unreachable.
+
+**AND THE TASK NEED NOT HAVE BEEN LOST.** `boinc_finish(1)` marks a task
+permanently errored and charges the host with a failure. New
+`bench_boinc_temporary_exit()` asks the client to retry after
+`BENCH_NO_GPU_RETRY_S` (600 s) instead. **It returns when BOINC is not managing
+the run**, so a `HAVE_BOINC` binary launched from a terminal still reaches its
+own error path -- `boinccheck` tests that half too, because the real
+`boinc_temporary_exit` never returns and only the stub can prove the wrapper
+does. Drift-ledger row added; nothing in the CUDA build calls it.
+
+**`boinc_temporary_exit` is not `extern "C"`**, unlike `boinc_finish` --
+BOINC's own API is not uniform. `boinclinkcheck` demangles instead of guessing
+a symbol name, and caught this by failing when it guessed. 9 checks, control
+still failing all four.
+
+**Unverified:** the login-session diagnosis fits every fact in the log but was
+not reproduced -- Metal device creation was not actually made to fail here. The
+retry delay is a compromise with nothing behind it: nobody has measured how
+long the condition lasts.
+
 ## Drift ledger — CUDA-side changes made for this port
 
 **The ledger lives in `bench/METAL_PORT_PLAN.md` section 9, and only there.**

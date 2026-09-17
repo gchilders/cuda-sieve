@@ -53,7 +53,16 @@ enum {
     mtlErrorSymbolNotFound,
     mtlErrorKernelNotFound,
     mtlErrorNotMapped,          /* pointer is not inside any allocation     */
-    mtlErrorUnsupported
+    mtlErrorUnsupported,
+    /* No Metal device is visible TO THIS PROCESS. Distinct from
+     * mtlErrorInitialization, which a metallib failure also returns, and from
+     * mtlErrorUnsupported, which means a device was found and refused. The
+     * distinction is not pedantic: this one is usually TRANSIENT (on macOS a
+     * process outside a GUI login session gets no device, so a BOINC task that
+     * starts while nobody is logged in sees this and a retry would succeed),
+     * while the other two are permanent properties of the host or the binary.
+     * A field log had all three collapsed into one message. */
+    mtlErrorNoDevice
 };
 
 enum {
