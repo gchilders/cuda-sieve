@@ -1347,6 +1347,65 @@ not reproduced -- Metal device creation was not actually made to fail here. The
 retry delay is a compromise with nothing behind it: nobody has measured how
 long the condition lasts.
 
+## 9z-m: the progress bar restarted at 0 on a resume
+
+Reported from the field as a CUDA-side bug; **fixed Metal-side only**, since
+`pipeline.cuh` and `bench_main.cu` are shared and a behaviour change there
+would reach HIP.
+
+**Everything in `run_pipeline_impl` knows about resume except the thing that
+draws the bar.** `base_rel`/`base_nq` are what earlier sessions put on disk;
+the `--target-rels` stop test adds `base_rel` ("counting only this session's
+would make a resumed run sieve the whole target again from scratch"), the
+checkpoint writer and every console q count add `base_nq`. The declaration
+comment even claims they "are added to the goal tests and the progress line" —
+they reach the console line's RELATION count and nothing else.
+`pipe_progress_fraction` was handed neither.
+
+**Three of its four branches were wrong, for two different reasons**, and the
+denominators are the subtle half — `bench_main` has ALREADY shrunk them:
+
+| branch | why it restarted |
+|---|---|
+| `target_rels` | both BOINC call sites passed this session's relations only (the console site already added `base_rel`, which is why this one looked right from a terminal) |
+| `nq_max` / `nq` | `cfg->nq_max` is **reduced** by the completed count ("--nq counts this session's q") and `nqdone` restarts at 0 — so the ratio measured progress through the REMAINDER |
+| q range | `cfg->qmin` is **overwritten** with the checkpoint's `next_q`, shrinking the span to what is left |
+
+Fixed by passing `base_nq` in and totalling relations at every call site, and
+by keeping the band's original lower bound in a new `cfg->resume_qmin` —
+inert CUDA-side (the CUDA build zero-initialises `cfg` and never reads it),
+drift-ledger row added.
+
+**MEASURED, with the pre-fix binary as the control.** The run log is the right
+instrument because ONE record carries both numbers: `nq=` is `base_nq +
+nqdone` and has always been right, `pct=` comes from the estimator.
+
+```
+control  nq=141  pct=18.06      <- 141 of 200 q done, bar at 18%
+control  nq=132  pct= 5.56      <- same checkpoint, 4/72 of the remainder
+gate     nq=132  pct=66.00      <- 132/200, exactly
+```
+
+Both branches confirmed end to end by stopping a 200-q band at 128 q with
+`--stop-file` and rerunning: `--nq` band 62% -> **18%** before, continuous
+after; q-range band (no `--nq`, the branch needing `resume_qmin`) 23.29% ->
+**3.01%** before, 22.17% -> **27.51%** after, which is `(q-q0+1)/span` to the
+digit. Unresumed runs are unchanged — control and fixed both report 62.00% at
+`nq=124`.
+
+**GATED: `make -f Makefile.metal progresscheck`.** One expensive run makes the
+checkpoint; the gate and its control each resume from a COPY of it, so the
+control costs a short resume rather than a whole band. The control is a second
+build compiled with `-DPIPE_PROGRESS_IGNORE_RESUME`, which reproduces the
+shipped behaviour exactly and **must fail**.
+
+**Two traps while building the gate, both of which looked like a result.**
+Comparing against a binary built during a `git stash` dance gave the fixed
+build's numbers as the control's — the stale-artifact trap this file already
+records. And the gate's wait loop watched the run log GROW, which `--log`'s
+per-run header satisfies instantly, so it killed the resumed band before it
+reported anything and called that "no record".
+
 ## Drift ledger — CUDA-side changes made for this port
 
 **The ledger lives in `bench/METAL_PORT_PLAN.md` section 9, and only there.**
