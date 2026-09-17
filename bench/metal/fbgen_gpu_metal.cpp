@@ -59,6 +59,13 @@
 #ifndef FB_ROOTS_STRIDES_MAX
 #define FB_ROOTS_STRIDES_MAX 256u
 #endif
+/* Attempts at one segment before giving up. The watchdog that motivates
+ * the retry is contention-dependent, so a couple of halvings is normally
+ * enough; a bound that is NOT transient (a page fault, say) then costs
+ * four quick attempts instead of hanging. */
+#ifndef FB_ROOTS_MAX_ATTEMPTS
+#define FB_ROOTS_MAX_ATTEMPTS 4
+#endif
 
 static uint32_t g_fb_strides = FB_ROOTS_STRIDES_START;
 static float    g_fb_launch_max;          /* worst over-bound launch reported */
@@ -604,55 +611,75 @@ static int gpu_fb_generate_complete(const poly_t *P, uint32_t lim, int maxbits,
 
         const size_t slots = (size_t)nprime * GPU_FB_MAX_ROOTS;
         MTL_OR_DIE(mtlMalloc((void **)&d_rootbuf, slots * sizeof(*d_rootbuf)));
-        MTL_OR_DIE(mtlMemset(d_failures, 0, sizeof(*d_failures)));
-        {
-            const uint32_t ablocks = std::min<uint32_t>((nprime + 127u) / 128u,
-                                                        (uint32_t)prop.multiProcessorCount * 8u);
-            /* SLICED AND STEERED. macOS's interactivity watchdog judges a
-             * COMMAND BUFFER, so each slice is flushed; the flush is half
-             * the mechanism and the slice SIZE is the other half.
-             *
-             * The size is MEASURED, not chosen. A fixed grid-stride count
-             * does not transfer between devices: one stride covers `wave`
-             * primes and wave scales with core count, so 16 strides was
-             * 130 ms on this 10-core M3 and an estimated 560-840 ms across
-             * the M1 family -- over the bound, and near the ~800 ms at
-             * which field tasks were actually killed. That is 9z-j's error
-             * one level up: 9z-j replaced a fixed prime count with a fixed
-             * stride count and assumed strides were the device-independent
-             * unit. They are not. Nothing here is.
-             *
-             * So start at a size safe on the slowest device there is field
-             * data for, and let the measurement move it -- exactly as
-             * cofq_flush steers the cofactor chunk. See plan 9z-o. */
-            const uint32_t wave = ablocks * 128u;
-            for (uint32_t off = 0; off < nprime; ) {
-                const uint64_t step64 = (uint64_t)wave * g_fb_strides;
-                const uint32_t step = step64 >= nprime ? nprime : (uint32_t)step64;
-                const uint32_t cnt = (nprime - off) < step ? (nprime - off) : step;
-                const uint32_t sb = std::min<uint32_t>((cnt + 127u) / 128u, ablocks);
-                uint32_t *r_off = d_rootbuf + (size_t)off * GPU_FB_MAX_ROOTS;
-                if (P->deg <= 6)
-                    MTL_LAUNCH(k_alg_roots_fixed_mark_6_1, sb, 128, 0, 0, d_primes + off, cnt, r_off, d_counts + off, d_special + off, d_failures, (const gpu_big_t *)mtlGetSymbol("c_alg"), *(const int *)mtlGetSymbol("c_alg_deg"));
-                else
-                    MTL_LAUNCH(k_alg_roots_fixed_mark_8_1, sb, 128, 0, 0, d_primes + off, cnt, r_off, d_counts + off, d_special + off, d_failures, (const gpu_big_t *)mtlGetSymbol("c_alg"), *(const int *)mtlGetSymbol("c_alg_deg"));
-                MTL_OR_DIE(mtlStreamFlush(0));
-                off += cnt;
+        for (int fb_try = 0; ; fb_try++) {
+            /* Consume any error left by the previous attempt. mtlMemcpy's
+             * failure also sets the sticky last-error, so without this the
+             * next attempt reads it back and 'fails' again having done
+             * nothing wrong -- measured: every injected fault produced
+             * exactly two retries. */
+            (void)mtlGetLastError();
+            MTL_OR_DIE(mtlMemset(d_failures, 0, sizeof(*d_failures)));
+            {
+                const uint32_t ablocks = std::min<uint32_t>((nprime + 127u) / 128u,
+                                                            (uint32_t)prop.multiProcessorCount * 8u);
+                /* SLICED AND STEERED. macOS's interactivity watchdog judges a
+                 * COMMAND BUFFER, so each slice is flushed; the flush is half
+                 * the mechanism and the slice SIZE is the other half.
+                 *
+                 * The size is MEASURED, not chosen. A fixed grid-stride count
+                 * does not transfer between devices: one stride covers `wave`
+                 * primes and wave scales with core count, so 16 strides was
+                 * 130 ms on this 10-core M3 and an estimated 560-840 ms across
+                 * the M1 family -- over the bound, and near the ~800 ms at
+                 * which field tasks were actually killed. That is 9z-j's error
+                 * one level up: 9z-j replaced a fixed prime count with a fixed
+                 * stride count and assumed strides were the device-independent
+                 * unit. They are not. Nothing here is.
+                 *
+                 * So start at a size safe on the slowest device there is field
+                 * data for, and let the measurement move it -- exactly as
+                 * cofq_flush steers the cofactor chunk. See plan 9z-o. */
+                const uint32_t wave = ablocks * 128u;
+                for (uint32_t off = 0; off < nprime; ) {
+                    const uint64_t step64 = (uint64_t)wave * g_fb_strides;
+                    const uint32_t step = step64 >= nprime ? nprime : (uint32_t)step64;
+                    const uint32_t cnt = (nprime - off) < step ? (nprime - off) : step;
+                    const uint32_t sb = std::min<uint32_t>((cnt + 127u) / 128u, ablocks);
+                    uint32_t *r_off = d_rootbuf + (size_t)off * GPU_FB_MAX_ROOTS;
+                    if (P->deg <= 6)
+                        MTL_LAUNCH(k_alg_roots_fixed_mark_6_1, sb, 128, 0, 0, d_primes + off, cnt, r_off, d_counts + off, d_special + off, d_failures, (const gpu_big_t *)mtlGetSymbol("c_alg"), *(const int *)mtlGetSymbol("c_alg_deg"));
+                    else
+                        MTL_LAUNCH(k_alg_roots_fixed_mark_8_1, sb, 128, 0, 0, d_primes + off, cnt, r_off, d_counts + off, d_special + off, d_failures, (const gpu_big_t *)mtlGetSymbol("c_alg"), *(const int *)mtlGetSymbol("c_alg_deg"));
+                    MTL_OR_DIE(mtlStreamFlush(0));
+                    off += cnt;
+                }
             }
+            mtlError_t fb_rc = mtlGetLastError();
+            if (fb_rc == mtlSuccess)
+                fb_rc = mtlMemcpy(&failures, d_failures, sizeof(failures),
+                                  mtlMemcpyDeviceToHost);
+            /* ONE adjustment per segment, here and nowhere else: that memcpy is
+             * the sync that drains this segment's submissions, so it is the only
+             * moment their durations exist. Steering inside the slice loop reads
+             * whatever OTHER stage last drained -- the odds sieve, the select, the
+             * scan -- and each of those is a fresh measurement by the seq test's
+             * reckoning, so the controller grows on every one of them. Measured:
+             * it ran to the 256-stride ceiling inside the first segment and put
+             * the whole segment in one 788 ms command buffer, which is worse than
+             * the fixed size it replaced. */
+            if (fb_rc == mtlSuccess) { fb_steer_strides(who); break; }
+            if (fb_try + 1 >= FB_ROOTS_MAX_ATTEMPTS) {
+                fprintf(stderr, "%s: root finder in [%u,%u] failed %d times: %s\n",
+                        who, lo, (uint32_t)hi64, fb_try + 1,
+                        mtlGetErrorString(fb_rc));
+                goto fail;
+            }
+            g_fb_strides = g_fb_strides > 1u ? g_fb_strides / 2u : 1u;
+            fprintf(stderr, "%s: root finder in [%u,%u] did not complete (%s);"
+                    " retrying at %u grid-strides\n",
+                    who, lo, (uint32_t)hi64, mtlGetErrorString(fb_rc),
+                    g_fb_strides);
         }
-        MTL_OR_DIE(mtlGetLastError());
-        MTL_OR_DIE(mtlMemcpy(&failures, d_failures, sizeof(failures),
-                               mtlMemcpyDeviceToHost));
-        /* ONE adjustment per segment, here and nowhere else: that memcpy is
-         * the sync that drains this segment's submissions, so it is the only
-         * moment their durations exist. Steering inside the slice loop reads
-         * whatever OTHER stage last drained -- the odds sieve, the select, the
-         * scan -- and each of those is a fresh measurement by the seq test's
-         * reckoning, so the controller grows on every one of them. Measured:
-         * it ran to the 256-stride ceiling inside the first segment and put
-         * the whole segment in one 788 ms command buffer, which is worse than
-         * the fixed size it replaced. */
-        fb_steer_strides(who);
         if (failures) {
             fprintf(stderr,
                     "%s: algebraic root/primality validation failed for %u candidates in [%u,%u]\n",
