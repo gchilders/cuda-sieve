@@ -103,7 +103,15 @@ bench/bench.*-[0-9]*
 # Metal port artifacts
 metal-probe/*.air
 metal-probe/*.metallib
+# The probe BINARIES. `metal-probe/probe` alone used to be listed, so fp32,
+# lanemap and spin were committed as build products -- and a committed probe
+# binary cannot even run from a fresh clone, since it loads its .metallib by
+# name at runtime and those are ignored above. Build them with
+# `make -C metal-probe`.
 metal-probe/probe
+metal-probe/fp32
+metal-probe/lanemap
+metal-probe/spin
 *.metallib
 bench/.metal-build/
 bench/fbgen_gpu
@@ -114,3 +122,6 @@ bench/*.d
 bench/.metal-build/
 bench/bench
 oracle/*.fb1
+
+# Finder metadata. Untracked files set the build stamp's -dirty flag.
+.DS_Store
