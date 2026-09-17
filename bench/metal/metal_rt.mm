@@ -126,6 +126,21 @@ mtlError_t                   g_bind_error = mtlSuccess;
  * per dispatch and a 256-byte snprintf per commit, ~70,000 of each per band,
  * for output nobody was going to read. Diagnostics that are off should cost
  * nothing. */
+/* FAULT INJECTION, for gates that must exercise a recovery path.
+ * CUDA_SIEVE_METAL_FAULT_SYNC=N makes the Nth sync on the default stream
+ * report a launch failure. Nothing is corrupted -- the work really ran -- so a
+ * caller's retry must produce identical output, which is the property worth
+ * testing. A recovery path that has never executed is not a recovery path, and
+ * the condition it recovers from (a contention-dependent watchdog kill) cannot
+ * be provoked on demand. Off unless the variable is set. */
+static int fault_sync_at(void)
+{
+    static int v = -2;
+    if (v == -2) { const char *e = getenv("CUDA_SIEVE_METAL_FAULT_SYNC");
+                   v = (e && *e) ? atoi(e) : 0; }
+    return v;
+}
+
 bool cbtiming(void)
 {
     static int v = -1;
@@ -344,6 +359,16 @@ mtlError_t sync(Stream *st)
     st->seq_drained += (unsigned long long)st->pending.size();
     st->pending.clear();
     st->plabel.clear();
+    { const int at = fault_sync_at();
+      /* N > 0: fail the Nth sync once -- exercises a recovery. N < 0: fail
+       * every sync from |N| onward -- exercises the give-up path that a
+       * bounded retry must still have. Failing from the FIRST sync instead
+       * would just kill the run in the select, before the code under test. */
+      if (at != 0) { static int n = 0; ++n;
+          if (at < 0 ? (n >= -at) : (n == at)) {
+              fprintf(stderr, "metal_rt: [fault] synthetic failure at sync %d\n", at);
+              if (e == mtlSuccess) e = mtlErrorLaunchFailure;
+          } } }
     return e == mtlSuccess ? mtlSuccess : fail(e);
 }
 
