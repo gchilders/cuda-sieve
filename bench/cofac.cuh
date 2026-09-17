@@ -1151,6 +1151,52 @@ typedef struct {
  * remain CF_INCOMPLETE are requeued into the next round with a different rho
  * constant (or a fresh band of ECM sigmas) and, for rho, twice the budget --
  * so an exhausted budget is never turned into a proof of anything. */
+/* A LAUNCH-DURATION SAFETY VALVE (2026-09-17).
+ *
+ * COF_CHUNK_TARGET_MS is compared against `stage` -- a whole side's device
+ * time summed over every round and slice -- which is tens of times the target
+ * at ANY chunk size, so the descent test is always true and the chunk simply
+ * parks at cof_chunk_floor(). That was believed harmless because the floor is
+ * one record per thread, i.e. a full grid.
+ *
+ * It is not harmless on a slow GPU. A field 980 Ti (22 SMs) parked at exactly
+ * 22*6*256 = 33,792 records and the launch exceeded Windows' 2 s TDR:
+ *
+ *   cofactor chunk: 33792 records/launch, 4 launches per round
+ *   CUDA cudaDeviceSynchronize(): the launch timed out and was terminated
+ *
+ * The controller was already trying to save itself; its own floor stopped it.
+ * A TDR reset then destroys the context -- every later call reports the same
+ * error -- so there is no recovering in process, and prevention has to be
+ * complete.
+ *
+ * So the floor stops being an absolute clamp and becomes a preference: it
+ * still holds when nothing is wrong, and an over-bound LAUNCH may descend past
+ * it to COF_CHUNK_HARD_FLOOR. Descent is driven by a measured launch, never by
+ * `stage`, because an always-true test cannot tell a slow device from a fast
+ * one.
+ *
+ * THIS IS ONE-WAY, AND DELIBERATELY SO. A host whose launches are already
+ * under the bound never steers and behaves exactly as before -- the growth
+ * path is untouched. The authoritative build does not get a new opinion about
+ * healthy hardware out of a bug fix for sick hardware.
+ *
+ * 1000 ms is chosen against the 2 s Windows TDR default with 2x margin, not
+ * measured: nobody has established where any particular driver gives up.
+ * Metal's own bound is a different number for a different watchdog. */
+#ifndef COF_LAUNCH_TARGET_MS
+#define COF_LAUNCH_TARGET_MS  1000.0f
+#endif
+#ifndef COF_CHUNK_HARD_FLOOR
+#define COF_CHUNK_HARD_FLOOR  1024u
+#endif
+
+/* One launch, bracketed, so the valve above has something real to read. An
+ * event record forces ordering, so this measures the FIRST slice of the first
+ * round and nothing else; the rest of the flush is untouched. */
+typedef struct { cudaEvent_t a, b; int armed, fired; } cof_peak_t;
+static cof_peak_t *g_cof_peak;
+
 template <int L>
 static void cf_run_rounds(const mz<L> *d_n, mz<L> lim2, uint32_t lpb, uint32_t n,
                           uint8_t *d_status, uint64_t *d_fac, uint8_t *d_nfac,
@@ -1183,6 +1229,10 @@ static void cf_run_rounds(const mz<L> *d_n, mz<L> lim2, uint32_t lpb, uint32_t n
         const int kth = (threads < COFAC_THREADS_MAX) ? threads : COFAC_THREADS_MAX;
         for (uint32_t b = 0; b < n; b += step) {
             const uint32_t e = (n - b > step) ? b + step : n;
+            /* The flush's worst-case launch; see the safety valve above. */
+            const int _peak = (r == 0 && b == 0 && g_cof_peak
+                               && g_cof_peak->armed);
+            if (_peak) cudaEventRecord(g_cof_peak->a);
             if (S->method) {
                 if (S->s2nv)
                     k_cofac<L, 1, 1><<<blocks, kth>>>(
@@ -1199,6 +1249,10 @@ static void cf_run_rounds(const mz<L> *d_n, mz<L> lim2, uint32_t lpb, uint32_t n
                     d_n, lim2, lpb, (uint32_t)(r + 1), S->budget << r,
                     W->d_sel, W->d_nsel, d_status, d_fac, d_nfac, d_iters,
                     NULL, 0, NULL, 0, 0, b, e);
+            }
+            if (_peak) {
+                cudaEventRecord(g_cof_peak->b);
+                g_cof_peak->armed = 0; g_cof_peak->fired = 1;
             }
         }
     }
@@ -1911,6 +1965,8 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     const uint32_t nb = (n + TD_SCAN_BLK - 1) / TD_SCAN_BLK;
     uint32_t nr = 0, novf = 0;
     cudaEvent_t e0 = NULL, e1 = NULL, e2 = NULL;
+    cof_peak_t pk0 = {NULL, NULL, 0, 0}, pk1 = {NULL, NULL, 0, 0};
+    int valve_acted = 0;   /* declared here: COF_FLUSH_CK hides a goto done */
     float t0 = 0, t1 = 0;
     double h0;
     int rc = -1;
@@ -1967,17 +2023,23 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     COF_FLUSH_CK(cudaEventCreate(&e0));
     COF_FLUSH_CK(cudaEventCreate(&e1));
     COF_FLUSH_CK(cudaEventCreate(&e2));
+    COF_FLUSH_CK(cudaEventCreate(&pk0.a)); COF_FLUSH_CK(cudaEventCreate(&pk0.b));
+    COF_FLUSH_CK(cudaEventCreate(&pk1.a)); COF_FLUSH_CK(cudaEventCreate(&pk1.b));
     COF_FLUSH_CK(cudaEventRecord(e0));
+    pk0.armed = 1; g_cof_peak = &pk0;
     if (cf_run_rounds_dyn(Q->L0, Q->d_c0, lim0, lpb0, n, Q->d_st0,
                           Q->d_sp0, Q->d_nsp0, &S, &W, NULL, blocks, threads))
         goto done;
     /* The class-aware gate: a record whose rational side did not split is dead
      * whatever the algebraic side does, so its side-1 job is never started. */
+    g_cof_peak = NULL;
     k_cof_gate<<<blocks, threads>>>(n, Q->d_st0, Q->d_st1);
     COF_FLUSH_CK(cudaEventRecord(e1));
+    pk1.armed = 1; g_cof_peak = &pk1;
     if (cf_run_rounds_dyn(Q->L1, Q->d_c1, lim1, lpb1, n, Q->d_st1,
                           Q->d_sp1, Q->d_nsp1, &S1, &W, NULL, blocks, threads))
         goto done;
+    g_cof_peak = NULL;
     COF_FLUSH_CK(cudaEventRecord(e2));
 
     /* Instrumentation, not accounting: recorded after e2 so it cannot land in
@@ -1995,6 +2057,43 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     COF_FLUSH_CK(cudaEventElapsedTime(&t1, e1, e2));
     Q->ms_rat += t0; Q->ms_alg += t1;
 
+    /* ---- the safety valve: an over-bound LAUNCH may descend past the floor -
+     *
+     * Ahead of the ordinary steering below, and independent of it: this is the
+     * only path that may go below cof_chunk_floor(), and it fires only on a
+     * measured launch that actually exceeded the bound. On hardware that never
+     * does, nothing here executes and the behaviour is bit-for-bit what it was.
+     */
+    if (!chunk) {
+        float pm0 = 0.0f, pm1 = 0.0f;
+        if (pk0.fired) COF_FLUSH_CK(cudaEventElapsedTime(&pm0, pk0.a, pk0.b));
+        if (pk1.fired) COF_FLUSH_CK(cudaEventElapsedTime(&pm1, pk1.a, pk1.b));
+        const float launch_ms = pm0 > pm1 ? pm0 : pm1;
+        if (launch_ms > COF_LAUNCH_TARGET_MS) {
+            /* Proportional, at 0.8x the bound: from a large overshoot this
+             * lands in one flush where halving needs several, and every flush
+             * spent descending is a flush run at a size already known to be
+             * dangerous. */
+            const double want = (double)Q->chunk_cur
+                              * ((double)COF_LAUNCH_TARGET_MS * 0.8)
+                              / (double)launch_ms;
+            uint32_t next = want < (double)COF_CHUNK_HARD_FLOOR
+                          ? COF_CHUNK_HARD_FLOOR : (uint32_t)want;
+            if (next >= Q->chunk_cur) next = Q->chunk_cur / 2;   /* always move */
+            if (next < COF_CHUNK_HARD_FLOOR) next = COF_CHUNK_HARD_FLOOR;
+            if (next != Q->chunk_cur) {
+                fprintf(stderr,
+                        "  cofactor: kernel launch %.0f ms is over this build's"
+                        " %.0f ms bound; %u -> %u records/launch\n",
+                        (double)launch_ms, (double)COF_LAUNCH_TARGET_MS,
+                        Q->chunk_cur, next);
+                Q->chunk_cur = next;
+                S.chunk = Q->chunk_cur;
+                valve_acted = 1;
+            }
+        }
+    }
+
     /* Steer the NEXT flush. Only in auto mode, and only ever between flushes,
      * so the slice is fixed for the whole of the one just measured.
      *
@@ -2003,7 +2102,7 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
      * band runs many of them. The floor is the real protection -- a device slow
      * enough to stay over budget simply parks there, which is the free point
      * for it, and a device fast enough grows to one slice and stops. */
-    if (!chunk) {
+    if (!chunk && !valve_acted) {
         const uint32_t floor_ch = cof_chunk_floor(blocks, threads);
         const uint32_t was = Q->chunk_cur;
         const float stage = t0 + t1;
@@ -2097,6 +2196,11 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     rc = 0;
 
 done:
+    if (pk0.a) cudaEventDestroy(pk0.a);
+    if (pk0.b) cudaEventDestroy(pk0.b);
+    if (pk1.a) cudaEventDestroy(pk1.a);
+    if (pk1.b) cudaEventDestroy(pk1.b);
+    g_cof_peak = NULL;
     if (e0 && CUDA_CHECKED(cudaEventDestroy(e0)) && rc == 0) rc = -1;
     if (e1 && CUDA_CHECKED(cudaEventDestroy(e1)) && rc == 0) rc = -1;
     if (e2 && CUDA_CHECKED(cudaEventDestroy(e2)) && rc == 0) rc = -1;

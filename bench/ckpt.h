@@ -460,12 +460,24 @@ again:
     return 0;
 }
 
-/* Held for the process lifetime and released via atexit, so every early
- * `return 1` between acquisition and the band drops it. _exit and fatal
- * signals still skip it -- that is what the staleness check above is for. */
+/* Held for the process lifetime. Registered with atexit, so every early
+ * `return 1` between acquisition and the band drops it -- but atexit is NOT
+ * enough on its own, and a BOINC application is the case that proves it.
+ *
+ * boinc_finish() ends in _exit() on Unix and TerminateProcess() on Windows,
+ * deliberately, so that a wedged static destructor cannot hang a task on its
+ * way out. atexit handlers are skipped with them, so under a BOINC client the
+ * lock file of every SUCCESSFULLY COMPLETED workunit survived. A volunteer
+ * reported hundreds of them. Nothing malfunctioned -- the staleness check
+ * below means a later run just takes the lock over, which is why this went
+ * unnoticed -- but the project directory fills up with litter.
+ *
+ * So the owner releases it EXPLICITLY before handing control to anything that
+ * may not return; see bench_main.cu. Idempotent, so the atexit registration
+ * costs nothing when both run. */
 static char ckpt_lock_held[CKPT_PATH_MAX];
 
-static inline void ckpt_unlock_atexit(void)
+static inline void ckpt_unlock_held(void)
 {
     if (ckpt_lock_held[0]) { remove(ckpt_lock_held); ckpt_lock_held[0] = 0; }
 }

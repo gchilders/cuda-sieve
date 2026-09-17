@@ -52,6 +52,56 @@
 
 #define GPU_FB_BIG_LIMBS 20
 #define GPU_FB_MAX_ROOTS (BENCH_MAX_DEGREE + 1)
+
+/* THE ROOT FINDER IS SLICED, AND THE SLICE IS MEASURED (2026-09-17).
+ *
+ * One launch per segment makes the whole segment a single uninterruptible
+ * piece of GPU work. On a card that also drives a display that is felt
+ * directly: the desktop stutters for the length of factor-base generation,
+ * which is every workunit's first several seconds, and the field reported
+ * exactly that. It is a milder relative of the cofactor's TDR problem -- long
+ * enough to be noticed, not long enough to be killed.
+ *
+ * A FIXED SLICE SIZE DOES NOT TRANSFER. One grid-stride covers `wave` primes
+ * and `wave` scales with the SM count, while per-SM throughput does not scale
+ * with it the same way, so any constant chosen on one card is wrong on
+ * another. The Metal port learned this twice: first with a fixed prime count,
+ * then with a fixed stride count. So start at a size safe on slow hardware and
+ * let the measurement move it.
+ *
+ * Cost, measured on the Metal port (same algorithm, 10-core M3): factor-base
+ * generation 6.479 -> 6.684 s, +3.2%, once per PROCESS and not per q. Set
+ * FB_ROOTS_STRIDES_START very large to get the old single-launch behaviour. */
+#ifndef FB_ROOTS_STRIDES_START
+#define FB_ROOTS_STRIDES_START 4u
+#endif
+#ifndef FB_ROOTS_STRIDES_MAX
+#define FB_ROOTS_STRIDES_MAX   256u
+#endif
+/* Tighter than the cofactor's TDR-derived bound because this is about a
+ * responsive desktop, not a surviving one. Chosen, not measured: nobody has
+ * established what a user actually notices. */
+#ifndef FB_LAUNCH_TARGET_MS
+#define FB_LAUNCH_TARGET_MS    250.0f
+#endif
+
+static uint32_t g_fb_strides = FB_ROOTS_STRIDES_START;
+
+/* Steer from the segment just finished. Proportional, aiming at 0.8x the
+ * bound, with the dead band cofq_flush uses: act when the measurement is over
+ * target or under a quarter of it, otherwise leave it alone. The caller reads
+ * the events AFTER its own hipMemcpy of d_failures, so no synchronisation is
+ * added -- only two event records on one slice per segment. */
+static void fb_steer_strides(float ms)
+{
+    const float target = FB_LAUNCH_TARGET_MS * 0.8f;
+    if (ms <= 0.0f) return;
+    if (ms <= target && ms >= target * 0.25f) return;
+    double want = (double)g_fb_strides * ((double)target / (double)ms);
+    if (want < 1.0) want = 1.0;
+    if (want > (double)FB_ROOTS_STRIDES_MAX) want = (double)FB_ROOTS_STRIDES_MAX;
+    g_fb_strides = (uint32_t)want;
+}
 #define GPU_FB_BRUTE_ROOT_LIMIT 67u
 #define GPU_FB_DEFAULT_SEG_ODDS (1u << 23)  /* 8M odds = ~16M integers */
 /* counts/offsets and the compact-root count are uint32_t.  A prime contributes
@@ -1586,6 +1636,10 @@ static int gpu_fb_generate_complete(const poly_t *P, uint32_t lim, int maxbits,
     uint32_t *d_nprime = NULL, *d_counts = NULL, *d_offsets = NULL;
     uint32_t *d_failures = NULL, *d_total = NULL;
     uint32_t *d_rootbuf = NULL, *d_out_p = NULL, *d_out_r = NULL;
+    /* Declared with the rest: CUDA_OR_DIE hides a goto fail, so anything
+     * the cleanup touches must exist before the first one. */
+    hipEvent_t fb_ev_a = NULL, fb_ev_b = NULL;
+    int fb_timed = 0;
     uint8_t *d_out_special = NULL;
     void *d_temp = NULL;
     size_t select_temp = 0, scan_temp = 0, temp_bytes = 0;
@@ -1671,6 +1725,11 @@ static int gpu_fb_generate_complete(const poly_t *P, uint32_t lim, int maxbits,
     temp_bytes = std::max(select_temp, scan_temp);
     CUDA_OR_DIE(hipMalloc(&d_temp, temp_bytes));
 
+    /* Best-effort: if the events cannot be created the slicing still
+     * happens, it simply never re-sizes. A factor base must not fail to
+     * build because a timer was unavailable. */
+    if (hipEventCreate(&fb_ev_a) != hipSuccess) fb_ev_a = NULL;
+    if (hipEventCreate(&fb_ev_b) != hipSuccess) fb_ev_b = NULL;
     if (sink->begin()) goto fail;
 
     /* p=2 is always exact.  Besides powers, this preserves the native
@@ -1708,16 +1767,44 @@ static int gpu_fb_generate_complete(const poly_t *P, uint32_t lim, int maxbits,
         {
             const uint32_t ablocks = std::min<uint32_t>((nprime + 127u) / 128u,
                                                         (uint32_t)prop.multiProcessorCount * 8u);
-            if (P->deg <= 6)
-                k_alg_roots_fixed_mark<6, true><<<ablocks, 128>>>(
-                    d_primes, nprime, d_rootbuf, d_counts, d_special, d_failures);
-            else
-                k_alg_roots_fixed_mark<8, true><<<ablocks, 128>>>(
-                    d_primes, nprime, d_rootbuf, d_counts, d_special, d_failures);
+            /* Slices of g_fb_strides grid-strides each, so no single launch
+             * owns the GPU for the whole segment. d_rootbuf, d_counts and
+             * d_special are indexed by PRIME, so a slice is just a base
+             * pointer and a count; d_failures accumulates across them. */
+            const uint32_t wave = ablocks * 128u;
+            uint32_t sliced = 0;
+            for (uint32_t off = 0; off < nprime; ) {
+                const uint64_t step64 = (uint64_t)wave * g_fb_strides;
+                const uint32_t step = step64 >= nprime ? nprime : (uint32_t)step64;
+                const uint32_t cnt = (nprime - off) < step ? (nprime - off) : step;
+                const uint32_t sb = std::min<uint32_t>((cnt + 127u) / 128u, ablocks);
+                uint32_t *r_off = d_rootbuf + (size_t)off * GPU_FB_MAX_ROOTS;
+                /* One slice per segment is bracketed; the events are read
+                 * after the d_failures copy below, which already syncs. */
+                const int tm = (off == 0 && fb_ev_a && fb_ev_b);
+                if (tm) hipEventRecord(fb_ev_a);
+                if (P->deg <= 6)
+                    k_alg_roots_fixed_mark<6, true><<<sb, 128>>>(
+                        d_primes + off, cnt, r_off, d_counts + off,
+                        d_special + off, d_failures);
+                else
+                    k_alg_roots_fixed_mark<8, true><<<sb, 128>>>(
+                        d_primes + off, cnt, r_off, d_counts + off,
+                        d_special + off, d_failures);
+                if (tm) { hipEventRecord(fb_ev_b); sliced = 1; }
+                off += cnt;
+            }
+            fb_timed = sliced;
         }
         CUDA_OR_DIE(hipGetLastError());
         CUDA_OR_DIE(hipMemcpy(&failures, d_failures, sizeof(failures),
                                hipMemcpyDeviceToHost));
+        if (fb_timed) {
+            float ms = 0.0f;
+            if (hipEventElapsedTime(&ms, fb_ev_a, fb_ev_b) == hipSuccess)
+                fb_steer_strides(ms);
+            fb_timed = 0;
+        }
         if (failures) {
             fprintf(stderr,
                     "%s: algebraic root/primality validation failed for %u candidates in [%u,%u]\n",
@@ -1793,6 +1880,8 @@ static int gpu_fb_generate_complete(const poly_t *P, uint32_t lim, int maxbits,
     rc = 0;
 
 fail:
+    if (fb_ev_a) hipEventDestroy(fb_ev_a);
+    if (fb_ev_b) hipEventDestroy(fb_ev_b);
     (void)gpu_fb_free(&d_out_special);
     (void)gpu_fb_free(&d_out_r);
     (void)gpu_fb_free(&d_out_p);

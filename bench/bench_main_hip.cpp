@@ -2334,7 +2334,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
                 ckpt_lock_held[0] = 0;
                 return 1;
             }
-            atexit(ckpt_unlock_atexit);
+            atexit(ckpt_unlock_held);
         }
         if (cfg.relations) {
             char part[CKPT_PATH_MAX], cpath[CKPT_PATH_MAX];
@@ -3398,5 +3398,11 @@ int main(int argc, char **argv)
                 " are NOT production output ***\n", runlog_build_defs());
     rc = bench_main_impl(argc, argv, &outcome);
     if (rc != 0 && outcome == BENCH_OUTCOME_OK) outcome = BENCH_OUTCOME_FAILED;
+    /* BEFORE bench_boinc_finish, because that one does not come back:
+     * boinc_finish() ends in _exit()/TerminateProcess(), which skips atexit,
+     * so the registration in ckpt.h never fires under a BOINC client and the
+     * lock of every completed workunit was left behind. Released here whatever
+     * the outcome -- the .part is what a resume needs, never the lock. */
+    ckpt_unlock_held();
     return bench_boinc_finish(outcome, rc);
 }

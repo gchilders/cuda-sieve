@@ -757,6 +757,15 @@ emitted, no device error). Clamping anyway would cap the cofactor kernel at
 port. If item 1's sweep ever adds a HIP bound to `k_cofac`, the clamps come
 with it -- keep all three in step then, as bench.h's comment says.
 
+**Consequence for later ports, 2026-09-17.** `cf_run_rounds`'s slice loop now
+differs from main's by that one `kth` line, so a patch against main's
+`cofac.cuh` will reject the hunk whose context includes it. main `8b62c81`
+(the launch-duration safety valve) hit this: seven of its eight hunks applied
+mechanically and the eighth -- the `_peak` event record at the top of the slice
+loop -- had to be placed by hand. Nothing about the valve depends on `kth`;
+it is purely a context mismatch. Expect it again for anything touching that
+loop, and check the placement rather than reaching for `--fuzz`.
+
 **What a future measurement would need**: a discrete RDNA card, not this box
 (ground rules), and the shared-memory ceiling addressed first -- at 1 block/CU
 the occupancy question is `log_region`/smem (item 2), not registers.
