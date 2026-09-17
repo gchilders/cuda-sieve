@@ -1456,6 +1456,50 @@ says must not happen ("anything that must stay shippable gets its own
 variable, never a DEFS value"). `CPUOBJ_MAKEVARS` now forwards it; verified by
 building with a `METAL_EXTRA_DEFS` and watching `--relations` get refused.
 
+## Fourth review, 2026-09-16 (after 9z-g..9z-n and the rebase)
+
+**Two suspicions raised by reading, both DISPROVEN by measurement. Recorded
+because the next reader will have the same suspicions.**
+
+1. **`pending` is bounded, not unbounded.** 9z-k made `commit()` push a
+   retained command buffer onto a vector drained only by `sync()`, and
+   `mtlStreamFlush` commits without syncing -- the shape of an unbounded leak,
+   and a command buffer retains every resource it references. Measured
+   high-water mark: **54 at `--nq 40`, 80 at 80, 80 at 160.** It plateaus. The
+   80-at-80 coincidence is what made it look proportional.
+2. **Memory is still flat over a band** (9z-f's property): RSS 370.8 -> 387.3
+   MB over the first 40 s, then **+0.13 MB across the next 100 s**. But the
+   PLATEAU IS ~19 MB HIGHER than 9z-f measured, which is the honest steady-state
+   cost of holding up to 80 command buffers -- about 200 KB each. Immaterial on
+   an 8 GB M1, and it is a working set, not a leak.
+
+**FIXED: the CBTIME accounting ran whether or not anyone asked for it.** A
+`std::string` assignment per DISPATCH and a 256-byte `snprintf` per COMMIT --
+**~70,000 of each per 288-q band** -- building labels for output that is
+discarded unless `CUDA_SIEVE_METAL_CBTIME` is set. Now gated on a cached
+predicate next to `tracing()`. The instrument added in 9z-k was paying for
+itself on every run instead of only when used.
+
+**MEASURED, and it contradicts the shim's own header comment:** that comment
+says dispatches "accumulate into that encoder, which is what keeps a band's
+many small kernels cheap". They do not. Over an 80-q band: **19,506 dispatches
+in 19,454 command buffers** -- essentially one each. The cause is pre-existing
+and not 9z-k's flush (a 1-q run was 1039 command buffers BEFORE 9z-k and 1011
+after): every blocking `mtlMemcpy` syncs, and every `mtlEventRecord` commits,
+and the pipeline does both per q per slab per side. At a plausible ~20 us of
+command-buffer overhead that is well under 1% of wall, so this is recorded as a
+documentation-accuracy finding and a latent opportunity, **not** a defect worth
+chasing -- but the comment should not be read as describing what happens.
+
+**Re-checked, still true:** `mtlGetDeviceCount` has exactly one caller, so
+9z-l's new return value cannot be silently dropped; validation is clean
+(`validationcheck`); the three 9z/9z-b open items are unchanged and still minor
+(zero-sized launch silently skipped, `pso_for` caches `nil`, `mtlDeviceAddress`
+lacks its sibling's warning).
+
+Nine gates green after the fix, `cofcheck.sh` **54 PASS / 0 FAIL**, 288-q band
+`cmp`-identical at 13,485 relations / `8e79762c…`.
+
 ## Rebase, 2026-09-16: upstream's ECM occupancy fix, and a silent kernel leak
 
 `metal-port` was 6 commits behind `main` and is now rebased onto `75d4cf7`
