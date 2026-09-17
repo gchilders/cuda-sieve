@@ -1186,8 +1186,13 @@ static int cf_run_rounds_dyn(int L, const uint32_t *d_n, uint64_t lim,
  * deliberately conservative, and free to be, because over-chunking costs
  * nothing on the devices that ever reach this path (see the floor below).
  */
-/* 400 ms on ONE launch: a UI-responsiveness bound as much as a watchdog
- * one, and explicitly worth throughput to hold. CUDA keeps 250 ms against
+/* The port's interactivity bound, defined ONCE in metal_rt.h and shared
+ * with the fbgen root finder, which bounds itself against the same number.
+ * Two constants that must agree is how this port has repeatedly hurt
+ * itself; see MTL_INTERACTIVITY_BOUND_MS for the value and its evidence.
+ *
+ * A UI-responsiveness bound as much as a watchdog one, and explicitly
+ * worth throughput to hold. CUDA keeps 250 ms against
  * a whole-side sum; this is 400 against a measured launch, so the two
  * numbers are not comparable. See gen_cofac_host.py.
  *
@@ -1200,7 +1205,7 @@ static int cf_run_rounds_dyn(int L, const uint32_t *d_n, uint64_t lim,
  * killed at rather than a hair under it. The true threshold is still
  * undocumented and unmeasured. */
 #ifndef COF_CHUNK_TARGET_MS
-#define COF_CHUNK_TARGET_MS   400.0f
+#define COF_CHUNK_TARGET_MS   MTL_INTERACTIVITY_BOUND_MS
 #endif
 
 /* Giant steps per curve above which cofq_init warns that record chunking can
