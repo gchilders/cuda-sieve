@@ -107,6 +107,20 @@ unsigned                     g_bind_grid = 0, g_bind_block = 0;
  * failure that happened somewhere else entirely. */
 mtlError_t                   g_bind_error = mtlSuccess;
 
+/* CUDA_SIEVE_METAL_CBTIME=1 turns on command-buffer accounting. Cached like
+ * tracing(): without this, the accounting below ran on EVERY dispatch and
+ * EVERY commit whether or not anyone had asked for it -- a std::string assign
+ * per dispatch and a 256-byte snprintf per commit, ~70,000 of each per band,
+ * for output nobody was going to read. Diagnostics that are off should cost
+ * nothing. */
+bool cbtiming(void)
+{
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("CUDA_SIEVE_METAL_CBTIME");
+                 v = (e && *e && *e != '0') ? 1 : 0; }
+    return v != 0;
+}
+
 /* CUDA_SIEVE_METAL_TRACE=1 reports every error at the point it is raised.
  * Ported code threads failures back through CK/PIPE_CK macros that often
  * `goto done` without printing, so a real fault can reach exit(255) with
@@ -210,12 +224,15 @@ id<MTLCommandBuffer> commit(Stream *st)
     close_encoder(st);
     if (st->cb) {
         [st->cb commit];
-        { char lb[256];
-          snprintf(lb, sizeof lb, "%d dispatches %s..%s", st->ndisp,
-                   st->first_k.empty() ? "-" : st->first_k.c_str(),
-                   st->last_k.empty() ? "-" : st->last_k.c_str());
-          st->plabel.push_back(lb); }
-        st->ndisp = 0; st->first_k.clear(); st->last_k.clear();
+        if (cbtiming()) {
+            char lb[256];
+            snprintf(lb, sizeof lb, "%d dispatches %s..%s", st->ndisp,
+                     st->first_k.empty() ? "-" : st->first_k.c_str(),
+                     st->last_k.empty() ? "-" : st->last_k.c_str());
+            st->plabel.push_back(lb);
+            st->first_k.clear(); st->last_k.clear();
+        }
+        st->ndisp = 0;
         st->pending.push_back([st->cb retain]);   /* pending holds its own */
         if (st->last != st->cb) [st->last release];
         st->last = st->cb;              /* takes cb's +1 */
@@ -996,8 +1013,10 @@ extern "C" mtlError_t mtl_launch_begin(const char *kernel, mtlStream_t s,
     id<MTLComputeCommandEncoder> enc = ensure_compute(st);
     /* Accounting for the CBTIME report: which dispatches share this command
      * buffer. ensure_compute may have opened a fresh one, so record after. */
-    if (st->ndisp == 0) st->first_k = kernel ? kernel : "?";
-    st->last_k = kernel ? kernel : "?";
+    if (cbtiming()) {
+        if (st->ndisp == 0) st->first_k = kernel ? kernel : "?";
+        st->last_k = kernel ? kernel : "?";
+    }
     st->ndisp++;
     [enc setComputePipelineState:pso];
     if (smem) [enc setThreadgroupMemoryLength:smem atIndex:0];
