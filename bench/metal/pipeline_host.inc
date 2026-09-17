@@ -211,13 +211,21 @@ static uint64_t pipe_est_records(const fb_t *fb, uint32_t xmax)
  * priority matches the user-visible progress line: a relation target is the
  * goal when present; otherwise use a bounded q count/range.  Open-ended work
  * is required by bench_main to have either --target-rels or --nq, so every
- * production band has a denominator. */
-/* `base_nq` is what earlier sessions completed, and `relations` must be a
- * total across sessions too -- every caller adds base_rel. Without both,
- * a resumed run restarts the bar at 0 and climbs again, because
- * bench_main has already SHRUNK the denominators: --nq is reduced by the
- * completed count and qmin is moved to the checkpoint's next_q. The band
- * this reports on is the operator's whole band, not this session. */
+ * production band has a denominator.
+ *
+ * IT REPORTS ON THE OPERATOR'S WHOLE BAND, NOT ON THIS SESSION. That is what
+ * `base_nq` is for, and why `relations` must be a cross-session total: on a
+ * resume this used to restart the bar at 0 and climb again. Everything else
+ * here already knew about resume -- the --target-rels stop test adds
+ * base_rel, the checkpoint writer and the console counts add base_nq -- and
+ * this one function was handed neither.
+ *
+ * The denominators are the half that is easy to miss, because bench_main has
+ * ALREADY shrunk them by the time they arrive: --nq is reduced by the
+ * completed count ("--nq counts this session's q") and qmin is moved to the
+ * checkpoint's next_q, which is why the band's original lower bound has to be
+ * kept aside in cfg->resume_qmin. Measured before the fix, one run-log record
+ * read `nq=141 ... pct=18.06` -- 141 of 200 special-q done, bar at 18%. */
 static double pipe_progress_fraction(const bench_cfg_t *cfg, int streaming,
                                      uint32_t nq, uint32_t nqdone,
                                      uint64_t current_q,
@@ -225,20 +233,9 @@ static double pipe_progress_fraction(const bench_cfg_t *cfg, int streaming,
                                      unsigned long long base_nq)
 {
     double fraction = 0.0;
-#ifdef PIPE_PROGRESS_IGNORE_RESUME
-    /* progresscheck's control: the pre-9z-m behaviour exactly -- count
-     * only this session and use the shrunken denominators. A gate whose
-     * control cannot fail proves nothing. Never defined in a real build. */
-    base_nq = 0;
-#endif
-    /* The band's original lower bound. cfg->qmin is the RESUMED one; the
-     * original is kept aside by bench_main because nothing else needed
-     * it, and 0 means this band never resumed. */
-#ifdef PIPE_PROGRESS_IGNORE_RESUME
-    const uint64_t q0 = cfg->qmin;
-#else
+    /* The band's original lower bound; 0 means this band never resumed, so
+     * cfg->qmin is already it. */
     const uint64_t q0 = cfg->resume_qmin ? cfg->resume_qmin : cfg->qmin;
-#endif
     const double done_q = (double)base_nq + (double)nqdone;
 
     if (cfg->target_rels) {
@@ -2853,7 +2850,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
 #ifdef HAVE_BOINC
         {
             /* base_rel, exactly as the --target-rels stop test does it a
-             * few lines below. Without it a resumed run reports progress
+             * few lines below: without it a resumed run reports progress
              * towards the target as though it had produced nothing. */
             const unsigned long long progress_rels = base_rel + (cfg->cofactor
                 ? Q.nrel : (unsigned long long)acc_rel);
