@@ -473,6 +473,13 @@ void bench_boinc_fraction_done(double fraction_done);
  * a clean stop exits 0 for the shell -- unattended scripts have always read it
  * that way -- while BOINC must NOT be told the work unit finished. */
 int  bench_boinc_finish(enum bench_outcome outcome, int status);
+/* Ask the client to run this task again later rather than recording an error,
+ * for a failure that is a property of the MOMENT rather than of the host: the
+ * motivating case is a macOS process that gets no Metal device because no user
+ * is logged in. Does not return when BOINC is managing the run; returns
+ * normally otherwise, so the caller must still fail on its own afterwards.
+ * Non-BOINC: no-op. */
+void bench_boinc_temporary_exit(int delay_seconds, const char *reason);
 
 /* ---- cofactor WIDTH, in 32-bit limbs ------------------------------------ *
  *

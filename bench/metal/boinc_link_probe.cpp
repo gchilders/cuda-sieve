@@ -33,6 +33,11 @@ int main(int argc, char **argv)
      * exits the process, which is the behaviour this probe documents. */
     if (argc > 1) {
         printf("init rc=%d\n", bench_boinc_init());
+        /* Same reason as finish: the real boinc_temporary_exit does not
+         * return either, so it is referenced from the same dead-at-runtime
+         * but live-at-link branch. What is being proved here is that the
+         * symbol resolves against the real archive. */
+        bench_boinc_temporary_exit(600, "link probe");
         printf("finish rc=%d (NOT REACHED: boinc_finish exits)\n",
                bench_boinc_finish(BENCH_OUTCOME_OK, 0));
     }

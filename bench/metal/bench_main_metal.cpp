@@ -935,6 +935,13 @@ static int boinc_discard_bad_resume(const resume_recovery_t *r,
  * the argument checks. main() supplies the default -- OK on a zero status,
  * FAILED otherwise -- so only the pipeline branch, the one caller that can
  * tell a checkpointed stop from a finished band, writes to it. */
+/* Seconds to ask BOINC to wait before retrying a task that found no GPU.
+ * The cause is usually a login session, which can change at any time, so
+ * this is a compromise: 10 minutes is six retries an hour rather than a
+ * busy loop, and does not park a task all evening after somebody logs
+ * in. Nothing has measured how long the condition typically lasts. */
+#define BENCH_NO_GPU_RETRY_S 600
+
 static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
 {
     /* Identity of the card this process actually selected, captured where the
@@ -1819,12 +1826,20 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
          * once. This does not create a primary context on any device, so it is
          * safe ahead of the flag/selection ordering below. */
         err = mtlGetDeviceCount(&ndev);
-        if (err != mtlSuccess) {
+        if (err != mtlSuccess && err != mtlErrorNoDevice) {
+            /* A refused GPU or an unloadable shader library: permanent,
+             * so error out. mtlErrorNoDevice is transient and is handled
+             * just below -- do not collapse the two again. */
             fprintf(stderr, "bench: cannot enumerate Metal devices: %s\n",
                     mtlGetErrorString(err));
             return 1;
         }
-        if (ndev < 1) {
+        if (err == mtlErrorNoDevice || ndev < 1) {
+            /* metal_rt has already said WHY on stderr. Ask the client to
+             * try again later rather than recording a permanent error;
+             * this returns only when BOINC is not managing the run. */
+            bench_boinc_temporary_exit(BENCH_NO_GPU_RETRY_S,
+                                       "no Metal device is visible to this process");
             fprintf(stderr, "bench: this process sees no Metal device\n");
             return 1;
         }

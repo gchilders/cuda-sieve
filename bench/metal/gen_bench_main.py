@@ -247,6 +247,74 @@ for _old, _new in [
     src = src.replace(_old, _new, 1)
 print('  six more device messages name Metal')
 
+# ---- a missing GPU is TRANSIENT on macOS, not an error --------------------
+# A field task (client 8.2.9) exited 1 seconds after starting with "this
+# process sees no Metal device", on a host whose client had already assigned
+# an apple_gpu -- so the hardware was there and the PROCESS could not reach
+# it. On macOS that is what happens outside a GUI login session, and a retry
+# once somebody logs in simply works. boinc_finish(1) instead burns the
+# workunit and charges the host with a failure.
+#
+# mtlGetDeviceCount now returns mtlErrorNoDevice for exactly this case and
+# something else for a refused GPU or an unloadable shader library, both of
+# which ARE permanent and must keep erroring out. That distinction is the
+# whole point: before it, all three shared one message and one exit path.
+_nd_old = chr(10).join([
+    "        if (ndev < 1) {",
+    '            fprintf(stderr, "bench: this process sees no Metal device\\n");',
+    "            return 1;",
+    "        }"])
+_nd_new = chr(10).join([
+    "        if (err == mtlErrorNoDevice || ndev < 1) {",
+    "            /* metal_rt has already said WHY on stderr. Ask the client to",
+    "             * try again later rather than recording a permanent error;",
+    "             * this returns only when BOINC is not managing the run. */",
+    "            bench_boinc_temporary_exit(BENCH_NO_GPU_RETRY_S,",
+    '                                       "no Metal device is visible to this'
+    ' process");',
+    '            fprintf(stderr, "bench: this process sees no Metal device\\n");',
+    "            return 1;",
+    "        }"])
+assert _nd_old in src, 'no-device block shape changed'
+src = src.replace(_nd_old, _nd_new, 1)
+
+# The generic "cannot enumerate" test sits BEFORE the block above and would
+# swallow mtlErrorNoDevice, leaving the new branch unreachable. Let that one
+# through; it is handled, and handled differently.
+_ee_old = chr(10).join([
+    "        if (err != mtlSuccess) {",
+    '            fprintf(stderr, "bench: cannot enumerate Metal devices: %s\\n",',
+    "                    mtlGetErrorString(err));",
+    "            return 1;",
+    "        }"])
+_ee_new = chr(10).join([
+    "        if (err != mtlSuccess && err != mtlErrorNoDevice) {",
+    "            /* A refused GPU or an unloadable shader library: permanent,",
+    "             * so error out. mtlErrorNoDevice is transient and is handled",
+    "             * just below -- do not collapse the two again. */",
+    '            fprintf(stderr, "bench: cannot enumerate Metal devices: %s\\n",',
+    "                    mtlGetErrorString(err));",
+    "            return 1;",
+    "        }"])
+assert _ee_old in src, 'enumerate-error block shape changed'
+src = src.replace(_ee_old, _ee_new, 1)
+
+# The retry delay. Long enough not to spin against a host nobody is using,
+# short enough that a task is not parked for an evening after a login.
+_rt_old = "static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)"
+_rt_new = chr(10).join([
+    "/* Seconds to ask BOINC to wait before retrying a task that found no GPU.",
+    " * The cause is usually a login session, which can change at any time, so",
+    " * this is a compromise: 10 minutes is six retries an hour rather than a",
+    " * busy loop, and does not park a task all evening after somebody logs",
+    " * in. Nothing has measured how long the condition typically lasts. */",
+    "#define BENCH_NO_GPU_RETRY_S 600",
+    "",
+    "static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)"])
+assert src.count(_rt_old) == 1, 'bench_main_impl signature not unique'
+src = src.replace(_rt_old, _rt_new, 1)
+print('  no Metal device: temporary exit rather than a burnt workunit')
+
 # ---- drop the allowance advisory ------------------------------------------
 # Two stderr notes, emitted once per run, saying an --allowance is looser than
 # the derived value. Useful at a terminal, noise in a BOINC log: under
