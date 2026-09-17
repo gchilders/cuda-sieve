@@ -382,6 +382,12 @@ progresscheck: ../oracle/c183.fb1
 # measured that until a shipped "fix" (9z-j) turned out to have changed only
 # the dispatch count. The control builds with the fbgen slicing defeated and
 # must FAIL; without that, a gate that passes proves nothing.
+#
+# IT MUST NAME THE CURRENT KNOBS. When the root finder became adaptive (9z-o)
+# this control kept passing -DFB_ROOTS_STRIDES_PER_LAUNCH, a macro that no
+# longer existed, so it defeated nothing and quietly became a second copy of
+# the gate. The gate caught that by refusing to pass -- which is the whole
+# argument for a control that must FAIL over an assertion that must pass.
 # Tracks COF_CHUNK_TARGET_MS in metal/gen_cofac_host.py: the gate should
 # enforce the policy the build actually holds, not an older, looser one.
 COF_BOUND_MS ?= 400
@@ -389,7 +395,7 @@ COF_BOUND_MS ?= 400
 cbtimecheck:
 	@echo "== control: fbgen root finder UNSLICED (must exceed the bound) =="
 	@$(MAKE) -f Makefile.metal $(BUILD)/bench \
-	    METAL_EXTRA_DEFS='-DFB_ROOTS_STRIDES_PER_LAUNCH=4000000u' >/dev/null
+	    METAL_EXTRA_DEFS='-DFB_ROOTS_STRIDES_START=4000000u -DFB_ROOTS_STRIDES_MAX=4000000u' >/dev/null
 	@sh metal/cbtimecheck.sh $(CURDIR)/$(BUILD)/bench \
 	    $(CURDIR)/../oracle/c183.poly $(COF_BOUND_MS) control
 	@echo

@@ -275,15 +275,27 @@ _rf_new = chr(10).join([
     "        {",
     "            const uint32_t ablocks = std::min<uint32_t>((nprime + 127u) / 128u,",
     "                                                        (uint32_t)prop.multiProcessorCount * 8u);",
-    "            /* One grid-stride covers `wave` primes; cap each SUBMISSION at",
-    "             * FB_ROOTS_STRIDES_PER_LAUNCH of them. The flush is the load-",
-    "             * bearing half: macOS's interactivity watchdog judges a command",
-    "             * buffer, and the stream would otherwise batch every slice into",
-    "             * one. See metal/gen_fbgen_host.py and plan 9z-k. */",
+    "            /* SLICED AND STEERED. macOS's interactivity watchdog judges a",
+    "             * COMMAND BUFFER, so each slice is flushed; the flush is half",
+    "             * the mechanism and the slice SIZE is the other half.",
+    "             *",
+    "             * The size is MEASURED, not chosen. A fixed grid-stride count",
+    "             * does not transfer between devices: one stride covers `wave`",
+    "             * primes and wave scales with core count, so 16 strides was",
+    "             * 130 ms on this 10-core M3 and an estimated 560-840 ms across",
+    "             * the M1 family -- over the bound, and near the ~800 ms at",
+    "             * which field tasks were actually killed. That is 9z-j's error",
+    "             * one level up: 9z-j replaced a fixed prime count with a fixed",
+    "             * stride count and assumed strides were the device-independent",
+    "             * unit. They are not. Nothing here is.",
+    "             *",
+    "             * So start at a size safe on the slowest device there is field",
+    "             * data for, and let the measurement move it -- exactly as",
+    "             * cofq_flush steers the cofactor chunk. See plan 9z-o. */",
     "            const uint32_t wave = ablocks * 128u;",
-    "            const uint64_t step64 = (uint64_t)wave * FB_ROOTS_STRIDES_PER_LAUNCH;",
-    "            const uint32_t step = step64 >= nprime ? nprime : (uint32_t)step64;",
-    "            for (uint32_t off = 0; off < nprime; off += step) {",
+    "            for (uint32_t off = 0; off < nprime; ) {",
+    "                const uint64_t step64 = (uint64_t)wave * g_fb_strides;",
+    "                const uint32_t step = step64 >= nprime ? nprime : (uint32_t)step64;",
     "                const uint32_t cnt = (nprime - off) < step ? (nprime - off) : step;",
     "                const uint32_t sb = std::min<uint32_t>((cnt + 127u) / 128u, ablocks);",
     "                uint32_t *r_off = d_rootbuf + (size_t)off * GPU_FB_MAX_ROOTS;",
@@ -292,8 +304,10 @@ _rf_new = chr(10).join([
     "                else",
     "                    MTL_LAUNCH(k_alg_roots_fixed_mark_8_1, sb, 128, 0, 0, d_primes + off, cnt, r_off, d_counts + off, d_special + off, d_failures, (const gpu_big_t *)mtlGetSymbol(\"c_alg\"), *(const int *)mtlGetSymbol(\"c_alg_deg\"));",
     "                MTL_OR_DIE(mtlStreamFlush(0));",
+    "                off += cnt;",
     "            }",
     "        }"])
+
 assert _rf_old in s, 'root-finder launch shape changed'
 s = s.replace(_rf_old, _rf_new, 1)
 
@@ -301,20 +315,66 @@ _k_old = "#define GPU_FB_MAX_ROOTS (BENCH_MAX_DEGREE + 1)"
 _k_new = chr(10).join([
     "#define GPU_FB_MAX_ROOTS (BENCH_MAX_DEGREE + 1)",
     "",
-    "/* Grid-strides per root-finder SUBMISSION -- each slice is flushed, so this",
-    " * bounds a command buffer rather than a dispatch, which is the unit macOS's",
-    " * interactivity watchdog actually judges. Measured on this 10-core M3: the",
-    " * unsliced segment is a 790 ms command buffer; at 16 it is ~100 ms, leaving",
-    " * ~7x for a device slower per stride (an M1 has 7-8 cores). Raise it only",
-    " * with a measurement of GPUEndTime - GPUStartTime, NOT of dispatch time --",
-    " * measuring the dispatch is how 9z-j came to report a fix that changed",
-    " * nothing. Too large is a workunit killed by macOS, not a slow one. */",
-    "#ifndef FB_ROOTS_STRIDES_PER_LAUNCH",
-    "#define FB_ROOTS_STRIDES_PER_LAUNCH 16u",
-    "#endif"])
+    "/* Grid-strides per root-finder SUBMISSION -- a STARTING POINT, not a",
+    " * constant. 4 is safe on the slowest device this port has field data for:",
+    " * an estimated 140-210 ms across the M1 family, where 16 strides measured",
+    " * 560-840 ms. A faster part is raised by the controller within one or two",
+    " * submissions, so starting low costs almost nothing. */",
+    "#ifndef FB_ROOTS_STRIDES_START",
+    "#define FB_ROOTS_STRIDES_START 4u",
+    "#endif",
+    "/* A ceiling, so a mismeasurement cannot run away. ~8x what a 10-core M3",
+    " * settles at. */",
+    "#ifndef FB_ROOTS_STRIDES_MAX",
+    "#define FB_ROOTS_STRIDES_MAX 256u",
+    "#endif",
+    "",
+    "static uint32_t g_fb_strides = FB_ROOTS_STRIDES_START;",
+    "static float    g_fb_launch_max;          /* worst over-bound launch reported */",
+    "static unsigned long long g_fb_seen_seq;  /* last submission steered on */",
+    "",
+    "/* Steer the slice size from the last COMPLETED submission. Proportional,",
+    " * aiming at 0.8x the bound, with the dead band cofq_flush uses: act when",
+    " * the measurement is over target or under a quarter of it, else leave it.",
+    " *",
+    " * THE seq TEST IS NOT OPTIONAL. The reading is one or two submissions",
+    " * stale, so steering twice on the same measurement applies the same",
+    " * correction twice: a 4 -> 38 grow would become 4 -> 38 -> 256, a",
+    " * multi-second command buffer, which is exactly what the bound exists to",
+    " * prevent. One measurement, one adjustment. */",
+    "static void fb_steer_strides(const char *who)",
+    "{",
+    "    const float bound  = MTL_INTERACTIVITY_BOUND_MS;",
+    "    const float target = bound * 0.8f;",
+    "    float ms = 0.0f;",
+    "    unsigned long long seq = 0;",
+    "    if (mtlStreamWorstMs(0, &ms, &seq) != mtlSuccess) return;",
+    "    if (ms <= 0.0f || seq <= g_fb_seen_seq) return;   /* nothing new */",
+    "    g_fb_seen_seq = seq;",
+    "    if (ms > bound && ms > g_fb_launch_max) {",
+    "        g_fb_launch_max = ms;",
+    "        fprintf(stderr,",
+    "                \"%s: root-finder launch %.0f ms is over this build's %.0f ms\"",
+    "                \" bound (%u grid-strides)\\n\",",
+    "                who, (double)ms, (double)bound, g_fb_strides);",
+    "    }",
+    "    if (ms <= target && ms >= target * 0.25f) return;  /* dead band */",
+    "    double want = (double)g_fb_strides * ((double)target / (double)ms);",
+    "    if (want < 1.0) want = 1.0;",
+    "    if (want > (double)FB_ROOTS_STRIDES_MAX) want = (double)FB_ROOTS_STRIDES_MAX;",
+    "    g_fb_strides = (uint32_t)want;",
+    "}"])
+
 assert _k_old in s, 'GPU_FB_MAX_ROOTS define not found'
 s = s.replace(_k_old, _k_new, 1)
 print('  root finder sliced to bound its launch duration')
+
+# ---- steer the root finder once per segment ------------------------------
+_st_old = '        MTL_OR_DIE(mtlMemcpy(&failures, d_failures, sizeof(failures),\n                               mtlMemcpyDeviceToHost));'
+_st_new = "        MTL_OR_DIE(mtlMemcpy(&failures, d_failures, sizeof(failures),\n                               mtlMemcpyDeviceToHost));\n        /* ONE adjustment per segment, here and nowhere else: that memcpy is\n         * the sync that drains this segment's submissions, so it is the only\n         * moment their durations exist. Steering inside the slice loop reads\n         * whatever OTHER stage last drained -- the odds sieve, the select, the\n         * scan -- and each of those is a fresh measurement by the seq test's\n         * reckoning, so the controller grows on every one of them. Measured:\n         * it ran to the 256-stride ceiling inside the first segment and put\n         * the whole segment in one 788 ms command buffer, which is worse than\n         * the fixed size it replaced. */\n        fb_steer_strides(who);"
+assert _st_old in s, 'segment sync shape changed'
+s = s.replace(_st_old, _st_new, 1)
+print('  root finder steers on the segment drain')
 
 open(OUT, 'w').write(s)
 print('re-wrote %s with macro dispatch fixed' % OUT)

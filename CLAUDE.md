@@ -1500,6 +1500,81 @@ lacks its sibling's warning).
 Nine gates green after the fix, `cofcheck.sh` **54 PASS / 0 FAIL**, 288-q band
 `cmp`-identical at 13,485 relations / `8e79762c…`.
 
+## 9z-o: the fbgen slice size is MEASURED now, not chosen
+
+**Field data, 2026-09-17: M1, M1 Max and M2 workunits now COMPLETE**
+(`outcome 1`, `boinc_finish(0)`) — the first ones ever, and they close 9z-k's
+open item: the cofactor half is field-proven, and the chunker's steering is
+visible in the logs (36864 -> 15369 -> 11930 on an M1 Max).
+
+**But the fbgen wall times say the margin was luck.** This M3 does fbgen in
+6.9 s with a measured 130 ms per command buffer at 16 strides. The field:
+
+| device | fbgen wall | cores | slices | per command buffer |
+|---|---|---|---|---|
+| M3 (Apple9) | 6.9 s | 10 | 50 | **130 ms** (measured) |
+| M1 | 41.3 s | 7-8 | ~62-71 | **~560-640 ms** (derived) |
+| M1 Max | 13.4 s | 24-32 | ~16-21 | **~640-840 ms** (derived) |
+
+Against a 400 ms policy and an ~800 ms observed kill line. **The M1 Max is the
+WORST because more cores means a wider `wave`, so each stride carries more
+primes.**
+
+**THAT IS 9z-j's ERROR ONE LEVEL UP.** 9z-j replaced a fixed prime count with a
+fixed stride count and assumed strides were the device-independent unit. They
+are not: a stride is `ablocks*128` primes and `ablocks` scales with core count,
+while per-core throughput does not scale with it the same way. **No fixed unit
+is device-independent, and `cbtimecheck` can never catch this because it only
+runs on this M3.**
+
+**Fix: start safe and measure.** `FB_ROOTS_STRIDES_START` = 4 (~140-210 ms on
+the M1 family), then steer proportionally at 0.8x the bound with cofq_flush's
+dead band. On this M3: segment 1 runs at 4 strides, then settles at ~32 —
+49 slices, **max 311 ms**, fbgen 6.54 -> 6.74 s (~3%). An M1 should settle near
+8 strides.
+
+**Three mistakes on the way, all of which measured as "working":**
+
+1. **The CPU races the GPU, so polling between submissions sees nothing.**
+   Eight pending command buffers, all still merely *Committed* — encoding is
+   microseconds, execution is tens of ms — and then `sync()` releases them and
+   the durations with them. The measurement has to be taken **at the drain**;
+   `mtlStreamWorstMs` reports the worst buffer of the last one, worst because
+   that is what the watchdog judges.
+2. **A stream-wide measurement is not a root-finder measurement.** Steering
+   inside the slice loop read whatever stage last drained — the odds sieve, the
+   select, the scan — and each was a fresh `seq`, so the controller grew on
+   every one of them, hit the 256 ceiling *inside the first segment*, and put
+   the whole segment in one **788 ms** command buffer: worse than the constant
+   it replaced. It now steers **once per segment**, on the drain that contains
+   the slices.
+3. **A stale reading applied twice compounds.** Hence `seq`: one measurement,
+   one adjustment. Without it a 4 -> 38 grow becomes 4 -> 38 -> 256.
+
+**THE GATE'S CONTROL CAUGHT ITSELF.** `cbtimecheck`'s control still passed
+`-DFB_ROOTS_STRIDES_PER_LAUNCH`, a macro this change deleted, so it defeated
+nothing and had quietly become a second copy of the gate — and the gate failed
+rather than passing, which is the entire argument for a control that must FAIL
+over an assertion that must pass. Now `-DFB_ROOTS_STRIDES_START=4000000u
+-DFB_ROOTS_STRIDES_MAX=4000000u`: control 803 ms, gate 317 ms.
+
+**ONE DEFINITION OF THE BOUND.** `MTL_INTERACTIVITY_BOUND_MS` (400 ms) now
+lives in `metal_rt.h` — the command buffer is the shim's own concept — and
+`COF_CHUNK_TARGET_MS` is defined from it. Two stages bound themselves against
+this number; two constants that must agree is how this port has repeatedly
+hurt itself.
+
+**Not measured:** the M1 figures above are DERIVED from wall time and an
+assumed core count, not measured per-buffer. The controller does not depend on
+them being right — that is the point of measuring — but the table should not be
+quoted as if it were instrumented.
+
+**Also in those logs, unfixed:** an M1 Max task restarted **six times**
+(`lock is stale (pid … is gone)`), each restart re-running fbgen (13.5 s) and
+re-learning the cofactor chunk from 36864, paying another 744-790 ms
+over-bound launch each time. The learned chunk is not carried in the
+checkpoint.
+
 ## Rebase, 2026-09-16: upstream's ECM occupancy fix, and a silent kernel leak
 
 `metal-port` was 6 commits behind `main` and is now rebased onto `75d4cf7`
