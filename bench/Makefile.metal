@@ -355,6 +355,23 @@ metallibcheck: ../oracle/c183.fb1
 	@sh metal/metallibcheck.sh $(CURDIR)/$(BUILD)/bench \
 	    $(CURDIR)/../oracle/c183.poly $(CURDIR)/../oracle/c183.fb1
 
+# ---- resume progress gate (9z-m) ----------------------------------------
+# The bar restarted at 0 when a band resumed. Its control is a second build
+# whose estimator is compiled to ignore resume, which is the behaviour that
+# shipped -- so the control must FAIL to report the whole band's position.
+.PHONY: progresscheck
+progresscheck: ../oracle/c183.fb1
+	@$(MAKE) -f Makefile.metal $(BUILD)/bench >/dev/null
+	@cp $(BUILD)/bench $(BUILD)/bench.progressgate
+	@$(MAKE) -f Makefile.metal $(BUILD)/bench \
+	    METAL_EXTRA_DEFS=-DPIPE_PROGRESS_IGNORE_RESUME >/dev/null
+	@cp $(BUILD)/bench $(BUILD)/bench.progressctrl
+	@$(MAKE) -f Makefile.metal $(BUILD)/bench >/dev/null
+	@sh metal/progresscheck.sh $(CURDIR)/$(BUILD)/bench.progressgate \
+	    $(CURDIR)/$(BUILD)/bench.progressctrl \
+	    $(CURDIR)/$(BUILD)/bench.metallib \
+	    $(CURDIR)/../oracle/c183.poly $(CURDIR)/../oracle/c183.fb1
+
 # ---- command-buffer duration gate (9z-k) --------------------------------
 # The watchdog's unit is a COMMAND BUFFER, not a dispatch. Nothing in this tree
 # measured that until a shipped "fix" (9z-j) turned out to have changed only
