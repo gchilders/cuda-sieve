@@ -247,22 +247,8 @@ for _old, _new in [
     src = src.replace(_old, _new, 1)
 print('  six more device messages name Metal')
 
-# ---- resume: keep the band's original qmin -------------------------------
-# bench_main overwrites cfg.qmin with the checkpoint's next_q so the q
-# generator starts in the right place. That is correct, and it also destroys
-# the only record of where the band began -- which the progress estimator
-# needs, or a resumed run's bar restarts at 0 and climbs through the
-# REMAINING span. Save it first; see metal/gen_pipeline_host.py.
-_qm_old = "                if (qrange_set) cfg.qmin = ck.next_q;"
-_qm_new = chr(10).join([
-    "                if (qrange_set) {",
-    "                    /* Before the overwrite, not after. */",
-    "                    cfg.resume_qmin = cfg.qmin;",
-    "                    cfg.qmin = ck.next_q;",
-    "                }"])
-assert src.count(_qm_old) == 1, 'resume qmin overwrite not unique'
-src = src.replace(_qm_old, _qm_new, 1)
-print('  resume keeps the original qmin for the progress estimator')
+# (The resume qmin save used to be applied here; it is in bench_main.cu now --
+# plan 9z-n.)
 
 # ---- a missing GPU is TRANSIENT on macOS, not an error --------------------
 # A field task (client 8.2.9) exited 1 seconds after starting with "this

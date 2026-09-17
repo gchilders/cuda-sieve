@@ -1406,6 +1406,50 @@ records. And the gate's wait loop watched the run log GROW, which `--log`'s
 per-run header satisfies instantly, so it killed the resumed band before it
 reported anything and called that "no record".
 
+## 9z-n: the same fix in the CUDA build, tested on a real NVIDIA card
+
+9z-m fixed the resume bar Metal-side only. Asked to fix the CUDA build too, so
+the fix now lives in **`pipeline.cuh` and `bench_main.cu` themselves** and the
+Metal generators do nothing about it — one fix, all three ports. **This is a
+real behaviour change and reaches HIP**, which shares those files; it is the
+only such row in the drift ledger. Nothing about it is platform-specific.
+
+**Verified on the hardware the bug was reported against**: GTX 1080 Ti
+(sm_61, driver 580.159.04), nvcc 12.8.93, NRP/Nautilus pod, factor base
+regenerated in-pod to the manifest hash `b4534cb6…`. The same
+`metal/progresscheck.sh` — it is portable, it drives any build of this tree —
+run against a **pre-fix build and the fixed one from the same checkpoint**:
+
+```
+pre-fix   resumed at nq=141: pct=18.06   (whole band 70.50)   3 assertions FAIL
+fixed     resumed at nq=141: pct=70.50   (whole band 70.50)   all PASS
+```
+
+`18.06` is the identical number the Metal build produced pre-fix — same
+deterministic band, same bug, both platforms.
+
+**Regression, and it is the strong one: a full 288-q band on that card emits
+`sha256 8e79762c…`, 13,485 relations, 564,696 enqueued — byte-identical to the
+Metal build and to Phase 7.** Shared-code surgery moved no relation.
+
+**THE GATE HAS NO CONTROL BINARY, AND THAT IS DELIBERATE.** The obvious
+control — a build with the fix compiled out — **cannot exist**: this tree marks
+any non-empty `DEFS` as a PRICING build and `bench` refuses `--relations` from
+it, which a resume gate needs. That guard predates the gate and is right. So
+`progresscheck.sh` DISCRIMINATES instead: it computes the pre-fix answer from
+the same run-log record and asserts the build does not produce it, so reverting
+the fix fails two assertions rather than none. The pre-fix binaries were
+measured once, on both ports, above.
+
+**AND THAT GUARD WAS MISSING FROM THE METAL BUILD — my fault, now fixed.**
+`METAL_EXTRA_DEFS` (added for `cbtimecheck`'s control) never reached
+`-DBENCH_DEFS`, because `Makefile.metal` forwarded no `DEFS` to the CPU
+objects at all. So a Metal build with experimental `-D`s was **unmarked and
+would happily write relations** — exactly what the CUDA Makefile's own comment
+says must not happen ("anything that must stay shippable gets its own
+variable, never a DEFS value"). `CPUOBJ_MAKEVARS` now forwards it; verified by
+building with a `METAL_EXTRA_DEFS` and watching `--relations` get refused.
+
 ## Drift ledger — CUDA-side changes made for this port
 
 **The ledger lives in `bench/METAL_PORT_PLAN.md` section 9, and only there.**

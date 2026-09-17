@@ -180,8 +180,17 @@ HOSTFLAGS := $(HOSTFLAGS_BASE) $(BOINC_DEFS) $(BOINC_CPPFLAGS) $(METAL_BOINC_GPU
 # HAVE_BOINC so a distributed binary carries no -march=native): -mcpu=apple-m1
 # is this port's declared floor, not the build host's ISA, so it is the right
 # value for a distributed binary too.
+# DEFS carries METAL_EXTRA_DEFS so the PRICING-BUILD guard works here too. The
+# default Makefile stamps runlog.o with -DBENCH_DEFS='"$(DEFS)"', and bench
+# refuses --relations when that string is non-empty -- the mechanism that stops
+# an experimental binary's output being mistaken for production. This Makefile
+# forwarded no DEFS at all, so METAL_EXTRA_DEFS (added for cbtimecheck's
+# control) built an UNMARKED experimental binary, which is precisely what that
+# guard exists to prevent. The CUDA Makefile's own comment states the rule:
+# anything that must stay shippable gets its own variable, never a DEFS value.
 CPUOBJ_MAKEVARS := HOST_TUNE='$(CPUOBJ_TUNE)' HAVE_BOINC=$(HAVE_BOINC) \
                    BOINC_CPPFLAGS='$(BOINC_CPPFLAGS) $(METAL_BOINC_GPU)' \
+                   DEFS='$(METAL_EXTRA_DEFS)' \
                    BOINC_HOST_STATIC=
 
 BUILD := .metal-build
@@ -356,19 +365,15 @@ metallibcheck: ../oracle/c183.fb1
 	    $(CURDIR)/../oracle/c183.poly $(CURDIR)/../oracle/c183.fb1
 
 # ---- resume progress gate (9z-m) ----------------------------------------
-# The bar restarted at 0 when a band resumed. Its control is a second build
-# whose estimator is compiled to ignore resume, which is the behaviour that
-# shipped -- so the control must FAIL to report the whole band's position.
+# The bar restarted at 0 when a band resumed. There is no control BINARY: a
+# build with the fix compiled out cannot emit --relations, because any
+# non-empty DEFS marks a pricing build (see Makefile). The script discriminates
+# instead -- it computes the pre-fix answer from the same run-log record and
+# asserts the build does not produce it.
 .PHONY: progresscheck
 progresscheck: ../oracle/c183.fb1
 	@$(MAKE) -f Makefile.metal $(BUILD)/bench >/dev/null
-	@cp $(BUILD)/bench $(BUILD)/bench.progressgate
-	@$(MAKE) -f Makefile.metal $(BUILD)/bench \
-	    METAL_EXTRA_DEFS=-DPIPE_PROGRESS_IGNORE_RESUME >/dev/null
-	@cp $(BUILD)/bench $(BUILD)/bench.progressctrl
-	@$(MAKE) -f Makefile.metal $(BUILD)/bench >/dev/null
-	@sh metal/progresscheck.sh $(CURDIR)/$(BUILD)/bench.progressgate \
-	    $(CURDIR)/$(BUILD)/bench.progressctrl \
+	@sh metal/progresscheck.sh $(CURDIR)/$(BUILD)/bench \
 	    $(CURDIR)/$(BUILD)/bench.metallib \
 	    $(CURDIR)/../oracle/c183.poly $(CURDIR)/../oracle/c183.fb1
 
