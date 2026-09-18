@@ -152,23 +152,6 @@ mtlError_t  mtlStreamSynchronize(mtlStream_t s);
  * long run of dispatches must be broken into submissions, not just into
  * launches. See the fbgen root finder (plan 9z-k). */
 mtlError_t  mtlStreamFlush(mtlStream_t s);
-/* The WORST command-buffer GPU duration in this stream's most recent drain
- * (i.e. as of the last sync), in ms; 0 before the first one. Never waits.
- *
- * It is drain-scoped because that is the only place the numbers exist. The
- * CPU encodes a whole run of submissions in microseconds while each takes
- * tens of ms on the GPU, so a caller polling between submissions finds
- * nothing completed -- measured: eight pending buffers, all still merely
- * Committed -- and then sync() releases them and the evidence with them.
- * WORST rather than last, because a watchdog judges the worst one.
- *
- * `seq` changes only when a new drain produces a new figure, and IT IS THE
- * LOAD-BEARING HALF. A controller that steers twice on one measurement
- * applies its correction twice: a proportional 4 -> 38 grow becomes
- * 4 -> 38 -> 256, a multi-second command buffer, which is the exact failure
- * the bound exists to prevent. Act only when seq is newer than the one you
- * last acted on. */
-mtlError_t  mtlStreamWorstMs(mtlStream_t s, float *ms, unsigned long long *seq);
 mtlError_t  mtlStreamWaitEvent(mtlStream_t s, mtlEvent_t e, unsigned flags);
 mtlError_t  mtlDeviceSynchronize(void);
 
