@@ -65,33 +65,45 @@ ck "$([ "$NVALVE" -ge 1 ] && echo 1 || echo 0)" \
  raise CHUNKCHECK_CURVES; do NOT lower the bound with DEFS, that makes the\
  valve fire every flush and the gate stops testing anything"
 
-# Two properties, both violated by the pre-fix build and neither by the fix.
-#   over/back: a report above the valve's last choice, or back at the floor.
-#   up:        ANY increase at all once the valve has spoken. The controller is
-#              one-way downward from that point, so this catches a snapback
-#              even if the floor itself were to change.
+# THE PRIMARY ASSERTION IS SILENCE, not a comparison of values.
 #
-# A PARK IS THE ONE LEGITIMATE INCREASE, and it is distinguishable because it
-# says so. There are two, and only the first moves the chunk:
-#   "parking at N"  -- the descent bought under 10%, so the launch is not
-#                      chunk-bound and the throughput goes back. An explicit,
-#                      logged decision, as against the silent relapse this gate
-#                      exists to catch, so it resets the ceiling.
-#   "parking here"  -- the floor is reached and the bound is still unmet. The
-#                      reduction is KEPT, because over the bound is not over the
-#                      watchdog and over it by 2.4x is, so nothing moves.
+# An earlier version compared each reported chunk against the valve's last
+# choice, AND ITS CONTROL PASSED: cof_report_chunk renders min(chunk, n), the
+# relapse happened to land on the band's final partial flush where n was 1890,
+# and the gate read 1890 as "below the ceiling, fine". On another card the same
+# control failed only because the relapse landed on a full flush. A gate whose
+# discrimination depends on where the band ends is not a gate.
+#
+# So: after the valve has spoken, a correct build says NOTHING MORE. That is an
+# invariant, not a coincidence -- the steering recomputes max(half, floor_ch),
+# floor_ch is clamped to the ceiling, chunk_cur already equals the ceiling, so
+# it lands on the same value and cof_report_chunk suppresses an unchanged line.
+# Any later `cofactor chunk:` line means the steering MOVED the chunk, which
+# after a valve descent is the relapse itself, whatever value got rendered.
+#
+# The two parks are valve lines, not chunk lines, so they do not trip this; and
+# they leave chunk_cur where the steering will hold it, so they produce no
+# chunk line afterwards either.
+AFTER=$(awk '/cofactor: kernel launch|parking at|parking here/ { seen = 1; next }
+             /cofactor chunk:/ { if (seen) n++ }
+             END { print n + 0 }' "$D/ctl")
+ck "$([ "$AFTER" = 0 ] && echo 1 || echo 0)" \
+   "the controller is SILENT once the valve has spoken ($AFTER later report(s))"
+[ "$AFTER" = 0 ] || sed -n '/cofactor: kernel launch/,$p' "$D/ctl" | \
+    grep "cofactor chunk:" | sed 's/^/       relapsed: /'
+
+# Kept as diagnostics, not as the verdict: they are informative when they do
+# fire, and worthless when the rendered value is clamped to a small final n.
 awk '
   function note(n) {
       if (ceil == "") return
       if (n + 0 > ceil + 0) over++
       if (n + 0 == open + 0) back++
-      if (last != "" && n + 0 > last + 0) up++
-      last = n
   }
-  /parking here/ { parked++; next }   # the floor case: nothing moved
+  /parking here/ { next }
   /parking at/ {
       n = $0; sub(/.*parking at /, "", n); sub(/ records.*/, "", n)
-      ceil = n; last = n; parked++; next
+      ceil = n; next
   }
   /cofactor chunk:/ {
       n = $0; sub(/.*cofactor chunk: /, "", n); sub(/ records.*/, "", n)
@@ -100,19 +112,10 @@ awk '
   }
   /cofactor: kernel launch/ {
       n = $0; sub(/.*-> /, "", n); sub(/ records.*/, "", n)
-      note(n); ceil = n; last = n
+      note(n); ceil = n
   }
-  END { printf "%d %d %d %d\n", over + 0, back + 0, up + 0, parked + 0 }' \
-    "$D/ctl" > "$D/verdict"
-read -r OVER BACK UP PARKED < "$D/verdict"
-[ "$PARKED" = 0 ] || echo "  (the valve parked $PARKED time(s): a descent stopped\
- paying, so it gave the throughput back -- a logged increase, not a relapse)"
-
-ck "$([ "$OVER" = 0 ] && echo 1 || echo 0)" \
-   "the chunk never climbs back over the valve's choice ($OVER violation(s))"
-ck "$([ "$BACK" = 0 ] && echo 1 || echo 0)" \
-   "and never returns to the floor the valve descended from ($BACK time(s))"
-ck "$([ "$UP" = 0 ] && echo 1 || echo 0)" \
-   "and never rises at all once the valve has spoken ($UP increase(s))"
+  END { printf "%d %d\n", over + 0, back + 0 }' "$D/ctl" > "$D/verdict"
+read -r OVER BACK < "$D/verdict"
+echo "  (diagnostics: $OVER report(s) over the valve's choice, $BACK back at the floor)"
 
 [ $fail = 0 ] && echo "AUTO CHUNK GATE: PASS" || { echo "AUTO CHUNK GATE: FAIL"; exit 1; }
