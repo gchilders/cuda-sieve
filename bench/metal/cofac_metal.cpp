@@ -1552,6 +1552,26 @@ typedef struct {
      * One-way and sticky: a device whose launches are inside the bound never
      * sets it, so nothing here changes for healthy hardware. */
     uint32_t chunk_ceiling;
+    /* The valve's no-progress guard. chunk/launch as they were at the last
+     * descent, and a latch once descending has been shown not to pay.
+     *
+     * The descent is proportional on the assumption that the launch is linear
+     * in the chunk. Below a few thousand records it is not -- measured on a
+     * 10-core M3 (plan 9z-h): the response flattens and then reverses, 1996
+     * records giving 94.0 ms against 1792 giving 139.9. Without a guard the
+     * valve rides all the way down to COF_CHUNK_HARD_FLOOR, paying a large
+     * throughput cost in a regime where shrinking the chunk no longer shortens
+     * the launch at all. Measured at an artificially low 200 ms bound on a
+     * TITAN RTX: 110592 -> 14871 -> 7481 -> 4137 -> 2659, still descending.
+     *
+     * If a descent does not buy at least 10%, the bound is below one ECM chain
+     * and NO chunk size can meet it. The right answer is then to give the
+     * throughput back and say so, not to subdivide for nothing -- and the
+     * bound has 2x margin on the TDR it is derived from, so a device parked
+     * over the bound still completes its tasks. */
+    uint32_t chunk_prev_valve;
+    float    ms_prev_valve;
+    int      valve_parked;
     uint32_t *d_s, ns, ecm_curves;
     /* Method PER SIDE, 0 = Pollard-Brent rho, 1 = ECM. Per side and not per
      * job because the two sides of a real job are usually different shapes:
@@ -2143,7 +2163,7 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
      * measured launch that actually exceeded the bound. On hardware that never
      * does, nothing here executes and the behaviour is bit-for-bit what it was.
      */
-    if (!chunk) {
+    if (!chunk && !Q->valve_parked) {
         if (launch_ms > COF_LAUNCH_TARGET_MS) {
             /* Proportional, at 0.8x the bound: from a large overshoot this
              * lands in one flush where halving needs several, and every flush
