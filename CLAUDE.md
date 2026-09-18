@@ -1806,6 +1806,77 @@ environment. The failure mode is a clean error exit rather than a wrong answer,
 and a volunteer controls far more than that already -- but it should be a
 decision on the record rather than a side effect of `fbretrycheck` needing it.
 
+## The valve's no-progress guard (2026-09-17, after the fifth review)
+
+The fifth review found the valve's descent being undone; fixing that exposed the
+next thing, which the review itself had flagged and not chased: **the descent had
+no guard.** It is proportional on the assumption that the launch is linear in
+the chunk, and 9z-h measured that assumption failing below a few thousand
+records -- the response flattens and then reverses, 1996 records giving 94.0 ms
+against 1792 giving 139.9. So on a device that cannot meet the bound the valve
+rode all the way to `COF_CHUNK_HARD_FLOOR`. Measured on a TITAN RTX at an
+artificially low 200 ms bound: **110592 -> 14871 -> 7481 -> 4137 -> 2659, still
+descending.** This port has had a guard since 9z-h; upstream's valve did not.
+
+Now it does (`d7225fe`), and the interesting part is that the two terminal
+conditions want **opposite** answers:
+
+| condition | answer |
+|---|---|
+| the last descent bought under 10% | restore the larger chunk and park -- the two are within 10% by construction, so the throughput is free |
+| the floor is reached and the bound is still unmet | **keep the reduction** and park in place |
+
+**MY FIRST VERSION RESTORED IN BOTH CASES AND THE MEASUREMENT SAID NO.** On an
+RTX 3090 at a 200 ms bound the descent went 125952 -> 1024 and cut the launch
+from **25449 ms to 6865** -- a 3.7x reduction that simply cannot reach 200 ms --
+and the guard handed it straight back. On a real slow card that trade is a TDR
+kill where staying put would have survived: **the bound carries 2x margin on the
+watchdog precisely so that over the bound is not over the watchdog, and over the
+bound by 2.4x is.** The log said it out loud, one line after reporting the
+reduction, which is why writing the message before trusting the logic paid.
+
+There is also a hole a trace found before any of it ran: once the descent
+reaches the hard floor, `next == chunk_cur`, and since the descent branch is
+what advances the guard's reference, the valve would re-measure the same floor
+every flush, print nothing, and never conclude anything. That is the second
+branch above.
+
+**BOTH BRANCHES ARE EXERCISED, deliberately, because neither fires at the
+shipped 1000 ms bound on healthy hardware:**
+
+```
+--ecm-b1 32000, 200 ms bound     1640 -> 1024 bought only 3245 -> 3290 ms,
+                                 so no chunk size can meet the 200 ms bound;
+                                 parking at 1640 records/launch
+-DCOF_CHUNK_HARD_FLOOR=125952u   125952 records/launch is the floor and the
+                                 launch is still 640 ms ... parking here
+                                 rather than giving the reduction back
+```
+
+A bound below one ECM chain is what makes the first deterministic -- the launch
+is then flat in the chunk by construction, which `cofac.cuh` has documented
+since 8h. Chasing the flat zone by lowering the bound alone did NOT work: the
+3090 reported 646 ms and then 226 ms for the same 125952-record launch in
+consecutive runs, so the stall point moves with the weather.
+
+`chunkcheck.sh` now distinguishes the two logged parks from the silent relapse
+it already catches: `parking at N` moves the chunk and resets the ceiling,
+`parking here` moves nothing.
+
+**On Metal all three valve branches are REMOVED, not just the descent.** The
+port's own steering owns the descent and has its own park (`chunk_parked`), so
+the valve keeps only the ceiling. The generator splices the block by index with
+four asserts naming what it discards -- the block is 60 lines of upstream prose
+and matching it as one literal would break on every comment edit. `valve_acted`
+is gone; `chunk_prev_valve`, `ms_prev_valve` and `valve_parked` remain in the
+shared struct, written by nobody here.
+
+**Validated:** fourteen gates green, `cofcheck.sh` 54 PASS / 0 FAIL, 288-q band
+`cmp`-identical at 13,485 / `8e79762c`. On the 3090: `make chunkcheck` 6/6 with
+125952 -> 57334 -> 40433 and no relapse, the `-DCOF_CHUNK_NO_CEILING` control
+failing three assertions, `cofcheck.sh` 54/0, and the 288-q band at
+`8e79762c` with `c183.fb1` regenerated in-pod to `b4534cb6`.
+
 ## Rebase, 2026-09-17 (second): the root-finder SLICING went upstream too
 
 The field reported **interactive stutter at workunit start** on CUDA -- no
