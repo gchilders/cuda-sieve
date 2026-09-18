@@ -436,19 +436,19 @@ src = src.replace(_v_old, "", 1)
 #
 # So the valve keeps the one thing only it can say -- that a measured launch
 # has disproved the floor -- and the steering does all the arithmetic.
-_valve_old = chr(10).join([
-    "            if (next != Q->chunk_cur) {",
-    "                fprintf(stderr,",
-    "                        \"  cofactor: kernel launch %.0f ms is over this build's\"",
-    "                        \" %.0f ms bound; %u -> %u records/launch\\n\",",
-    "                        (double)launch_ms, (double)COF_LAUNCH_TARGET_MS,",
-    "                        Q->chunk_cur, next);",
-    "                Q->chunk_cur = next;",
-    "                S.chunk = Q->chunk_cur;",
-    "                /* Sticky, so the steering's floor cannot pull it back up. */",
-    "                Q->chunk_ceiling = next;",
-    "                valve_acted = 1;",
-    "            }"])
+# Upstream's action is three branches now -- descend, park having stopped
+# paying, park at the floor -- and ALL THREE go, because on Metal the steering
+# owns the descent and has its own park (chunk_parked). Spliced by index rather
+# than matched as one literal, because it is 60 lines of upstream prose; the
+# asserts below name what is being discarded, so a shape change cannot pass
+# quietly. .index() raises on a miss, which is the assert for the bounds.
+_va = src.index("            /* DID THE LAST DESCENT PAY?")
+_vz = src.index(chr(10) + "        }" + chr(10) + "    }" + chr(10), _va)
+_valve_old = src[_va:_vz]
+assert 'parking at %u records/launch' in _valve_old, 'no-progress park missing'
+assert 'parking here rather than giving' in _valve_old, 'floor park missing'
+assert 'Q->chunk_ceiling = next;' in _valve_old, "the valve's ceiling missing"
+assert _valve_old.count('valve_acted = 1;') == 3, 'not three valve branches'
 _valve_new = chr(10).join([
     "            /* THE CEILING ONLY, AND ONLY EVER DOWNWARD. The steering below",
     "             * measures this same launch against a tighter bound and has a",
@@ -462,8 +462,7 @@ _valve_new = chr(10).join([
     "                        (double)launch_ms, (double)COF_LAUNCH_TARGET_MS, next);",
     "                Q->chunk_ceiling = next;",
     "            }"])
-assert src.count(_valve_old) == 1, "upstream's valve action shape changed"
-src = src.replace(_valve_old, _valve_new, 1)
+src = src[:_va] + _valve_new + src[_vz:]
 
 # ... and with the valve no longer claiming a flush, valve_acted has no reader.
 _va_old = "    int valve_acted = 0;   /* declared here: COF_FLUSH_CK hides a goto done */" + chr(10)
