@@ -1539,6 +1539,19 @@ typedef struct {
      * flush picks the opening value. Ignored entirely when the operator gave
      * an explicit --cof-chunk. */
     uint32_t chunk_cur;
+    /* An upper bound the LAUNCH VALVE has established, or 0 if it never fired.
+     *
+     * The valve may descend below cof_chunk_floor(), but the steering below it
+     * clamps UP to that same floor on every flush -- and its test against
+     * `stage` is always true -- so without this the valve's choice survived
+     * exactly one flush and the chunk oscillated back onto the size that was
+     * killing the device. Measured on a TITAN RTX: 110592 -> 75466 -> 110592
+     * -> 75735 -> 110592, i.e. every second flush ran at the value the valve
+     * had just rejected.
+     *
+     * One-way and sticky: a device whose launches are inside the bound never
+     * sets it, so nothing here changes for healthy hardware. */
+    uint32_t chunk_ceiling;
     uint32_t *d_s, ns, ecm_curves;
     /* Method PER SIDE, 0 = Pollard-Brent rho, 1 = ECM. Per side and not per
      * job because the two sides of a real job are usually different shapes:
@@ -2017,7 +2030,6 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     uint32_t nr = 0, novf = 0;
     mtlEvent_t e0 = NULL, e1 = NULL, e2 = NULL;
     cof_peak_t pk0 = {NULL, NULL, 0, 0}, pk1 = {NULL, NULL, 0, 0};
-    int valve_acted = 0;   /* declared here: COF_FLUSH_CK hides a goto done */
     float t0 = 0, t1 = 0, launch_ms = 0;
     double h0;
     int rc = -1;
@@ -2106,6 +2118,15 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     COF_FLUSH_CK(mtlEventElapsedTime(&t0, e0, e1));
     COF_FLUSH_CK(mtlEventElapsedTime(&t1, e1, e2));
     Q->ms_rat += t0; Q->ms_alg += t1;
+    {   /* The measured launch, hoisted out of the valve block below --
+         * which is where upstream computes it, BELOW this report and only
+         * in auto mode. Both are wrong for this line: it fired on a
+         * launch_ms that was still zero, and a pinned --cof-chunk that
+         * overruns is exactly the case worth reporting. */
+        float pm0 = 0.0f, pm1 = 0.0f;
+        if (pk0.fired) COF_FLUSH_CK(mtlEventElapsedTime(&pm0, pk0.a, pk0.b));
+        if (pk1.fired) COF_FLUSH_CK(mtlEventElapsedTime(&pm1, pk1.a, pk1.b));
+        launch_ms = pm0 > pm1 ? pm0 : pm1; }
     if (launch_ms > COF_CHUNK_TARGET_MS && launch_ms > Q->ms_launch_max) {
         Q->ms_launch_max = launch_ms;
         fprintf(stderr,
@@ -2123,10 +2144,6 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
      * does, nothing here executes and the behaviour is bit-for-bit what it was.
      */
     if (!chunk) {
-        float pm0 = 0.0f, pm1 = 0.0f;
-        if (pk0.fired) COF_FLUSH_CK(mtlEventElapsedTime(&pm0, pk0.a, pk0.b));
-        if (pk1.fired) COF_FLUSH_CK(mtlEventElapsedTime(&pm1, pk1.a, pk1.b));
-        launch_ms = pm0 > pm1 ? pm0 : pm1;
         if (launch_ms > COF_LAUNCH_TARGET_MS) {
             /* Proportional, at 0.8x the bound: from a large overshoot this
              * lands in one flush where halving needs several, and every flush
@@ -2139,15 +2156,17 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
                           ? COF_CHUNK_HARD_FLOOR : (uint32_t)want;
             if (next >= Q->chunk_cur) next = Q->chunk_cur / 2;   /* always move */
             if (next < COF_CHUNK_HARD_FLOOR) next = COF_CHUNK_HARD_FLOOR;
-            if (next != Q->chunk_cur) {
+            /* THE CEILING ONLY, AND ONLY EVER DOWNWARD. The steering below
+             * measures this same launch against a tighter bound and has a
+             * no-progress guard, so it -- not this -- picks the chunk; all
+             * that is needed from here is that the floor stop applying. */
+            if (!Q->chunk_ceiling || next < Q->chunk_ceiling) {
                 fprintf(stderr,
                         "  cofactor: kernel launch %.0f ms is over this build's"
-                        " %.0f ms bound; %u -> %u records/launch\n",
-                        (double)launch_ms, (double)COF_LAUNCH_TARGET_MS,
-                        Q->chunk_cur, next);
-                Q->chunk_cur = next;
-                S.chunk = Q->chunk_cur;
-                valve_acted = 1;
+                        " %.0f ms valve bound; the chunk floor no longer holds"
+                        " above %u records/launch\n",
+                        (double)launch_ms, (double)COF_LAUNCH_TARGET_MS, next);
+                Q->chunk_ceiling = next;
             }
         }
     }
@@ -2160,9 +2179,19 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
      * band runs many of them. The floor is the real protection -- a device slow
      * enough to stay over budget simply parks there, which is the free point
      * for it, and a device fast enough grows to one slice and stops. */
-    if (!chunk && !valve_acted) {
-        const uint32_t floor_ch = cof_chunk_floor(blocks, threads);
+    if (!chunk) {
+        uint32_t floor_ch = cof_chunk_floor(blocks, threads);
         const uint32_t was = Q->chunk_cur;
+#ifndef COF_CHUNK_NO_CEILING
+        /* A measured over-bound launch has already proved that a full grid of
+         * records does not fit this device's watchdog, so the floor -- which
+         * is one record per thread and nothing more -- stops being a lower
+         * limit. Without this the clamp below restores the rejected size on
+         * the very next flush. COF_CHUNK_NO_CEILING is chunkcheck.sh's
+         * control build; it must fail the gate. */
+        if (Q->chunk_ceiling && floor_ch > Q->chunk_ceiling)
+            floor_ch = Q->chunk_ceiling;
+#endif
         /* The MEASURED longest launch, not t0+t1. The sum over every round
          * and slice of a side is not what a watchdog kills and, on a
          * 10-core Apple GPU, exceeds the target at every reachable chunk
@@ -2219,6 +2248,14 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
             if (next <= Q->chunk_cur) next = (uint64_t)Q->chunk_cur * 2ull;
             if (next > Q->cap) next = Q->cap;
             Q->chunk_cur = (uint32_t)next;
+#ifndef COF_CHUNK_NO_CEILING
+            /* Growth is the other way back over the valve's choice. Unreachable
+             * while `stage` is a side sum (it never falls below a quarter of
+             * the target), but the Metal port steers this same branch on a real
+             * per-launch measurement, where it is live. */
+            if (Q->chunk_ceiling && Q->chunk_cur > Q->chunk_ceiling)
+                Q->chunk_cur = Q->chunk_ceiling;
+#endif
         }
         if (Q->chunk_cur != was) cof_report_chunk(Q->chunk_cur, n, 0);
     }

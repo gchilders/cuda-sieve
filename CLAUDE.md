@@ -1671,6 +1671,141 @@ the STAGE is not, because more launches means more per-launch overhead --
 immaterial against a workunit measured in hours, though a host that restarts
 repeatedly pays it again each time (the field M1 Max restarted six times).
 
+## Fifth review, 2026-09-17 (after the two rebases and the lock fix)
+
+**THREE FINDINGS, ALL THREE MEASURED RATHER THAN READ, AND ALL THREE WERE
+INTRODUCED BY THE TWO REBASES.** Inheriting upstream code is not free: each of
+these is a piece of shared code that is correct on CUDA and wrong here, or
+correct in isolation and wrong in the order it landed.
+
+### 1. Upstream's launch valve was undone on the very next flush (CUDA)
+
+`8b62c81` let an over-bound launch descend past `cof_chunk_floor()`. It did --
+for exactly one flush. The steering below it clamps UP to that same floor every
+flush, and its test against `stage` is the always-true one 8b62c81 itself
+documents. Measured on a **TITAN RTX** (sm_75, nvcc 12.8.93, NRP) at the
+shipped 1000 ms bound:
+
+```
+cofactor chunk: 110592 records/launch                  <- cof_chunk_floor()
+cofactor: kernel launch 1172 ms ...; 110592 -> 75466 records/launch
+cofactor chunk: 110592 records/launch                  <- snapped back
+cofactor: kernel launch 1168 ms ...; 110592 -> 75735 records/launch
+cofactor chunk: 110592 records/launch                  <- and again
+```
+
+**Every second flush ran at the value just measured over the bound**, which on
+the 980 Ti this was written for is a TDR kill, and one is enough. Fixed on
+`main` (`252fef4`) with a sticky `chunk_ceiling` the floor yields to; this port
+inherits it through regeneration and clamps its growth branch with it too.
+
+**8b62c81's own V100 verification could not have seen this.** At the 50 ms bound
+it tested, the valve fires on EVERY flush, `valve_acted` suppresses the
+steering, and the code that snaps back never runs. The configuration that proves
+the descent works is the one that hides the relapse.
+
+### 2. The over-bound launch report went dead in the rebase (Metal)
+
+`cofac_host.inc` read `launch_ms` **above** the point upstream's valve assigns
+it. `launch_ms` is a fresh local per call, so the test was always false and 9c's
+report -- the line a volunteer's `stderr.txt` carries when a host cannot meet
+the bound, kept precisely because it "is invisible from anywhere else" -- had
+been dead since `5c7b75c`, **including in the binary that was signed for
+deployment**. Same shape as 9z-l's `mtlGetDeviceCount`: the value is computed,
+then read in the wrong order.
+
+Measured, not read: a build at `COF_CHUNK_TARGET_MS=1.0f` printed the valve's
+own line at 238 ms and this report not at all. After the fix the same build
+prints `kernel launch 241 ms is over this build's 1 ms bound`. The measurement
+is now hoisted above the report and **out of auto mode**, which 9c also asked
+for and upstream's placement had quietly taken away.
+
+### 3. The inherited valve pre-empted this port's own controller (Metal)
+
+`valve_acted` skips the steering for that flush, so a launch over the **1000 ms**
+valve bound got a correction aimed at 0.8x1000 instead of 0.8x this build's own
+**400 ms**, and the no-progress guard did not run either. Measured at a 200 ms
+valve bound against a 1 ms steering bound: **two consecutive flushes, ~134
+special-q**, steered by the valve at 0.67x per step while the primary bound
+wanted 0.33x. Those are M1-at-opening-chunk flushes -- command buffers in the
+range macOS has actually been observed killing.
+
+**Upstream's valve is a backstop for a floor this port does not have**:
+`cof_chunk_floor()` here is one WAVE, not one grid (8j), so the steering can
+already descend past the point the valve exists to reach. So the valve now
+records the CEILING only -- the one thing only it can say, that a measured
+launch has disproved the floor -- and the steering keeps the flush. `valve_acted`
+is gone. The same probe now reaches the target on flush **1** instead of flush 3.
+
+### GATED: `make chunkcheck` on main -- and its first version passed its own control
+
+`cofcheck.sh` exercises only PINNED `--cof-chunk` values, and both the valve and
+the steering are gated on `!chunk`, so **the entire adaptive path -- the one
+every production band runs -- had no gate at all.** That is how finding 1
+shipped.
+
+**The first `chunkcheck.sh` lowered the valve bound to 200 ms with `DEFS` so the
+valve would fire on any card, and the control PASSED.** At a bound the device
+cannot reach the valve fires every flush and suppresses the steering, so the
+code under test never executes -- **the identical blind spot as 8b62c81's V100
+run, reproduced in the gate written to catch it.** The gate now runs the
+SHIPPING binary at the SHIPPED bound and uses `--ecm-curves` to lengthen the
+launch, and fails loudly if no launch reaches the bound rather than passing on
+an assertion that never ran.
+
+```
+make chunkcheck                 valve fires ONCE, 110592 -> 74921, and the
+                                controller is silent for the remaining 200 q
+                                6/6 PASS
+DEFS=-DCOF_CHUNK_NO_CEILING     snaps back to 110592
+                                3 assertions FAIL, exit 1
+```
+
+### Verified
+
+CUDA: `cofcheck.sh` **54 PASS / 0 FAIL**, 288-q band **13,485 relations, sha256
+`8e79762c…`**, `c183.fb1` regenerated in-pod to the manifest hash `b4534cb6`.
+Metal: fourteen gates green, `cofcheck.sh` **54 PASS / 0 FAIL**, 288-q band run
+the field's way with no `--fb1` **`cmp`-identical at 13,485 / `8e79762c…`**,
+worst command buffer **190.80 ms**.
+
+### Reviewed with no finding
+
+Zero generator drift -- all twelve `gen_*.py` reproduce their committed output
+byte for byte. The lock fix covers every non-returning exit: both
+`boinc_temporary_exit` sites are either inside `bench_boinc_finish` (after the
+release) or at `bench_main_metal.cpp:1841`, before the lock is taken. The fbgen
+slice loop cannot spin (`cnt >= 128` always) and its interior-pointer offsets
+stay 128-byte aligned, so the unified-memory `setBuffer:offset:` requirement the
+family gate guarantees is met; `d_rootbuf` is freed per segment; and
+`MTL_OR_DIE(mtlStreamFlush(0))` inside the retry cannot bypass the retry,
+because `mtlStreamFlush` cannot fail.
+
+### Smaller, fixed in the same pass
+
+- **`mtlStreamWorstMs` is gone**, with the `worst_ms`/`worst_seq` bookkeeping
+  that fed only it. The second rebase replaced its drain-based measurement with
+  upstream's event bracket; CLAUDE.md flagged it for "remove or justify at the
+  next review" and this is that review.
+- **`sync()` re-implemented `cbtiming()`** with its own cached static, after the
+  fourth review added the shared predicate for exactly this. One copy now.
+- **`COF_BOUND_MS` in `Makefile.metal` duplicated `MTL_INTERACTIVITY_BOUND_MS`
+  by hand.** Lower the header and the gate kept asserting the old, looser number
+  -- passing, vacuously. Derived from the header with `sed` now, so there is one
+  definition of the bound in the tree and the gate cannot drift loose of it.
+- **`fbretrycheck` claimed more than it proved.** Its header says a correct
+  retry must produce THE SAME factor base; it compared only the summary counts,
+  so a retry with the same counts and different roots passed. It now also pins
+  the relation count, which is already in the output it captures.
+
+### Recorded, not changed
+
+**The fault injection ships.** `CUDA_SIEVE_METAL_FAULT_SYNC` is compiled into
+the distributed BOINC binary and is settable by anyone who controls the process
+environment. The failure mode is a clean error exit rather than a wrong answer,
+and a volunteer controls far more than that already -- but it should be a
+decision on the record rather than a side effect of `fbretrycheck` needing it.
+
 ## Rebase, 2026-09-17 (second): the root-finder SLICING went upstream too
 
 The field reported **interactive stutter at workunit start** on CUDA -- no

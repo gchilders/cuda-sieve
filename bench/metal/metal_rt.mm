@@ -84,15 +84,6 @@ struct Stream {
      * caller tell one measurement from the next without the shim holding a
      * parallel array. */
     unsigned long long seq_drained = 0;
-    /* The WORST command-buffer duration in the most recent drain, and a
-     * counter that changes when it does. Recorded at drain time because that
-     * is the only moment the durations exist: the CPU encodes a whole
-     * segment's submissions in microseconds while each takes tens of ms on
-     * the GPU, so a caller polling between submissions sees nothing finished
-     * and then sync() throws the evidence away. Worst, not last, because the
-     * watchdog judges the worst one. */
-    float              worst_ms = 0.0f;
-    unsigned long long worst_seq = 0;
     /* What went into the command buffer now open, for the CBTIME report. */
     int         ndisp = 0;
     std::string first_k, last_k;
@@ -333,9 +324,9 @@ mtlError_t sync(Stream *st)
     id<MTLCommandBuffer> cb = commit(st);
     if (!cb) return mtlSuccess;
     [cb waitUntilCompleted];
-    { static int cbt = -1;
-      if (cbt < 0) { const char *e = getenv("CUDA_SIEVE_METAL_CBTIME"); cbt = (e && *e && *e != '0') ? 1 : 0; }
-      if (cbt) for (size_t i = 0; i < st->pending.size(); i++)
+    /* cbtiming(), not a second copy of the same getenv: the fourth review added
+     * that cached predicate precisely so this decision has one definition. */
+    { if (cbtiming()) for (size_t i = 0; i < st->pending.size(); i++)
           fprintf(stderr, "CBTIME %.2f ms [%s]\n",
                   (st->pending[i].GPUEndTime - st->pending[i].GPUStartTime) * 1000.0,
                   i < st->plabel.size() ? st->plabel[i].c_str() : "?"); }
@@ -344,17 +335,10 @@ mtlError_t sync(Stream *st)
      * Report the FIRST failure: a later buffer's error is usually a
      * consequence of the first, and the first is the one worth diagnosing. */
     mtlError_t e = mtlSuccess;
-    double worst = 0.0;
     for (size_t i = 0; i < st->pending.size(); i++) {
         mtlError_t ei = cb_status(st->pending[i]);
         if (ei != mtlSuccess && e == mtlSuccess) e = ei;
-        const double d = st->pending[i].GPUEndTime - st->pending[i].GPUStartTime;
-        if (d > worst) worst = d;
         [st->pending[i] release];
-    }
-    if (!st->pending.empty() && worst > 0.0) {
-        st->worst_ms = (float)(worst * 1000.0);
-        st->worst_seq++;
     }
     st->seq_drained += (unsigned long long)st->pending.size();
     st->pending.clear();
@@ -871,22 +855,6 @@ extern "C" mtlError_t mtlStreamFlush(mtlStream_t s)
 {
     std::lock_guard<std::mutex> lk(g_lock);
     commit(resolve(s));
-    return mtlSuccess;
-}
-
-/* The newest command buffer that has actually FINISHED. Buffers on one queue
- * complete in commit order, so walking back from the end and taking the first
- * completed one gives the most recent measurement available without waiting.
- * Returns 0 ms when nothing has completed -- the caller must treat that as
- * "no information", not as "instantaneous". */
-extern "C" mtlError_t mtlStreamWorstMs(mtlStream_t s, float *ms,
-                                      unsigned long long *seq)
-{
-    if (!ms) return fail(mtlErrorInvalidValue);
-    std::lock_guard<std::mutex> lk(g_lock);
-    Stream *st = resolve(s);
-    *ms = st->worst_ms;
-    if (seq) *seq = st->worst_seq;
     return mtlSuccess;
 }
 

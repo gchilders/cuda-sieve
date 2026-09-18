@@ -398,11 +398,16 @@ progresscheck: ../oracle/c183.fb1
 # longer existed, so it defeated nothing and quietly became a second copy of
 # the gate. The gate caught that by refusing to pass -- which is the whole
 # argument for a control that must FAIL over an assertion that must pass.
-# Tracks COF_CHUNK_TARGET_MS in metal/gen_cofac_host.py: the gate should
-# enforce the policy the build actually holds, not an older, looser one.
-COF_BOUND_MS ?= 400
+# DERIVED FROM THE HEADER, not retyped. This used to be a literal 400 that
+# "tracked" MTL_INTERACTIVITY_BOUND_MS by hand -- so lowering the bound in
+# metal_rt.h would have left the gate asserting the old, looser number and
+# PASSING, vacuously. 9z-o consolidated the bound to one definition for exactly
+# this reason and then left the gate's copy behind. The recipe refuses if the
+# extraction yields nothing, rather than falling back to a guess.
+COF_BOUND_MS ?= $(shell awk '/^\#define MTL_INTERACTIVITY_BOUND_MS/ {print $$3}' metal/metal_rt.h | tr -d f)
 .PHONY: cbtimecheck
 cbtimecheck:
+	@test -n "$(COF_BOUND_MS)" || { echo "COF_BOUND_MS is empty: MTL_INTERACTIVITY_BOUND_MS could not be read from metal/metal_rt.h"; exit 1; }
 	@echo "== control: fbgen root finder UNSLICED (must exceed the bound) =="
 	@$(MAKE) -f Makefile.metal $(BUILD)/bench \
 	    METAL_EXTRA_DEFS='-DFB_ROOTS_STRIDES_START=4000000u -DFB_ROOTS_STRIDES_MAX=4000000u' >/dev/null
