@@ -70,6 +70,16 @@ ck "$([ "$NVALVE" -ge 1 ] && echo 1 || echo 0)" \
 #   up:        ANY increase at all once the valve has spoken. The controller is
 #              one-way downward from that point, so this catches a snapback
 #              even if the floor itself were to change.
+#
+# A PARK IS THE ONE LEGITIMATE INCREASE, and it is distinguishable because it
+# says so. There are two, and only the first moves the chunk:
+#   "parking at N"  -- the descent bought under 10%, so the launch is not
+#                      chunk-bound and the throughput goes back. An explicit,
+#                      logged decision, as against the silent relapse this gate
+#                      exists to catch, so it resets the ceiling.
+#   "parking here"  -- the floor is reached and the bound is still unmet. The
+#                      reduction is KEPT, because over the bound is not over the
+#                      watchdog and over it by 2.4x is, so nothing moves.
 awk '
   function note(n) {
       if (ceil == "") return
@@ -77,6 +87,11 @@ awk '
       if (n + 0 == open + 0) back++
       if (last != "" && n + 0 > last + 0) up++
       last = n
+  }
+  /parking here/ { parked++; next }   # the floor case: nothing moved
+  /parking at/ {
+      n = $0; sub(/.*parking at /, "", n); sub(/ records.*/, "", n)
+      ceil = n; last = n; parked++; next
   }
   /cofactor chunk:/ {
       n = $0; sub(/.*cofactor chunk: /, "", n); sub(/ records.*/, "", n)
@@ -87,8 +102,11 @@ awk '
       n = $0; sub(/.*-> /, "", n); sub(/ records.*/, "", n)
       note(n); ceil = n; last = n
   }
-  END { printf "%d %d %d\n", over + 0, back + 0, up + 0 }' "$D/ctl" > "$D/verdict"
-read -r OVER BACK UP < "$D/verdict"
+  END { printf "%d %d %d %d\n", over + 0, back + 0, up + 0, parked + 0 }' \
+    "$D/ctl" > "$D/verdict"
+read -r OVER BACK UP PARKED < "$D/verdict"
+[ "$PARKED" = 0 ] || echo "  (the valve parked $PARKED time(s): a descent stopped\
+ paying, so it gave the throughput back -- a logged increase, not a relapse)"
 
 ck "$([ "$OVER" = 0 ] && echo 1 || echo 0)" \
    "the chunk never climbs back over the valve's choice ($OVER violation(s))"

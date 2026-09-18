@@ -1471,6 +1471,26 @@ typedef struct {
      * One-way and sticky: a device whose launches are inside the bound never
      * sets it, so nothing here changes for healthy hardware. */
     uint32_t chunk_ceiling;
+    /* The valve's no-progress guard. chunk/launch as they were at the last
+     * descent, and a latch once descending has been shown not to pay.
+     *
+     * The descent is proportional on the assumption that the launch is linear
+     * in the chunk. Below a few thousand records it is not -- measured on a
+     * 10-core M3 (plan 9z-h): the response flattens and then reverses, 1996
+     * records giving 94.0 ms against 1792 giving 139.9. Without a guard the
+     * valve rides all the way down to COF_CHUNK_HARD_FLOOR, paying a large
+     * throughput cost in a regime where shrinking the chunk no longer shortens
+     * the launch at all. Measured at an artificially low 200 ms bound on a
+     * TITAN RTX: 110592 -> 14871 -> 7481 -> 4137 -> 2659, still descending.
+     *
+     * If a descent does not buy at least 10%, the bound is below one ECM chain
+     * and NO chunk size can meet it. The right answer is then to give the
+     * throughput back and say so, not to subdivide for nothing -- and the
+     * bound has 2x margin on the TDR it is derived from, so a device parked
+     * over the bound still completes its tasks. */
+    uint32_t chunk_prev_valve;
+    float    ms_prev_valve;
+    int      valve_parked;
     uint32_t *d_s, ns, ecm_curves;
     /* Method PER SIDE, 0 = Pollard-Brent rho, 1 = ECM. Per side and not per
      * job because the two sides of a real job are usually different shapes:
@@ -2077,7 +2097,7 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
      * measured launch that actually exceeded the bound. On hardware that never
      * does, nothing here executes and the behaviour is bit-for-bit what it was.
      */
-    if (!chunk) {
+    if (!chunk && !Q->valve_parked) {
         float pm0 = 0.0f, pm1 = 0.0f;
         if (pk0.fired) COF_FLUSH_CK(cudaEventElapsedTime(&pm0, pk0.a, pk0.b));
         if (pk1.fired) COF_FLUSH_CK(cudaEventElapsedTime(&pm1, pk1.a, pk1.b));
@@ -2094,16 +2114,67 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
                           ? COF_CHUNK_HARD_FLOOR : (uint32_t)want;
             if (next >= Q->chunk_cur) next = Q->chunk_cur / 2;   /* always move */
             if (next < COF_CHUNK_HARD_FLOOR) next = COF_CHUNK_HARD_FLOOR;
-            if (next != Q->chunk_cur) {
+            /* DID THE LAST DESCENT PAY? See chunk_prev_valve. A descent
+             * that bought under 10% says the launch is not chunk-bound, so
+             * the next one will not help either: hand the throughput back,
+             * park, and put the reason in the log a volunteer uploads. */
+            if (Q->chunk_prev_valve > Q->chunk_cur && Q->ms_prev_valve > 0.0f
+                && launch_ms > Q->ms_prev_valve * 0.90f) {
+                fprintf(stderr,
+                        "  cofactor: %u -> %u records/launch bought only"
+                        " %.0f -> %.0f ms, so no chunk size can meet the"
+                        " %.0f ms bound; parking at %u records/launch\n",
+                        Q->chunk_prev_valve, Q->chunk_cur,
+                        (double)Q->ms_prev_valve, (double)launch_ms,
+                        (double)COF_LAUNCH_TARGET_MS, Q->chunk_prev_valve);
+                Q->chunk_cur = Q->chunk_prev_valve;
+                S.chunk = Q->chunk_cur;
+                /* The ceiling moves WITH the park, or the steering's floor
+                 * clamp would hold the chunk down and undo the restore. */
+                Q->chunk_ceiling = Q->chunk_prev_valve;
+                Q->valve_parked = 1;
+                valve_acted = 1;
+            } else if (next != Q->chunk_cur) {
                 fprintf(stderr,
                         "  cofactor: kernel launch %.0f ms is over this build's"
                         " %.0f ms bound; %u -> %u records/launch\n",
                         (double)launch_ms, (double)COF_LAUNCH_TARGET_MS,
                         Q->chunk_cur, next);
+                /* Recorded BEFORE the assignment, for the guard above. */
+                Q->chunk_prev_valve = Q->chunk_cur;
+                Q->ms_prev_valve = launch_ms;
                 Q->chunk_cur = next;
                 S.chunk = Q->chunk_cur;
                 /* Sticky, so the steering's floor cannot pull it back up. */
                 Q->chunk_ceiling = next;
+                valve_acted = 1;
+            } else {
+                /* ALREADY AT COF_CHUNK_HARD_FLOOR AND STILL OVER THE BOUND.
+                 * next == chunk_cur, so there is nothing left to subdivide --
+                 * and because the branch above is what advances the guard's
+                 * reference, without this the valve would re-measure the same
+                 * floor every flush, print nothing and never conclude
+                 * anything.
+                 *
+                 * PARKS HERE, NOT AT THE SIZE IT CAME FROM, and that is the
+                 * difference from the no-progress branch above. The descent
+                 * did shorten the launch -- measured on an RTX 3090 at a
+                 * 200 ms bound, 6865 ms at the floor against 25449 ms at one
+                 * grid -- it simply cannot reach the bound. Handing the
+                 * throughput back would be trading a launch that survives the
+                 * WATCHDOG for one that does not: the bound carries 2x margin
+                 * on the TDR it is derived from, so over the bound is not over
+                 * the watchdog, and over the bound by 2.4x is. Restoring is
+                 * only safe when the shorter launch bought nothing, which is
+                 * exactly the branch above. */
+                fprintf(stderr,
+                        "  cofactor: %u records/launch is the floor and the"
+                        " launch is still %.0f ms, so no chunk size can meet"
+                        " the %.0f ms bound; parking here rather than giving"
+                        " the reduction back\n",
+                        Q->chunk_cur, (double)launch_ms,
+                        (double)COF_LAUNCH_TARGET_MS);
+                Q->valve_parked = 1;
                 valve_acted = 1;
             }
         }
