@@ -42,8 +42,19 @@ ck "$(grep -q "root finder in .* retrying at" "$D/hurt.err" && echo 1 || echo 0)
    "the kill is reported and the segment is retried at a smaller slice"
 HURT=$(grep -oE "[0-9]+ ideals through .*exact primes" "$D/hurt.err" | head -1)
 ck "$([ -n "$HURT" ] && [ "$HURT" = "$BASE" ] && echo 1 || echo 0)" \
-   "and the recovered factor base is IDENTICAL to the clean one"
+   "and the recovered factor base has the same shape as the clean one"
 [ "$HURT" = "$BASE" ] || { echo "       clean: $BASE"; echo "       hurt:  $HURT"; }
+
+# AND THE SAME CONTENT, which the counts above do not show. This gate's own
+# header says a correct retry must produce THE SAME factor base, and for a
+# while it only compared the summary line -- so a retry with identical counts
+# and different roots would have passed. The relation count at the parity
+# special-q is the cheap end-to-end check on the content: it is already in the
+# output both runs captured, and 37 is what cofcheck.sh pins.
+relof() { grep -E "^  total relations" "$1" | tail -1 | awk '{print $NF}'; }
+RB=$(relof "$D/clean.out"); RH=$(relof "$D/hurt.out")
+ck "$([ "$RB" = 37 ] && [ "$RH" = 37 ] && echo 1 || echo 0)" \
+   "and both runs sieve the golden 37 relations from it (clean $RB, retried $RH)"
 
 # ---- and a kill that never stops must still terminate --------------------
 set +e
