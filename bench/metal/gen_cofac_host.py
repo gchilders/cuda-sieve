@@ -443,12 +443,21 @@ src = src.replace(_v_old, "", 1)
 # asserts below name what is being discarded, so a shape change cannot pass
 # quietly. .index() raises on a miss, which is the assert for the bounds.
 _va = src.index("            /* DID THE LAST DESCENT PAY?")
-_vz = src.index(chr(10) + "        }" + chr(10) + "    }" + chr(10), _va)
+# Ends at the 8-SPACE `} else if` that closes `if (launch_ms > ...)` and opens
+# the history reset -- NOT at the first `\n        }\n    }\n`, which is where
+# this pointed when the reset was added upstream and which would have taken the
+# reset with it. The branches inside the region close at twelve spaces, so
+# eight is unambiguous. .index() raises on a miss, which is the bound's assert;
+# the asserts below name what is discarded AND what must survive, because an
+# `in` test alone cannot notice the region growing.
+_vz = src.index(chr(10) + "        } else if (Q->chunk_prev_valve) {", _va)
 _valve_old = src[_va:_vz]
 assert 'parking at %u records/launch' in _valve_old, 'no-progress park missing'
 assert 'parking here rather than giving' in _valve_old, 'floor park missing'
 assert 'Q->chunk_ceiling = next;' in _valve_old, "the valve's ceiling missing"
 assert _valve_old.count('valve_acted = 1;') == 3, 'not three valve branches'
+assert 'chunk_prev_valve = 0;' not in _valve_old, \
+    "the splice reached past the valve into the history reset"
 _valve_new = chr(10).join([
     "            /* THE CEILING ONLY, AND ONLY EVER DOWNWARD. The steering below",
     "             * measures this same launch against a tighter bound and has a",
