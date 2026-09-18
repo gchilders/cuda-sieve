@@ -396,10 +396,83 @@ _h_new = "    float t0 = 0, t1 = 0, launch_ms = 0;"
 assert src.count(_h_old) == 1, 'cofq_flush declarations changed'
 src = src.replace(_h_old, _h_new, 1)
 
-_v_old = "        const float launch_ms = pm0 > pm1 ? pm0 : pm1;"
-_v_new = "        launch_ms = pm0 > pm1 ? pm0 : pm1;"
+# THE MEASUREMENT IS HOISTED OUT OF THE VALVE, and out of auto mode with it.
+#
+# Upstream computes launch_ms inside its `if (!chunk)` valve block, which sits
+# BELOW the over-bound report this generator inserts further down. Inherited as
+# it stands, that report read a launch_ms that was still zero -- dead code, and
+# measured as such: a build with COF_CHUNK_TARGET_MS at 1 ms printed the valve's
+# own line at 238 ms and this report not at all. 9c kept the report because an
+# over-bound launch is the condition the bound exists for and is invisible from
+# anywhere else; it went dead in the rebase that took upstream's valve.
+#
+# Deliberately not re-gated on auto mode either, for 9c's stated reason: a
+# pinned --cof-chunk that overruns is worth more, not less, since nothing will
+# adapt. The excised lines reappear above the report.
+_v_old = chr(10).join([
+    "        float pm0 = 0.0f, pm1 = 0.0f;",
+    "        if (pk0.fired) COF_FLUSH_CK(mtlEventElapsedTime(&pm0, pk0.a, pk0.b));",
+    "        if (pk1.fired) COF_FLUSH_CK(mtlEventElapsedTime(&pm1, pk1.a, pk1.b));",
+    "        const float launch_ms = pm0 > pm1 ? pm0 : pm1;",
+    ""])
 assert src.count(_v_old) == 1, "upstream's valve no longer computes launch_ms"
-src = src.replace(_v_old, _v_new, 1)
+src = src.replace(_v_old, "", 1)
+
+# THE VALVE RECORDS A CEILING AND YIELDS THE FLUSH TO THE STEERING.
+#
+# Upstream's valve is a backstop for a floor this port does not have.
+# cof_chunk_floor() here is one WAVE, not one grid (8j), so the steering below
+# can already descend past the point the valve exists to reach. What the valve
+# did instead was PRE-EMPT it: `valve_acted` skips the steering for that flush,
+# so a launch over the 1000 ms valve bound got a correction aimed at 0.8x1000
+# rather than at 0.8x this build's own MTL_INTERACTIVITY_BOUND_MS, and the
+# no-progress guard did not run either.
+#
+# Measured, with the valve bound at 200 ms and the steering bound at 1 ms: two
+# consecutive flushes -- about 134 special-q -- were steered by the valve at
+# 0.67x per step while the build's primary bound wanted 0.33x. The cases where
+# this fires are an M1 at its opening chunk, whose command buffers are then in
+# the range macOS has actually been observed killing.
+#
+# So the valve keeps the one thing only it can say -- that a measured launch
+# has disproved the floor -- and the steering does all the arithmetic.
+_valve_old = chr(10).join([
+    "            if (next != Q->chunk_cur) {",
+    "                fprintf(stderr,",
+    "                        \"  cofactor: kernel launch %.0f ms is over this build's\"",
+    "                        \" %.0f ms bound; %u -> %u records/launch\\n\",",
+    "                        (double)launch_ms, (double)COF_LAUNCH_TARGET_MS,",
+    "                        Q->chunk_cur, next);",
+    "                Q->chunk_cur = next;",
+    "                S.chunk = Q->chunk_cur;",
+    "                /* Sticky, so the steering's floor cannot pull it back up. */",
+    "                Q->chunk_ceiling = next;",
+    "                valve_acted = 1;",
+    "            }"])
+_valve_new = chr(10).join([
+    "            /* THE CEILING ONLY, AND ONLY EVER DOWNWARD. The steering below",
+    "             * measures this same launch against a tighter bound and has a",
+    "             * no-progress guard, so it -- not this -- picks the chunk; all",
+    "             * that is needed from here is that the floor stop applying. */",
+    "            if (!Q->chunk_ceiling || next < Q->chunk_ceiling) {",
+    "                fprintf(stderr,",
+    "                        \"  cofactor: kernel launch %.0f ms is over this build's\"",
+    "                        \" %.0f ms valve bound; the chunk floor no longer holds\"",
+    "                        \" above %u records/launch\\n\",",
+    "                        (double)launch_ms, (double)COF_LAUNCH_TARGET_MS, next);",
+    "                Q->chunk_ceiling = next;",
+    "            }"])
+assert src.count(_valve_old) == 1, "upstream's valve action shape changed"
+src = src.replace(_valve_old, _valve_new, 1)
+
+# ... and with the valve no longer claiming a flush, valve_acted has no reader.
+_va_old = "    int valve_acted = 0;   /* declared here: COF_FLUSH_CK hides a goto done */" + chr(10)
+assert src.count(_va_old) == 1, 'valve_acted declaration changed'
+src = src.replace(_va_old, "", 1)
+_vu_old = "    if (!chunk && !valve_acted) {"
+assert src.count(_vu_old) == 1, 'the steering gate changed'
+src = src.replace(_vu_old, "    if (!chunk) {", 1)
+print('  the valve records a ceiling; the steering keeps the flush')
 
 _s_old = "        const float stage = t0 + t1;"
 _s_new = ("        /* The MEASURED longest launch, not t0+t1. The sum over every round" + chr(10) +
@@ -429,6 +502,15 @@ print('  auto chunker steers on the measured launch, not the side sum')
 # since nothing will adapt.
 _rep_old = "    Q->ms_rat += t0; Q->ms_alg += t1;"
 _rep_new = _rep_old + chr(10) + chr(10).join([
+    "    {   /* The measured launch, hoisted out of the valve block below --",
+    "         * which is where upstream computes it, BELOW this report and only",
+    "         * in auto mode. Both are wrong for this line: it fired on a",
+    "         * launch_ms that was still zero, and a pinned --cof-chunk that",
+    "         * overruns is exactly the case worth reporting. */",
+    "        float pm0 = 0.0f, pm1 = 0.0f;",
+    "        if (pk0.fired) COF_FLUSH_CK(mtlEventElapsedTime(&pm0, pk0.a, pk0.b));",
+    "        if (pk1.fired) COF_FLUSH_CK(mtlEventElapsedTime(&pm1, pk1.a, pk1.b));",
+    "        launch_ms = pm0 > pm1 ? pm0 : pm1; }",
     "    if (launch_ms > COF_CHUNK_TARGET_MS && launch_ms > Q->ms_launch_max) {",
     "        Q->ms_launch_max = launch_ms;",
     "        fprintf(stderr,",
