@@ -233,6 +233,13 @@ $(shell [ "$$(cat $(ARCH_STAMP) 2>/dev/null)" = '$(NVCC_ARCH)' ] || printf '%s' 
 # would be indistinguishable from real output.
 DEFS      ?=
 
+# Special-q for chunkcheck: enough for the valve to fire and the flush after
+# it to be reported. Three flushes at CQ_FLUSH = 131072 records (~67 q each).
+CHUNKCHECK_NQ ?= 200
+# Curves per round for chunkcheck: enough to push one launch over the valve's
+# bound. Raise it on hardware fast enough that 48 stays under.
+CHUNKCHECK_CURVES ?= 48
+
 # Widest cofactor the build carries, in 32-bit limbs: 3 = 96-bit residuals,
 # 4 = 128-bit. See "cofactor WIDTH" in bench.h.
 #
@@ -565,7 +572,7 @@ mkcofbatch: mkcofbatch.c $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE
 clean:
 	rm -f bench fbtest fbgen fbgen_gpu sqgentest normscan dumpcmp mkcofbatch ckpttest stoptest slabtest *.o *.d $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP) $(GIT_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE_K_STAMP)
 
-.PHONY: all clean check ckptcheck stopcheck cofcheck fbgencheck fbgpucheck sqgencheck walkcheck slabcheck skipcheck degradecheck
+.PHONY: all clean check ckptcheck stopcheck cofcheck chunkcheck fbgencheck fbgpucheck sqgencheck walkcheck slabcheck skipcheck degradecheck
 
 # `check` depended on fbtest alone, so the whole CUDA path -- kernels, the
 # cofactoriser, the pipeline -- could fail to compile while the gates reported
@@ -665,3 +672,20 @@ sqgencheck: sqgentest
 # change of method or a truncated parse fails here rather than in a band run.
 cofcheck: bench
 	@./cofcheck.sh
+
+# The AUTO chunk controller. NOT in `check`: it needs its own build (the valve
+# bound has to be lowered before any healthy card can reach it) and a band of
+# a few hundred special-q, so it is run deliberately rather than with the rest.
+#
+#   make chunkcheck
+#
+# and the control, which must FAIL:
+#
+#   make DEFS=-DCOF_CHUNK_NO_CEILING bench && make chunkcheck
+#
+# It runs the SHIPPING binary at the SHIPPED bound. Do not lower the bound with
+# DEFS to make the valve fire more readily -- at a bound the device cannot
+# reach, the valve fires every flush, suppresses the steering, and the gate
+# stops testing the thing it exists for. See the script's header.
+chunkcheck: bench
+	@./chunkcheck.sh ./bench ../oracle/c183.poly $(CHUNKCHECK_NQ) $(CHUNKCHECK_CURVES)

@@ -1458,6 +1458,19 @@ typedef struct {
      * flush picks the opening value. Ignored entirely when the operator gave
      * an explicit --cof-chunk. */
     uint32_t chunk_cur;
+    /* An upper bound the LAUNCH VALVE has established, or 0 if it never fired.
+     *
+     * The valve may descend below cof_chunk_floor(), but the steering below it
+     * clamps UP to that same floor on every flush -- and its test against
+     * `stage` is always true -- so without this the valve's choice survived
+     * exactly one flush and the chunk oscillated back onto the size that was
+     * killing the device. Measured on a TITAN RTX: 110592 -> 75466 -> 110592
+     * -> 75735 -> 110592, i.e. every second flush ran at the value the valve
+     * had just rejected.
+     *
+     * One-way and sticky: a device whose launches are inside the bound never
+     * sets it, so nothing here changes for healthy hardware. */
+    uint32_t chunk_ceiling;
     uint32_t *d_s, ns, ecm_curves;
     /* Method PER SIDE, 0 = Pollard-Brent rho, 1 = ECM. Per side and not per
      * job because the two sides of a real job are usually different shapes:
@@ -2089,6 +2102,8 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
                         Q->chunk_cur, next);
                 Q->chunk_cur = next;
                 S.chunk = Q->chunk_cur;
+                /* Sticky, so the steering's floor cannot pull it back up. */
+                Q->chunk_ceiling = next;
                 valve_acted = 1;
             }
         }
@@ -2103,8 +2118,18 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
      * enough to stay over budget simply parks there, which is the free point
      * for it, and a device fast enough grows to one slice and stops. */
     if (!chunk && !valve_acted) {
-        const uint32_t floor_ch = cof_chunk_floor(blocks, threads);
+        uint32_t floor_ch = cof_chunk_floor(blocks, threads);
         const uint32_t was = Q->chunk_cur;
+#ifndef COF_CHUNK_NO_CEILING
+        /* A measured over-bound launch has already proved that a full grid of
+         * records does not fit this device's watchdog, so the floor -- which
+         * is one record per thread and nothing more -- stops being a lower
+         * limit. Without this the clamp below restores the rejected size on
+         * the very next flush. COF_CHUNK_NO_CEILING is chunkcheck.sh's
+         * control build; it must fail the gate. */
+        if (Q->chunk_ceiling && floor_ch > Q->chunk_ceiling)
+            floor_ch = Q->chunk_ceiling;
+#endif
         const float stage = t0 + t1;
         if (stage > COF_CHUNK_TARGET_MS) {
             const uint32_t half = Q->chunk_cur / 2;
@@ -2123,6 +2148,14 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
              * chunk >= n as the single-slice case. */
             Q->chunk_cur = (Q->chunk_cur > Q->cap / 2) ? Q->cap
                                                        : Q->chunk_cur * 2;
+#ifndef COF_CHUNK_NO_CEILING
+            /* Growth is the other way back over the valve's choice. Unreachable
+             * while `stage` is a side sum (it never falls below a quarter of
+             * the target), but the Metal port steers this same branch on a real
+             * per-launch measurement, where it is live. */
+            if (Q->chunk_ceiling && Q->chunk_cur > Q->chunk_ceiling)
+                Q->chunk_cur = Q->chunk_ceiling;
+#endif
         }
         if (Q->chunk_cur != was) cof_report_chunk(Q->chunk_cur, n, 0);
     }
