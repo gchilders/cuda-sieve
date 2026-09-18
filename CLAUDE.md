@@ -1877,6 +1877,80 @@ shared struct, written by nobody here.
 failing three assertions, `cofcheck.sh` 54/0, and the 288-q band at
 `8e79762c` with `c183.fb1` regenerated in-pod to `b4534cb6`.
 
+## Walking the valve guard again, 2026-09-18: four corrections
+
+The guard looked too intricate to trust, so it got re-derived from the
+committed source. **Three of the four are mine and none of them was visible
+from the diff that introduced them; the fourth is the gate passing its own
+control for the SECOND time, on new grounds.**
+
+1. **The valve could RAISE the chunk.** `next` is clamped up to
+   `COF_CHUNK_HARD_FLOOR` and only then compared with `chunk_cur`, so where
+   `cof_chunk_floor()` is itself below the hard floor -- `--blocks 1 --threads
+   256` gives 256 -- the valve enlarged the launch it was trying to shorten,
+   printed it as a descent, and oscillated against the steering's floor. Now
+   clamped to `chunk_cur`, which routes the degenerate case into the park
+   branch. Shown with `COF_CHUNK_HARD_FLOOR` set above the floor: `104448
+   records/launch is the floor ... parking here`, where the unclamped code
+   would have said `104448 -> 200000`.
+
+2. **A stale reference could be read as "descending does not help".** The guard
+   compares this launch against the one that provoked the last descent, and the
+   valve only speaks when over the bound -- so the reference could be fifty
+   flushes old. A machine that merely got slower later would satisfy "within
+   10% at a smaller chunk", be read as no-progress, and have the LARGER chunk
+   restored: a longer launch, concluded from two measurements taken under
+   different conditions. The history is cleared by any flush that measures
+   under the bound.
+
+3. **THE GROWTH CLAMP WAS BACKWARDS, and the argument for it named the reason
+   against it.** It capped the steering's growth at the ceiling "for the Metal
+   port's benefit, where that branch is live" -- which is exactly where it does
+   damage. The interactivity watchdog is contention-dependent (9z-p), so one
+   busy moment sets a ceiling from an inflated launch -- an M1 at 36864 records
+   measuring 1200 ms sets 24576 -- and the process could never climb back once
+   the machine went idle, though every later measurement said it should.
+   Removed. The ceiling now does one job: stop the FLOOR restoring a size a
+   measured launch has rejected. A measurement-driven controller does not need
+   protecting from growth, because growing too far is self-correcting.
+
+4. **THE GATE PASSED ITS CONTROL AGAIN.** It compared each reported chunk
+   against the valve's last choice, but `cof_report_chunk` renders
+   `min(chunk, n)`: the relapse landed on the band's final partial flush where
+   `n` was 1890, and the gate read 1890 as "below the ceiling, fine". On
+   another card the same control failed only because the relapse landed on a
+   full flush. **A gate whose discrimination depends on where the band ends is
+   not a gate.** The assertion is now SILENCE -- after the valve speaks a
+   correct build reports nothing more, which is an invariant of the clamp and
+   not a coincidence -- and the value comparisons are kept as diagnostics that
+   print `0 over, 0 back` on exactly the run that fooled the old version.
+
+**All three valve branches executed, on an RTX 2080 Ti** (sm_75, nvcc 12.8.93,
+NRP, `c183.fb1` regenerated in-pod to `b4534cb6`):
+
+```
+descent            104448 -> 1256 -> 1024
+no-progress park   1256 -> 1024 bought only 2034 -> 1980 ms; parking at 1256
+floor park         104448 is the floor and the launch is still 1232 ms;
+                   parking here rather than giving the reduction back
+make chunkcheck    104448 -> 24957 -> 18691, then silent          4/4 PASS
+control            1 later report                                 FAIL, exit 1
+cofcheck.sh        54 PASS / 0 FAIL
+288-q band         13485 relations, sha256 8e79762c
+```
+
+A bound below one ECM chain is what makes the no-progress branch deterministic;
+at `--ecm-b1 32000` the descent reaches the floor in ONE step and takes the
+floor branch instead, so `--ecm-b1 8000` is what produces the two-step descent
+the guard is about. Chasing it by lowering the bound alone does not work -- the
+3090 reported 646 ms and then 226 ms for the same 125952-record launch in
+consecutive runs.
+
+**Open, unexplained:** one `cofcheckgate` run failed with cofcheck.sh's
+build-detection message in a sequence of gates, and the identical sequence
+re-run twice afterwards is clean. Not reproduced, not diagnosed; recorded here
+rather than dismissed.
+
 ## Rebase, 2026-09-17 (second): the root-finder SLICING went upstream too
 
 The field reported **interactive stutter at workunit start** on CUDA -- no

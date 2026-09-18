@@ -1405,8 +1405,14 @@ typedef struct {
      * -> 75735 -> 110592, i.e. every second flush ran at the value the valve
      * had just rejected.
      *
-     * One-way and sticky: a device whose launches are inside the bound never
-     * sets it, so nothing here changes for healthy hardware. */
+     * A device whose launches are inside the bound never sets it, so nothing
+     * here changes for healthy hardware.
+     *
+     * It descends on every valve descent and RISES exactly once, with a
+     * no-progress park: that restores a larger chunk whose launch measured
+     * within 10% of the current one, so the ceiling has to follow or the
+     * steering's floor clamp would undo the restore. valve_parked then stops
+     * any further movement, so it is monotone apart from that one step. */
     uint32_t chunk_ceiling;
     /* The valve's no-progress guard. chunk/launch as they were at the last
      * descent, and a latch once descending has been shown not to pay.
@@ -2032,6 +2038,15 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
                           ? COF_CHUNK_HARD_FLOOR : (uint32_t)want;
             if (next >= Q->chunk_cur) next = Q->chunk_cur / 2;   /* always move */
             if (next < COF_CHUNK_HARD_FLOOR) next = COF_CHUNK_HARD_FLOOR;
+            /* THE VALVE NEVER RAISES. The clamp above is what makes this
+             * necessary: where cof_chunk_floor() is itself below
+             * COF_CHUNK_HARD_FLOOR -- `--blocks 1 --threads 256` gives 256 --
+             * the chunk opens at 256, the clamp lifts `next` to 1024, and the
+             * valve would enlarge the launch it is trying to shorten, print it
+             * as a descent, and then oscillate against the steering's floor.
+             * Clamped here rather than by reordering the two lines above,
+             * because HARD_FLOOR must still stop a descent going below it. */
+            if (next > Q->chunk_cur) next = Q->chunk_cur;
             /* THE CEILING ONLY, AND ONLY EVER DOWNWARD. The steering below
              * measures this same launch against a tighter bound and has a
              * no-progress guard, so it -- not this -- picks the chunk; all
@@ -2044,6 +2059,19 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
                         (double)launch_ms, (double)COF_LAUNCH_TARGET_MS, next);
                 Q->chunk_ceiling = next;
             }
+        } else if (Q->chunk_prev_valve) {
+            /* UNDER THE BOUND, SO THE HISTORY IS SPENT. The guard above
+             * compares this launch against the one that provoked the last
+             * descent, and the valve only speaks when it is over the bound --
+             * so without this the reference could be fifty flushes old. A
+             * machine that merely got slower later would then satisfy
+             * `within 10% of the old measurement at a smaller chunk`, be read
+             * as "descending does not help", and have the LARGER chunk
+             * restored: a longer launch, concluded from two measurements taken
+             * under different conditions. Resetting here means the guard only
+             * ever compares consecutive over-bound flushes. */
+            Q->chunk_prev_valve = 0;
+            Q->ms_prev_valve = 0.0f;
         }
     }
 
@@ -2124,14 +2152,24 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
             if (next <= Q->chunk_cur) next = (uint64_t)Q->chunk_cur * 2ull;
             if (next > Q->cap) next = Q->cap;
             Q->chunk_cur = (uint32_t)next;
-#ifndef COF_CHUNK_NO_CEILING
-            /* Growth is the other way back over the valve's choice. Unreachable
-             * while `stage` is a side sum (it never falls below a quarter of
-             * the target), but the Metal port steers this same branch on a real
-             * per-launch measurement, where it is live. */
-            if (Q->chunk_ceiling && Q->chunk_cur > Q->chunk_ceiling)
-                Q->chunk_cur = Q->chunk_ceiling;
-#endif
+            /* NOT clamped by chunk_ceiling, and that is deliberate.
+             *
+             * The ceiling exists to stop the FLOOR restoring a size a measured
+             * launch has rejected; capping growth with it as well is a
+             * different thing, and on a port whose steering is a real
+             * measurement it is harmful. The interactivity watchdog is
+             * contention-dependent (9z-p), so one busy moment sets a ceiling
+             * from an inflated launch -- an M1 at 36864 records measuring
+             * 1200 ms sets 24576 -- and the process could then never climb
+             * back once the machine went idle, though every later measurement
+             * said it should. A measurement-driven controller does not need
+             * protecting from growth: if it grows too far, the next launch is
+             * over the bound and it descends again, which is the loop working.
+             *
+             * This branch is in any case unreachable here, where `stage` is a
+             * whole side's sum and never falls below a quarter of the target.
+             * It was clamped for the Metal port's benefit, where it IS live --
+             * which is exactly where the cap does the damage. */
         }
         if (Q->chunk_cur != was) cof_report_chunk(Q->chunk_cur, n, 0);
     }
