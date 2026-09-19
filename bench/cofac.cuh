@@ -1474,22 +1474,41 @@ typedef struct {
      * STRICTLY MONOTONE DOWNWARD, and permanent once set. Neither park raises
      * it -- both keep the reduction already achieved -- and nothing clears it.
      *
-     * THAT PERMANENCE IS A DELIBERATE, ASYMMETRIC TRADE, not an oversight. A
-     * healthy card that suffers ONE spurious over-bound measurement (another
-     * GPU task starting, a thermal cap) is capped for the rest of the band
-     * where the baseline restored it on the next flush. The cost is bounded
-     * and small: the ceiling is 0.8*bound/launch of the chunk, so a 1.5x
-     * spurious inflation caps at ~73%, and the M3 pricing measured a 3x
-     * reduction at ~1.5% of wall, putting this well under 1%. The alternative
-     * -- a releasable ceiling -- restores the oscillation this whole mechanism
-     * exists to remove, and on the 980 Ti that oscillation costs the WHOLE
-     * task. A bounded sub-1% throughput risk against a total-loss risk is not
-     * a close call.
+     * THAT PERMANENCE IS A DELIBERATE, ASYMMETRIC TRADE -- and the cost of it
+     * is MUCH HIGHER THAN AN EARLIER VERSION OF THIS COMMENT CLAIMED. It said
+     * "well under 1% of wall", reasoning that throughput is proportional to
+     * the chunk. It is not. The expensive step on that curve is a WAVE
+     * boundary: going from one k_cofac launch per round to two. cof_chunk_floor
+     * below is one record per thread, so a ceiling that lands just under n
+     * turns a single full-width launch into two, and the table above measures
+     * that step at 27.97 -> 33.86 ms, +21% of the algebraic queue stage. Two
+     * independent audits put the real range at 12-64% of the cofactor stage,
+     * i.e. up to several percent of wall, not a fraction of one.
      *
-     * It does not ratchet away either: each further descent shrinks the chunk,
-     * so the next spurious firing needs a LARGER relative inflation than the
-     * last (1.43x, then 1.97x, then 2.7x from a typical starting point). The
-     * sequence is self-limiting rather than cumulative. */
+     * AND THERE IS A CARD CLASS WHERE THE BASELINE COST WAS EXACTLY ZERO.
+     * Where cof_chunk_floor() exceeds n -- any card with 86 or more SMs, so a
+     * 4090, A100, H100, L40S, 5090 -- the baseline's descent landed above n,
+     * left step = min(chunk, n) untouched, and cost nothing at all; the next
+     * flush restored it. Scaling from eff (see the descent below) is what
+     * makes the valve work there on a REAL overrun, and the same change is
+     * what makes a SPURIOUS firing cost something where it used to cost
+     * nothing. That is a regression against the baseline for that class, in
+     * that case, and it is recorded here rather than buried.
+     *
+     * It is still the right trade, for one reason: every alternative is a
+     * RELEASE path, and releasing restores the oscillation this whole
+     * mechanism exists to remove -- which on the 980 Ti costs the WHOLE task,
+     * not a percentage of it. A bounded throughput loss against a total loss
+     * is not close, even at 64%. A release rule keyed on the descent landing
+     * far below its own 0.8x aim would discriminate, but it is a fourth
+     * threshold in a mechanism where the previous three were each wrong once,
+     * and nobody has measured how often a healthy card actually sees a
+     * >1000 ms transient. It wants field data first.
+     *
+     * It does not ratchet, at least: each descent shrinks the chunk, so the
+     * next spurious firing needs a LARGER relative inflation than the last
+     * (1.43x, then 1.97x, then 2.7x from a typical start). Self-limiting
+     * rather than cumulative. */
     uint32_t chunk_ceiling;
     /* The valve's no-progress guard. chunk/launch as they were at the last
      * descent, and a latch once descending has been shown not to pay.
