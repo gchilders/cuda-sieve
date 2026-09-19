@@ -1552,11 +1552,25 @@ typedef struct {
      * A device whose launches are inside the bound never sets it, so nothing
      * here changes for healthy hardware.
      *
-     * It descends on every valve descent and RISES exactly once, with a
-     * no-progress park: that restores a larger chunk whose launch measured
-     * within 10% of the current one, so the ceiling has to follow or the
-     * steering's floor clamp would undo the restore. valve_parked then stops
-     * any further movement, so it is monotone apart from that one step. */
+     * STRICTLY MONOTONE DOWNWARD, and permanent once set. Neither park raises
+     * it -- both keep the reduction already achieved -- and nothing clears it.
+     *
+     * THAT PERMANENCE IS A DELIBERATE, ASYMMETRIC TRADE, not an oversight. A
+     * healthy card that suffers ONE spurious over-bound measurement (another
+     * GPU task starting, a thermal cap) is capped for the rest of the band
+     * where the baseline restored it on the next flush. The cost is bounded
+     * and small: the ceiling is 0.8*bound/launch of the chunk, so a 1.5x
+     * spurious inflation caps at ~73%, and the M3 pricing measured a 3x
+     * reduction at ~1.5% of wall, putting this well under 1%. The alternative
+     * -- a releasable ceiling -- restores the oscillation this whole mechanism
+     * exists to remove, and on the 980 Ti that oscillation costs the WHOLE
+     * task. A bounded sub-1% throughput risk against a total-loss risk is not
+     * a close call.
+     *
+     * It does not ratchet away either: each further descent shrinks the chunk,
+     * so the next spurious firing needs a LARGER relative inflation than the
+     * last (1.43x, then 1.97x, then 2.7x from a typical starting point). The
+     * sequence is self-limiting rather than cumulative. */
     uint32_t chunk_ceiling;
     /* The valve's no-progress guard. chunk/launch as they were at the last
      * descent, and a latch once descending has been shown not to pay.
@@ -1570,12 +1584,24 @@ typedef struct {
      * the launch at all. Measured at an artificially low 200 ms bound on a
      * TITAN RTX: 110592 -> 14871 -> 7481 -> 4137 -> 2659, still descending.
      *
-     * If a descent does not buy at least 10%, the bound is below one ECM chain
-     * and NO chunk size can meet it. The right answer is then to give the
-     * throughput back and say so, not to subdivide for nothing -- and the
-     * bound has 2x margin on the TDR it is derived from, so a device parked
-     * over the bound still completes its tasks. */
-    uint32_t chunk_prev_valve;
+     * THE SLICE, NOT THE CHUNK. cf_run_rounds launches min(chunk, n) records,
+     * and cof_chunk_floor() can exceed n outright -- a 4090's 196,608 against
+     * CQ_FLUSH's 131,072, which cofac.cuh's own floor comment already notes.
+     * Comparing chunk_cur across two flushes then compares two numbers that
+     * produced the IDENTICAL launch, reads the equality as "descending does
+     * not pay", and parks the valve one step before it would first have had
+     * any effect. Recording the effective slice makes the guard compare what
+     * actually ran.
+     *
+     * AND IT PARKS ONLY ON PROOF, not on a ratio. An earlier version gave up
+     * when a descent bought under 10%, which is only sound if the response is
+     * proportional; 8h documents that it is not -- there is a serial ECM-chain
+     * term. With a 950 ms serial floor a 125,952 -> 80,609 descent moves
+     * 1250 -> 1142 ms, under 10%, while 20,990 records would have met the
+     * 1000 ms bound outright. Two measurements at different slice sizes give
+     * that affine response directly, so the test is now whether the implied
+     * serial floor is ITSELF over the bound -- which is the actual question. */
+    uint32_t eff_prev_valve;
     float    ms_prev_valve;
     int      valve_parked;
     uint32_t *d_s, ns, ecm_curves;
@@ -2171,11 +2197,24 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
      */
     if (!chunk && !Q->valve_parked) {
         if (launch_ms > COF_LAUNCH_TARGET_MS) {
+            /* The slice this launch actually ran; see both uses below. */
+            const uint32_t eff = Q->chunk_cur < n ? Q->chunk_cur : n;
             /* Proportional, at 0.8x the bound: from a large overshoot this
              * lands in one flush where halving needs several, and every flush
              * spent descending is a flush run at a size already known to be
-             * dangerous. */
-            const double want = (double)Q->chunk_cur
+             * dangerous.
+             *
+             * SCALED FROM THE SLICE THAT RAN, NOT FROM chunk_cur. cf_run_rounds
+             * launches min(chunk, n) records, so launch_ms is the cost of `eff`
+             * records and `eff` is what the ratio applies to. Scaling chunk_cur
+             * instead divides the wrong quantity whenever the two differ --
+             * which is not exotic: cof_chunk_floor() exceeds CQ_FLUSH on any
+             * card with 86 or more SMs (a 4090's 196,608 against 131,072), so
+             * the opening chunk is ALWAYS larger than n there. A 1100 ms
+             * launch then descended 196,608 -> 142,987, still above n, leaving
+             * the slice and the launch completely unchanged; from `eff` it
+             * descends 131,072 -> 95,325 and bites on the first firing. */
+            const double want = (double)eff
                               * ((double)COF_LAUNCH_TARGET_MS * 0.8)
                               / (double)launch_ms;
             uint32_t next = want < (double)COF_CHUNK_HARD_FLOOR
@@ -2203,7 +2242,7 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
                         (double)launch_ms, (double)COF_LAUNCH_TARGET_MS, next);
                 Q->chunk_ceiling = next;
             }
-        } else if (Q->chunk_prev_valve) {
+        } else if (Q->eff_prev_valve) {
             /* UNDER THE BOUND, SO THE HISTORY IS SPENT. The guard above
              * compares this launch against the one that provoked the last
              * descent, and the valve only speaks when it is over the bound --
@@ -2214,7 +2253,7 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
              * restored: a longer launch, concluded from two measurements taken
              * under different conditions. Resetting here means the guard only
              * ever compares consecutive over-bound flushes. */
-            Q->chunk_prev_valve = 0;
+            Q->eff_prev_valve = 0;
             Q->ms_prev_valve = 0.0f;
         }
     }
@@ -2249,6 +2288,10 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
          * still has to happen here. Falls back to the old sum if no
          * launch was timed, so a flush that never fired steers as before. */
         const float stage = launch_ms > 0.0f ? launch_ms : (t0 + t1);
+        if (!Q->chunk_parked && stage <= COF_CHUNK_TARGET_MS
+            && Q->chunk_prev) {
+            Q->ms_launch_prev = 0.0f; Q->chunk_prev = 0;
+        }
         if (Q->chunk_parked) {
             /* Descent already proved useless at this size; see below. */
         } else if (stage > COF_CHUNK_TARGET_MS) {
@@ -2296,7 +2339,17 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
             if (next <= Q->chunk_cur) next = (uint64_t)Q->chunk_cur * 2ull;
             if (next > Q->cap) next = Q->cap;
             Q->chunk_cur = (uint32_t)next;
-            /* NOT clamped by chunk_ceiling, and that is deliberate.
+            /* REACHABLE, BUT ONLY ON A SMALL FLUSH -- an earlier version of
+             * this comment claimed outright that it cannot run here. `stage`
+             * is t0+t1 over a whole side, which for a full CQ_FLUSH is tens of
+             * times the 62.5 ms threshold, but pipeline.cuh's checkpoint- and
+             * stop-driven call sites flush a few thousand records, where t0+t1
+             * genuinely falls under it. So growth does run occasionally, and
+             * being unclamped it is the one path that can lift chunk_cur back
+             * over a ceiling set from an inflated measurement -- an accidental
+             * relief valve, not a designed one, and it cannot be relied on.
+             *
+             * NOT clamped by chunk_ceiling, and that is deliberate.
              *
              * The ceiling exists to stop the FLOOR restoring a size a measured
              * launch has rejected; capping growth with it as well is a

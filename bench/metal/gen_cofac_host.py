@@ -442,7 +442,7 @@ src = src.replace(_v_old, "", 1)
 # than matched as one literal, because it is 60 lines of upstream prose; the
 # asserts below name what is being discarded, so a shape change cannot pass
 # quietly. .index() raises on a miss, which is the assert for the bounds.
-_va = src.index("            /* DID THE LAST DESCENT PAY?")
+_va = src.index("            /* IS THE BOUND REACHABLE AT ALL?")
 # Ends at the 8-SPACE `} else if` that closes `if (launch_ms > ...)` and opens
 # the history reset -- NOT at the first `\n        }\n    }\n`, which is where
 # this pointed when the reset was added upstream and which would have taken the
@@ -450,13 +450,13 @@ _va = src.index("            /* DID THE LAST DESCENT PAY?")
 # eight is unambiguous. .index() raises on a miss, which is the bound's assert;
 # the asserts below name what is discarded AND what must survive, because an
 # `in` test alone cannot notice the region growing.
-_vz = src.index(chr(10) + "        } else if (Q->chunk_prev_valve) {", _va)
+_vz = src.index(chr(10) + "        } else if (Q->eff_prev_valve) {", _va)
 _valve_old = src[_va:_vz]
-assert 'parking at %u records/launch' in _valve_old, 'no-progress park missing'
+assert 'so the launch is not chunk-bound' in _valve_old, 'unreachable park missing'
 assert 'parking here rather than giving' in _valve_old, 'floor park missing'
 assert 'Q->chunk_ceiling = next;' in _valve_old, "the valve's ceiling missing"
 assert _valve_old.count('valve_acted = 1;') == 3, 'not three valve branches'
-assert 'chunk_prev_valve = 0;' not in _valve_old, \
+assert 'eff_prev_valve = 0;' not in _valve_old, \
     "the splice reached past the valve into the history reset"
 _valve_new = chr(10).join([
     "            /* THE CEILING ONLY, AND ONLY EVER DOWNWARD. The steering below",
@@ -562,8 +562,21 @@ print('  over-bound launches reported; in-bound ones are not')
 #    controller halves forever and lands exactly there: the same unconditional
 #    slowdown 8j removed, arrived at from the other direction. So a halving
 #    that does not buy at least 10% is undone and the descent stops.
+#
+# AND THE REFERENCE IS CLEARED BY ANY IN-BOUND FLUSH. ms_launch_prev/chunk_prev
+# are written only by the descent below, so without this they can be fifty
+# flushes old: a machine that merely got slower later satisfies "within 10% at
+# a smaller chunk", is read as no-progress, and has the LARGER chunk RESTORED
+# and latched. That is the stale-reference defect 556dc15 item 2 fixed on
+# upstream's valve, and this -- the port's live controller, on the very hosts
+# the interactivity work exists for -- had the same one. An in-bound flush
+# means the descent worked, so the pair has nothing left to say.
 _g_old = "        if (stage > COF_CHUNK_TARGET_MS) {"
 _g_new = chr(10).join([
+    "        if (!Q->chunk_parked && stage <= COF_CHUNK_TARGET_MS",
+    "            && Q->chunk_prev) {",
+    "            Q->ms_launch_prev = 0.0f; Q->chunk_prev = 0;",
+    "        }",
     "        if (Q->chunk_parked) {",
     "            /* Descent already proved useless at this size; see below. */",
     "        } else if (stage > COF_CHUNK_TARGET_MS) {",
