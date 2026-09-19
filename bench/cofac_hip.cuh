@@ -1430,6 +1430,90 @@ typedef struct {
      * flush picks the opening value. Ignored entirely when the operator gave
      * an explicit --cof-chunk. */
     uint32_t chunk_cur;
+    /* An upper bound the LAUNCH VALVE has established, or 0 if it never fired.
+     *
+     * The valve may descend below cof_chunk_floor(), but the steering below it
+     * clamps UP to that same floor on every flush -- and its test against
+     * `stage` is always true -- so without this the valve's choice survived
+     * exactly one flush and the chunk oscillated back onto the size that was
+     * killing the device. Measured on a TITAN RTX: 110592 -> 75466 -> 110592
+     * -> 75735 -> 110592, i.e. every second flush ran at the value the valve
+     * had just rejected.
+     *
+     * A device whose launches are inside the bound never sets it, so nothing
+     * here changes for healthy hardware.
+     *
+     * STRICTLY MONOTONE DOWNWARD, and permanent once set. Neither park raises
+     * it -- both keep the reduction already achieved -- and nothing clears it.
+     *
+     * THAT PERMANENCE IS A DELIBERATE, ASYMMETRIC TRADE -- and the cost of it
+     * is MUCH HIGHER THAN AN EARLIER VERSION OF THIS COMMENT CLAIMED. It said
+     * "well under 1% of wall", reasoning that throughput is proportional to
+     * the chunk. It is not. The expensive step on that curve is a WAVE
+     * boundary: going from one k_cofac launch per round to two. cof_chunk_floor
+     * below is one record per thread, so a ceiling that lands just under n
+     * turns a single full-width launch into two, and the table above measures
+     * that step at 27.97 -> 33.86 ms, +21% of the algebraic queue stage. Two
+     * independent audits put the real range at 12-64% of the cofactor stage,
+     * i.e. up to several percent of wall, not a fraction of one.
+     *
+     * AND THERE IS A CARD CLASS WHERE THE BASELINE COST WAS EXACTLY ZERO.
+     * Where cof_chunk_floor() exceeds n -- any card with 86 or more SMs, so a
+     * 4090, A100, H100, L40S, 5090 -- the baseline's descent landed above n,
+     * left step = min(chunk, n) untouched, and cost nothing at all; the next
+     * flush restored it. Scaling from eff (see the descent below) is what
+     * makes the valve work there on a REAL overrun, and the same change is
+     * what makes a SPURIOUS firing cost something where it used to cost
+     * nothing. That is a regression against the baseline for that class, in
+     * that case, and it is recorded here rather than buried.
+     *
+     * It is still the right trade, for one reason: every alternative is a
+     * RELEASE path, and releasing restores the oscillation this whole
+     * mechanism exists to remove -- which on the 980 Ti costs the WHOLE task,
+     * not a percentage of it. A bounded throughput loss against a total loss
+     * is not close, even at 64%. A release rule keyed on the descent landing
+     * far below its own 0.8x aim would discriminate, but it is a fourth
+     * threshold in a mechanism where the previous three were each wrong once,
+     * and nobody has measured how often a healthy card actually sees a
+     * >1000 ms transient. It wants field data first.
+     *
+     * It does not ratchet, at least: each descent shrinks the chunk, so the
+     * next spurious firing needs a LARGER relative inflation than the last
+     * (1.43x, then 1.97x, then 2.7x from a typical start). Self-limiting
+     * rather than cumulative. */
+    uint32_t chunk_ceiling;
+    /* The valve's no-progress guard. chunk/launch as they were at the last
+     * descent, and a latch once descending has been shown not to pay.
+     *
+     * The descent is proportional on the assumption that the launch is linear
+     * in the chunk. Below a few thousand records it is not -- measured on a
+     * 10-core M3 (plan 9z-h): the response flattens and then reverses, 1996
+     * records giving 94.0 ms against 1792 giving 139.9. Without a guard the
+     * valve rides all the way down to COF_CHUNK_HARD_FLOOR, paying a large
+     * throughput cost in a regime where shrinking the chunk no longer shortens
+     * the launch at all. Measured at an artificially low 200 ms bound on a
+     * TITAN RTX: 110592 -> 14871 -> 7481 -> 4137 -> 2659, still descending.
+     *
+     * THE SLICE, NOT THE CHUNK. cf_run_rounds launches min(chunk, n) records,
+     * and cof_chunk_floor() can exceed n outright -- a 4090's 196,608 against
+     * CQ_FLUSH's 131,072, which cofac.cuh's own floor comment already notes.
+     * Comparing chunk_cur across two flushes then compares two numbers that
+     * produced the IDENTICAL launch, reads the equality as "descending does
+     * not pay", and parks the valve one step before it would first have had
+     * any effect. Recording the effective slice makes the guard compare what
+     * actually ran.
+     *
+     * AND IT PARKS ONLY ON PROOF, not on a ratio. An earlier version gave up
+     * when a descent bought under 10%, which is only sound if the response is
+     * proportional; 8h documents that it is not -- there is a serial ECM-chain
+     * term. With a 950 ms serial floor a 125,952 -> 80,609 descent moves
+     * 1250 -> 1142 ms, under 10%, while 20,990 records would have met the
+     * 1000 ms bound outright. Two measurements at different slice sizes give
+     * that affine response directly, so the test is now whether the implied
+     * serial floor is ITSELF over the bound -- which is the actual question. */
+    uint32_t eff_prev_valve;
+    float    ms_prev_valve;
+    int      valve_parked;
     uint32_t *d_s, ns, ecm_curves;
     /* Method PER SIDE, 0 = Pollard-Brent rho, 1 = ECM. Per side and not per
      * job because the two sides of a real job are usually different shapes:
@@ -2036,33 +2120,137 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
      * measured launch that actually exceeded the bound. On hardware that never
      * does, nothing here executes and the behaviour is bit-for-bit what it was.
      */
-    if (!chunk) {
+    if (!chunk && !Q->valve_parked) {
         float pm0 = 0.0f, pm1 = 0.0f;
         if (pk0.fired) COF_FLUSH_CK(hipEventElapsedTime(&pm0, pk0.a, pk0.b));
         if (pk1.fired) COF_FLUSH_CK(hipEventElapsedTime(&pm1, pk1.a, pk1.b));
         const float launch_ms = pm0 > pm1 ? pm0 : pm1;
         if (launch_ms > COF_LAUNCH_TARGET_MS) {
+            /* The slice this launch actually ran; see both uses below. */
+            const uint32_t eff = Q->chunk_cur < n ? Q->chunk_cur : n;
             /* Proportional, at 0.8x the bound: from a large overshoot this
              * lands in one flush where halving needs several, and every flush
              * spent descending is a flush run at a size already known to be
-             * dangerous. */
-            const double want = (double)Q->chunk_cur
+             * dangerous.
+             *
+             * SCALED FROM THE SLICE THAT RAN, NOT FROM chunk_cur. cf_run_rounds
+             * launches min(chunk, n) records, so launch_ms is the cost of `eff`
+             * records and `eff` is what the ratio applies to. Scaling chunk_cur
+             * instead divides the wrong quantity whenever the two differ --
+             * which is not exotic: cof_chunk_floor() exceeds CQ_FLUSH on any
+             * card with 86 or more SMs (a 4090's 196,608 against 131,072), so
+             * the opening chunk is ALWAYS larger than n there. A 1100 ms
+             * launch then descended 196,608 -> 142,987, still above n, leaving
+             * the slice and the launch completely unchanged; from `eff` it
+             * descends 131,072 -> 95,325 and bites on the first firing. */
+            const double want = (double)eff
                               * ((double)COF_LAUNCH_TARGET_MS * 0.8)
                               / (double)launch_ms;
             uint32_t next = want < (double)COF_CHUNK_HARD_FLOOR
                           ? COF_CHUNK_HARD_FLOOR : (uint32_t)want;
             if (next >= Q->chunk_cur) next = Q->chunk_cur / 2;   /* always move */
             if (next < COF_CHUNK_HARD_FLOOR) next = COF_CHUNK_HARD_FLOOR;
-            if (next != Q->chunk_cur) {
+            /* THE VALVE NEVER RAISES. The clamp above is what makes this
+             * necessary: where cof_chunk_floor() is itself below
+             * COF_CHUNK_HARD_FLOOR -- `--blocks 1 --threads 256` gives 256 --
+             * the chunk opens at 256, the clamp lifts `next` to 1024, and the
+             * valve would enlarge the launch it is trying to shorten, print it
+             * as a descent, and then oscillate against the steering's floor.
+             * Clamped here rather than by reordering the two lines above,
+             * because HARD_FLOOR must still stop a descent going below it. */
+            if (next > Q->chunk_cur) next = Q->chunk_cur;
+            /* IS THE BOUND REACHABLE AT ALL? See eff_prev_valve. Two
+             * measurements at genuinely different SLICE sizes give the affine
+             * response 8h documents: a serial ECM-chain floor plus a
+             * per-record term. Extrapolate the serial floor; if that alone is
+             * over the bound, no chunk size can meet it and subdividing
+             * further only multiplies per-launch overhead.
+             *
+             * PARKS IN PLACE. It never restores a larger chunk -- the reduction
+             * already achieved is the safest launch this device has been shown
+             * to run, and giving it back trades a launch that survives the
+             * watchdog for one that may not. That also makes a park triggered
+             * by a noisy measurement conservative rather than dangerous. */
+            int unreachable = 0;
+            if (Q->eff_prev_valve > eff && Q->ms_prev_valve > 0.0f) {
+                if (launch_ms >= Q->ms_prev_valve) {
+                    unreachable = 1;      /* smaller slice, no faster at all */
+                } else {
+                    const double slope = (double)(Q->ms_prev_valve - launch_ms)
+                                       / (double)(Q->eff_prev_valve - eff);
+                    const double serial = (double)launch_ms
+                                        - slope * (double)eff;
+                    if (serial >= (double)COF_LAUNCH_TARGET_MS) unreachable = 1;
+                }
+            }
+            if (unreachable) {
+                fprintf(stderr,
+                        "  cofactor: %u -> %u records/launch moved"
+                        " %.0f -> %.0f ms, so the launch is not chunk-bound"
+                        " and no slice can meet the %.0f ms bound; parking"
+                        " here at %u records/launch\n",
+                        Q->eff_prev_valve, eff,
+                        (double)Q->ms_prev_valve, (double)launch_ms,
+                        (double)COF_LAUNCH_TARGET_MS, Q->chunk_cur);
+                Q->valve_parked = 1;
+                valve_acted = 1;
+            } else if (next != Q->chunk_cur) {
                 fprintf(stderr,
                         "  cofactor: kernel launch %.0f ms is over this build's"
                         " %.0f ms bound; %u -> %u records/launch\n",
                         (double)launch_ms, (double)COF_LAUNCH_TARGET_MS,
                         Q->chunk_cur, next);
+                /* Recorded BEFORE the assignment, for the guard above, and
+                 * as the SLICE that ran rather than the chunk that named it. */
+                Q->eff_prev_valve = eff;
+                Q->ms_prev_valve = launch_ms;
                 Q->chunk_cur = next;
                 S.chunk = Q->chunk_cur;
+                /* Sticky, so the steering's floor cannot pull it back up. */
+                Q->chunk_ceiling = next;
+                valve_acted = 1;
+            } else {
+                /* ALREADY AT COF_CHUNK_HARD_FLOOR AND STILL OVER THE BOUND.
+                 * next == chunk_cur, so there is nothing left to subdivide --
+                 * and because the branch above is what advances the guard's
+                 * reference, without this the valve would re-measure the same
+                 * floor every flush, print nothing and never conclude
+                 * anything.
+                 *
+                 * PARKS HERE, NOT AT THE SIZE IT CAME FROM, and that is the
+                 * difference from the no-progress branch above. The descent
+                 * did shorten the launch -- measured on an RTX 3090 at a
+                 * 200 ms bound, 6865 ms at the floor against 25449 ms at one
+                 * grid -- it simply cannot reach the bound. Handing the
+                 * throughput back would be trading a launch that survives the
+                 * WATCHDOG for one that does not: the bound carries 2x margin
+                 * on the TDR it is derived from, so over the bound is not over
+                 * the watchdog, and over the bound by 2.4x is. Restoring is
+                 * only safe when the shorter launch bought nothing, which is
+                 * exactly the branch above. */
+                fprintf(stderr,
+                        "  cofactor: %u records/launch is the floor and the"
+                        " launch is still %.0f ms, so no chunk size can meet"
+                        " the %.0f ms bound; parking here rather than giving"
+                        " the reduction back\n",
+                        Q->chunk_cur, (double)launch_ms,
+                        (double)COF_LAUNCH_TARGET_MS);
+                Q->valve_parked = 1;
                 valve_acted = 1;
             }
+        } else if (Q->eff_prev_valve) {
+            /* UNDER THE BOUND, SO THE HISTORY IS SPENT. The guard above
+             * compares this launch against the one that provoked the last
+             * descent, and the valve only speaks when it is over the bound --
+             * so without this the reference could be fifty flushes old. A
+             * machine that merely got slower later would then satisfy
+             * `within 10% of the old measurement at a smaller chunk`, be read
+             * as "descending does not help", and have the LARGER chunk
+             * restored: a longer launch, concluded from two measurements taken
+             * under different conditions. Resetting here means the guard only
+             * ever compares consecutive over-bound flushes. */
+            Q->eff_prev_valve = 0;
+            Q->ms_prev_valve = 0.0f;
         }
     }
 
@@ -2075,8 +2263,18 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
      * enough to stay over budget simply parks there, which is the free point
      * for it, and a device fast enough grows to one slice and stops. */
     if (!chunk && !valve_acted) {
-        const uint32_t floor_ch = cof_chunk_floor(blocks, threads);
+        uint32_t floor_ch = cof_chunk_floor(blocks, threads);
         const uint32_t was = Q->chunk_cur;
+#ifndef COF_CHUNK_NO_CEILING
+        /* A measured over-bound launch has already proved that a full grid of
+         * records does not fit this device's watchdog, so the floor -- which
+         * is one record per thread and nothing more -- stops being a lower
+         * limit. Without this the clamp below restores the rejected size on
+         * the very next flush. COF_CHUNK_NO_CEILING is chunkcheck.sh's
+         * control build; it must fail the gate. */
+        if (Q->chunk_ceiling && floor_ch > Q->chunk_ceiling)
+            floor_ch = Q->chunk_ceiling;
+#endif
         const float stage = t0 + t1;
         if (stage > COF_CHUNK_TARGET_MS) {
             const uint32_t half = Q->chunk_cur / 2;
@@ -2095,6 +2293,34 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
              * chunk >= n as the single-slice case. */
             Q->chunk_cur = (Q->chunk_cur > Q->cap / 2) ? Q->cap
                                                        : Q->chunk_cur * 2;
+            /* REACHABLE, BUT ONLY ON A SMALL FLUSH -- an earlier version of
+             * this comment claimed outright that it cannot run here. `stage`
+             * is t0+t1 over a whole side, which for a full CQ_FLUSH is tens of
+             * times the 62.5 ms threshold, but pipeline.cuh's checkpoint- and
+             * stop-driven call sites flush a few thousand records, where t0+t1
+             * genuinely falls under it. So growth does run occasionally, and
+             * being unclamped it is the one path that can lift chunk_cur back
+             * over a ceiling set from an inflated measurement -- an accidental
+             * relief valve, not a designed one, and it cannot be relied on.
+             *
+             * NOT clamped by chunk_ceiling, and that is deliberate.
+             *
+             * The ceiling exists to stop the FLOOR restoring a size a measured
+             * launch has rejected; capping growth with it as well is a
+             * different thing, and on a port whose steering is a real
+             * measurement it is harmful. The interactivity watchdog is
+             * contention-dependent (9z-p), so one busy moment sets a ceiling
+             * from an inflated launch -- an M1 at 36864 records measuring
+             * 1200 ms sets 24576 -- and the process could then never climb
+             * back once the machine went idle, though every later measurement
+             * said it should. A measurement-driven controller does not need
+             * protecting from growth: if it grows too far, the next launch is
+             * over the bound and it descends again, which is the loop working.
+             *
+             * This branch is in any case unreachable here, where `stage` is a
+             * whole side's sum and never falls below a quarter of the target.
+             * It was clamped for the Metal port's benefit, where it IS live --
+             * which is exactly where the cap does the damage. */
         }
         if (Q->chunk_cur != was) cof_report_chunk(Q->chunk_cur, n, 0);
     }
