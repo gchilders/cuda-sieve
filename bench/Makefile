@@ -572,12 +572,12 @@ mkcofbatch: mkcofbatch.c $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE
 clean:
 	rm -f bench fbtest fbgen fbgen_gpu sqgentest normscan dumpcmp mkcofbatch ckpttest stoptest slabtest *.o *.d $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP) $(GIT_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE_K_STAMP)
 
-.PHONY: all clean check ckptcheck stopcheck cofcheck chunkcheck fbgencheck fbgpucheck sqgencheck walkcheck slabcheck skipcheck degradecheck
+.PHONY: all clean check ckptcheck stopcheck cofcheck chunkcheck chunksimcheck fbgencheck fbgpucheck sqgencheck walkcheck slabcheck skipcheck degradecheck
 
 # `check` depended on fbtest alone, so the whole CUDA path -- kernels, the
 # cofactoriser, the pipeline -- could fail to compile while the gates reported
 # "all gates passed". Depend on `all`.
-check: all ckptcheck stopcheck cofcheck fbgencheck sqgencheck walkcheck slabcheck
+check: all ckptcheck stopcheck cofcheck chunksimcheck fbgencheck sqgencheck walkcheck slabcheck
 	./fbtest --fb1 ../oracle/c183.fb1
 
 ckptcheck: ckpttest
@@ -689,3 +689,13 @@ cofcheck: bench
 # stops testing the thing it exists for. See the script's header.
 chunkcheck: bench
 	@./chunkcheck.sh ./bench ../oracle/c183.poly $(CHUNKCHECK_NQ) $(CHUNKCHECK_CURVES)
+
+# The same controller with NO GPU AT ALL. gen_chunksim.py lifts it verbatim out
+# of cofq_flush and compiles it for the host, so it cannot drift from the code
+# it reports on, and it drives every device response on purpose instead of
+# whichever one a particular card happens to produce. Seconds, not minutes, and
+# it needs no nvcc -- which is the point: chunkcheck above needs an NVIDIA card,
+# and the branches that matter never fire on healthy hardware.
+.PHONY: chunksimcheck
+chunksimcheck:
+	@./chunksimcheck.sh
