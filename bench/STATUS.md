@@ -4,7 +4,7 @@
 the order they were discovered, including the ones later refuted, because the
 refutations are the most useful part. That makes them bad at answering "what
 does this thing do today". This file answers only that, and holds nothing that
-is not current. **Last updated 2026-09-14.**
+is not current. **Last updated 2026-09-23.**
 
 ## Architecture
 
@@ -14,8 +14,11 @@ One process, both sides, one special-q at a time:
 per special-q:
   host    reduce the q-lattice, build the three modulus tiers
   device  k_transform    plattice transform of the factor base
-          k_fill_atomic  bucket-sieve into regions
-          k_apply        norm init + bucket add + threshold scan  ->  survivor bitmap
+          k_fill_atomic  bucket-sieve into regions (no record where gcd(i,j)
+                         is visibly > 1: both even, or 3 | both)
+          k_apply        norm init + small-prime line sieve + bucket add
+                         + threshold scan  ->  survivor bitmap
+                         (both-even cells get no norm and no small-prime hits)
   (repeat for the other side)
   device  k_intersect_compact   both-sides bitmap AND, gcd filter, rank scan
           trial division, classification, resieve
@@ -824,6 +827,15 @@ already bounded.
 
 ### Performance accounting
 
+**Where the time is after `--sieve-skip` (finding 100, 2026-09-23).** Positions
+`gcd(i,j)` rules out are no longer sieved: default level 2 drops both-even
+positions everywhere and `3 | i, 3 | j` in fill. Relations are byte-identical;
+wall fell **12.3%** on c183 I15, **13.1%** on C194 I16 and **10.0%** on AS276
+I17. c183 now reads fill 17.0 / apply 27.0 of 79.2 ms/q, and **~17 ms of that
+apply is the fused small-prime sieve — the largest single component, ~21% of
+wall**, whose cost is per (entry, region) rather than per hit. That is the next
+profiling target; the older numbers below are all pre-skip.
+
 **`k_fill_atomic` is L2-bound, measured 2026-08-25 (finding 76).** ncu on a
 5070: L2 throughput 68.7%, DRAM 24.7%, SM throughput 9.4%, IPC 0.22 of 4.0,
 101 warp-cycles per issued instruction. Its theoretical occupancy is 50%,
@@ -917,6 +929,8 @@ remaining estimates are source review, not measured schedules.
 | **Real job** | snfs236, ~20M relations before deliberate interruption | 5070 |
 | **Full NFS factorisation** | C123 sieved entirely by us, filtered and solved by msieve: `p42 * p82` | `work/c123run` |
 | **`A = 32`** | AS276 at `2^17 x 2^15`, 8 slabs: 1,322/1,322 norms rebuilt, rectangle confirmed from the relations (finding 82) | 5070 |
+| **Completeness at `A = 32`** | AS276 at GGNFS's own `2^17 x 2^15`, 8 slabs, 30 q: 4,563 of GGNFS's 4,564 relations found (99.98%), no loss at any slab boundary (finding 100) | 5070 |
+| **`--sieve-skip` identity** | relations byte-identical at levels 0/1/2 on c183 I15, C194 I16 (4 slabs) and c183 with odd slab starts (`--slab-j 4095`), and at 0/2 on AS276 I17 (8 slabs); gated in `cofcheck.sh` (finding 100) | 5070 |
 
 Cards with measured band data: **RTX 5070** (WSL2), **RTX 5090**, **RTX 4090**,
 **A100 80GB** (native Linux), and an **RTX 3090** via an external reporter.
@@ -1273,6 +1287,11 @@ not by size.
 | 4 | Three-position `--qspan` delay calibration (before first launch, between, after last) | local GPU, idle box | **optional** — settles the unreconciled `wall - span`; frame it as testing event-endpoint/submission semantics, not as perf work |
 | 5 | Next rental: **concurrent fill primary, concurrent resieve as a second arm**, interleaved, fresh baseline | rented card (3090/L40S/4090) | **ANSWERED ON A 5090, 2026-09-10: -7.62% of wall** — `--fill-concurrent` sieves the two sides on two streams; finding 94. The rental is now pure measurement rather than development, which is the point: card-hours are the scarce resource and this needed none of them. The number came in at **-7.62% of wall** on c183 I15e (three interleaved pairs, -7.77/-6.86/-8.24), inside the pre-registered 5.8-8.3% bracket and above the ~4% ship threshold; rel/J on the 5090 is **withdrawn** — its only power data is `board=`, now shown to be aliased by tens of percent in either direction. Finding 94. **The session was one script, `bench/rental5090.sh`** (removed 2026-09-14; `git show e47f205:bench/rental5090.sh`) (build, factor base, identity gate, three interleaved band pairs, the c147 small-geometry arm, the `--fill-streams` sweep including the N=8 a 12 GB card refuses) — about 35 minutes of card time, smoke-tested end to end on the 5070 2026-09-10 |
 | 6 | Leave `pipeline.cuh:1924`'s `cudaDeviceSynchronize` alone | — | **decided, no action** |
+| 7 | Stop sieving positions `gcd(i,j)` rules out | local GPU | **DONE 2026-09-23, now the default** — `--sieve-skip 2`, finding 100: wall −12.3% (c183), −13.1% (C194), −10.0% (AS276 I17), relations byte-identical on all three, fill −31 to −33%. `--sieve-skip 0` restores the old behaviour |
+| 8 | Profile the fused small-prime sieve | local GPU, `ncu` | **NEXT** — ~17 ms/q, ~62% of apply, ~21% of wall on c183, and barely moved when finding 100 removed a quarter of its hits, so its cost is per (entry, region). First suspect: the whole-block tier handles one p < 64 entry at a time with every thread recomputing the same start |
+| 9 | Reclaim bucket VRAM freed by the skip | local GPU | **open, and NOT by scaling the estimate** — the per-region cap is uniform and a third of rows (odd `j`, `3` not dividing `j`) lose no records, so a cap scaled to 2/3 would overflow every slab (finding 100, review). Needs a per-row-class capacity; the current sizing is correct |
+| 10 | Lazy / bounded norm evaluation | local GPU | **demoted** — proposed 2026-09-23 at ~3.5-6% of wall; finding 100 already removed a quarter of norm init, leaving a few ms at most. Revisit after item 8 |
+| 11 | `--bkthresh` below `I` | nothing | **FIXED 2026-09-23** — silently lost relations (5,079 and 7,456 of 9,053 at 8192 / 16384, exit 0) because the Franke-Kleinjung walk needs `p >= I`; now refused at startup and again in `run_pipeline_impl`, and capped at 2^30. Defaults were never affected. Raising it is correct but not faster, so the sweep is closed |
 
 **On (5), why both arms in one session.** Card-hours are the scarce resource
 and `resieve + scatter` is the same bucket-structured shape as fill: finding

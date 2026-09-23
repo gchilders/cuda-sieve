@@ -126,6 +126,29 @@ __global__ void k_transform(const uint32_t *__restrict primes,
     }
 }
 
+/* ---- positions gcd(i,j) already rules out (--sieve-skip, finding 100) ----
+ *
+ * x = j*I + (i + I/2) and I/2 is even, so parity(i) == parity(x). Every stage
+ * that skips a both-even position -- fill, apply's init, the small sieve and
+ * the scan -- asks these two helpers, because they must agree exactly: fill
+ * dropping a record for a cell apply still scans in would lose relations
+ * silently, and no gate compares the four sites with each other.
+ *
+ * pos_row is the GLOBAL row. Slabbed kernels add j_base; unslabbed ones do not,
+ * so they stay correct whatever j_base a caller passes. */
+template <bool SLABBED>
+__device__ __forceinline__ uint32_t pos_row(uint32_t x, int logI, uint32_t j_base)
+{
+    uint32_t j = x >> logI;
+    if constexpr (SLABBED) j += j_base;
+    return j;
+}
+
+__device__ __forceinline__ int pos_both_even(uint32_t x, uint32_t j)
+{
+    return ((x | j) & 1u) == 0u;
+}
+
 /* ---- stage (a): naive single-level atomic append ---------------------- */
 
 /* One atomicAdd per record into a 2^log_nbuckets-way split. This is the
@@ -139,11 +162,14 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
                               uint8_t *__restrict out, uint32_t cap,
                               uint32_t *__restrict overflow,
                               const uint64_t *__restrict walk_cur,
-                              uint64_t *__restrict walk_next)
+                              uint64_t *__restrict walk_next,
+                              int sieve_skip, uint32_t j_base)
 {
     const uint32_t Imask = (1u << logI) - 1;
     const uint32_t offmask = (1u << log_region) - 1;
     const uint64_t stride = bench_grid_stride_x();
+    /* --sieve-skip: 3 | i  <=>  (x & Imask) == I/2 (mod 3), since i = (x & Imask) - I/2. */
+    const uint32_t ih3 = (1u << (logI - 1)) % 3u;
 
     for (uint64_t kk = bench_grid_thread_x(); kk < n; kk += stride) {
         const uint32_t k = (uint32_t)kk;
@@ -191,6 +217,16 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
         else                   x = pl_first64(&P, logI);
         for (; x < xmax; x = pl_next64(x, &P, Imask)) {
             const uint32_t xl = (uint32_t)x;
+            /* --sieve-skip: a position k_intersect_compact's gcd(i,j) test will
+             * reject gets no record. Fill is L2-bound with the ALU nearly idle,
+             * so the test is free and every skipped record is one write and one
+             * cursor atomic fewer. parity(i) == parity(x) because I/2 is even. */
+            if (sieve_skip) {
+                const uint32_t j = pos_row<SLABBED>(xl, logI, j_base);
+                if (pos_both_even(xl, j)) continue;
+                if (sieve_skip > 1 && (j % 3u) == 0u && ((xl & Imask) % 3u) == ih3)
+                    continue;
+            }
             const uint32_t b = xl >> log_region;
             const uint32_t slot = atomicAdd(&cursor[b], 1u);
             if (slot >= cap) { atomicAdd(overflow, 1u); continue; }
@@ -308,7 +344,8 @@ __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_regi
                             const uint16_t *__restrict slp,
                             const uint32_t *__restrict smag,
                             uint32_t nsmall, uint32_t nblk, uint32_t nwrp,
-                            uint32_t tid, uint32_t nth, uint32_t j_base)
+                            uint32_t tid, uint32_t nth, uint32_t j_base,
+                            int skipeven)
 {
     const uint32_t width = 1u << log_region;
     const uint32_t x0    = region << log_region;
@@ -321,6 +358,14 @@ __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_regi
      * the same definition. */
     const uint32_t kshift = SS_KSHIFT(logI);
     const uint32_t warp = tid >> 5, lane = tid & 31, nwarps = nth >> 5;
+    /* --sieve-skip: in an even row only odd i can ever be a relation -- the
+     * row half of pos_both_even -- and parity(c) == parity(i) because ilo is
+     * even (x0 is even, I/2 is even). An odd modulus alternates parity, so
+     * start at the first odd hit and step 2m; an even one never changes it, so
+     * the entry either keeps every hit or contributes nothing to this row.
+     * 2m cannot wrap: bench_main caps --bkthresh, and so every line-sieved
+     * modulus, at 2^30. */
+    const int evenrow = skipeven && !(j & 1u);
 
     /* Every entry is (m, rt, g): hits this row only when g | j, and then at
      * i == rt*(j/g) (mod m). g == 1 is the ordinary case; m == 1 means every
@@ -330,9 +375,14 @@ __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_regi
             const uint32_t m = sp[e], g = sg[e], lp = slp[e];                 \
             if (g > 1 && (j % g)) break;                                      \
             {                                                                 \
-                const uint32_t c0 = ss_first(m, srt[e], g > 1 ? j / g : j, ilo, \
-                                             smag ? smag[e] : 0u, kshift);     \
-                for (uint32_t c = c0 + (first) * m; c < width; c += (step) * m)\
+                uint32_t c0 = ss_first(m, srt[e], g > 1 ? j / g : j, ilo,     \
+                                       smag ? smag[e] : 0u, kshift);           \
+                uint32_t mm = m;                                              \
+                if (evenrow) {                                                \
+                    if (m & 1u) { if (!(c0 & 1u)) c0 += m; mm = 2u * m; }     \
+                    else if (!(c0 & 1u)) break;                               \
+                }                                                             \
+                for (uint32_t c = c0 + (first) * mm; c < width; c += (step) * mm)\
                     ss_add<CELLBITS,ATOMIC>(S, c, lp);                        \
             }                                                                 \
         } while (0)
@@ -358,7 +408,9 @@ __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_regi
  * >= 2, so parity(i) == parity(x) and parity(j) == parity(x >> logI). Both even
  * means (a,b) are both even and the relation is a duplicate of (a/2, b/2); las
  * marks these 255 so they can never survive. Off by default so that every
- * survivor count recorded before 2026-08-03 still reproduces. */
+ * survivor count recorded before 2026-08-03 still reproduces -- except that
+ * k_apply ORs in its sieve_skip argument, because the cells --sieve-skip
+ * leaves unsieved must never be scanned in. */
 /* The per-cell side effects that accompany the predicate: the gate-5 probe and
  * the optional dump byte. They live here for the same reason apply_keep does --
  * the threshold scan has two shapes and anything duplicated between them drifts.
@@ -388,10 +440,8 @@ __device__ __forceinline__ int apply_keep(uint32_t x, uint32_t v,
                                           uint32_t THRESH, int logI,
                                           uint32_t j_base, int not_both_even)
 {
-    uint32_t jpar = x >> logI;
-    if constexpr (SLABBED) jpar += j_base;
-    const int botheven = ((x & 1u) == 0u) && ((jpar & 1u) == 0u);
-    return (v >= THRESH) && !(not_both_even && botheven);
+    return (v >= THRESH)
+        && !(not_both_even && pos_both_even(x, pos_row<SLABBED>(x, logI, j_base)));
 }
 
 /* One block owns one bucket region for its entire life: it initialises the
@@ -466,7 +516,7 @@ void k_apply(const uint32_t *__restrict buckets,
                         uint32_t nsmall, uint32_t nblk, uint32_t nwrp,
                         uint32_t probe_x, uint32_t *__restrict probe_out,
                         uint32_t *__restrict survbits, int not_both_even,
-                        uint32_t j_base)
+                        int sieve_skip, uint32_t j_base)
 {
     extern __shared__ uint32_t sm[];
     const uint32_t ncell  = 1u << log_region;
@@ -479,6 +529,11 @@ void k_apply(const uint32_t *__restrict buckets,
     const uint32_t Imask = (1u << logI) - 1;
     const int32_t  Ihalf = 1 << (logI - 1);
     const uint32_t xbase = b << log_region;
+    /* --sieve-skip: both-even cells get no norm, no small-prime hits and are
+     * never scanned in. The region lies in one row -- bench_main refuses
+     * --region > --logI under --pipeline -- so the row is one value per block. */
+    const uint32_t jblk = pos_row<SLABBED>(xbase, logI, j_base);
+    const int drop_both_even = not_both_even || sieve_skip;
 
     for (uint32_t i = tid; i < nslice; i += nth) lut[i] = slice_logp[i];
 
@@ -488,10 +543,14 @@ void k_apply(const uint32_t *__restrict buckets,
         #pragma unroll
         for (uint32_t c = 0; c < CPW; c++) {
             uint32_t t;
-            if (NORMMODE == NORM_CONST) {
+            const uint32_t x = xbase + w * CPW + c;
+            /* Warp-uniform: cell c has the same parity in every word, because
+             * xbase and CPW are even. */
+            if (sieve_skip && pos_both_even(x, jblk)) {
+                t = CINIT;                       /* cell starts at 0 */
+            } else if (NORMMODE == NORM_CONST) {
                 t = tconst;
             } else {
-                const uint32_t x = xbase + w * CPW + c;
                 const int32_t  ii = (int32_t)(x & Imask) - Ihalf;
                 const uint32_t jlocal = x >> logI;
                 uint32_t jj = jlocal;
@@ -571,7 +630,7 @@ report spurious cell mismatches. Pricing builds only, never for relations."
                 const uint32_t TMAX = (CELLBITS == 8) ? 255u : CINIT;
                 t = (ti < 0) ? 0u : ((uint32_t)ti > TMAX ? TMAX : (uint32_t)ti);
             }
-            if (probe_out && (xbase + w * CPW + c) == probe_x) probe_out[0] = t;
+            if (probe_out && x == probe_x) probe_out[0] = t;
             word |= (CINIT - t) << (c * CELLBITS);
         }
         S[w] = word;
@@ -582,7 +641,8 @@ report spurious cell mismatches. Pricing builds only, never for relations."
     if (nsmall)
         sieve_small<CELLBITS, ATOMIC, SLABBED>(S, b, logI, log_region, sp, srt, sg, slp,
                                                smag,
-                                               nsmall, nblk, nwrp, tid, nth, j_base);
+                                               nsmall, nblk, nwrp, tid, nth, j_base,
+                                               sieve_skip);
 
     /* ---- apply ---- */
     uint32_t n = cnt[b];
@@ -663,7 +723,7 @@ report spurious cell mismatches. Pricing builds only, never for relations."
             const uint32_t v   =
                 (S[off / CPW] >> ((off % CPW) * CELLBITS)) & CMASK;
             const int keep = apply_keep<SLABBED>(x, v, THRESH, logI,
-                                                 j_base, not_both_even);
+                                                 j_base, drop_both_even);
             const uint32_t mask = __ballot_sync(0xFFFFFFFFu, keep);
             if (lane == 0) {
                 if (survbits) survbits[x >> 5] = mask;
@@ -683,7 +743,7 @@ report spurious cell mismatches. Pricing builds only, never for relations."
                 const uint32_t v = (word >> (c * CELLBITS)) & CMASK;
                 const uint32_t x = xbase + w * CPW + c;
                 if (apply_keep<SLABBED>(x, v, THRESH, logI, j_base,
-                                        not_both_even)) {
+                                        drop_both_even)) {
                     atomicAdd(nsurv, 1u);
                     if (survbits) atomicOr(&survbits[x >> 5], 1u << (x & 31u));
                 }
@@ -2347,15 +2407,15 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
         if (cfg->record_bytes == 2)                                          \
             k_fill_atomic<2, false><<<(GRID), fthreads, 0, (STREAM)>>>(      \
                 (PLAT), D.slice, fb->n, xmax, cfg->logI, log_region,         \
-                (CUR), (OUT), cap, (OVF), NULL, NULL);                       \
+                (CUR), (OUT), cap, (OVF), NULL, NULL, 0, 0u);                       \
         else if (cfg->record_bytes == 4)                                     \
             k_fill_atomic<4, false><<<(GRID), fthreads, 0, (STREAM)>>>(      \
                 (PLAT), D.slice, fb->n, xmax, cfg->logI, log_region,         \
-                (CUR), (OUT), cap, (OVF), NULL, NULL);                       \
+                (CUR), (OUT), cap, (OVF), NULL, NULL, 0, 0u);                       \
         else                                                                 \
             k_fill_atomic<8, false><<<(GRID), fthreads, 0, (STREAM)>>>(      \
                 (PLAT), D.slice, fb->n, xmax, cfg->logI, log_region,         \
-                (CUR), (OUT), cap, (OVF), NULL, NULL);                       \
+                (CUR), (OUT), cap, (OVF), NULL, NULL, 0, 0u);                       \
     } while (0)
 
         cudaEventRecord(e2);
@@ -2722,7 +2782,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                         D.dbg, dbgreg, D.sp, D.srt, D.sg, D.slp,             \
                         D.smag,                                               \
                         nsmall, nblk, nwrp, probe_x, D.probe,                  \
-                        D.survbits, cfg->not_both_even, 0u);                   \
+                        D.survbits, cfg->not_both_even, 0, 0u);                   \
                 }                                                              \
                 cudaEventRecord(e4);                                           \
                 CK(cudaEventSynchronize(e4));                                  \

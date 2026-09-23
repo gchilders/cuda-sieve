@@ -619,6 +619,16 @@ typedef struct {
     const char *cadofb;     /* fbgen/CADO text factor base (has powers)        */
     const char *survbits;   /* write a 1-bit-per-position survivor bitmap here  */
     int      not_both_even; /* apply las's not_both_even filter (see k_apply)   */
+    /* Stop spending sieve work on positions gcd(i,j) != 1 already rules out
+     * (k_intersect_compact drops them whatever else happens). 0 = off,
+     * 1 = both-even positions get no fill record, no norm and no small-prime
+     * hits, 2 (the default) = also no fill record where 3 | i and 3 | j.
+     * Output-identical by construction as long as no bucket overflows -- a
+     * slab that overflows (and is skipped) at level 0 can fit at level 2,
+     * since level 2 writes a third fewer records. Pipeline only; passed to
+     * k_apply as its own argument, which ORs it into not_both_even.
+     * RESULTS finding 100. */
+    int      sieve_skip;
     const char *other_bits; /* the OTHER side's bitmap; enables device intersect */
     const char *emit;       /* write the compacted survivor list here           */
     int      td;            /* run exact norms + trial division on survivors    */

@@ -3986,7 +3986,7 @@ The remaining comparison constants and scope limits are:
 
 Also unmeasured: target-equivalent persistent YAFU-derived GPU cofactor
 throughput, coverage, power and recurring host demand; weak-host and multi-GPU
-scaling; `bkthresh` sweep; I16e slabbing; throughput mode; production scales
+scaling; `bkthresh` sweep (**measured 2026-09-23, finding 100: the default is right, and below `I` it silently loses relations**); I16e slabbing; throughput mode; production scales
 2/4/8 (finding 23); and the per-q host-side small-FB transform and sort
 (`bench_kernels.cu`), which runs outside every timed number.
 
@@ -9723,3 +9723,220 @@ never the problem. A 9% error in one relation target was.**
   the difference, the compromised arm is the suspect.
 - **The 1.94x model is not refuted as a model** of the ideal universe — it is
   refuted only as an estimate of required relations.
+
+## Finding 100 — a third of every fill went to positions gcd(i,j) had already ruled out. Skipping them is −10 to −13% of wall with relations byte-identical on three jobs, now the default (`--sieve-skip 2`). Apply barely moves, because ~60% of it is the small-prime sieve and that is not paying per hit. And `--bkthresh` below `I` was a silent wrong-answer path; it is now refused
+
+**Date:** 2026-09-23, RTX 5070, on `0075743` (Greg's cofactor-valve merge).
+Card idle for every timed run; host load ~14.5 throughout from GGNFS clients,
+which finding 96 prices at ~3% and which was the same for every arm.
+
+### What was being wasted
+
+`k_intersect_compact` drops every two-sided survivor with `gcd(i,j) != 1`
+(`bench_kernels.cu`, the `bgcd` test), whatever `--not-both-even` says. Nothing
+before it knew that. Fill wrote a bucket record for every hit, apply computed a
+norm for every cell and line-sieved every small prime into every cell, and only
+the scan at the very end could discard a position. **A quarter of all positions
+are both-even and a further 1/12 have `3 | gcd`**, so for an odd factor-base
+prime a third of its bucket records land somewhere that can never be a
+relation.
+
+GGNFS never paid this. `gnfs-lasieve4e.c:2964` loops `oddness_type` over three
+of the four parity classes and never sieves the both-even one, so **every
+cross-siever margin in this file (item 0's ~3x included) was measured with the
+GPU giving away a quarter of its sieve area.**
+
+### The change: `--sieve-skip {0,1,2}`, default 2, pipeline only
+
+| level | fill | apply: norm init | apply: small-prime sieve | scan |
+|---|---|---|---|---|
+| 0 | every hit | every cell | every hit | `--not-both-even` only |
+| 1 | no record if `i`, `j` both even | skipped for both-even cells | even rows: odd `m` steps `2m` from the first odd `i`; even `m` keeps the row only if its hits are odd | rejects both-even |
+| 2 | also no record if `3 \| i` and `3 \| j` | as 1 | as 1 | as 1 |
+
+The mod-3 filter is fill-only on purpose: fill is L2-bound with the ALU nearly
+idle (finding 76), so two multiply-shift remainders per hit are free, whereas in
+apply's init every third cell would diverge within a warp and save nothing.
+`parity(i) == parity(x)` because `I/2` is even, and a region lies inside one
+row, so the both-even test in init is warp-uniform. Slabbed runs take the row
+parity from `j_base`. `ptxas`: `k_apply` stays at **40 registers, zero spill**
+(finding 75's three-blocks-per-SM premise holds); `k_fill_atomic` 26 -> 28.
+
+### Output identity — byte-identical at every level, on three jobs
+
+| job | geometry | relations | md5 at 0 / 1 / 2 |
+|---|---|---:|---|
+| c183 `input.job` | I15, 1 slab, 200 q from 130M | 9,053 | `a6545ecf` all three |
+| C194 `c194.job` | I16/J32768, **4 slabs**, 40 q from 80000023 | 4,487 | `a2811e49` all three |
+| AS276 (C208) | I17/J32768, **8 slabs**, 30 q from 80M | 6,250 | `20022ca0` at 0 and 2 (1 not run) |
+| c183 `input.job` | I15, `--slab-j 4095`: **5 slabs starting on rows 0, 4095, 8190, 12285, 16380**, 60 q from 130M | 2,693 | `9960b785` all three |
+
+Two-sided primitive survivors are identical too (80,993.8 / 238,100.4 /
+198,916.6 per q) — the skipped positions were never among them. What does change
+is anything counting ONE-sided survivors: level 1 drops the both-even positions
+from them, and level 2 drops further ones, since a cell with `3 | i` and
+`3 | j` gets no bucket logs and so falls below the bound more often. Per-side
+survivor counts therefore differ between ALL three levels, by design.
+
+**Only the last row tests the `j_base` parity.** The C194 and AS276 slabs are
+8192 and 4096 rows tall, so every slab starts on an even row and the `+ j_base`
+term in each skip site never changes an answer there — the first draft of this
+finding claimed those arms tested it, and a review caught that. `--slab-j 4095`
+starts two of its five slabs on odd rows, which is where a wrong row parity
+would drop live records. It is now a `cofcheck.sh` case, at levels 0/1/2, both
+unslabbed and with odd slab starts, so the identity is gated rather than
+asserted. **Its negative control fails as it must:** with the `+ j_base` removed
+from `pos_row`, the odd-slab case reads 37 / 34 / 34 relations at levels 0/1/2
+and FAILS, while the unslabbed case (no offset to lose) still passes.
+
+**"By construction" assumes no bucket overflow.** An overflowing slab is
+skipped (a SOFT failure: `pipe_side_sieve_join` returns 1), and level 2 writes a third
+fewer records, so a slab that overflows at level 0 can complete at level 2 and
+the two outputs then differ legitimately. None of the runs here overflowed.
+
+### Timing
+
+c183, three interleaved rounds (orders 0-1-2, 2-0-1, 1-2-0), arms
+non-overlapping:
+
+| skip | wall ms/q | COMPLETE ms/q | fill | apply |
+|---|---:|---:|---:|---:|
+| 0 | 89.12 / 90.50 / 91.13 -> **90.25** | 95.27 | 25.16 | 29.11 |
+| 1 | 81.14 / 81.15 / 80.76 -> **81.02 (−10.2%)** | 85.99 | 18.55 (−26%) | 27.14 (−6.8%) |
+| 2 | 79.09 / 79.22 / 79.17 -> **79.16 (−12.3%)** | 84.10 (−11.7%) | 16.99 (−32%) | 27.02 (−7.2%) |
+
+The larger jobs, one run per arm (the stage changes are far outside noise):
+
+| | skip 0 wall | skip 2 wall | fill | apply | resieve |
+|---|---:|---:|---:|---:|---:|
+| C194 I16, 4 slabs | 337.94 | **293.70 (−13.1%)** | 95.70 -> 64.46 (−33%) | 119.85 -> 110.71 (−7.6%) | 33.15 -> 33.30 |
+| AS276 I17, 8 slabs | 792.83 | **713.25 (−10.0%)** | 173.71 -> 119.37 (−31%) | 289.48 -> 270.39 (−6.6%) | 62.04 -> 62.13 |
+
+**Fill falls by the fraction of records removed** — 25% at level 1, 33% at
+level 2 — which is what an L2-transaction-bound kernel should do. Nothing
+downstream moves, as expected: resieve, TD and cofactorisation only ever see
+primitive survivors. **Every timing before this finding is at level 0**; compare
+across the boundary with that in mind.
+
+### Why apply barely moves: the small-prime sieve is ~60% of it and is not hit-bound
+
+Pricing arm (drops relations, 1,348 against 9,053 — measurement only),
+c183 at skip 2: `--no-smallsieve` takes apply **27.17 -> 10.22 ms**. The
+fused small-prime sieve is therefore **~17 ms/q, ~62% of apply and ~21% of
+wall** — now the largest single component of the pipeline, ahead of fill
+(17.0).
+
+Level 1 removes a quarter of its hits (half of every even row, and every affine
+power-of-two hit in an even row), yet apply fell only ~2 ms, part of which is
+the norm cells. So its cost is **per (entry, region), not per hit**: the entry
+loads and the `ss_first` start computation for ~7K entries x 32K regions per
+side. That is the next thing to profile (`ncu`, source-level), and it outranks
+a lazy-norm scheme — norm init lost a quarter of its work here and is now a few
+ms at most. The whole-block tier (p < 64, one entry at a time, every thread
+recomputing the same start) is the first suspect; prototype.md's "concurrent
+entries in the block tier" lever has never been built.
+
+### `--bkthresh`: the sweep, and a wrong-answer path it found
+
+c183 at skip 2, one run each (this is the "`bkthresh` sweep" long listed as
+unmeasured under "What is not yet measured"):
+
+| `--bkthresh` | wall | fill | apply | relations |
+|---:|---:|---:|---:|---:|
+| 8192 | 86.79 | 22.38 | 25.86 | **5,079** |
+| 16384 | 90.33 | 22.43 | 26.32 | **7,456** |
+| 32768 (default, `= I`) | 79.71 | 17.16 | 27.17 | 9,053 |
+| 65536 | 81.31 | 14.88 | 28.38 | 9,053, identical md5 |
+
+**Below `I` the run silently loses relations and exits 0.** The bucket walk is
+Franke-Kleinjung (`plattice.cuh`), whose reduced basis exists only for
+`p >= I`: then a row holds at most one hit and each step moves to the next row.
+Below `I` a row holds ~`I/p` hits and the walk visits one of them. The default
+`bkthresh = 1 << logI` always satisfies the precondition at any `logI`, so no
+default run was ever affected — but nothing enforced it. **`bench_main.cu` now
+refuses `--bkthresh < 2^logI`.** Above `I` it is correct and no faster (fill
+−2.3 ms, apply +1.2 ms): **the default stands and the sweep is closed.**
+
+### logI 17, re-verified at GGNFS's own rectangle
+
+Asked in passing — does the walk precondition threaten `logI > 16`? Not at
+default settings, per the above. But the last completeness check at `logI 17`
+was finding 69's, on 2026-08-19, before slabbing, on nested sub-rectangles. The
+AS276 arm above sieves `--logI 17 --J 32768`, GGNFS's exact `I16e -J 16` shape
+(finding 65's rule), and its 30 q are exactly work unit `000000`. `relgeom.py
+compare` against that work unit:
+
+| j band | both | ours only | theirs only |
+|---|---:|---:|---:|
+| 0 - 4096 | 961 | 281 | 0 |
+| 4096 - 8192 | 744 | 273 | 0 |
+| 8192 - 12288 | 602 | 224 | 0 |
+| 12288 - 16384 | 538 | 200 | 1 |
+| 16384 - 20480 | 497 | 176 | 0 |
+| 20480 - 24576 | 430 | 188 | 0 |
+| 24576 - 28672 | 418 | 172 | 0 |
+| 28672 - 32768 | 373 | 173 | 0 |
+| **total** | **4,563** | **1,687** | **1** |
+
+**Recall 4,563 / 4,564 = 99.98%**, with the eight bands lining up with the
+eight 4096-row slabs and no loss at any boundary; the one miss matches finding
+69's residual. The ours-only 1.37x is in line with finding 69, which traced its
+equivalent to relations GGNFS re-finds under other special-q (not re-checked
+here). This is the first like-for-like check at the full `A = 32` rectangle,
+and the first completeness check of the slabbed path at `logI 17`. `logI 18-20`
+still have walk-level gates only.
+
+### Not done, and worth doing
+
+- **The bucket array cannot simply be shrunk to match.** An earlier draft
+  proposed scaling `pipe_est_records` by the skip fraction; a review showed it
+  would OVERFLOW every slab. The per-region capacity is uniform
+  (`est/nregion + 256`), a region lies in one row, and in the third of rows
+  where `j` is odd and `3` does not divide it, level 2 removes **no** records —
+  so those regions still need the full level-0 capacity, and a cap scaled to
+  2/3 fails there on every slab. The average falls by a third, the maximum does
+  not. Reclaiming the memory needs a capacity that depends on the row class
+  (three classes: even `j`, `3 | j` odd, neither); the uniform-cap estimate is
+  correct as it stands.
+- **Mod 5** (`5 | i` and `5 | j`) would remove a further ~3% of records at
+  level 2's cost; not measured.
+- The small-prime sieve could skip `3 | gcd` too, but only by restructuring it
+  around the rows where `3 | j`; not worth it before the profile says where its
+  time goes.
+
+### Hardening after an xhigh code review, same day
+
+The review found no relation-losing defect in the kernels. It did find the
+three doc errors corrected above (the `j_base` parity claim, the one-sided
+count claim, the bucket-shrink proposal), and these, all fixed:
+
+- **The both-even predicate existed in four hand-written copies** (fill,
+  apply's init, the small sieve, the scan), and fill added `j_base` even in
+  the unslabbed build. They now share `pos_row<SLABBED>` / `pos_both_even`, so
+  the sites cannot drift apart — fill dropping a record for a cell apply still
+  scans in would lose relations and no gate compares the sites with each
+  other.
+- **The skip level reaches `k_apply` as its own argument**, not packed into
+  bit 1 of `not_both_even`; the kernel ORs the two for the scan, and the
+  even-row test is computed once per block rather than per cell.
+- **`p >= I` is enforced where the factor base is consumed**
+  (`run_pipeline_impl`), not only where `--bkthresh` is parsed, along with
+  line-sieved moduli `< 2^30` so the small sieve's even-row step `2m` cannot
+  wrap.
+- **`--bkthresh` is parsed strictly and capped at 2^30** (`-1` used to become
+  0xFFFFFFFF); **`--sieve-skip` is parsed strictly** (`two` used to become 0,
+  i.e. silently off) **and refused outside `--pipeline`**, where it would have
+  been ignored.
+
+### Commands
+
+    ./bench --pipeline --cofactor --poly ../oracle/input.job --fb1 ../oracle/c183.fb1 \
+            --logI 15 --qrange 130000000: --nq 200 --sieve-skip N [--relations F]
+    ./bench --pipeline --cofactor --poly ../oracle/input.job --fb1 ../oracle/c183.fb1 \
+            --logI 15 --slab-j 4095 --qrange 130000000: --nq 60 --sieve-skip N --relations F
+    ./bench --pipeline --cofactor --poly ../oracle/c194.job --fb1 ../oracle/c194.roots1.m16 \
+            --logI 16 --J 32768 --qrange 80000023: --nq 40 --sieve-skip N --relations F
+    ./bench --pipeline --cofactor --poly ../oracle/AS276.job --logI 17 --J 32768 \
+            --maxbits 17 --qrange 80000000:80001000 --sieve-skip N --relations F
+    zstd -dc ~/code/ggnfs-distributed/AS276/rels/wu-38370f06-000000.dat.zst > theirs
+    ./relgeom.py --band 80000000:80001000 --skew 51059252.11 compare F theirs 32768 17

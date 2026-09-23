@@ -199,6 +199,27 @@ static void pside_free(pside_t *S)
     memset(S, 0, sizeof(*S));
 }
 
+/* The walk and line-sieve preconditions, checked where the factor bases are
+ * CONSUMED rather than only where --bkthresh is parsed, so a caller that
+ * builds its own split cannot bypass them (finding 100):
+ *   - every BUCKETED modulus must be >= I: the Franke-Kleinjung walk
+ *     (plattice.cuh) visits one hit per row, and below I a row holds several,
+ *     so the rest are lost silently;
+ *   - every LINE-SIEVED modulus must be < 2^30, so sieve_small's even-row
+ *     step 2m under --sieve-skip cannot wrap a uint32. */
+static int pipe_fb_bounds_ok(const fb_t *fb, uint32_t lo, uint32_t hi,
+                             const char *what)
+{
+    if (!fb) return 1;
+    for (uint32_t i = 0; i < fb->n; i++)
+        if (fb->primes[i] < lo || fb->primes[i] >= hi) {
+            fprintf(stderr, "run_pipeline: %s modulus %u is outside [%u, %u)\n",
+                    what, fb->primes[i], lo, hi);
+            return 0;
+        }
+    return 1;
+}
+
 /* Records the fill will produce, for sizing the bucket array. */
 static uint64_t pipe_est_records(const fb_t *fb, uint32_t xmax)
 {
@@ -744,7 +765,8 @@ static int pipe_side_sieve_issue(const fb_t *fb, const bench_cfg_t *cfg,
     SLAB_CK(cudaMemsetAsync(bk->overflow, 0, 4, st));
     k_fill_atomic<4, SLABBED><<<fblocks, fthreads, 0, st>>>(
         S->plat, S->slice, fb->n, xmax, cfg->logI, log_region,
-        bk->cursor, bk->bucket, bk->cap, bk->overflow, S->walk_cur, S->walk_next);
+        bk->cursor, bk->bucket, bk->cap, bk->overflow, S->walk_cur, S->walk_next,
+        cfg->sieve_skip, j_base);
     SLAB_CK(cudaEventRecord(S->ev[2], st));
     SLAB_CK(cudaMemsetAsync(S->d_nsurv, 0, 4, st));
     /* Provably redundant on every production geometry: k_apply's warp-ballot
@@ -767,7 +789,8 @@ static int pipe_side_sieve_issue(const fb_t *fb, const bench_cfg_t *cfg,
         S->tconst, NULL, S->d_nsurv, NULL, 0xFFFFFFFFu,
         S->sp, S->srt, S->sg, S->slp, S->smag,
         S->nsmall, S->nblk, S->nwrp,
-        0xFFFFFFFFu, NULL, S->survbits, cfg->not_both_even, j_base);
+        0xFFFFFFFFu, NULL, S->survbits, cfg->not_both_even, cfg->sieve_skip,
+        j_base);
     SLAB_CK(cudaEventRecord(S->ev[3], st));
     rc = 0;
 done:
@@ -1736,6 +1759,11 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                             "run_pipeline side 1 survivor parameters") ||
         sieve_bound_checked(cfg->scale0, cfg->allowance0, 4096u, &bound0,
                             "run_pipeline side 0 survivor parameters"))
+        return -1;
+    if (!pipe_fb_bounds_ok(fb1, I, UINT32_MAX, "side 1 bucketed") ||
+        !pipe_fb_bounds_ok(fb0, I, UINT32_MAX, "side 0 bucketed") ||
+        !pipe_fb_bounds_ok(fbs1, 1u, 1u << 30, "side 1 line-sieved") ||
+        !pipe_fb_bounds_ok(fbs0, 1u, 1u << 30, "side 0 line-sieved"))
         return -1;
 
     memset(&S1, 0, sizeof S1); memset(&S0, 0, sizeof S0);
