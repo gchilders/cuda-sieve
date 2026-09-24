@@ -9940,3 +9940,209 @@ count claim, the bucket-shrink proposal), and these, all fixed:
             --maxbits 17 --qrange 80000000:80001000 --sieve-skip N --relations F
     zstd -dc ~/code/ggnfs-distributed/AS276/rels/wu-38370f06-000000.dat.zst > theirs
     ./relgeom.py --band 80000000:80001000 --skew 51059252.11 compare F theirs 32768 17
+
+## Finding 101 — the small-prime sieve's whole-block tier recomputed identical per-entry setup in every warp. Sharing it by warp shuffle cuts apply 19-24% and wall 7-9%, relations byte-identical on three jobs
+
+**Date:** 2026-09-23, RTX 5070, card idle, host load ~4 (lower than finding
+100's ~14.5, so compare within this finding only). Base: the finding-100
+commit. STATUS item 8.
+
+### The profile
+
+`ncu --set full --import-source yes` on two `k_apply` launches (q 3, both
+sides) of the finding-100 c183 band, then `--page source --print-source
+cuda,sass` aggregated by source line. Apply is compute-bound — SM throughput
+86%, occupancy 99.6%, 40 registers — so the question is which instructions.
+
+On the algebraic side the largest line was the whole-block tier's
+`SS_ROW(e, tid, nth)`: **22.5% of warp-stall samples and 30.3% of executed
+instructions**, plus 3.7% on its loop. The per-instruction execution counts say
+what it was doing. Instructions executed exactly **95 times per warp** — once
+per block-tier entry (p < 64: 95 entries here, prime powers and multiple roots
+included) for each of a block's 16 warps — are the per-entry SETUP: five table
+loads, the `g` test, `ss_first`, the even-row adjustment. Grouped by execution
+count they are **~19% of the kernel's samples**, before counting their share of
+`ss_first`'s own lines. The hits were of the same order, not smaller: the hit
+code is unchanged by this finding, and after it the hit loop plus its atomics
+are ~21% of a kernel 28% shorter, i.e. ~15% of the original. The rational side
+(27 block-tier entries) shows the same setup pattern at ~10%.
+
+The tier boundary is on the effective modulus `m = q/g`, not on the prime:
+"p < 64" in the kernel's header comment is loose, and the 95 entries include
+row-divisor and projective entries with a large `q` and a small `m`.
+
+The setup is identical for every thread in the block — `j` and `ilo` are
+per-region — so every warp was recomputing all 95 of them. prototype.md's
+"concurrent entries in the block tier" lever had the right tier; the profile
+shows the largest cost there was replicated setup. It did NOT measure idle
+threads or load balance, which finding 102 takes up.
+
+### The change
+
+Lane `k` of each warp computes entry `base + k`'s setup once and packs it into
+one register — `c0` (< 2m <= 128), step `mm` (<= 2m) and the 16-bit log, with
+`mm == 0` meaning "no hits in this row" — and the warp walks those 32 entries
+with one `__shfl_sync` each. A warp now pays `ceil(nblk/32)` setups (3) instead
+of `nblk` (95). No shared memory is added (apply has ~0.3 KB of headroom before
+losing its third block per SM, finding 75), `k_apply` stays at **40 registers,
+zero spill**, and a `static_assert` pins `SS_BLOCK_CUT <= 128` so the packing
+cannot silently overflow. (A fallback for blocks that are not whole warps was
+added here and then removed in finding 102: every launch path already requires
+whole warps, and the warp tier cannot run without them anyway.) The cell sums
+are integer adds, so reordering them is output-identical by construction.
+
+### Result
+
+`ncu`, same launches: algebraic `k_apply` **18.25 -> 13.14 ms (−28%)**, warp
+instructions 8.03e9 -> 6.15e9; rational 10.29 -> 9.20 ms (−11%).
+
+c183, three interleaved rounds (base-new, new-base, base-new), arms
+non-overlapping, relation md5 `a6545ecf` both:
+
+| | wall ms/q | COMPLETE ms/q | fill | apply |
+|---|---:|---:|---:|---:|
+| base | 77.19 / 76.04 / 76.85 -> **76.69** | 81.66 | 16.72 | 26.21 |
+| new | 69.61 / 69.58 / 69.49 -> **69.56 (−9.3%)** | 74.48 (−8.8%) | 16.61 | **19.90 (−24.1%)** |
+
+The larger jobs, one pair each:
+
+| | wall | apply | md5 |
+|---|---:|---:|---|
+| C194 I16, 4 slabs | 287.79 -> **265.47 (−7.8%)** | 108.44 -> 87.58 (−19.2%) | `a2811e49` both |
+| AS276 I17, 8 slabs | 695.55 -> **646.93 (−7.0%)** | 264.15 -> 214.60 (−18.8%) | `20022ca0` both |
+
+`cofcheck.sh` passes, including finding 100's odd-slab-start identity gate;
+every cofcheck case runs the small sieve, so the block tier is covered by exact
+relation counts as well as by the md5s above.
+
+**With finding 100, c183 is ~20% faster today.** Compounding the two
+same-load deltas gives 0.877 x 0.907 = 0.796, **−20.4%**. The raw 90.25 ->
+69.56 (−23%) is not a fair figure: finding 100 ran at host load ~14.5 and this
+one at ~4, and the same finding-100 binary measured 79.16 then and 76.69 now,
+so ~3 points of that raw drop are host load (finding 96's size).
+
+### What leads now
+
+Re-profiled after the change — **algebraic-side `k_apply` only**, share of
+its samples; the rational side has 27 block-tier entries against 95, so its
+shares differ: the block tier's HIT loop 11.2% plus shared-memory atomics ~10%;
+the norm ~15% (`log2f` 5.4, the two Horner chains 5.1 + 3.2, cancellation
+guard); the warp tier 7.0%; the bucket-record load (`lut[...]`, latency) 6.0%;
+the thread tier 4.5%.
+
+**The block tier is now per-hit, but the warp tier is not established to be.**
+It still ran one full setup per entry, as a whole-warp sequence, for 0.5-8
+hits per lane; finding 102 applies the same lane-parallel setup there.
+
+**A pattern sieve is NOT the easy follow-up it looks like.** Cells are 16 bits,
+so a 32-bit word holds two, and a single modulus m >= 2 adds at most one hit
+per word: composing ONE entry word-wide writes as many words as it has hits,
+and saves nothing. The only version that can win is a thread owning its words
+and summing ALL the tiny moduli into each word in registers, replacing their
+per-hit atomics with one plain read-modify-write per word — at the price of
+per-(entry, word) residue arithmetic. Pricing it by dropping those moduli
+would measure only the removal ceiling, not the replacement's cost, and
+overstate the lever.
+
+### Method notes
+
+- Aggregation: `ncu --import R --page source --csv --print-source cuda,sass
+  --launch-skip K --launch-count 1`, then sum column 4 (`Warp Stall Sampling
+  (All Samples)`) and column 7 (`Instructions Executed`) over each CUDA source
+  row; the SASS rows beneath each CUDA row carry per-instruction execution
+  counts, which is what identified the 95-per-warp setup.
+- `--print-source cuda` alone exports source text with NO metrics; use
+  `cuda,sass`.
+- `pkill -f PATTERN` from a shell whose own command line contains PATTERN
+  kills that shell (exit 144) — the same trap as finding 97's `pgrep`. Kill by
+  PID.
+
+## Finding 102 — the warp tier had the same replicated setup: sharing it too is apply −4 to −5%, wall −2 to −3%, relations byte-identical. Rotating the block tier's start thread to fix its load imbalance is SLOWER. And a review of finding 101 hardened the tier split
+
+**Date:** 2026-09-23, RTX 5070, card idle, host load 8-10 (a CPU ECM job).
+Base: finding 101's binary. Everything below compares within this finding.
+
+### Two leads from an xhigh review of finding 101
+
+1. **The warp tier** (`64 <= m < 1024`, one warp per entry) ran each entry's
+   whole setup as a warp-wide sequence for 0.5-8 hits per lane — the same
+   shape finding 101 removed from the block tier, one tier down. It is not
+   replicated across warps, but it costs one full setup per ENTRY where a
+   lane-parallel pass costs one per 32 entries.
+2. **The block tier's load balance.** `c = c0 + tid*mm` always hands an entry's
+   leftover hits to the lowest `tid`s, so warp 0 runs the most iterations of
+   every entry — the review simulated 1.21x warp 15's in odd rows and 1.44x in
+   even rows — and the block waits at `__syncthreads` for the slowest warp.
+   Finding 101's profile never measured this.
+
+### The A/B
+
+Both were built behind a temporary `SS_MODE` switch (one build, four arms,
+removed before commit) so the arms shared a binary. c183, three rotated rounds,
+all fifteen runs md5 `a6545ecf`:
+
+| arm | apply ms/q | wall ms/q |
+|---|---:|---:|
+| finding 101's binary | 20.11 | 71.12 |
+| mode 0: refactor only | 20.36 | 71.04 |
+| **mode 1: warp-tier shuffle** | **18.94 (−7.0% vs mode 0)** | **69.78** |
+| mode 2: block-tier rotation | 21.10 (**+3.6%**) | 71.96 |
+| mode 3: both | 19.42 | 70.16 |
+
+**The warp-tier shuffle wins in every round and the rotation loses in every
+round**, with or without the shuffle. The imbalance is real but evening it out
+costs more than the tail it removes: it adds per-entry arithmetic to every
+warp, and it changes which warps' atomics coincide. Rotation is dropped and
+the reason is recorded at the code, so it is not re-tried. Mode 0's small cost
+against finding 101 was the switch's own per-entry branch; the final build
+below does not show it.
+
+### The change as shipped, against finding 101's binary
+
+Warp `w` still owns entries `nblk + w + i*nwarps`. Lane `k` sets up the warp's
+`k`-th next entry, packing `c0 | mm << 16` (both `< 2m < 2^16`, pinned by a
+`static_assert` on `SS_WARP_CUT`) with the log in a second register; the warp
+walks them with two shuffles per entry. `k_apply` stays at **<= 40 registers,
+zero spill** on every architecture in the default build.
+
+| | wall ms/q | apply ms/q | md5 |
+|---|---:|---:|---|
+| c183, 3 interleaved rounds | 70.08 -> **68.90 (−1.7%)** | 19.88 -> 18.84 (−5.2%) | `a6545ecf` |
+| C194 I16, 4 slabs | 262.22 -> **257.53 (−1.8%)** | 85.82 -> 81.70 (−4.8%) | `a2811e49` |
+| AS276 I17, 8 slabs | 658.88 -> **639.60 (−2.9%)** | 216.51 -> 208.38 (−3.8%) | `20022ca0` |
+
+`make check` passes (108), including finding 100's odd-slab identity gate.
+
+### The review's other findings, all fixed
+
+- **The block tier's 8-bit packing depended on an invariant nothing
+  checked**: that every entry below `nblk` has `m < SS_BLOCK_CUT`. It held
+  because two hand-written host loops (pipeline and `run_bench`) stopped at the
+  first entry past the cut; a change to either would have let an `m >= 128`
+  entry overflow its field and be silently mis-sieved. Both now call one
+  `ss_tiers()`.
+- **The per-entry setup existed in two copies** (the `SS_ROW` macro and finding
+  101's block tier), and finding 100 names a follow-up that edits exactly that
+  logic. All three tiers now call one `ss_setup()`.
+- **The whole-warp fallback finding 101 added was dead** — every launch path
+  requires whole warps, and the warp tier cannot run without them — so it is
+  gone, replaced by a comment stating the requirement.
+- **Doc corrections, made in finding 101's text:** the replicated setup (~19%)
+  was the same order as the hits (~15% of the original kernel), not "much
+  smaller" as the first draft said of them; the tier cut is on the modulus `m = q/g`, not the prime; the
+  after-change shares are the ALGEBRAIC side's `k_apply` only; the day's
+  cumulative gain is **−20.4% at matched host load**, not the raw −23%; and the
+  pattern sieve's premise does not hold at 16-bit cells (two per word, so one
+  modulus composed word-wide saves nothing — only summing all tiny moduli per
+  word in registers can win).
+
+### Where apply stands
+
+c183 apply is now **18.8 ms/q of 68.9** (27%), down from 29.1 of 90.3 at
+level 0 this morning. Across findings 100-102, at matched load where
+measurable: finding 100 −12.3%, finding 101 −9.3%, this one −1.7%, compounding
+to **~−21.8%** on c183 wall (0.877 x 0.907 x 0.983). The next candidates are STATUS item 10 (a norm
+that evaluates `log2` only where a sound bound says a cell can pass; the norm
+is ~15% of the algebraic `k_apply`) and item 8b (block-tier hits and their
+atomics, ~21%), in that order: item 10 keeps output identical by
+construction and needs no new data layout.

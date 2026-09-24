@@ -259,10 +259,15 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
  * between regions, so every block is independent.
  *
  * Three tiers, sized so each entry's hit count matches the number of threads
- * assigned to it:
- *   p <   64  (52 entries, 84% of updates): the whole block, one entry at a time
- *   p < 1024  (165 entries):                one warp per entry
- *   p >= 1024 (1752 entries, <=16 hits):    one thread per entry
+ * assigned to it. The cut is on the entry's effective MODULUS m = q/g, not on
+ * the prime: row-divisor and projective entries have a large q and a small m.
+ * (Entry counts below are from an early job; c183's algebraic side has 95
+ * block-tier entries.)
+ *   m <   64  (52 entries, 84% of updates): the whole block
+ *   m < 1024  (165 entries):                one warp per entry
+ *   m >= 1024 (1752 entries, <=16 hits):    one thread per entry
+ * The two lower tiers share each entry's setup across a warp by shuffle
+ * (RESULTS findings 101-102); see sieve_small.
  */
 #define SS_BLOCK_CUT   64u
 #define SS_WARP_CUT  1024u
@@ -336,6 +341,48 @@ __device__ __forceinline__ uint32_t ss_first(uint32_t p, uint32_t rt,
  * next to the td_magic_build they call -- shared by both builds rather than
  * forked, and reachable from pipeline.cuh without depending on include order. */
 
+/* One entry's per-row setup, shared by all three tiers of sieve_small: returns
+ * the first hit c0 (< 2m) and sets *mm_out to the step, or to 0 when the entry
+ * has no hits in this row -- g does not divide j, or under --sieve-skip an even
+ * modulus whose hits in an even row all fall on even i. */
+__device__ __forceinline__ uint32_t ss_setup(uint32_t e,
+                                             const uint32_t *__restrict sp,
+                                             const uint32_t *__restrict srt,
+                                             const uint32_t *__restrict sg,
+                                             const uint32_t *__restrict smag,
+                                             uint32_t j, int32_t ilo,
+                                             uint32_t kshift, int evenrow,
+                                             uint32_t *mm_out)
+{
+    const uint32_t m = sp[e], g = sg[e];
+    *mm_out = 0;
+    if (g > 1 && (j % g)) return 0;
+    uint32_t c0 = ss_first(m, srt[e], g > 1 ? j / g : j, ilo,
+                           smag ? smag[e] : 0u, kshift);
+    uint32_t mm = m;
+    if (evenrow) {
+        if (m & 1u) { if (!(c0 & 1u)) c0 += m; mm = 2u * m; }
+        else if (!(c0 & 1u)) return 0;
+    }
+    *mm_out = mm;
+    return c0;
+}
+
+/* The tier split, for BOTH callers (the pipeline and run_bench). hsp must be
+ * sorted by modulus; the counts are the leading runs below each cut, which is
+ * what sieve_small's packing relies on: every e < nblk has m < SS_BLOCK_CUT
+ * and every e < nwrp has m < SS_WARP_CUT. One copy, so the two callers cannot
+ * drift apart and hand the block tier a modulus its 8-bit fields cannot hold. */
+static inline void ss_tiers(const uint32_t *hsp, uint32_t n,
+                            uint32_t *nblk, uint32_t *nwrp)
+{
+    uint32_t b = 0, w = 0;
+    while (b < n && hsp[b] < SS_BLOCK_CUT) b++;
+    w = b;
+    while (w < n && hsp[w] < SS_WARP_CUT) w++;
+    *nblk = b; *nwrp = w;
+}
+
 template <int CELLBITS, int ATOMIC, bool SLABBED = false>
 __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_region,
                             const uint32_t *__restrict sp,
@@ -367,33 +414,101 @@ __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_regi
      * modulus, at 2^30. */
     const int evenrow = skipeven && !(j & 1u);
 
+    /* Callers launch whole warps -- bench_main refuses an --apply-threads that
+     * is not a multiple of 32 -- and every tier below depends on it: the two
+     * shuffle tiers need full warps, and the warp tier's stride nth >> 5 would
+     * be 0 otherwise. */
+
     /* Every entry is (m, rt, g): hits this row only when g | j, and then at
      * i == rt*(j/g) (mod m). g == 1 is the ordinary case; m == 1 means every
-     * position in the row. See pl_transform_gen. */
+     * position in the row. See pl_transform_gen. ss_setup is that per-row
+     * setup, shared by all three tiers so they cannot sieve different position
+     * sets. */
+    #define SS_SETUP(e, MM) ss_setup((e), sp, srt, sg, smag, j, ilo, kshift, evenrow, &(MM))
     #define SS_ROW(e, first, step)                                            \
         do {                                                                  \
-            const uint32_t m = sp[e], g = sg[e], lp = slp[e];                 \
-            if (g > 1 && (j % g)) break;                                      \
-            {                                                                 \
-                uint32_t c0 = ss_first(m, srt[e], g > 1 ? j / g : j, ilo,     \
-                                       smag ? smag[e] : 0u, kshift);           \
-                uint32_t mm = m;                                              \
-                if (evenrow) {                                                \
-                    if (m & 1u) { if (!(c0 & 1u)) c0 += m; mm = 2u * m; }     \
-                    else if (!(c0 & 1u)) break;                               \
-                }                                                             \
-                for (uint32_t c = c0 + (first) * mm; c < width; c += (step) * mm)\
-                    ss_add<CELLBITS,ATOMIC>(S, c, lp);                        \
-            }                                                                 \
+            uint32_t mm;                                                      \
+            const uint32_t c0 = SS_SETUP(e, mm);                              \
+            if (!mm) break;                                                   \
+            const uint32_t lp = slp[e];                                       \
+            for (uint32_t c = c0 + (first) * mm; c < width; c += (step) * mm) \
+                ss_add<CELLBITS,ATOMIC>(S, c, lp);                            \
         } while (0)
 
-    for (uint32_t e = 0; e < nblk; e++)                     /* whole block   */
-        SS_ROW(e, tid, nth);
-    for (uint32_t e = nblk + warp; e < nwrp; e += nwarps)   /* one warp      */
-        SS_ROW(e, lane, 32u);
-    for (uint32_t e = nwrp + tid; e < nsmall; e += nth)     /* one thread    */
+    /* WHOLE-BLOCK TIER (m < SS_BLOCK_CUT), setup shared by shuffle. An entry's
+     * setup is the same for every thread in the block, and the per-warp form
+     * computed it in all nth/32 warps for every entry: ncu on the c183
+     * algebraic side (95 entries) put that replicated setup at ~19% of
+     * k_apply's samples, against ~15% for the hits (finding 101). Lane k of
+     * each warp now sets up entry base+k and the warp walks those 32 entries
+     * with ONE __shfl_sync each: ceil(nblk/32) setups per warp, not nblk.
+     *
+     * One register carries it all: m < SS_BLOCK_CUT <= 128 bounds c0 (< 2m
+     * after the even-row shift) and the step mm (<= 2m) to 8 bits each, and the
+     * log is 16. mm == 0 means "no hits in this row". The host guarantees
+     * m < SS_BLOCK_CUT for every e < nblk (ss_tiers); the static_assert keeps
+     * the constant inside the packing. Cell sums are integer adds, so the
+     * reordering is output-identical.
+     *
+     * Leftover hits always land on the lowest tids, so warp 0 runs the most
+     * iterations of each entry. Rotating the start thread per entry evens that
+     * out and was measured SLOWER (apply +3.6%, finding 102): leave it. */
+    static_assert(SS_BLOCK_CUT <= 128u, "block-tier fields are packed in 8 bits");
+    for (uint32_t base = 0; base < nblk; base += 32u) {
+        const uint32_t e = base + lane;
+        uint32_t pk = 0;
+        if (e < nblk) {
+            uint32_t mm;
+            const uint32_t c0 = SS_SETUP(e, mm);
+            if (mm) pk = c0 | (mm << 8) | ((uint32_t)slp[e] << 16);
+        }
+        const uint32_t ne = (nblk - base < 32u) ? nblk - base : 32u;
+        for (uint32_t k = 0; k < ne; k++) {
+            const uint32_t q  = __shfl_sync(0xFFFFFFFFu, pk, k);
+            const uint32_t mm = (q >> 8) & 0xFFu;
+            if (!mm) continue;
+            const uint32_t lp = q >> 16;
+            for (uint32_t c = (q & 0xFFu) + tid * mm; c < width; c += nth * mm)
+                ss_add<CELLBITS,ATOMIC>(S, c, lp);
+        }
+    }
+
+    /* WARP TIER (SS_BLOCK_CUT <= m < SS_WARP_CUT), setup shared by shuffle
+     * too. Warp w still owns entries nblk + w + i*nwarps, but instead of
+     * running each entry's setup as a whole-warp sequence for its 0.5-8 hits
+     * per lane, lane k sets up the warp's k-th next entry and the warp walks
+     * them: apply −7.0% on c183 (finding 102). c0 and mm are < 2m < 2^16. */
+    {
+        static_assert(SS_WARP_CUT <= 32768u, "warp-tier c0/mm are packed in 16 bits");
+        for (uint32_t base = 0; ; base += 32u) {
+            const uint32_t e0 = nblk + warp + base * nwarps;
+            if (e0 >= nwrp) break;
+            const uint32_t e = e0 + lane * nwarps;
+            uint32_t pk = 0, lp = 0;
+            if (e < nwrp) {
+                uint32_t mm;
+                const uint32_t c0 = SS_SETUP(e, mm);
+                if (mm) { pk = c0 | (mm << 16); lp = slp[e]; }
+            }
+            const uint32_t left = (nwrp - e0 + nwarps - 1) / nwarps;
+            const uint32_t ne = left < 32u ? left : 32u;
+            for (uint32_t k = 0; k < ne; k++) {
+                const uint32_t q  = __shfl_sync(0xFFFFFFFFu, pk, k);
+                const uint32_t kl = __shfl_sync(0xFFFFFFFFu, lp, k);
+                const uint32_t mm = q >> 16;
+                if (!mm) continue;
+                for (uint32_t c = (q & 0xFFFFu) + lane * mm; c < width; c += 32u * mm)
+                    ss_add<CELLBITS,ATOMIC>(S, c, kl);
+            }
+        }
+    }
+
+    /* THREAD TIER (m >= SS_WARP_CUT): one thread per entry, so the setup is
+     * already lane-parallel. */
+    for (uint32_t e = nwrp + tid; e < nsmall; e += nth)
         SS_ROW(e, 0u, 1u);
     #undef SS_ROW
+    #undef SS_SETUP
 }
 
 /* ---- stage (A): apply -- accumulate logs into a shared-memory region ---- */
@@ -2288,8 +2403,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                            hsg[i] > 1 ? cfg->J / hsg[i] : cfg->J,
                            cfg->logI, &hsmag[i]);
 
-        for (i = 0; i < nsmall && hsp[i] < SS_BLOCK_CUT; i++) nblk = i + 1;
-        for (i = 0; i < nsmall && hsp[i] < SS_WARP_CUT;  i++) nwrp = i + 1;
+        ss_tiers(hsp, nsmall, &nblk, &nwrp);
         CK(cudaMalloc(&D.smag, (size_t)nsmall * 4));
         CK(cudaMalloc(&D.sp,  (size_t)nsmall * 4));
         CK(cudaMalloc(&D.srt, (size_t)nsmall * 4));

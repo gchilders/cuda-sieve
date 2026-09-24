@@ -831,10 +831,15 @@ already bounded.
 `gcd(i,j)` rules out are no longer sieved: default level 2 drops both-even
 positions everywhere and `3 | i, 3 | j` in fill. Relations are byte-identical;
 wall fell **12.3%** on c183 I15, **13.1%** on C194 I16 and **10.0%** on AS276
-I17. c183 now reads fill 17.0 / apply 27.0 of 79.2 ms/q, and **~17 ms of that
-apply is the fused small-prime sieve — the largest single component, ~21% of
-wall**, whose cost is per (entry, region) rather than per hit. That is the next
-profiling target; the older numbers below are all pre-skip.
+I17. **Then finding 101 (same day)** removed the small-prime sieve's replicated
+per-entry setup: apply −19 to −24%, wall −7 to −9%, again byte-identical, and
+**finding 102** did the same for the warp tier (apply −4 to −5%, wall −2 to
+−3%). c183 now reads **fill 16.6 / apply 18.8 of 68.9 ms/q**; the three findings
+compound to **~−21.8%** at matched host load (raw figures across the day mix
+host loads from ~4 to ~14.5). On the ALGEBRAIC side's `k_apply`, what leads now is the block tier's
+hits and their shared-memory atomics (~21% of its samples) and the norm (~15%);
+the rational side's shares differ. The older numbers below are all from before
+these two findings.
 
 **`k_fill_atomic` is L2-bound, measured 2026-08-25 (finding 76).** ncu on a
 5070: L2 throughput 68.7%, DRAM 24.7%, SM throughput 9.4%, IPC 0.22 of 4.0,
@@ -1288,9 +1293,11 @@ not by size.
 | 5 | Next rental: **concurrent fill primary, concurrent resieve as a second arm**, interleaved, fresh baseline | rented card (3090/L40S/4090) | **ANSWERED ON A 5090, 2026-09-10: -7.62% of wall** — `--fill-concurrent` sieves the two sides on two streams; finding 94. The rental is now pure measurement rather than development, which is the point: card-hours are the scarce resource and this needed none of them. The number came in at **-7.62% of wall** on c183 I15e (three interleaved pairs, -7.77/-6.86/-8.24), inside the pre-registered 5.8-8.3% bracket and above the ~4% ship threshold; rel/J on the 5090 is **withdrawn** — its only power data is `board=`, now shown to be aliased by tens of percent in either direction. Finding 94. **The session was one script, `bench/rental5090.sh`** (removed 2026-09-14; `git show e47f205:bench/rental5090.sh`) (build, factor base, identity gate, three interleaved band pairs, the c147 small-geometry arm, the `--fill-streams` sweep including the N=8 a 12 GB card refuses) — about 35 minutes of card time, smoke-tested end to end on the 5070 2026-09-10 |
 | 6 | Leave `pipeline.cuh:1924`'s `cudaDeviceSynchronize` alone | — | **decided, no action** |
 | 7 | Stop sieving positions `gcd(i,j)` rules out | local GPU | **DONE 2026-09-23, now the default** — `--sieve-skip 2`, finding 100: wall −12.3% (c183), −13.1% (C194), −10.0% (AS276 I17), relations byte-identical on all three, fill −31 to −33%. `--sieve-skip 0` restores the old behaviour |
-| 8 | Profile the fused small-prime sieve | local GPU, `ncu` | **NEXT** — ~17 ms/q, ~62% of apply, ~21% of wall on c183, and barely moved when finding 100 removed a quarter of its hits, so its cost is per (entry, region). First suspect: the whole-block tier handles one p < 64 entry at a time with every thread recomputing the same start |
+| 8 | Profile the fused small-prime sieve | local GPU, `ncu` | **DONE 2026-09-23, finding 101** — the whole-block tier recomputed identical per-entry setup in all 16 warps (~19% of the algebraic `k_apply`'s samples). Shared by warp shuffle: apply −24% / wall −9.3% on c183, −7.8% C194, −7.0% AS276, relations byte-identical |
+| 8a | Share the warp tier's setup; fix the block tier's load balance | local GPU | **DONE 2026-09-23, finding 102** — warp-tier shuffle: apply −5.2% / wall −1.7% c183, −1.8% C194, −2.9% AS276, byte-identical. Rotating the block tier's start thread was SLOWER (apply +3.6%) and is dropped |
+| 8b | Pattern-sieve the tiniest moduli | local GPU | **open, and harder than it looks** — with 16-bit cells a word holds 2, so one modulus composed word-wide saves nothing; only summing ALL tiny moduli per word in registers (dropping their atomics for one plain RMW) can win, and it pays per-(entry, word) residue arithmetic. Dropping those moduli prices only the ceiling (finding 101). Block-tier hits + atomics are ~21% of the ALGEBRAIC `k_apply`'s samples |
 | 9 | Reclaim bucket VRAM freed by the skip | local GPU | **open, and NOT by scaling the estimate** — the per-region cap is uniform and a third of rows (odd `j`, `3` not dividing `j`) lose no records, so a cap scaled to 2/3 would overflow every slab (finding 100, review). Needs a per-row-class capacity; the current sizing is correct |
-| 10 | Lazy / bounded norm evaluation | local GPU | **demoted** — proposed 2026-09-23 at ~3.5-6% of wall; finding 100 already removed a quarter of norm init, leaving a few ms at most. Revisit after item 8 |
+| 10 | Lazy / bounded norm evaluation | local GPU | **open, re-ranked after item 8** — after finding 101 the norm is ~15% of the algebraic `k_apply`'s samples (`log2f` 5.4, the two Horner chains 5.1 + 3.2), the same size as item 8b's target and simpler to keep exact: evaluate `log2` only where a sound per-group lower bound says a cell could pass. Candidate next after finding 102 |
 | 11 | `--bkthresh` below `I` | nothing | **FIXED 2026-09-23** — silently lost relations (5,079 and 7,456 of 9,053 at 8192 / 16384, exit 0) because the Franke-Kleinjung walk needs `p >= I`; now refused at startup and again in `run_pipeline_impl`, and capped at 2^30. Defaults were never affected. Raising it is correct but not faster, so the sweep is closed |
 
 **On (5), why both arms in one session.** Card-hours are the scarce resource

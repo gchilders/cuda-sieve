@@ -530,9 +530,7 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
         for (uint32_t i = 0; i < k; i++)
             ss_magic_build(hsp[i], hsg[i] > 1 ? cfg->J / hsg[i] : cfg->J,
                            cfg->logI, &S->hsmag[i]);
-        S->nblk = S->nwrp = 0;
-        for (uint32_t i = 0; i < k && hsp[i] < SS_BLOCK_CUT; i++) S->nblk = i + 1;
-        for (uint32_t i = 0; i < k && hsp[i] < SS_WARP_CUT; i++) S->nwrp = i + 1;
+        ss_tiers(hsp, k, &S->nblk, &S->nwrp);
         /* ASYNC on purpose. A synchronous cudaMemcpy on the legacy default
          * stream cannot begin until prior stream work drains, so once the
          * transform sync was removed from the end of this function these
