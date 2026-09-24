@@ -279,19 +279,53 @@ if m:
 # and every store is bounds-checked against it -- so the change is
 # functionally neutral, not an approximation.
 
+# ---- host code that sits among the device functions ----------------------
+# ss_tiers (upstream 6997d77) is `static inline` HOST code -- run_bench and
+# pipeline.cuh call it to split the small-prime tiers before any launch -- but
+# it is written between two device helpers, so the span this generator takes as
+# "the device half" swallows it. It compiled as a device function with `thread`
+# pointers and shipped in the metallib as dead code that no kernel calls; the
+# only reason it surfaced is that the address-space assert below refuses to
+# guess. gen_bench_host.py has the mirror-image bug and rescues it instead.
+def drop_fn(text, sig):
+    i = text.index(sig)
+    j = text.index('{', i); d = 0
+    while j < len(text):
+        if text[j] == '{': d += 1
+        elif text[j] == '}':
+            d -= 1
+            if d == 0: break
+        j += 1
+    return text[:i] + text[j + 1:].lstrip('\n')
+
+_ss = 'static inline void ss_tiers('
+assert body.count(_ss) == 1, 'ss_tiers is not in the device body, or is not unique'
+body = drop_fn(body, _ss)
+# The remaining mention is k_apply's comment citing ss_tiers as the host-side
+# guarantee behind its static_assert -- prose, and worth keeping.
+assert 'void ss_tiers(' not in body, 'the ss_tiers definition survives'
+assert 'ss_tiers(' not in body.replace('(ss_tiers)', ''), 'a CALL to ss_tiers survives'
+print('  dropped ss_tiers from the metallib (host code, no kernel calls it)')
+
 # ---- address spaces ------------------------------------------------------
 head_re = re.compile(r'(static inline[^;{()]*?\b(\w+)\s*\()([^{;]*?)(\)\s*\n?\s*\{)', re.S)
 # Address spaces on device-helper parameters are a per-parameter decision, not
 # a blanket one, and getting it wrong would be silent: `S` is the THREADGROUP
 # sieve array, while the small-prime tables passed beside it are device
-# buffers. Only three helpers in this region take pointers at all, so they are
-# spelled out rather than guessed.
+# buffers. Every helper in this region that takes a pointer is spelled out
+# here rather than guessed, and the assert below REFUSES to guess for one that
+# is not -- upstream 6997d77 added ss_setup, which the old default sent to
+# `thread` and which then failed as an MSL overload error 600 lines into a
+# generated file, with nothing pointing back to this table.
 HELPER_SPACES = {
     'ss_add':                  {'S': 'threadgroup'},
+    'ss_setup':                {'sp': 'device', 'srt': 'device', 'sg': 'device',
+                                'smag': 'device', 'mm_out': 'thread'},
     'sieve_small':             {'S': 'threadgroup', 'sp': 'device', 'srt': 'device',
                                 'sg': 'device', 'slp': 'device', 'smag': 'device'},
     'apply_cell_side_effects': {'probe_out': 'device', 'dump': 'device'},
 }
+_unspecified = []
 
 def qual(params, fname):
     res = []
@@ -300,11 +334,18 @@ def qual(params, fname):
         if '*' not in p or re.search(r'\b(thread|constant|device|threadgroup)\b', p):
             res.append(p); continue
         nm = re.sub(r'.*?(\w+)\s*$', r'\1', p.strip().replace('*', ' '))
+        if nm not in spaces:
+            _unspecified.append('%s(%s)' % (fname, nm))
         space = spaces.get(nm, 'thread') + ' '
         st = p.lstrip(); pad = p[:len(p)-len(st)]
         res.append(pad + ('const ' + space + st[6:] if st.startswith('const ') else space + st))
     return ','.join(res)
 body, nq = head_re.subn(lambda m: m.group(1) + qual(m.group(3), m.group(2)) + m.group(4), body)
+assert not _unspecified, (
+    'device helper pointer parameters with no entry in HELPER_SPACES: %s.\n'
+    'Add each one explicitly -- defaulting to `thread` is a guess, and a wrong\n'
+    'guess surfaces as an MSL overload error in the generated file rather than\n'
+    'here.' % ', '.join(sorted(set(_unspecified))))
 
 # nlost is this file's only 64-bit atomic counter. Metal has no 64-bit atomics
 # at all (Phase 0), so it becomes a PAIR of uint32 words and

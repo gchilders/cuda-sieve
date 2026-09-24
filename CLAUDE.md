@@ -1877,6 +1877,65 @@ shared struct, written by nobody here.
 failing three assertions, `cofcheck.sh` 54/0, and the 288-q band at
 `8e79762c` with `c183.fb1` regenerated in-pod to `b4534cb6`.
 
+## Rebase, 2026-09-24: the sieve-skip work, and TWO generators mis-classified
+## the same function in opposite directions
+
+Upstream landed `250677e` (a bkthresh precondition fix plus `--sieve-skip`,
+which stops spending sieve work on positions `gcd(i,j)` already rules out) and
+`6997d77` (a deduplicated apply setup). Between them: new device helpers
+`pos_row<SLABBED>`, `pos_both_even` and `ss_setup`, three changed kernel
+signatures (`k_fill_atomic` +2, `sieve_small` +1, `k_apply` +1), and a new host
+helper `ss_tiers`.
+
+**ALL TWELVE GENERATORS RAN CLEAN, AND THAT WAS THE WARNING.** 266 lines of
+kernel change and not one assert fired. What the asserts cover is anchors, and
+none of the anchors moved; what broke was classification, which nothing was
+checking.
+
+**`ss_tiers` IS HOST CODE WRITTEN BETWEEN TWO DEVICE HELPERS, and the two
+generators disagreed about it in opposite directions:**
+
+- `gen_bench_host.py` strips spans of device code, so it took `ss_tiers` with
+  them -- a link error in two generated files, `bench_host.cpp` and
+  `pipeline_host.inc`, both of which call it. Rescued by name exactly as
+  `build_slices_b` already was, which is the same bug from the same cause and
+  was already solved once in the same file.
+- `gen_bench_kernels.py` treats that region as the device half, so it compiled
+  `ss_tiers` INTO THE METALLIB as a device function with `thread` pointers,
+  dead code no kernel calls. It compiled, so nothing ever complained; it has
+  presumably been shipping for as long as the function has existed.
+
+**The metallib copy surfaced only because the address-space table refused to
+guess.** `HELPER_SPACES` spells out the address space of every pointer
+parameter of every device helper, with a comment claiming "only three helpers
+in this region take pointers at all". Upstream's `ss_setup` made four, the
+default sent its four device buffers to `thread`, and MSL rejected the call --
+600 lines into a generated file, with nothing pointing back at the table. The
+generator now ASSERTS that every pointer-taking helper has an explicit entry
+and names the ones that do not, so the next addition fails here with an
+instruction instead of there with an overload error. That assert is what then
+named `ss_tiers`, which is how the metallib copy was found at all.
+
+**MEASURED, and the measurement is the point.** A 288-q band came back
+`cmp`-identical at **13,485 relations / `8e79762c`**, 564,696 enqueued -- but a
+matching hash proves nothing if the new path never ran, which is this file's
+oldest lesson. So the three levels were run against each other on 24 q:
+
+| `--sieve-skip` | wall/q | fill | relations |
+|---|---|---|---|
+| 2 (default) | **508.96 ms** | **109.99 ms** | 186 |
+| 1 | 544.07 ms | 124.54 ms | 186 |
+| 0 (off) | 624.11 ms | 143.82 ms | 186 |
+
+**-18.5% wall and -23.5% on fill against skip off, with the relation count
+identical at all three levels.** Upstream reported ~12% on CUDA; this port gets
+more of it because fill is the stage UMA already favours (Phase 7: fill is the
+one stage where Metal beats the 1080 Ti). The hash is therefore meaningful:
+the work really changed and the output really did not.
+
+Twelve gates green including `sievecheck`, `cofcheck.sh` 54 PASS / 0 FAIL, zero
+generator drift, idempotent across a second run.
+
 ## Walking the valve guard again, 2026-09-18: four corrections
 
 The guard looked too intricate to trust, so it got re-derived from the
