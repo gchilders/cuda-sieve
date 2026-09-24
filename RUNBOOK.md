@@ -193,6 +193,22 @@ bound implied by the **actual largest direct-tested small prime**. Raising
 forced height that violates either bound is rejected rather than used
 unsafely.
 
+`--bkthresh` has a floor as well: it may not go below `I = 2^logI` (or above
+2^30), and the run refuses to start if it does. The bucket walk needs every bucketed prime
+to be at least `I`; below that it silently skipped hits and lost relations
+(RESULTS finding 100). The default is `I`, and raising it is correct but not
+faster, so leave it alone.
+
+**`--sieve-skip` (default 2) is output-identical and should be left on.** It
+stops sieving positions that `gcd(i,j) != 1` already rules out — both-even
+positions, and in fill also positions where 3 divides both — for 10-13% of wall
+(finding 100). `--sieve-skip 0` restores the old full-rectangle sieve and exists
+for A/B timing and for comparing against run logs from before 2026-09-23. One
+caveat for such comparisons: a slab that overflows its buckets is skipped, and
+level 2 writes a third fewer records, so if a level-0 run reports skipped
+slabs the two outputs can differ legitimately. Per-side survivor counts also
+differ between levels by design; only the relations are identical.
+
 The remaining representation limits are:
 
 - `lpbr` or `lpba` above 64;

@@ -250,7 +250,7 @@ static void usage(void)
 "                   Looser than the derived default on every job measured\n"
 "  --scale S / --scale0 S   las byte scale per side\n"
 "  --fbbound N      truncate FB at this p      [alim]  (GGNFS truncates at q)\n"
-"  --bkthresh N     bucket-sieve p >= this     [1<<logI]\n"
+"  --bkthresh N     bucket-sieve p >= this     [1<<logI], within [1<<logI, 2^30]\n"
 "  --region N       log2 bucket region size    [14]  (16384 16-bit cells, 32 KB)\n"
 "  --maxbits N      prime powers below 2^N      [logI]; used by generated FBs,\n"
 "                   and should match the maxbits recorded by a cached --fb1 file\n"
@@ -333,6 +333,9 @@ static void usage(void)
 "  --verify         run the CPU cross-check (slow)\n"
 "  --no-smallsieve  skip the p < bkthresh line sieve\n"
 "  --not-both-even  apply las's filter: i,j both even can never survive\n"
+"  --sieve-skip N   pipeline: skip sieve work gcd(i,j) rules out [2]\n"
+"                   0 = off, 1 = both-even positions, 2 = also 3|i and 3|j\n"
+"                   (fill only); relations are identical at every level\n"
 "  --survbits FILE  write a survivor bitmap (1 bit/position, x order)\n"
 "  --other-bits F   the other side's bitmap -> device intersect+gcd+compact\n"
 "  --emit FILE      write the compacted survivor list (x, a, b) here\n"
@@ -1074,7 +1077,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     cfg.small_sieve = 1; cfg.side = 1;
     cfg.scale = 1.0; cfg.dump = NULL; cfg.cadofb = NULL;
     cfg.probe_i = 0; cfg.probe_j = 0xFFFFFFFFu;
-    cfg.survbits = NULL; cfg.not_both_even = 0;
+    cfg.survbits = NULL; cfg.not_both_even = 0; cfg.sieve_skip = 2;
     cfg.other_bits = NULL; cfg.emit = NULL;
     cfg.td = 0; cfg.cofgate = NULL; cfg.emit_cof = NULL;
     cfg.lim = 0; cfg.lpb = 0; cfg.mfb = 0;   /* 0 == take the side's default */
@@ -1120,6 +1123,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     cfg.resume_rel_bytes = 0; cfg.resume_cand_bytes = 0;
     cfg.resume_nrel = 0; cfg.resume_nq = 0;
     int maxbits = 0, maxbits_set = 0;
+    int sieve_skip_set = 0;
     int allowance_set = 0, allowance0_set = 0, scale0_set = 0;
     const char *cofac_in = NULL;
     const char *check_rel = NULL;
@@ -1151,7 +1155,14 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
                                     &cfg.slab_j)) return 1;
         }
         else if (!strcmp(argv[i], "--region") && i + 1 < argc) cfg.log_region = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--bkthresh") && i + 1 < argc) bkthresh = (uint32_t)strtoul(argv[++i], 0, 10);
+        else if (!strcmp(argv[i], "--bkthresh") && i + 1 < argc) {
+            /* Floor (>= I) is checked once logI is final, below. The ceiling
+             * keeps every line-sieved modulus under 2^30, where sieve_small's
+             * even-row step 2m cannot wrap. */
+            if (parse_u32_range_arg("--bkthresh", argv[++i], 1u, 1u << 30,
+                                    &bkthresh))
+                return 1;
+        }
         else if (!strcmp(argv[i], "--fbbound") && i + 1 < argc) { fbbound = (uint32_t)strtoul(argv[++i], 0, 10); fbbound_set = 1; }
         else if (!strcmp(argv[i], "--q") && i + 1 < argc) {
             if (parse_u64_arg("--q", argv[++i], &q)) return 1;
@@ -1506,6 +1517,12 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
             if (bench_boinc_resolve_path("--emit-cof", argv[++i], &cfg.emit_cof)) return 1;
         }
         else if (!strcmp(argv[i], "--not-both-even")) cfg.not_both_even = 1;
+        else if (!strcmp(argv[i], "--sieve-skip") && i + 1 < argc) {
+            if (parse_int_range_arg("--sieve-skip", argv[++i], 0, 2,
+                                    &cfg.sieve_skip))
+                return 1;
+            sieve_skip_set = 1;
+        }
         else if (!strcmp(argv[i], "--maxbits") && i + 1 < argc) {
             maxbits = atoi(argv[++i]); maxbits_set = 1;
         }
@@ -1540,7 +1557,25 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     /* las's survivor bound is scale*lambda*lpb per side; ours is the same
      * quantity in unscaled bits (16-bit cells need no scale). */
     if (!allowance_set && cfg.side == 0) cfg.allowance = 2.35 * 31.0;
+    /* run_bench has no skip path: it would time level 0 while the command line
+     * said otherwise. */
+    if (sieve_skip_set && !cfg.pipeline) {
+        fprintf(stderr, "--sieve-skip applies to --pipeline only\n");
+        return 1;
+    }
     if (!bkthresh) bkthresh = 1u << cfg.logI;
+    /* The bucket walk is Franke-Kleinjung, whose basis (plattice.cuh) exists
+     * only for p >= I: then a row holds at most one hit and each walk step
+     * moves to the next row. Below I a row holds ~I/p hits and the walk visits
+     * one of them, so the relations are lost SILENTLY -- measured 2026-09-23 on
+     * the c183 band, 9,053 relations at the default against 7,456 at
+     * --bkthresh 16384 and 5,079 at 8192, every run exiting 0. */
+    if (bkthresh < (1u << cfg.logI)) {
+        fprintf(stderr, "--bkthresh %u is below I = 2^%d: the lattice walk"
+                        " needs p >= I and would miss hits\n",
+                bkthresh, cfg.logI);
+        return 1;
+    }
     if (!fbbound && cfg.side == 1 && !cfg.pipeline)
         fbbound = (q > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (uint32_t)q;
 

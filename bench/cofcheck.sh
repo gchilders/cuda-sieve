@@ -489,6 +489,39 @@ for sj in 0 4096; do
     fi
 done
 
+# --sieve-skip is output-identical by construction (RESULTS finding 100), and
+# this pins it. Levels 1 and 2 are compared against level 0, which runs none of
+# the skip code, so the reference is independent of what is under test.
+#
+# --slab-j 4095 is the case that matters: it starts slabs on ODD rows (4095,
+# 12285), which is the only place the row parity every skip site takes from
+# j_base can change an answer. The 4096-row slabs above always start on even
+# rows, so dropping j_base from a skip site would still pass there.
+for sj in 0 4095; do
+    case $sj in
+        0) sjarg=""            ; shape="unslabbed"       ;;
+        *) sjarg="--slab-j $sj"; shape="odd slab starts" ;;
+    esac
+    got=""
+    ok=1
+    for lv in 0 1 2; do
+        n=$(run --cofactor $sjarg --sieve-skip $lv --relations $TMP/k$lv.txt \
+            | grep 'total relations' | tail -1 | awk '{print $NF}') || true
+        got="$got${got:+/}${n:-none}"
+        [ "$n" = "37" ] || ok=0
+        [ $lv -eq 0 ] || cmp -s $TMP/k0.txt $TMP/k$lv.txt || ok=0
+    done
+    if [ $ok -eq 1 ]; then
+        printf 'PASS   %-34s %s, 37 at 0/1/2, byte-identical\n' "sieve-skip output identity" "$shape"
+    else
+        printf 'FAIL   %-34s %s, expected 37/37/37 identical, got %s\n' \
+               "sieve-skip output identity" "$shape" "$got"; fail=1
+    fi
+done
+expect_refused "sieve-skip not an integer"      --sieve-skip two
+expect_refused "bkthresh below I"               --bkthresh 16384
+expect_refused "bkthresh above 2^30"            --bkthresh 2147483648
+
 # Post-cofactor reconstruction: what was EMITTED must rebuild both norms. The
 # pre-split gate cannot see this, and a corrupted factor is the negative control.
 for f in inline s1; do

@@ -3986,7 +3986,7 @@ The remaining comparison constants and scope limits are:
 
 Also unmeasured: target-equivalent persistent YAFU-derived GPU cofactor
 throughput, coverage, power and recurring host demand; weak-host and multi-GPU
-scaling; `bkthresh` sweep; I16e slabbing; throughput mode; production scales
+scaling; `bkthresh` sweep (**measured 2026-09-23, finding 100: the default is right, and below `I` it silently loses relations**); I16e slabbing; throughput mode; production scales
 2/4/8 (finding 23); and the per-q host-side small-FB transform and sort
 (`bench_kernels.cu`), which runs outside every timed number.
 
@@ -9723,3 +9723,426 @@ never the problem. A 9% error in one relation target was.**
   the difference, the compromised arm is the suspect.
 - **The 1.94x model is not refuted as a model** of the ideal universe — it is
   refuted only as an estimate of required relations.
+
+## Finding 100 — a third of every fill went to positions gcd(i,j) had already ruled out. Skipping them is −10 to −13% of wall with relations byte-identical on three jobs, now the default (`--sieve-skip 2`). Apply barely moves, because ~60% of it is the small-prime sieve and that is not paying per hit. And `--bkthresh` below `I` was a silent wrong-answer path; it is now refused
+
+**Date:** 2026-09-23, RTX 5070, on `0075743` (Greg's cofactor-valve merge).
+Card idle for every timed run; host load ~14.5 throughout from GGNFS clients,
+which finding 96 prices at ~3% and which was the same for every arm.
+
+### What was being wasted
+
+`k_intersect_compact` drops every two-sided survivor with `gcd(i,j) != 1`
+(`bench_kernels.cu`, the `bgcd` test), whatever `--not-both-even` says. Nothing
+before it knew that. Fill wrote a bucket record for every hit, apply computed a
+norm for every cell and line-sieved every small prime into every cell, and only
+the scan at the very end could discard a position. **A quarter of all positions
+are both-even and a further 1/12 have `3 | gcd`**, so for an odd factor-base
+prime a third of its bucket records land somewhere that can never be a
+relation.
+
+GGNFS never paid this. `gnfs-lasieve4e.c:2964` loops `oddness_type` over three
+of the four parity classes and never sieves the both-even one, so **every
+cross-siever margin in this file (item 0's ~3x included) was measured with the
+GPU giving away a quarter of its sieve area.**
+
+### The change: `--sieve-skip {0,1,2}`, default 2, pipeline only
+
+| level | fill | apply: norm init | apply: small-prime sieve | scan |
+|---|---|---|---|---|
+| 0 | every hit | every cell | every hit | `--not-both-even` only |
+| 1 | no record if `i`, `j` both even | skipped for both-even cells | even rows: odd `m` steps `2m` from the first odd `i`; even `m` keeps the row only if its hits are odd | rejects both-even |
+| 2 | also no record if `3 \| i` and `3 \| j` | as 1 | as 1 | as 1 |
+
+The mod-3 filter is fill-only on purpose: fill is L2-bound with the ALU nearly
+idle (finding 76), so two multiply-shift remainders per hit are free, whereas in
+apply's init every third cell would diverge within a warp and save nothing.
+`parity(i) == parity(x)` because `I/2` is even, and a region lies inside one
+row, so the both-even test in init is warp-uniform. Slabbed runs take the row
+parity from `j_base`. `ptxas`: `k_apply` stays at **40 registers, zero spill**
+(finding 75's three-blocks-per-SM premise holds); `k_fill_atomic` 26 -> 28.
+
+### Output identity — byte-identical at every level, on three jobs
+
+| job | geometry | relations | md5 at 0 / 1 / 2 |
+|---|---|---:|---|
+| c183 `input.job` | I15, 1 slab, 200 q from 130M | 9,053 | `a6545ecf` all three |
+| C194 `c194.job` | I16/J32768, **4 slabs**, 40 q from 80000023 | 4,487 | `a2811e49` all three |
+| AS276 (C208) | I17/J32768, **8 slabs**, 30 q from 80M | 6,250 | `20022ca0` at 0 and 2 (1 not run) |
+| c183 `input.job` | I15, `--slab-j 4095`: **5 slabs starting on rows 0, 4095, 8190, 12285, 16380**, 60 q from 130M | 2,693 | `9960b785` all three |
+
+Two-sided primitive survivors are identical too (80,993.8 / 238,100.4 /
+198,916.6 per q) — the skipped positions were never among them. What does change
+is anything counting ONE-sided survivors: level 1 drops the both-even positions
+from them, and level 2 drops further ones, since a cell with `3 | i` and
+`3 | j` gets no bucket logs and so falls below the bound more often. Per-side
+survivor counts therefore differ between ALL three levels, by design.
+
+**Only the last row tests the `j_base` parity.** The C194 and AS276 slabs are
+8192 and 4096 rows tall, so every slab starts on an even row and the `+ j_base`
+term in each skip site never changes an answer there — the first draft of this
+finding claimed those arms tested it, and a review caught that. `--slab-j 4095`
+starts two of its five slabs on odd rows, which is where a wrong row parity
+would drop live records. It is now a `cofcheck.sh` case, at levels 0/1/2, both
+unslabbed and with odd slab starts, so the identity is gated rather than
+asserted. **Its negative control fails as it must:** with the `+ j_base` removed
+from `pos_row`, the odd-slab case reads 37 / 34 / 34 relations at levels 0/1/2
+and FAILS, while the unslabbed case (no offset to lose) still passes.
+
+**"By construction" assumes no bucket overflow.** An overflowing slab is
+skipped (a SOFT failure: `pipe_side_sieve_join` returns 1), and level 2 writes a third
+fewer records, so a slab that overflows at level 0 can complete at level 2 and
+the two outputs then differ legitimately. None of the runs here overflowed.
+
+### Timing
+
+c183, three interleaved rounds (orders 0-1-2, 2-0-1, 1-2-0), arms
+non-overlapping:
+
+| skip | wall ms/q | COMPLETE ms/q | fill | apply |
+|---|---:|---:|---:|---:|
+| 0 | 89.12 / 90.50 / 91.13 -> **90.25** | 95.27 | 25.16 | 29.11 |
+| 1 | 81.14 / 81.15 / 80.76 -> **81.02 (−10.2%)** | 85.99 | 18.55 (−26%) | 27.14 (−6.8%) |
+| 2 | 79.09 / 79.22 / 79.17 -> **79.16 (−12.3%)** | 84.10 (−11.7%) | 16.99 (−32%) | 27.02 (−7.2%) |
+
+The larger jobs, one run per arm (the stage changes are far outside noise):
+
+| | skip 0 wall | skip 2 wall | fill | apply | resieve |
+|---|---:|---:|---:|---:|---:|
+| C194 I16, 4 slabs | 337.94 | **293.70 (−13.1%)** | 95.70 -> 64.46 (−33%) | 119.85 -> 110.71 (−7.6%) | 33.15 -> 33.30 |
+| AS276 I17, 8 slabs | 792.83 | **713.25 (−10.0%)** | 173.71 -> 119.37 (−31%) | 289.48 -> 270.39 (−6.6%) | 62.04 -> 62.13 |
+
+**Fill falls by the fraction of records removed** — 25% at level 1, 33% at
+level 2 — which is what an L2-transaction-bound kernel should do. Nothing
+downstream moves, as expected: resieve, TD and cofactorisation only ever see
+primitive survivors. **Every timing before this finding is at level 0**; compare
+across the boundary with that in mind.
+
+### Why apply barely moves: the small-prime sieve is ~60% of it and is not hit-bound
+
+Pricing arm (drops relations, 1,348 against 9,053 — measurement only),
+c183 at skip 2: `--no-smallsieve` takes apply **27.17 -> 10.22 ms**. The
+fused small-prime sieve is therefore **~17 ms/q, ~62% of apply and ~21% of
+wall** — now the largest single component of the pipeline, ahead of fill
+(17.0).
+
+Level 1 removes a quarter of its hits (half of every even row, and every affine
+power-of-two hit in an even row), yet apply fell only ~2 ms, part of which is
+the norm cells. So its cost is **per (entry, region), not per hit**: the entry
+loads and the `ss_first` start computation for ~7K entries x 32K regions per
+side. That is the next thing to profile (`ncu`, source-level), and it outranks
+a lazy-norm scheme — norm init lost a quarter of its work here and is now a few
+ms at most. The whole-block tier (p < 64, one entry at a time, every thread
+recomputing the same start) is the first suspect; prototype.md's "concurrent
+entries in the block tier" lever has never been built.
+
+### `--bkthresh`: the sweep, and a wrong-answer path it found
+
+c183 at skip 2, one run each (this is the "`bkthresh` sweep" long listed as
+unmeasured under "What is not yet measured"):
+
+| `--bkthresh` | wall | fill | apply | relations |
+|---:|---:|---:|---:|---:|
+| 8192 | 86.79 | 22.38 | 25.86 | **5,079** |
+| 16384 | 90.33 | 22.43 | 26.32 | **7,456** |
+| 32768 (default, `= I`) | 79.71 | 17.16 | 27.17 | 9,053 |
+| 65536 | 81.31 | 14.88 | 28.38 | 9,053, identical md5 |
+
+**Below `I` the run silently loses relations and exits 0.** The bucket walk is
+Franke-Kleinjung (`plattice.cuh`), whose reduced basis exists only for
+`p >= I`: then a row holds at most one hit and each step moves to the next row.
+Below `I` a row holds ~`I/p` hits and the walk visits one of them. The default
+`bkthresh = 1 << logI` always satisfies the precondition at any `logI`, so no
+default run was ever affected — but nothing enforced it. **`bench_main.cu` now
+refuses `--bkthresh < 2^logI`.** Above `I` it is correct and no faster (fill
+−2.3 ms, apply +1.2 ms): **the default stands and the sweep is closed.**
+
+### logI 17, re-verified at GGNFS's own rectangle
+
+Asked in passing — does the walk precondition threaten `logI > 16`? Not at
+default settings, per the above. But the last completeness check at `logI 17`
+was finding 69's, on 2026-08-19, before slabbing, on nested sub-rectangles. The
+AS276 arm above sieves `--logI 17 --J 32768`, GGNFS's exact `I16e -J 16` shape
+(finding 65's rule), and its 30 q are exactly work unit `000000`. `relgeom.py
+compare` against that work unit:
+
+| j band | both | ours only | theirs only |
+|---|---:|---:|---:|
+| 0 - 4096 | 961 | 281 | 0 |
+| 4096 - 8192 | 744 | 273 | 0 |
+| 8192 - 12288 | 602 | 224 | 0 |
+| 12288 - 16384 | 538 | 200 | 1 |
+| 16384 - 20480 | 497 | 176 | 0 |
+| 20480 - 24576 | 430 | 188 | 0 |
+| 24576 - 28672 | 418 | 172 | 0 |
+| 28672 - 32768 | 373 | 173 | 0 |
+| **total** | **4,563** | **1,687** | **1** |
+
+**Recall 4,563 / 4,564 = 99.98%**, with the eight bands lining up with the
+eight 4096-row slabs and no loss at any boundary; the one miss matches finding
+69's residual. The ours-only 1.37x is in line with finding 69, which traced its
+equivalent to relations GGNFS re-finds under other special-q (not re-checked
+here). This is the first like-for-like check at the full `A = 32` rectangle,
+and the first completeness check of the slabbed path at `logI 17`. `logI 18-20`
+still have walk-level gates only.
+
+### Not done, and worth doing
+
+- **The bucket array cannot simply be shrunk to match.** An earlier draft
+  proposed scaling `pipe_est_records` by the skip fraction; a review showed it
+  would OVERFLOW every slab. The per-region capacity is uniform
+  (`est/nregion + 256`), a region lies in one row, and in the third of rows
+  where `j` is odd and `3` does not divide it, level 2 removes **no** records —
+  so those regions still need the full level-0 capacity, and a cap scaled to
+  2/3 fails there on every slab. The average falls by a third, the maximum does
+  not. Reclaiming the memory needs a capacity that depends on the row class
+  (three classes: even `j`, `3 | j` odd, neither); the uniform-cap estimate is
+  correct as it stands.
+- **Mod 5** (`5 | i` and `5 | j`) would remove a further ~3% of records at
+  level 2's cost; not measured.
+- The small-prime sieve could skip `3 | gcd` too, but only by restructuring it
+  around the rows where `3 | j`; not worth it before the profile says where its
+  time goes.
+
+### Hardening after an xhigh code review, same day
+
+The review found no relation-losing defect in the kernels. It did find the
+three doc errors corrected above (the `j_base` parity claim, the one-sided
+count claim, the bucket-shrink proposal), and these, all fixed:
+
+- **The both-even predicate existed in four hand-written copies** (fill,
+  apply's init, the small sieve, the scan), and fill added `j_base` even in
+  the unslabbed build. They now share `pos_row<SLABBED>` / `pos_both_even`, so
+  the sites cannot drift apart — fill dropping a record for a cell apply still
+  scans in would lose relations and no gate compares the sites with each
+  other.
+- **The skip level reaches `k_apply` as its own argument**, not packed into
+  bit 1 of `not_both_even`; the kernel ORs the two for the scan, and the
+  even-row test is computed once per block rather than per cell.
+- **`p >= I` is enforced where the factor base is consumed**
+  (`run_pipeline_impl`), not only where `--bkthresh` is parsed, along with
+  line-sieved moduli `< 2^30` so the small sieve's even-row step `2m` cannot
+  wrap.
+- **`--bkthresh` is parsed strictly and capped at 2^30** (`-1` used to become
+  0xFFFFFFFF); **`--sieve-skip` is parsed strictly** (`two` used to become 0,
+  i.e. silently off) **and refused outside `--pipeline`**, where it would have
+  been ignored.
+
+### Commands
+
+    ./bench --pipeline --cofactor --poly ../oracle/input.job --fb1 ../oracle/c183.fb1 \
+            --logI 15 --qrange 130000000: --nq 200 --sieve-skip N [--relations F]
+    ./bench --pipeline --cofactor --poly ../oracle/input.job --fb1 ../oracle/c183.fb1 \
+            --logI 15 --slab-j 4095 --qrange 130000000: --nq 60 --sieve-skip N --relations F
+    ./bench --pipeline --cofactor --poly ../oracle/c194.job --fb1 ../oracle/c194.roots1.m16 \
+            --logI 16 --J 32768 --qrange 80000023: --nq 40 --sieve-skip N --relations F
+    ./bench --pipeline --cofactor --poly ../oracle/AS276.job --logI 17 --J 32768 \
+            --maxbits 17 --qrange 80000000:80001000 --sieve-skip N --relations F
+    zstd -dc ~/code/ggnfs-distributed/AS276/rels/wu-38370f06-000000.dat.zst > theirs
+    ./relgeom.py --band 80000000:80001000 --skew 51059252.11 compare F theirs 32768 17
+
+## Finding 101 — the small-prime sieve's whole-block tier recomputed identical per-entry setup in every warp. Sharing it by warp shuffle cuts apply 19-24% and wall 7-9%, relations byte-identical on three jobs
+
+**Date:** 2026-09-23, RTX 5070, card idle, host load ~4 (lower than finding
+100's ~14.5, so compare within this finding only). Base: the finding-100
+commit. STATUS item 8.
+
+### The profile
+
+`ncu --set full --import-source yes` on two `k_apply` launches (q 3, both
+sides) of the finding-100 c183 band, then `--page source --print-source
+cuda,sass` aggregated by source line. Apply is compute-bound — SM throughput
+86%, occupancy 99.6%, 40 registers — so the question is which instructions.
+
+On the algebraic side the largest line was the whole-block tier's
+`SS_ROW(e, tid, nth)`: **22.5% of warp-stall samples and 30.3% of executed
+instructions**, plus 3.7% on its loop. The per-instruction execution counts say
+what it was doing. Instructions executed exactly **95 times per warp** — once
+per block-tier entry (p < 64: 95 entries here, prime powers and multiple roots
+included) for each of a block's 16 warps — are the per-entry SETUP: five table
+loads, the `g` test, `ss_first`, the even-row adjustment. Grouped by execution
+count they are **~19% of the kernel's samples**, before counting their share of
+`ss_first`'s own lines. The hits were of the same order, not smaller: the hit
+code is unchanged by this finding, and after it the hit loop plus its atomics
+are ~21% of a kernel 28% shorter, i.e. ~15% of the original. The rational side
+(27 block-tier entries) shows the same setup pattern at ~10%.
+
+The tier boundary is on the effective modulus `m = q/g`, not on the prime:
+"p < 64" in the kernel's header comment is loose, and the 95 entries include
+row-divisor and projective entries with a large `q` and a small `m`.
+
+The setup is identical for every thread in the block — `j` and `ilo` are
+per-region — so every warp was recomputing all 95 of them. prototype.md's
+"concurrent entries in the block tier" lever had the right tier; the profile
+shows the largest cost there was replicated setup. It did NOT measure idle
+threads or load balance, which finding 102 takes up.
+
+### The change
+
+Lane `k` of each warp computes entry `base + k`'s setup once and packs it into
+one register — `c0` (< 2m <= 128), step `mm` (<= 2m) and the 16-bit log, with
+`mm == 0` meaning "no hits in this row" — and the warp walks those 32 entries
+with one `__shfl_sync` each. A warp now pays `ceil(nblk/32)` setups (3) instead
+of `nblk` (95). No shared memory is added (apply has ~0.3 KB of headroom before
+losing its third block per SM, finding 75), `k_apply` stays at **40 registers,
+zero spill**, and a `static_assert` pins `SS_BLOCK_CUT <= 128` so the packing
+cannot silently overflow. (A fallback for blocks that are not whole warps was
+added here and then removed in finding 102: every launch path already requires
+whole warps, and the warp tier cannot run without them anyway.) The cell sums
+are integer adds, so reordering them is output-identical by construction.
+
+### Result
+
+`ncu`, same launches: algebraic `k_apply` **18.25 -> 13.14 ms (−28%)**, warp
+instructions 8.03e9 -> 6.15e9; rational 10.29 -> 9.20 ms (−11%).
+
+c183, three interleaved rounds (base-new, new-base, base-new), arms
+non-overlapping, relation md5 `a6545ecf` both:
+
+| | wall ms/q | COMPLETE ms/q | fill | apply |
+|---|---:|---:|---:|---:|
+| base | 77.19 / 76.04 / 76.85 -> **76.69** | 81.66 | 16.72 | 26.21 |
+| new | 69.61 / 69.58 / 69.49 -> **69.56 (−9.3%)** | 74.48 (−8.8%) | 16.61 | **19.90 (−24.1%)** |
+
+The larger jobs, one pair each:
+
+| | wall | apply | md5 |
+|---|---:|---:|---|
+| C194 I16, 4 slabs | 287.79 -> **265.47 (−7.8%)** | 108.44 -> 87.58 (−19.2%) | `a2811e49` both |
+| AS276 I17, 8 slabs | 695.55 -> **646.93 (−7.0%)** | 264.15 -> 214.60 (−18.8%) | `20022ca0` both |
+
+`cofcheck.sh` passes, including finding 100's odd-slab-start identity gate;
+every cofcheck case runs the small sieve, so the block tier is covered by exact
+relation counts as well as by the md5s above.
+
+**With finding 100, c183 is ~20% faster today.** Compounding the two
+same-load deltas gives 0.877 x 0.907 = 0.796, **−20.4%**. The raw 90.25 ->
+69.56 (−23%) is not a fair figure: finding 100 ran at host load ~14.5 and this
+one at ~4, and the same finding-100 binary measured 79.16 then and 76.69 now,
+so ~3 points of that raw drop are host load (finding 96's size).
+
+### What leads now
+
+Re-profiled after the change — **algebraic-side `k_apply` only**, share of
+its samples; the rational side has 27 block-tier entries against 95, so its
+shares differ: the block tier's HIT loop 11.2% plus shared-memory atomics ~10%;
+the norm ~15% (`log2f` 5.4, the two Horner chains 5.1 + 3.2, cancellation
+guard); the warp tier 7.0%; the bucket-record load (`lut[...]`, latency) 6.0%;
+the thread tier 4.5%.
+
+**The block tier is now per-hit, but the warp tier is not established to be.**
+It still ran one full setup per entry, as a whole-warp sequence, for 0.5-8
+hits per lane; finding 102 applies the same lane-parallel setup there.
+
+**A pattern sieve is NOT the easy follow-up it looks like.** Cells are 16 bits,
+so a 32-bit word holds two, and a single modulus m >= 2 adds at most one hit
+per word: composing ONE entry word-wide writes as many words as it has hits,
+and saves nothing. The only version that can win is a thread owning its words
+and summing ALL the tiny moduli into each word in registers, replacing their
+per-hit atomics with one plain read-modify-write per word — at the price of
+per-(entry, word) residue arithmetic. Pricing it by dropping those moduli
+would measure only the removal ceiling, not the replacement's cost, and
+overstate the lever.
+
+### Method notes
+
+- Aggregation: `ncu --import R --page source --csv --print-source cuda,sass
+  --launch-skip K --launch-count 1`, then sum column 4 (`Warp Stall Sampling
+  (All Samples)`) and column 7 (`Instructions Executed`) over each CUDA source
+  row; the SASS rows beneath each CUDA row carry per-instruction execution
+  counts, which is what identified the 95-per-warp setup.
+- `--print-source cuda` alone exports source text with NO metrics; use
+  `cuda,sass`.
+- `pkill -f PATTERN` from a shell whose own command line contains PATTERN
+  kills that shell (exit 144) — the same trap as finding 97's `pgrep`. Kill by
+  PID.
+
+## Finding 102 — the warp tier had the same replicated setup: sharing it too is apply −4 to −5%, wall −2 to −3%, relations byte-identical. Rotating the block tier's start thread to fix its load imbalance is SLOWER. And a review of finding 101 hardened the tier split
+
+**Date:** 2026-09-23, RTX 5070, card idle, host load 8-10 (a CPU ECM job).
+Base: finding 101's binary. Everything below compares within this finding.
+
+### Two leads from an xhigh review of finding 101
+
+1. **The warp tier** (`64 <= m < 1024`, one warp per entry) ran each entry's
+   whole setup as a warp-wide sequence for 0.5-8 hits per lane — the same
+   shape finding 101 removed from the block tier, one tier down. It is not
+   replicated across warps, but it costs one full setup per ENTRY where a
+   lane-parallel pass costs one per 32 entries.
+2. **The block tier's load balance.** `c = c0 + tid*mm` always hands an entry's
+   leftover hits to the lowest `tid`s, so warp 0 runs the most iterations of
+   every entry — the review simulated 1.21x warp 15's in odd rows and 1.44x in
+   even rows — and the block waits at `__syncthreads` for the slowest warp.
+   Finding 101's profile never measured this.
+
+### The A/B
+
+Both were built behind a temporary `SS_MODE` switch (one build, four arms,
+removed before commit) so the arms shared a binary. c183, three rotated rounds,
+all fifteen runs md5 `a6545ecf`:
+
+| arm | apply ms/q | wall ms/q |
+|---|---:|---:|
+| finding 101's binary | 20.11 | 71.12 |
+| mode 0: refactor only | 20.36 | 71.04 |
+| **mode 1: warp-tier shuffle** | **18.94 (−7.0% vs mode 0)** | **69.78** |
+| mode 2: block-tier rotation | 21.10 (**+3.6%**) | 71.96 |
+| mode 3: both | 19.42 | 70.16 |
+
+**The warp-tier shuffle wins in every round and the rotation loses in every
+round**, with or without the shuffle. The imbalance is real but evening it out
+costs more than the tail it removes: it adds per-entry arithmetic to every
+warp, and it changes which warps' atomics coincide. Rotation is dropped and
+the reason is recorded at the code, so it is not re-tried. Mode 0's small cost
+against finding 101 was the switch's own per-entry branch; the final build
+below does not show it.
+
+### The change as shipped, against finding 101's binary
+
+Warp `w` still owns entries `nblk + w + i*nwarps`. Lane `k` sets up the warp's
+`k`-th next entry, packing `c0 | mm << 16` (both `< 2m < 2^16`, pinned by a
+`static_assert` on `SS_WARP_CUT`) with the log in a second register; the warp
+walks them with two shuffles per entry. `k_apply` stays at **<= 40 registers,
+zero spill** on every architecture in the default build.
+
+| | wall ms/q | apply ms/q | md5 |
+|---|---:|---:|---|
+| c183, 3 interleaved rounds | 70.08 -> **68.90 (−1.7%)** | 19.88 -> 18.84 (−5.2%) | `a6545ecf` |
+| C194 I16, 4 slabs | 262.22 -> **257.53 (−1.8%)** | 85.82 -> 81.70 (−4.8%) | `a2811e49` |
+| AS276 I17, 8 slabs | 658.88 -> **639.60 (−2.9%)** | 216.51 -> 208.38 (−3.8%) | `20022ca0` |
+
+`make check` passes (108), including finding 100's odd-slab identity gate.
+
+### The review's other findings, all fixed
+
+- **The block tier's 8-bit packing depended on an invariant nothing
+  checked**: that every entry below `nblk` has `m < SS_BLOCK_CUT`. It held
+  because two hand-written host loops (pipeline and `run_bench`) stopped at the
+  first entry past the cut; a change to either would have let an `m >= 128`
+  entry overflow its field and be silently mis-sieved. Both now call one
+  `ss_tiers()`.
+- **The per-entry setup existed in two copies** (the `SS_ROW` macro and finding
+  101's block tier), and finding 100 names a follow-up that edits exactly that
+  logic. All three tiers now call one `ss_setup()`.
+- **The whole-warp fallback finding 101 added was dead** — every launch path
+  requires whole warps, and the warp tier cannot run without them — so it is
+  gone, replaced by a comment stating the requirement.
+- **Doc corrections, made in finding 101's text:** the replicated setup (~19%)
+  was the same order as the hits (~15% of the original kernel), not "much
+  smaller" as the first draft said of them; the tier cut is on the modulus `m = q/g`, not the prime; the
+  after-change shares are the ALGEBRAIC side's `k_apply` only; the day's
+  cumulative gain is **−20.4% at matched host load**, not the raw −23%; and the
+  pattern sieve's premise does not hold at 16-bit cells (two per word, so one
+  modulus composed word-wide saves nothing — only summing all tiny moduli per
+  word in registers can win).
+
+### Where apply stands
+
+c183 apply is now **18.8 ms/q of 68.9** (27%), down from 29.1 of 90.3 at
+level 0 this morning. Across findings 100-102, at matched load where
+measurable: finding 100 −12.3%, finding 101 −9.3%, this one −1.7%, compounding
+to **~−21.8%** on c183 wall (0.877 x 0.907 x 0.983). The next candidates are STATUS item 10 (a norm
+that evaluates `log2` only where a sound bound says a cell can pass; the norm
+is ~15% of the algebraic `k_apply`) and item 8b (block-tier hits and their
+atomics, ~21%), in that order: item 10 keeps output identical by
+construction and needs no new data layout.
