@@ -35,11 +35,21 @@ spans.append((a, upto_close(find(r'^__global__ void k_intersect_compact', a))))
 a = find(r'^__global__ void k_verify_td_mod_cases')
 spans.append((a, upto_close(a)))
 
+# ss_tiers (upstream 6997d77) is the same case as build_slices_b below: HOST
+# code that sits among the device functions, so the span removal takes it with
+# them -- and BOTH generated host files call it, bench_host.cpp's run_bench and
+# pipeline_host.inc's small-sieve setup. Rescued by name, and `find` raises if
+# it ever moves, because the alternative signal is an "undeclared identifier"
+# two generated files away with nothing pointing back to here.
+ts_a = find(r'^static inline void ss_tiers\(')
+ss_tiers_src = '\n'.join(lines[ts_a:upto_close(ts_a) + 1])
+assert 'nblk' in ss_tiers_src and 'nwrp' in ss_tiers_src, 'ss_tiers shape changed'
+
 # build_slices_b is host code that happens to sit between two kernels, so the
 # device-span removal would take it with them. Lift it out and re-insert.
 bs_a = find(r'^static uint32_t build_slices_b\(')
 bs_b = upto_close(bs_a)
-build_slices = '\n'.join(lines[bs_a:bs_b + 1])
+build_slices = ss_tiers_src + '\n\n' + '\n'.join(lines[bs_a:bs_b + 1])
 
 keep, prev = [], 0
 for (s0, e0) in sorted(spans):

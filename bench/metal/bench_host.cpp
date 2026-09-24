@@ -113,6 +113,16 @@ static int mtl_optin_smem_limit(size_t *out)
  * accumulates the number of positions thereby dropped so the loss is a printed
  * number rather than a silence. With the default bkthresh = I >= J it is
  * exactly zero: g > 1 needs q | (rows), and every bucketed q exceeds J. */
+static inline void ss_tiers(const uint32_t *hsp, uint32_t n,
+                            uint32_t *nblk, uint32_t *nwrp)
+{
+    uint32_t b = 0, w = 0;
+    while (b < n && hsp[b] < SS_BLOCK_CUT) b++;
+    w = b;
+    while (w < n && hsp[w] < SS_WARP_CUT) w++;
+    *nblk = b; *nwrp = w;
+}
+
 static uint32_t build_slices_b(const fb_t *fb, uint32_t **starts_out)
 {
     uint32_t ns = 0, k, capacity = 256;
@@ -1060,8 +1070,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                            hsg[i] > 1 ? cfg->J / hsg[i] : cfg->J,
                            cfg->logI, &hsmag[i]);
 
-        for (i = 0; i < nsmall && hsp[i] < SS_BLOCK_CUT; i++) nblk = i + 1;
-        for (i = 0; i < nsmall && hsp[i] < SS_WARP_CUT;  i++) nwrp = i + 1;
+        ss_tiers(hsp, nsmall, &nblk, &nwrp);
         CK(mtlMalloc(&D.smag, (size_t)nsmall * 4));
         CK(mtlMalloc(&D.sp,  (size_t)nsmall * 4));
         CK(mtlMalloc(&D.srt, (size_t)nsmall * 4));
@@ -1175,11 +1184,11 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
 #define FILL_ONE(GRID, STREAM, PLAT, CUR, OUT, OVF)                          \
     do {                                                                     \
         if (cfg->record_bytes == 2)                                          \
-            MTL_LAUNCH(k_fill_atomic_2_0, (GRID), fthreads, 0, (STREAM), (PLAT), D.slice, fb->n, xmax, cfg->logI, log_region, (CUR), (OUT), cap, (OVF), nullptr, nullptr);                       \
+            MTL_LAUNCH(k_fill_atomic_2_0, (GRID), fthreads, 0, (STREAM), (PLAT), D.slice, fb->n, xmax, cfg->logI, log_region, (CUR), (OUT), cap, (OVF), nullptr, nullptr, 0, 0u);                       \
         else if (cfg->record_bytes == 4)                                     \
-            MTL_LAUNCH(k_fill_atomic_4_0, (GRID), fthreads, 0, (STREAM), (PLAT), D.slice, fb->n, xmax, cfg->logI, log_region, (CUR), (OUT), cap, (OVF), nullptr, nullptr);                       \
+            MTL_LAUNCH(k_fill_atomic_4_0, (GRID), fthreads, 0, (STREAM), (PLAT), D.slice, fb->n, xmax, cfg->logI, log_region, (CUR), (OUT), cap, (OVF), nullptr, nullptr, 0, 0u);                       \
         else                                                                 \
-            MTL_LAUNCH(k_fill_atomic_8_0, (GRID), fthreads, 0, (STREAM), (PLAT), D.slice, fb->n, xmax, cfg->logI, log_region, (CUR), (OUT), cap, (OVF), nullptr, nullptr);                       \
+            MTL_LAUNCH(k_fill_atomic_8_0, (GRID), fthreads, 0, (STREAM), (PLAT), D.slice, fb->n, xmax, cfg->logI, log_region, (CUR), (OUT), cap, (OVF), nullptr, nullptr, 0, 0u);                       \
     } while (0)
 
         mtlEventRecord(e2);
@@ -1547,7 +1556,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                     CK(mtlMemset(D.nsurv, 0, 4));                             \
                     if (D.survbits)                                            \
                         CK(mtlMemset(D.survbits, 0, (size_t)nbitword * 4));   \
-                    MTL_LAUNCH_NAMED("k_apply_" #CBV "_" #AT "_" #NM "_0", nregion, athr, smem, 0, (const uint32_t *)D.out, D.cursor, cap, cfg->logI, log_region, D.slice_logp, nslice_pow2, N, CINIT, CINIT - BOUND, tconst, D.dumpbuf, D.nsurv, D.dbg, dbgreg, D.sp, D.srt, D.sg, D.slp, D.smag, nsmall, nblk, nwrp, probe_x, D.probe, D.survbits, cfg->not_both_even, 0u);                   \
+                    MTL_LAUNCH_NAMED("k_apply_" #CBV "_" #AT "_" #NM "_0", nregion, athr, smem, 0, (const uint32_t *)D.out, D.cursor, cap, cfg->logI, log_region, D.slice_logp, nslice_pow2, N, CINIT, CINIT - BOUND, tconst, D.dumpbuf, D.nsurv, D.dbg, dbgreg, D.sp, D.srt, D.sg, D.slp, D.smag, nsmall, nblk, nwrp, probe_x, D.probe, D.survbits, cfg->not_both_even, 0, 0u);                   \
                 }                                                              \
                 mtlEventRecord(e4);                                           \
                 CK(mtlEventSynchronize(e4));                                  \
