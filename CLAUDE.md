@@ -1936,6 +1936,50 @@ the work really changed and the output really did not.
 Twelve gates green including `sievecheck`, `cofcheck.sh` 54 PASS / 0 FAIL, zero
 generator drift, idempotent across a second run.
 
+## Rebase, 2026-09-27: a docs-and-messages rebase, and a check that checked nothing
+
+Three upstream commits, and only one reaches this port. `8d36ed4` and
+`5c645a1` are RESULTS/STATUS plus three patch files parked in `bench/attic/` --
+experiments that did not win, not applied to the build. `db85a39` touches
+`bench/fbtest.c`, which `Makefile.metal` does not compile at all, and
+`bench/poly.c`, which it does.
+
+So the whole surface is `poly.c`: a UTF-8 decoder and a `diag_non_ascii` helper
+that explain WHY a poly file failed to parse. All twelve generators regenerate
+to byte-identical output, because `poly.c` is not a generator input -- this is
+the first rebase in a while that needed no generator work at all.
+
+**THE FIRST EQUIVALENCE CHECK I RAN PROVED NOTHING.** It compared the old and
+new binaries across all six oracle poly/job files under `--verify-only` and
+reported "same" six times -- and `--verify-only` runs the Franke-Kleinjung walk
+check and exits BEFORE the poly is ever loaded. Six files, zero parses, six
+agreements. This file has recorded that shape twice already (the `--cofactor`
+omission in 9e, the stale-artifact trap in 9z-m); it is apparently still easy to
+walk into, and the tell was available -- the output contained no `polynomial
+...: algebraic degree` line, which is what parsing looks like.
+
+Redone in a mode that parses, the valid files really are identical. And the new
+path was then exercised rather than assumed, with two deliberately malformed
+copies of `c183.poly`:
+
+```
+U+2212 MINUS SIGN for ASCII '-'
+  pre : c0 must be a complete finite integer shorter than 80 bytes
+  post: c0 contains U+2212 (minus sign) at column 5; use ASCII '-'
+
+U+00A0 NO-BREAK SPACE
+  post: c5 contains U+00A0 (no-break space) at column 4; it is invisible,
+        and usually pasted from a web page; retype the line
+```
+
+Same accept/reject decision in both builds -- only the message changed, which
+is exactly what the commit claims. Worth having: a volunteer or operator who
+pastes a polynomial out of a web page gets told what is wrong instead of being
+told the integer is too long.
+
+Eight gates green including `sievecheck`, `cofcheck.sh` 54 PASS / 0 FAIL, 288-q
+band `cmp`-identical at **13,485 relations / `8e79762c`**, 564,696 enqueued.
+
 ## Walking the valve guard again, 2026-09-18: four corrections
 
 The guard looked too intricate to trust, so it got re-derived from the
