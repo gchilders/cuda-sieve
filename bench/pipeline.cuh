@@ -161,6 +161,11 @@ typedef struct {
     /* Present only in the slabbed specialization. fill advances walk_cur into
      * walk_next; resieve replays walk_cur, then the host swaps the pointers. */
     uint64_t *walk_cur, *walk_next;
+    /* --fill-rows: the first nrow bucketed entries (q < fill_rows * I) are
+     * filled by k_fill_rows from their transformed roots, written here by
+     * k_transform; k_fill_atomic walks the rest. nrow == 0 is the old fill. */
+    uint32_t *rowrt;
+    uint32_t  nrow;
     uint32_t *survbits;
     uint16_t *slice, *slice_logp;
     uint32_t *sp, *srt, *sg;
@@ -185,6 +190,7 @@ static void pside_free(pside_t *S)
 {
     cudaFree(S->primes); cudaFree(S->roots); cudaFree(S->plat);
     cudaFree(S->walk_cur); cudaFree(S->walk_next);
+    cudaFree(S->rowrt);
     cudaFree(S->survbits); cudaFree(S->slice); cudaFree(S->slice_logp);
     cudaFree(S->sp); cudaFree(S->srt); cudaFree(S->sg); cudaFree(S->slp);
     cudaFree(S->smag);
@@ -312,6 +318,15 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
         SIDE_INIT_CK(cudaMalloc(&S->walk_next, (size_t)fb->n * sizeof(uint64_t)));
     }
     SIDE_INIT_CK(cudaMalloc(&S->survbits, (size_t)nbitword * 4));
+    if (cfg->fill_rows) {
+        /* The row tier is a PREFIX of the bucketed entries, which is what lets
+         * k_fill_atomic take the rest by pointer offset. Ascending order is
+         * fb_validate's (fb_load.c), and the check above refuses a base that
+         * has not passed it. */
+        const uint64_t rb = (uint64_t)cfg->fill_rows << cfg->logI;
+        while (S->nrow < fb->n && fb->primes[S->nrow] < rb) S->nrow++;
+        if (S->nrow) SIDE_INIT_CK(cudaMalloc(&S->rowrt, (size_t)S->nrow * 4));
+    }
     SIDE_INIT_CK(cudaMemcpy(S->primes, fb->primes, (size_t)fb->n * 4,
                             cudaMemcpyHostToDevice));
     SIDE_INIT_CK(cudaMemcpy(S->roots, fb->roots, (size_t)fb->n * 4,
@@ -671,7 +686,7 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
     PERQ_CK(cudaEventRecord(S->ev[0]));
     k_transform<SLABBED><<<blocks, cfg->threads>>>(S->primes, S->roots, S->plat, fb->n,
         cfg->logI, cfg->J, L->a0, L->a1, L->b0, L->b1,
-        S->d_nproj, S->d_nlost, S->walk_cur);
+        S->d_nproj, S->d_nlost, S->walk_cur, S->rowrt, S->nrow);
     PERQ_CK(cudaEventRecord(S->ev[4]));
     /* NO SYNCHRONIZE HERE. This function used to block on the transform purely
      * to read t_transform, and nothing after that read touches device data --
@@ -730,11 +745,23 @@ typedef struct {
  * emitting correct relations, so no output gate would catch it. That is also
  * why the memsets below became cudaMemsetAsync ON THE SIDE'S STREAM: the
  * synchronous form runs on the default stream and would do exactly that. */
+/* Row bands per slab for the row tier (k_fill_rows, k_resieve_rows):
+ * --fill-row-bands, else one band per FILL_ROW_RUN rows; never more bands
+ * than rows, so no band is empty. */
+static uint32_t pipe_row_bands(const bench_cfg_t *cfg, uint32_t rows)
+{
+    uint32_t nb = cfg->fill_row_bands ? (uint32_t)cfg->fill_row_bands
+                                      : (rows + FILL_ROW_RUN - 1) / FILL_ROW_RUN;
+    if (nb > rows) nb = rows;
+    return nb ? nb : 1;
+}
+
 template <bool SLABBED>
 static int pipe_side_sieve_issue(const fb_t *fb, const bench_cfg_t *cfg,
                                  int side, uint32_t xmax, uint32_t j_base,
                                  const pbkt_t *bk, int fblocks, int fthreads,
-                                 pside_t *S)
+                                 pside_t *S, const uint32_t *gate_bits = NULL,
+                                 uint32_t *gate_fold = NULL)
 {
     const int log_region = cfg->log_region;
     const uint32_t nregion = xmax >> log_region;
@@ -761,10 +788,47 @@ static int pipe_side_sieve_issue(const fb_t *fb, const bench_cfg_t *cfg,
     SLAB_CK(cudaEventRecord(S->ev[1], st));
     SLAB_CK(cudaMemsetAsync(bk->cursor, 0, (size_t)nregion * 4, st));
     SLAB_CK(cudaMemsetAsync(bk->overflow, 0, 4, st));
-    k_fill_atomic<4, SLABBED><<<fblocks, fthreads, 0, st>>>(
-        S->plat, S->slice, fb->n, xmax, cfg->logI, log_region,
-        bk->cursor, bk->bucket, bk->cap, bk->overflow, S->walk_cur, S->walk_next,
-        cfg->sieve_skip, j_base);
+    {
+        /* --fill-gate: gate_bits is the OTHER side's survivor bitmap for this
+         * slab, already complete (the serial arm joins it first). The fold
+         * runs inside the fill window so the gate's cost is billed to fill. */
+        const uint32_t *gate = gate_bits;
+        const int gshift = gate_bits ? cfg->fill_gate_shift : 0;
+        if (gate_bits && gshift) {
+            /* rounded up: a bitmap tail shorter than 2^gshift words still
+             * gets a gate word, which k_gate_fold fills from what exists */
+            const uint32_t nbw = xmax >> 5;
+            const uint32_t ngword = (nbw + (1u << gshift) - 1) >> gshift;
+            k_gate_fold<<<(ngword + 255) / 256, 256, 0, st>>>(gate_bits, gate_fold,
+                                                             gshift, ngword, nbw);
+            gate = gate_fold;
+        }
+        const uint32_t nrow = S->nrow;
+        if (nrow) {
+            const uint32_t rows = xmax >> cfg->logI;
+            const uint32_t nband = pipe_row_bands(cfg, rows);
+            const uint64_t nthr = (uint64_t)((nrow + 31u) >> 5) * nband * 32u;
+            k_fill_rows<SLABBED><<<(unsigned)((nthr + 255) / 256), 256, 0, st>>>(
+                S->primes, S->rowrt, S->slice, nrow, nband, rows, cfg->logI,
+                log_region, bk->cursor, bk->bucket, bk->cap, bk->overflow,
+                cfg->sieve_skip, j_base, gate, gshift);
+            /* Only k_resieve_scatter reads the row tier's walk state, and only
+             * when --resieve-rows is off; nothing else needs it. */
+            if (SLABBED && !cfg->resieve_rows)
+                k_rows_walk_next<<<(nrow + 255) / 256, 256, 0, st>>>(
+                    S->primes, S->rowrt, nrow, j_base + rows, cfg->logI,
+                    S->walk_cur, S->walk_next);
+        }
+        /* The rest by pointer offset: k_fill_atomic indexes every per-entry
+         * array by the same k. */
+        if (fb->n > nrow)
+            k_fill_atomic<4, SLABBED><<<fblocks, fthreads, 0, st>>>(
+                S->plat + nrow, S->slice + nrow, fb->n - nrow, xmax, cfg->logI,
+                log_region, bk->cursor, bk->bucket, bk->cap, bk->overflow,
+                SLABBED ? S->walk_cur + nrow : NULL,
+                SLABBED ? S->walk_next + nrow : NULL,
+                cfg->sieve_skip, j_base, gate, gshift);
+    }
     SLAB_CK(cudaEventRecord(S->ev[2], st));
     SLAB_CK(cudaMemsetAsync(S->d_nsurv, 0, 4, st));
     /* Provably redundant on every production geometry: k_apply's warp-ballot
@@ -1317,10 +1381,25 @@ static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
         const int side = si ? 0 : 1;          /* side 1 first, as before */
         const int e = si ? 7 : 4;
         CK(cudaMemsetAsync(C->d_pcnt[side], 0, (size_t)n * 4));
-        k_resieve_scatter<4, SLABBED><<<blocks, threads>>>(
-            S[side]->plat, S[side]->primes, NULL, S[side]->nfb, xmax, cfg->logI,
-            C->d_sum, d_two, C->d_gbase, C->d_plist[side], C->d_pcnt[side],
-            PIPE_K, C->d_ovf, 6, S[side]->walk_cur);
+        /* --resieve-rows: the --fill-rows tier, banded by row; the FK walk
+         * takes the rest by pointer offset, as in the fill. */
+        const uint32_t nr = cfg->resieve_rows ? S[side]->nrow : 0;
+        if (nr) {
+            const uint32_t rows = xmax >> cfg->logI;
+            const uint32_t nband = pipe_row_bands(cfg, rows);
+            const uint64_t nthr = (uint64_t)nr * nband;
+            k_resieve_rows<4, SLABBED><<<(unsigned)((nthr + 255) / 256), 256>>>(
+                S[side]->primes, S[side]->rowrt, NULL, nr, nband, rows, cfg->logI,
+                C->d_sum, d_two, C->d_gbase, C->d_plist[side], C->d_pcnt[side],
+                PIPE_K, C->d_ovf, 6, j_base);
+        }
+        if (S[side]->nfb > nr)
+            k_resieve_scatter<4, SLABBED><<<blocks, threads>>>(
+                S[side]->plat + nr, S[side]->primes + nr, NULL,
+                S[side]->nfb - nr, xmax, cfg->logI,
+                C->d_sum, d_two, C->d_gbase, C->d_plist[side], C->d_pcnt[side],
+                PIPE_K, C->d_ovf, 6,
+                SLABBED ? S[side]->walk_cur + nr : NULL);
         CK(cudaEventRecord(E[e + 1]));
         k_td<1, 0, 0, SLABBED><<<blocks, threads>>>(
             C->d_a, C->d_b, C->d_x, NULL, n, cfg->logI, C->d_poly[side],
@@ -1642,6 +1721,8 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     double vram_prev = 0;
     size_t need = 0;
     uint32_t *d_cursor = NULL, *d_overflow = NULL, *d_two = NULL;
+    /* --fill-gate with --fill-gate-shift > 0: side 1's folded bitmap */
+    uint32_t *d_gate = NULL;
     /* Second bucket workspace, allocated only under --fill-concurrent. The
      * two sides share one today because they run back to back; overlapping
      * them is exactly what that sharing forbids. */
@@ -1870,6 +1951,10 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     }
     VRAM_MARK("factor bases + bitmaps");
     PIPE_CK(cudaMalloc(&d_two, (size_t)nbitword_alloc * 4));
+    if (cfg->fill_gate && cfg->fill_gate_shift)
+        PIPE_CK(cudaMalloc(&d_gate, (size_t)((nbitword_alloc +
+                           (1u << cfg->fill_gate_shift) - 1) >>
+                           cfg->fill_gate_shift) * 4));
     PIPE_CK(cudaMalloc(&d_n, 4));
     PIPE_CK(cudaMalloc(&d_pre, 8));
     /* Untimed warm-up, n = 0 so it touches nothing. Everything above this line
@@ -1954,6 +2039,19 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         VRAM_MARK("second bucket array");
     }
 #undef VRAM_MARK
+    /* Name the fill knobs in the banner: a knob the log does not show is one
+     * a reader cannot prove was live. */
+    if (cfg->fill_rows)
+        printf("  --fill-rows %d: q < %d*I filled by row (side 1: %u entries,"
+               " side 0: %u), %s\n", cfg->fill_rows, cfg->fill_rows,
+               S1.nrow, S0.nrow,
+               cfg->fill_row_bands ? "fixed row bands" : "auto row bands");
+    if (cfg->resieve_rows)
+        printf("  --resieve-rows: the same tier is resieved by row\n");
+    if (cfg->fill_gate)
+        printf("  --fill-gate: side 0 stores fill records only under side 1's"
+               " survivors, 1 gate bit per %u positions\n",
+               1u << cfg->fill_gate_shift);
 
     /* Serial mode points BOTH sides at the one workspace on the legacy default
      * stream, which is what the two sides have always shared -- so the slab
@@ -2514,9 +2612,14 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 if (!sv1)
                     sv1 = pipe_side_sieve_join(1, &bk1, &S1, &sf1, &sa1, concurrent);
                 if (!sv1) {
+                    /* --fill-gate: side 1 has been joined, so its bitmap for
+                     * this slab is complete. Refused with --fill-concurrent,
+                     * whose side 0 is issued before side 1 finishes. */
                     sv0 = pipe_side_sieve_issue<SLABBED>(fb0, cfg, 0, xmax,
                                                j_base, &bk0, fblocks, fthreads,
-                                               &S0);
+                                               &S0,
+                                               cfg->fill_gate ? S1.survbits : NULL,
+                                               d_gate);
                     if (!sv0)
                         sv0 = pipe_side_sieve_join(0, &bk0, &S0, &sf0, &sa0, concurrent);
                 }
@@ -2877,10 +2980,13 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                    ts1[0], ts1[1], ts1[2], ts1[0] + ts1[1] + ts1[2],
                    (unsigned long long)side_surv1, S1.BOUND,
                    SLABBED ? " [slabbed]" : "");
+            /* Gated, side 0's own count is not its survivor population: its
+             * fill skips every position side 1 rejected. */
             printf("  side 0: transform %.3f + fill %.3f + apply %.3f = %7.3f ms,"
-                   " %8llu survivors (bound %u)%s\n",
+                   " %8llu survivors (bound %u)%s%s\n",
                    ts0[0], ts0[1], ts0[2], ts0[0] + ts0[1] + ts0[2],
                    (unsigned long long)side_surv0, S0.BOUND,
+                   cfg->fill_gate ? " [gated by side 1]" : "",
                    SLABBED ? " [slabbed]" : "");
         }
 
@@ -3729,7 +3835,7 @@ done:
     cudaFree(d_bucket_c); cudaFree(d_cursor_c); cudaFree(d_overflow_c);
     if (st_side[0]) cudaStreamDestroy(st_side[0]);
     if (st_side[1]) cudaStreamDestroy(st_side[1]);
-    cudaFree(d_two); cudaFree(d_n); cudaFree(d_pre);
+    cudaFree(d_two); cudaFree(d_n); cudaFree(d_pre); cudaFree(d_gate);
     if (ea) cudaEventDestroy(ea);
     if (eb) cudaEventDestroy(eb);
     if (qspan0) cudaEventDestroy(qspan0);

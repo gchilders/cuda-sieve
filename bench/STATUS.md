@@ -4,7 +4,7 @@
 the order they were discovered, including the ones later refuted, because the
 refutations are the most useful part. That makes them bad at answering "what
 does this thing do today". This file answers only that, and holds nothing that
-is not current. **Last updated 2026-09-25.**
+is not current. **Last updated 2026-10-13.**
 
 ## Architecture
 
@@ -14,14 +14,18 @@ One process, both sides, one special-q at a time:
 per special-q:
   host    reduce the q-lattice, build the three modulus tiers
   device  k_transform    plattice transform of the factor base
-          k_fill_atomic  bucket-sieve into regions (no record where gcd(i,j)
-                         is visibly > 1: both even, or 3 | both)
+          k_fill_rows    bucketed q < 4I at logI <= 15: row-banded, one
+                         atomic per region per row for a warp's hits
+          k_fill_atomic  the rest: bucket-sieve into regions (no record where
+                         gcd(i,j) is visibly > 1: both even, or 3 | both;
+                         side 0 stores only under side 1's survivors)
           k_apply        norm init + small-prime line sieve + bucket add
                          + threshold scan  ->  survivor bitmap
                          (both-even cells get no norm and no small-prime hits)
   (repeat for the other side)
   device  k_intersect_compact   both-sides bitmap AND, gcd filter, rank scan
           trial division, classification, resieve
+                               (resieve of q < 4I row-banded at logI <= 13)
                                (the candidate RECORDING pass is
                                k_td_record_warp, one warp per candidate;
                                the two dense passes are k_td, one thread
@@ -30,9 +34,21 @@ per special-q:
   host    emit relations
 ```
 
-Two sides run **sequentially through one shared bucket allocation**. There is
-no stream concurrency and no second workspace. Every timing in `RESULTS.md` is
-one-q-at-a-time.
+By default, two sides run **sequentially through one shared bucket
+allocation**, side 1 first, and side 0's fill stores records only where side
+1's survivor bitmap (folded to 8 positions per bit) has a survivor
+(`--fill-gate`). `--fill-concurrent` is an opt-in two-stream path with a
+second bucket allocation (finding 94); it overlaps sides of the same q, so it
+turns the gate off. The production scheduler still handles one q at a time.
+
+**Fill defaults since 2026-10-13 (finding 107), all output-identical:**
+`--fill-gate` on (off under `--fill-concurrent`), `--fill-rows 4` at
+logI <= 15, `--resieve-rows` at logI <= 13. They remove the tail
+`k_fill_atomic` and `k_resieve_scatter` had, where the thread for the smallest
+bucketed modulus walks `xmax/I` hits while the average walks a few hundred.
+`bench/fillcheck.sh` is the identity gate. `--fill-rows 0`, `--no-fill-gate`
+and `--no-resieve-rows` restore the old fill; every run log names them on a
+`# fill` line.
 
 **The algebraic factor base is generated in-process by default, added
 2026-08-24.** With `--fb1` omitted the pipeline calls the same GPU root finder
@@ -949,6 +965,30 @@ Cards with measured band data: **RTX 5070** (WSL2), **RTX 5090**, **RTX 4090**,
 
 ## Measured, and what it means
 
+- **C143 against cado-gpu, 2026-10-12/13** (findings
+  [105](RESULTS.md#finding-105) and [107](RESULTS.md#finding-107)). On the
+  first 6,983-q band, external clocks, same day, with 2026-10-13's fill
+  defaults:
+
+  | | µs per raw relation | raw relations/q |
+  |---|---:|---:|
+  | CADO (A=26, its default `p < 96` skip) | 34.2 | 118.3 |
+  | CADO with the skip off | 34.8 | 153.6 |
+  | cuda-sieve I13 | 63.3 (**1.85x**) | 153.8 |
+  | cuda-sieve I14 | 56.8 (**1.66x**) | 173.7 |
+
+  CADO's lower yield is its skip: with it off, the two I13 relation sets
+  overlap 99.9%. Our extras are marginal relations (87% with two algebraic
+  large primes), so the useful-yield advantage is below the raw 30%. The
+  completed 78M-raw campaigns (62m24s against 133m54s, before the fill fix)
+  hold 54.24M and 54.35M unique relations; singleton removal on both is open.
+  **Per kernel we are within ~1.4x of CADO** (5.58 against ~7.8 ms/q of GPU
+  work at one q in flight). **Most of the remaining gap is CADO's eight q in
+  flight**, worth 1.77x to it, against one here (NOW/NEXT row 14). CADO's ~8 CPUs
+  are GPU-feeding threads spinning in `cudaStreamSynchronize`; its real host
+  work is ~1.2 cores, and ours is under one. This 2LP/2LP job does not
+  establish the comparison on cofactor-heavy jobs.
+
 - **Our relations filter and factor — a complete NFS run, not a gate.** The
   C123 `223187...173681` was sieved entirely by this siever (29,933 special-q
   over `[400000, 800000]`, CADO for polynomial selection, msieve for
@@ -1281,7 +1321,7 @@ survive; if work is worth returning to, it belongs here. Two lists drifted
 apart once already — items 7–9 below existed only in a chat session and were
 absent from every document in the repo.
 
-### NOW / NEXT — agreed 2026-09-03
+### NOW / NEXT — agreed 2026-09-03, updated 2026-10-12
 
 The numbered list below is the full record and contains many *closed* items;
 this block is the short open-only view. Order is by what is actually blocking,
@@ -1304,6 +1344,11 @@ not by size.
 | 9 | Reclaim bucket VRAM freed by the skip | local GPU | **open, and NOT by scaling the estimate** — the per-region cap is uniform and a third of rows (odd `j`, `3` not dividing `j`) lose no records, so a cap scaled to 2/3 would overflow every slab (finding 100, review). Needs a per-row-class capacity; the current sizing is correct |
 | 10 | Lazy / bounded norm evaluation | local GPU | **parked by finding 104** — five designs, all byte-identical, with a floor clean on every cell checked (0 of 16.1e9 c183, 0 of 12.9e9 C194; mean gap ~1 unit). The best (lane-per-group scan) takes c183 apply −13.6% / wall −4.3% but C194 apply +3% and AS276 +16%, so it is not shipped. Designs 4-5 saved 20-39% of the instructions and lost issue slots (80-90% -> 50-73% busy, at base and boost clocks alike), with barrier stall growing with job size (0.5-0.7 per issued instruction eager, 3-9 lazy); why is not identified. Ceiling ~24% of apply, ~6.8% of c183 wall (finding 103), of which design 5 took ~60% on c183. A per-side switch does not help (AS276 loses on both sides). Next: explain the barrier-stall growth. Patches `bench/attic/lazy_norm_v4.patch`, `lazy_norm_v5.patch` (default off) |
 | 11 | `--bkthresh` below `I` | nothing | **FIXED 2026-09-23** — silently lost relations (5,079 and 7,456 of 9,053 at 8192 / 16384, exit 0) because the Franke-Kleinjung walk needs `p >= I`; now refused at startup and again in `run_pipeline_impl`, and capped at 2^30. Defaults were never affected. Raising it is correct but not faster, so the sweep is closed |
+| 12 | Complete blocking event waits and measure host CPU use | CPU/API trace; idle and contended C143 + C183/C194 bands | **proposed 2026-10-12** — NFS@Home objective is sustained use below one logical CPU. Existing `--blocking-sync` leaves default event waits spinning. Then evaluate fewer count readbacks, CUDA graphs and a bounded queue driven by one host thread. [Item 4](#low-cpu-plan), [finding 106](RESULTS.md#finding-106). No implementation or performance result yet. **First check that a blocking wait sleeps on WSL2 at all:** CADO's sievers spin at 80-90% of a core each, mostly system time, with blocking sync on (finding 107) |
+| 13 | Fix fill's tail, gate side 0's fill | local GPU | **DONE 2026-10-13, now the defaults** — finding 107. Row-banded tier for `q < 4I` (`--fill-rows`, logI <= 15) and its resieve (`--resieve-rows`, logI <= 13), CADO's side-0 fill gate (`--fill-gate`). Relations byte-identical (`fillcheck.sh`, 44 of 44). C143 first band wall -25.7% (I13) / -10.5% (I14); c183 -6.4%, C194 -5.5% |
+| 14 | Several special-q in flight | local GPU | **open, the largest measured lever** — CADO's eight slots are worth 1.77x to it (finding 107), half from filling host gaps and half from overlapping one q's low-occupancy kernels with another's. Our per-kernel work is within ~1.4x of CADO's. This is [item 4](#low-cpu-plan)'s queue design, justified by throughput as well as CPU; whole q in flight need independent bucket state and a VRAM budget |
+| 15 | Filter both C143 campaigns | CPU (msieve or CADO purge) | **open** — 54.35M against 54.24M unique; our extras are marginal 2LP relations. Excess after singleton removal prices them |
+| 16 | `--fill-concurrent` against the gate on wider cards | rented card | **open** — the flag now loses the gate. On a 5070 the gate (-4 to -6% wall on c183/C194) beats finding 94's -4.3%; on a 5090 at small geometry, where the flag gained -13.7%, the row tier has probably removed part of what it repaired. Measure before recommending the flag anywhere |
 
 **On (5), why both arms in one session.** Card-hours are the scarce resource
 and `resieve + scatter` is the same bucket-structured shape as fill: finding
@@ -2253,146 +2298,91 @@ finding 92.
      18.6% — the false low-end "q" can never re-find anything, so whole
      buckets read exactly 0.0%. Cross-check against the q count in the run log
      (`RUNBOOK.md:110`: 1,088,865 q for the c151, i.e. π(33.5M) − π(15M)).
-4. **Host cost — overlap first, graphs second, micro-optimisation last.**
-   Identifiable host work is 1.694 ms/q, only **7%** of a 24.30 ms idle wall,
-   but it triples under CPU contention (finding 53). It is three different
-   problems and they do not have the same fix:
+4. <a id="low-cpu-plan"></a> **Low CPU use and tolerance of competing work —
+   reopened 2026-10-12 for NFS@Home.**
 
-   **MEASURED 2026-08-17, and it moves this item DOWN — finding 56.** The free
-   experiment below was run and **renice buys nothing**: ~1% in every paired
-   comparison, at 12 competing workers and at full saturation alike. The reason
-   is that at 16 runnable threads on 16 logical CPUs nothing waits for a slot —
-   the feeder thread *shares a physical core* over SMT, and nice values do not
-   decide who you share a core with.
+   **Deployment objective:** retain GPU cofactorisation and keep sustained
+   aggregate process CPU use below one logical CPU, preferably with headroom.
+   Measure CPU seconds and the throughput of other host tasks as well as
+   sieve relations/s. A small isolated sieve slowdown can be acceptable if
+   total useful work on a volunteer host improves. No fractional-core target
+   has yet been demonstrated. [Finding 106](RESULTS.md#finding-106) records
+   the code inspection, sources and proposed experiments.
 
-   **Affinity, `SCHED_FIFO` and `--blocking-sync` were then all tried and all
-   fail** (finding 56). `taskset` pins the whole process including the CUDA
-   runtime's threads, so pinning *alone* costs 5.8% and reserving the physical
-   core only returns to parity; `chrt -f 1` costs 1.6%; `--blocking-sync`
-   costs 2.4%; and the two combined — the textbook low-latency recipe — are
-   the **worst** arm at 4.5%. **Every zero-code lever is exhausted.**
+   **WSL2 caveat, 2026-10-13 (finding 107).** CADO enables
+   `cudaDeviceScheduleBlockingSync` by default, yet its GPU-feeding threads
+   use 80-90% of a core each on this box, mostly as system time, while
+   waiting in `cudaStreamSynchronize`. Before the step below, check with a
+   small wait microbenchmark, or `--blocking-sync` CPU-seconds, that a
+   blocking wait actually sleeps under WSL2, and repeat on native Linux.
 
-   **What the contention actually is:** it tracks *oversubscription*, not
-   busyness. At one runnable thread per logical CPU it costs ~6%, measured
-   twice independently (12 real sievers, 15 spinners); at 1.7x subscribed it
-   roughly doubles. No scheduler knob reaches it because it is contention for
-   core resources — SMT siblings, cache, memory bandwidth. **The operational
-   lever is worker count: keep competing work at or below `nproc - 1`.**
+   **First: complete and measure the blocking-wait option.** The device
+   scheduling flag set by `--blocking-sync` does not cover
+   `cudaEventSynchronize` on events made with plain `cudaEventCreate`.
+   That is how the side, TD and intersection events are currently created.
+   NVIDIA documents that they busy-wait unless the event itself has
+   `cudaEventBlockingSync`. Make this an opt-in experiment, preserving
+   timing where required. The earlier +2.4% wall-time result for the existing
+   flag (finding 56) is not a measurement of fully blocking event waits or
+   of the CPU capacity they could release.
 
-   Note also that `taskset` never keeps *others* off a CPU. Real reservation is
-   cgroup v2 `cpuset.cpus.partition`, `isolcpus=` or `nohz_full=`; under WSL2
-   all of them still sit above the Windows host's own scheduler.
+   Then, guided by a CPU/API trace:
 
-   Two numbers now bound the prize. On a **verified-idle box** `acc/wall` is
-   0.885 and GPU utilisation 89.5%, so the structural gap is **11.5%** on the
-   c147 — contention adds ~6% at 12 workers and ~14% at 1.7x subscription
-   (a mixed sieve-plus-spinner load, not saturation) on top. **Those are c147
-   figures; at c183 `2^29` the 1:1 cost is about half -- finding 96.**
-   But the gap **shrinks with area**, because host work per q is fixed while
-   GPU work is not: 11.5% at `2^27`, 5.4% at `2^29`, **3.8% at `2^30`**. At the
-   geometry a C195 would deploy at, this whole item is worth under 4%, part of
-   which is interleaved launch/sync that overlap cannot recover. Treat it as a
-   small-job concern; it is not a prerequisite for the LPB work or item 0.
+   1. **Reduce GPU-to-host-to-GPU handoffs.** Keep survivor/accepted counts
+      on-device where subsequent kernels can consume them. Use bounded
+      allocations and checked overflow/retry, batch status readback at a
+      completion boundary, and retain all correctness/error gates. Merely
+      making a count copy asynchronous does not help if the next launch
+      still needs the count on the host.
+   2. **Graph repeated stage sequences.** Cofactor rounds are a candidate
+      because selection counts already stay on-device; TD needs the
+      readback work above. Explicitly handle changing parameters, capacity
+      growth and cofactor chunk adaptation. Graph capture of the existing
+      synchronizing path is not a drop-in operation. Keep watchdog-sized
+      kernels. This renews investigation of historical item 4.2 for CPU use,
+      without reviving its withdrawn 1.56 ms/q speedup estimate.
+   3. **Queue ahead with one submitting thread.** Now the measured
+      throughput lever as well (NOW/NEXT row 14): CADO's eight q in flight are worth
+      1.77x to it. Start with two or three work descriptors and pinned
+      staging buffers, retaining each buffer
+      until its GPU consumer has completed. Prepare successors or format
+      earlier output while the GPU runs; block only when space/results are
+      needed. Ordered work may reuse the bucket allocation; concurrently
+      executing whole q requires independent mutable state and a VRAM
+      budget. Bound stop latency, and checkpoint only durably completed work.
+      Queue depth and useful stream overlap must come from measurements.
+   4. **Make host preparation/output cheaper.** Reuse sort scratch instead
+      of per-q allocations, investigate sharing the small-prime transforms
+      for sieve and TD, and batch formatting/readback. Keep one host worker
+      initially. Work already overlapped with GPU execution still consumes
+      CPU, so hiding it does not satisfy the CPU-use objective on its own.
 
-   Two thirds of it is *prep* (host per-q tables/staging, small-prime tables)
-   and one third is *launch + sync overhead* (`host: unaccounted`). **Finding
-   53 holds the canonical table** — do not copy it here; it has drifted once
-   already.
+   **What the earlier measurements still establish:**
 
-   1. **Overlap the prep with GPU execution. PROMOTED then RESIZED
-      2026-09-03.** Finding 90 measured `unaccounted` as host time with nothing
-      in flight on the GPU and promoted this item; **finding 91 then attributed
-      that time by region and cut this item's value roughly in half.**
+   - Preparation-only overlap (historical item 4.1) has limited measured
+     headroom. Finding 89 already hides side-0 and TD preparation under
+     transforms. Finding 91 leaves roughly **0.5 ms/q**, about 0.5% on its
+     C183 case, exposed in side-1 preparation. Adding preparation threads
+     alone has no demonstrated large benefit.
+   - Nice, whole-process affinity and real-time priority did not improve
+     the measured throughput in finding 56. They are not the proposed
+     mechanism. Avoid CPU oversubscription; a logical CPU left idle is not
+     a reserved physical core, and WSL adds the host scheduler.
+   - Finding 96 is the current C183 contention measurement: about 3% rate
+     loss near one runnable thread per logical CPU and 6% at roughly 1.7x.
+     Finding 53's much larger penalty remains unexplained and is not a
+     universal bound. Small jobs have more frequent host handoffs.
 
-      **The premise as written is worth 0.03 ms/q.** "q+1's host work can run
-      during q's kernels" names q generation, `qsel_validate`, checkpointing
-      and `qlat_build` -- all of which happen before any GPU op is issued, and
-      together they cost **0.03 ms/q**. Hiding them buys nothing.
+   **Acceptance:** interleave baseline/variant runs on C143 and C183/C194,
+   idle and with realistic competing CPU work. Record process user+system
+   CPU seconds/wall across all threads, CPU seconds per million relations,
+   relation rate, competing-task throughput, GPU gaps and wakeup delays.
+   Check relation identity for scheduling-only changes, buffer limits,
+   memory use, stop responsiveness and checkpoint/resume. Validate relevant
+   Linux and Windows/WSL paths. Investigate finding 105's conflicting elapsed
+   clocks before precise cross-timer attribution. All changes above are
+   **proposed and unmeasured**, not shipped.
 
-      **And the real target is only ~0.5 ms/q (~0.5%) -- PARKED 2026-09-03.**
-      The 1.89 ms of prep is not exposed: `prepare_q(side 0)` runs while
-      transform 1 executes and `td_prepare_q` runs while transform 0 does, both
-      already hidden under the 3.27 ms of asynchronous transform that finding
-      89 unblocked. Only `prepare_q(side 1)` runs with the GPU drained, because
-      the previous q ended synchronised. **Finding 89's async-transform change
-      already collected most of what this item was for.**
-
-      Half a percent does not justify doubling the host staging buffers,
-      splitting `prepare_q` into compute and upload phases, and peeking the
-      generator ahead of the checkpoint and stop-file logic. **Parked; item 4.2
-      is the larger remaining host-side win at 1.56 ms/q**, and it too is
-      parked for now (owner's call, both are ~1-2% combined).
-
-      Both prep terms depend only on
-      the q-lattice, not on any GPU result, so q+1's host work can run during
-      q's kernels. This is double-buffering, **not threading**: 1.166 ms of
-      prep against ~20.7 ms of GPU work per q fits entirely inside the GPU's
-      shadow with 18× room to spare, so perfect overlap takes it to *zero* on
-      the critical path. **(That 1.166 ms is a c147 figure and the argument is
-      SUPERSEDED -- finding 91 measured the prep at 1.89 ms on c183/I15e and
-      showed most of it is ALREADY in the shadow. The prep does fit; it is
-      already there. Read the 2026-09-03 note at the head of this item, not
-      this paragraph, for the item's size.)** Threading the same work would reach maybe 0.4 ms with
-      four threads and leave it *on* the critical path — strictly worse, for
-      more code and a synchronisation problem we do not currently have.
-   2. **CUDA graphs for the per-q kernel sequence.** `unaccounted` is
-      wall-minus-device inside TD/classify: the CPU issuing launches and
-      waiting on syncs. **(Finding 90 measured `unaccounted` at the band level
-      as host time with nothing in flight on the GPU, and finding 91 could not
-      quantify how much is launch overhead -- so this sub-item's size is
-      unknown, not the 1.56 ms briefly claimed on 2026-09-03. Parked.)** Overlap cannot help — it is interleaved with GPU
-      execution by nature — and it is the term that grew **443%** under load,
-      so it is what makes the box fragile. The per-q sequence is fixed, so it
-      can be captured once and replayed.
-   3. **Then make the prep cheaper** — three-way partition replacing the per-q
-      stable sort, fusing the small-ideal transform that is currently done
-      twice, and **hoisting the per-q allocations**: `pipeline.cuh:169-183`
-      mallocs and frees five temporaries (`idx/tp/trt/tg/tlp`) per side per q,
-      i.e. 10 malloc/free pairs per special-q, plus three memcpys back over the
-      pinned arrays. Reusable scratch removes that churn, and it is the part a
-      better sort algorithm does *not* fix. **This was previously the whole of this item and it is the least
-      valuable third of it**: after (1) the work is hidden in the GPU shadow
-      and costs nothing regardless of how fast it is.
-
-   **Priority note, 2026-08-07 (owner).** Sharing the box is a **requirement,
-   not a robustness nicety**: a sieve that only performs on an idle host is
-   much less useful, because the host is a desktop someone wants to use. That
-   moves this item up and changes what "done" means — the target is that the
-   GPU does not wait on the CPU, not that host work is small on a quiet box.
-
-   **Do the free experiment before any of the code below.** The host thread is
-   not obviously starved of CPU *time* — measured 2026-08-07 it holds 92.9% of
-   one core, because CUDA's default sync spins. What it competes for is the
-   *moment* it needs to issue the next launch, and at equal priority it loses
-   that race as often as it wins. Two zero-code levers:
-
-   - **Renice the competing work.** Raising your own processes' nice value
-     needs no privileges. With the sieve at nice 0 and everything else at 19,
-     CFS weights the sieve ~1024 to 15 and it wins essentially every contest.
-   - **Leave headroom, but know what you are leaving.** This box is 8 physical
-     cores / 16 threads, so 14 `ecm` workers plus one spinning sieve thread is
-     15 of 16 *threads* and **every physical core is loaded** — there is no
-     idle core to fall back on, and the sieve thread shares a core with an ECM
-     worker whatever you do. Dropping batch work to `nproc - 2` frees two
-     threads, i.e. one core's worth of SMT capacity, not a quiet core. That is
-     why the renice lever matters more here than on a wide box: on 8 cores you
-     cannot isolate the sieve by subtraction, only by priority.
-
-   **The live instrument is GPU utilisation, and it is now automatic.** Every
-   `--log` record carries `gpu=` and `acc/wall` (item 12b), so the pair of runs
-   this rule needs is a `grep`. The rule was: if renicing moves utilisation
-   toward the mid-90s the penalty is a scheduling problem, and otherwise the
-   dependency is architectural. **Resolved 2026-08-17: it does not move, so the
-   dependency is architectural** — but see the measured prize above before
-   concluding that makes this item urgent. A caution that survives: 88–89%
-   during the co-scheduled snfs236 run is *not* comparable to the 89.5% idle
-   figure on the c147, because utilisation is a function of the job's area as
-   much as of the host.
-
-   One caution retained: this interacts with item 1: two concurrent q roughly
-   **doubles host work per unit time**, so on a contended host that experiment
-   can come back negative for host reasons unrelated to the GPU. Run it on a
-   verified-idle box and check `GPU-accounted / wall` first.
 5. **True rectangle maximum** for the norm approximation — one safe band-wide
    scale, or a few scale/slice-table buckets, gated at low/mid/high q on more
    than one job. Note the payoff is job-shaped: for the snfs236 polynomial the
@@ -3882,21 +3872,22 @@ finding 92.
        none measured) rather than to hunt a commit.
     4. Only then chase the 08-27 trigger, if the attribution points at
        something a package could plausibly have changed.
-    5. **Item 4.1 is NOT the fix, and is parked.** Finding 91 showed its prep
+    5. **Preparation-only overlap remains parked.** Finding 91 showed its prep
        is already hidden under the asynchronous transform that finding 89
-       unblocked, leaving ~0.5 ms/q exposed. The "1.166 ms fits in the shadow"
-       argument in item 4 predates that and is superseded: the prep does fit,
-       but it is already there.
+       unblocked, leaving ~0.5 ms/q exposed. The earlier "1.166 ms fits in the
+       shadow" argument is superseded. The current [item 4](#low-cpu-plan)
+       addresses CPU consumption and handoffs as well as preparation.
     6. **Per-launch overhead is real but UNQUANTIFIED.** The 1.56 ms/q figure
        once here came from a slab-loop sub-split that code review found unsound
        -- its window included the `k_intersect_compact` launch and a blocking
        GPU wait -- and which has been removed; see finding 91. What survives is
        finding 89's Nsight ranking putting the largest remaining gaps in the
-       fill/apply region. **PARKED 2026-09-03 with item 4.1** -- 1.5% and 0.5% respectively do not justify
-       restructuring the per-q loop now. The standing candidate for it
-       is **CUDA graphs** (item 4.2): capture the fixed per-q sequence once and
-       replay it, attacking launch count and latency directly. The other
-       candidate that used to sit here -- the mid-sequence transform sync --
+       fill/apply region. **Preparation-only overlap remains limited by
+       finding 91; the broader host work is reopened 2026-10-12 for CPU
+       consumption as well as throughput.** See [item 4](#low-cpu-plan) and
+       finding 106. CUDA graphs are a candidate after addressing host
+       readbacks and dynamic buffer management; no numeric gain is established.
+       The other candidate that used to sit here -- the mid-sequence transform sync --
        was removed by finding 89 and is no longer available as a lever.
 
     **The separate inefficiency found while chasing this is now FIXED**

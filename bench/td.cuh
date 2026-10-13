@@ -560,6 +560,80 @@ __global__ void k_resieve_scatter(const plat_t *__restrict plat,
     if (ovf) atomicAdd(noverflow, ovf);
 }
 
+/* ---- --resieve-rows: the row tier of k_resieve_scatter ------------------ *
+ *
+ * k_resieve_scatter has k_fill_rows' problem: one thread per modulus, so the
+ * smallest bucketed modulus (~I) probes xmax/I positions on one thread while
+ * the average thread probes a few hundred. For q >= I a row holds at most one
+ * lattice point, at i + I/2 == (rt*j + I/2) mod q, so the rows split into bands
+ * that start independently. Thread t takes entry t % n over band t / n, so a
+ * warp's lanes share their rows. UNROLL rows are probed before any is acted
+ * on, for the memory-level parallelism the note above k_resieve_scatter
+ * measured. Same (survivor, prime) pairs as the FK walk; the order of primes
+ * inside a survivor's list may differ, and k_td divides them in any order.
+ *
+ * Row 0 needs no test: its only lattice point is (0,0), never a survivor.
+ * j_base counts only under SLABBED, as in pos_row. */
+template <int UNROLL, bool SLABBED>
+__global__ void k_resieve_rows(const uint32_t *__restrict primes,
+                               const uint32_t *__restrict rts,
+                               const uint8_t *__restrict ispow,
+                               uint32_t n, uint32_t nbands, uint32_t rows,
+                               int logI,
+                               const uint32_t *__restrict summary,
+                               const uint32_t *__restrict bits,
+                               const uint32_t *__restrict gbase,
+                               uint32_t *__restrict plist,
+                               uint32_t *__restrict pcnt,
+                               uint32_t K,
+                               unsigned long long *__restrict noverflow,
+                               int log_gran, uint32_t j_base)
+{
+    const uint32_t I = 1u << logI;
+    const uint32_t NONE = 0xFFFFFFFFu;      /* local x < 2^31, cannot collide */
+    const uint64_t t = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= (uint64_t)n * nbands) return;
+    const uint32_t k = (uint32_t)(t % n);
+    const uint32_t band = (uint32_t)(t / n);
+    const uint32_t rt = rts[k];
+    if (rt == ROWRT_NONE) return;
+    if (ispow && ispow[k]) return;
+    const uint32_t q = primes[k];
+    const uint32_t r0 = (uint32_t)((uint64_t)band * rows / nbands);
+    const uint32_t r1 = (uint32_t)((uint64_t)(band + 1) * rows / nbands);
+    /* the offset follows the GLOBAL row; positions are slab-local */
+    const uint32_t jb = SLABBED ? j_base : 0u;
+    uint32_t off = (uint32_t)(((uint64_t)rt * (jb + r0) + (I >> 1)) % q);
+    unsigned long long ovf = 0;
+
+    for (uint32_t r = r0; r < r1; ) {
+        uint32_t xs[UNROLL], hit[UNROLL];
+        #pragma unroll
+        for (int u = 0; u < UNROLL; u++) {
+            xs[u] = (r < r1 && off < I) ? (r << logI) + off : NONE;
+            if (r < r1) { off += rt; if (off >= q) off -= q; r++; }
+        }
+        /* every one of these is independent, so they issue together */
+        #pragma unroll
+        for (int u = 0; u < UNROLL; u++) {
+            const uint32_t sb = xs[u] >> log_gran;
+            hit[u] = (xs[u] == NONE) ? 0u
+                                     : ((summary[sb >> 5] >> (sb & 31u)) & 1u);
+        }
+        #pragma unroll
+        for (int u = 0; u < UNROLL; u++) {
+            if (!hit[u]) continue;
+            const uint32_t xv = xs[u];
+            if (!((bits[xv >> 5] >> (xv & 31u)) & 1u)) continue;
+            const uint32_t idx = td_rank(bits, gbase, xv);
+            const uint32_t slot = atomicAdd(&pcnt[idx], 1u);
+            if (slot < K) plist[(size_t)idx * K + slot] = q;
+            else ovf++;
+        }
+    }
+    if (ovf) atomicAdd(noverflow, ovf);
+}
+
 /* ---- the trial-division kernel ----------------------------------------- */
 
 #define TDF_NORM_OVERFLOW  1u

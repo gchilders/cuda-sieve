@@ -1,8 +1,9 @@
 # oracle/ — frozen inputs for the cuda-sieve feasibility probe
 
-Everything in this directory is **frozen**. `../test-sieve/` is the owner's live
-working directory and its polynomial is expected to be replaced with a different
-number; these copies were taken on **2026-08-01** so the target job survives that.
+Inputs in this directory are **frozen**. The original C183 copies were taken
+on **2026-08-01** from the owner's live `../test-sieve/` directory so the target
+job survives polynomial changes there. Later inputs and captures have their
+own dates below.
 
 These files are correctness oracles and CPU performance baselines for the
 project's primary **GPU-resident relation-collection** goal. Their presence does
@@ -189,3 +190,124 @@ the bucket array** (`../bench/RESULTS.md` finding 64).
 Both carry `maxbits` in the header, so `head -4 c194.roots1.m16` identifies a
 stale copy without hashing 197 MB. A mismatch against `--logI` is only a `note:`
 from `bench`, not an error.
+
+## C143 cado-gpu comparison (2026-10-12)
+
+[`c143.job`](c143.job) preserves the degree-5 GNFS polynomial and bounds from
+the owner's `~/cado-gpu/c143-649044015427` campaign.
+[`c143.poly`](c143.poly) is its original CADO polynomial file. This is a
+**performance comparison input**, with two large primes on both sides, not a
+new relation-containment oracle. Findings [105](../bench/RESULTS.md#finding-105)
+and [106](../bench/RESULTS.md#finding-106) record the results and proposed CPU
+work; the current plan is [STATUS item 4](../bench/STATUS.md#low-cpu-plan).
+
+| setting | value |
+|---|---|
+| `rlim` / `alim` | 14,000,000 / 18,000,000 |
+| `lpbr` / `lpba` | 30 / 30 |
+| `mfbr` / `mfba` | 57 / 58 |
+| CADO `lambda0` / `lambda1` | 1.905 / 1.94, supplied on the command line |
+| special-q side / start | algebraic (1) / 2,200,000 |
+| first comparison band | `[2200000, 2300000)`, 6,983 prime/root pairs |
+| full campaign target | 78,000,000 **raw** relations |
+| CADO geometry | `A=26`, `logI=13`, q-dependent `J <= 8192` |
+| cuda-sieve campaign geometry | `logI=14`, `J=4096`, `region=13`, `maxbits=13` |
+
+The lambdas use CADO units. The job deliberately omits GGNFS
+`rlambda`/`alambda`; do not substitute those for the command-line overrides.
+The I14 experiment deliberately keeps `maxbits=13` to match the saved CADO
+factor base's prime-power convention.
+
+The small evidence files in [`c143-comparison-20261012/`](c143-comparison-20261012/)
+are tracked and pinned in `MANIFEST.sha256`:
+
+- `cuda-i13.*`, `cuda-i14.*`, `cuda-campaign.*`: verbatim output, run log,
+  and `/usr/bin/time` result, copied respectively from root-level local
+  `c143-timing.fHQfNX`, `c143-timing.FinIL9`, and `c143-timing.7GYZN2`.
+  Paths and command lines in these historical captures are unchanged.
+- `cado.parameters.txt`: the campaign's `c143.parameters_snapshot.1`.
+- `cado.campaign.txt`: original first-workunit dispatch and target-reached
+  log lines, plus the original first sieve command.
+- `cado.bands.tsv`: summary fields from the 165 accepted-range workunit
+  stderr files, with source filenames. It excludes later surplus workunits.
+- `cado.samples.txt`: non-per-q comment lines from four compressed relation
+  files, followed by explicitly labelled geometry aggregates derived from
+  their per-q headers. Relation rows are not copied.
+- `cado.dup2.slice*.txt`: verbatim duplicate-removal summaries.
+
+The multi-gigabyte relation files remain local in their original directories;
+they are not part of this capture. The temporary root `c143-timing.sh` was
+removed after preserving its effective commands here and in the run logs.
+
+To repeat the I14 first band, from the repository root, use a fresh output
+directory so an earlier run cannot resume. **Since 2026-10-13 this command
+runs the new fill defaults** (finding 107: about 68.9 s, not the captured
+~77-81 s). To reproduce the configuration of the captures above, add
+`--fill-rows 0 --no-fill-gate`.
+
+```sh
+mkdir -p work
+run_dir=$(mktemp -d work/c143.XXXXXX)
+/usr/bin/time -f 'elapsed_s=%e user_s=%U system_s=%S max_rss_kb=%M' \
+  -o "$run_dir/wall-time.txt" \
+  ./bench/bench --pipeline --cofactor --poly oracle/c143.job \
+    --logI 14 --J 4096 --region 13 --maxbits 13 \
+    --sq-side 1 --qrange 2200000:2299999 \
+    --lambda0 1.905 --lambda1 1.94 \
+    --relations "$run_dir/relations.dat" --log "$run_dir/run.log" \
+    >"$run_dir/output.txt" 2>&1
+```
+
+For I13, change `--logI 14 --J 4096` to `--logI 13 --J 8192`. For the full
+campaign, replace the bounded q range with
+`--qrange 2200000: --target-rels 78000000`. Our upper q endpoint is inclusive;
+the saved CADO command uses the exclusive `-q1 2300000`.
+
+With the compared cado-gpu checkout built at `~/code/cado-nfs-public`, the
+corresponding first-band commands are:
+
+```sh
+cado_dir="$HOME/code/cado-nfs-public/gpu-siever"
+mkdir -p work
+cado_run=$(mktemp -d work/c143-cado.XXXXXX)
+"$cado_dir/build/cado/sieve/makefb" -poly oracle/c143.poly \
+  -lim 18000000 -maxbits 13 -side 1 -t 16 \
+  -out "$cado_run/roots1.gz"
+"$cado_dir/scripts/las-glas" -poly oracle/c143.poly \
+  -q0 2200000 -q1 2300000 -A 26 \
+  -lim0 14000000 -lim1 18000000 -lpb0 30 -lpb1 30 \
+  -mfb0 57 -mfb1 58 -lambda0 1.905 -lambda1 1.94 \
+  -ncurves0 13 -ncurves1 14 -fb1 "$cado_run/roots1.gz" \
+  -out "$cado_run/relations.gz" -t 16 -stats-stderr \
+  >"$cado_run/output.txt" 2>"$cado_run/stderr.txt"
+```
+
+The launcher replaces `-t` with its host CPU allocation unless
+`GLAS_THREADS` overrides it; record that setting when comparing CPU budgets.
+`GLAS_GPU_STATS=1` enables additional diagnostics for a new measurement.
+These are reproduction recipes, not new measurements. Compare fresh,
+interleaved runs and record host load and aggregate process CPU time.
+
+## C143 fill tier, fill gate and cado-gpu ablations (2026-10-13)
+
+[`c143-fill-20261013/`](c143-fill-20261013/) holds the small evidence for
+[finding 107](../bench/RESULTS.md#finding-107), pinned in `MANIFEST.sha256`.
+Paths and command lines inside the captured scripts are verbatim, and the
+runs they name live in the git-ignored `../work/`.
+
+- `fillcheck.txt`: the identity gate with the new defaults, 44 of 44
+  byte-identical.
+- `sweep-*.txt`, `confirm*.txt`: interleaved A/B lines (one per run, host load
+  on the confirmation lines), from `fillab.sh` and `confirm.sh`. `summ.py`
+  turns them into the median tables.
+- `firstband-*`: the 6,983-q first band, old fill against the new defaults at
+  I13 and I14, with `--relations` and `/usr/bin/time` (`firstband.sh`).
+- `cado-<arm>.{stderr,time,threads}.txt`: the six `las-glas` arms of
+  `cado-ablation.sh`. `threads` is a `ps -L` snapshot 15 s into the run.
+- `relcmp.py` and `cado-*_vs_cuda-i13.txt`: the first band's relation sets,
+  CADO default and CADO with `GLAS_SKIP_BOUND=0`, each against cuda-sieve I13.
+
+The CADO arms run the launcher with `-fb1` pointing at a copy of the
+campaign's `c143.roots1.gz` in `work/`, so glas writes its factor-base cache
+there and not into the campaign directory. The environment variables are
+the only difference between arms.

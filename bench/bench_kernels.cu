@@ -104,13 +104,18 @@ __global__ void k_transform(const uint32_t *__restrict primes,
                             int64_t a0, int64_t a1, int64_t b0, int64_t b1,
                             uint32_t *__restrict nproj,
                             unsigned long long *__restrict nlost,
-                            uint64_t *__restrict walk_cur)
+                            uint64_t *__restrict walk_cur,
+                            uint32_t *__restrict rt_out = nullptr,
+                            uint32_t n_rt = 0)
 {
     const uint64_t stride = bench_grid_stride_x();
     for (uint64_t kk = bench_grid_thread_x(); kk < n; kk += stride) {
         const uint32_t k = (uint32_t)kk;
         const uint32_t q = primes[k];
         uint32_t rt, g, m = pl_transform_enc(q, roots[k], a0, a1, b0, b1, &rt, &g);
+        /* --fill-rows: the row tier walks i == rt*j (mod q) row by row, which
+         * is the same lattice pl_make reduces whenever g == 1 (then m == q). */
+        if (k < n_rt) rt_out[k] = (g > 1) ? ROWRT_NONE : rt;
         if (g > 1) {                         /* rows only: emit an empty walk */
             plat_t P; P.inc_warp = PL_INVALID; P.inc_step = PL_VERTICAL;
             P.bound_warp = 0; P.bound_step = 0;
@@ -149,6 +154,19 @@ __device__ __forceinline__ int pos_both_even(uint32_t x, uint32_t j)
     return ((x | j) & 1u) == 0u;
 }
 
+/* --fill-gate: the side filled SECOND stores a record only where the side
+ * filled first has a survivor within the same 2^gate_shift positions. A
+ * position the first side rejected is dropped by k_intersect_compact whatever
+ * the second side's sum is, so the records that matter are all still written
+ * and the relations are unchanged. gate == NULL is the ungated fill. */
+__device__ __forceinline__ int fill_gate_drops(const uint32_t *__restrict gate,
+                                               int gate_shift, uint32_t x)
+{
+    if (!gate) return 0;
+    const uint32_t g = x >> gate_shift;
+    return !((gate[g >> 5] >> (g & 31u)) & 1u);
+}
+
 /* ---- stage (a): naive single-level atomic append ---------------------- */
 
 /* One atomicAdd per record into a 2^log_nbuckets-way split. This is the
@@ -163,7 +181,9 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
                               uint32_t *__restrict overflow,
                               const uint64_t *__restrict walk_cur,
                               uint64_t *__restrict walk_next,
-                              int sieve_skip, uint32_t j_base)
+                              int sieve_skip, uint32_t j_base,
+                              const uint32_t *__restrict gate = nullptr,
+                              int gate_shift = 0)
 {
     const uint32_t Imask = (1u << logI) - 1;
     const uint32_t offmask = (1u << log_region) - 1;
@@ -227,6 +247,7 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
                 if (sieve_skip > 1 && (j % 3u) == 0u && ((xl & Imask) % 3u) == ih3)
                     continue;
             }
+            if (fill_gate_drops(gate, gate_shift, xl)) continue;
             const uint32_t b = xl >> log_region;
             const uint32_t slot = atomicAdd(&cursor[b], 1u);
             if (slot >= cap) { atomicAdd(overflow, 1u); continue; }
@@ -241,6 +262,150 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
         }
         /* x is already the exact first hit at/after the slab end. */
         if constexpr (SLABBED) walk_next[k] = x - xmax;
+    }
+}
+
+/* ---- --fill-rows: the smallest bucketed moduli, row by row ------------ *
+ *
+ * k_fill_atomic gives each modulus ONE thread, and that thread visits all of
+ * its xmax/q hits in sequence, each a cursor atomic whose returned slot the
+ * store must wait for. The smallest bucketed modulus is ~I, so its thread
+ * runs xmax/I = J dependent atomic->store steps while the average thread
+ * runs a few hundred: the kernel's tail is a handful of warps on an
+ * otherwise idle card. (C143: fill +60% from I14 to I13 for +14% records.)
+ *
+ * For q >= I a row holds at most one hit, at i + I/2 == (rt*j + I/2) mod q,
+ * so the strip can be enumerated by row instead of by FK step, and the rows
+ * split into bands that start independently. A warp takes 32 consecutive
+ * moduli over one band of rows; its hits in a row land in one or two
+ * regions, so one atomic per region per row reserves slots for all of them
+ * (CADO's fill_row_kernel does the same). Same records as the FK walk; only
+ * their order inside a bucket changes, which k_apply's sum does not see.
+ *
+ * rts[k] is k_transform's rt_out: the root, or ROWRT_NONE where k_fill_atomic
+ * would skip the entry (PL_INVALID). The row tier needs no walk state; when
+ * k_resieve_scatter still walks it (--no-resieve-rows), k_rows_walk_next
+ * supplies the cursor. j_base counts only under SLABBED, as in pos_row. */
+template <bool SLABBED>
+__global__ void k_fill_rows(const uint32_t *__restrict primes,
+                            const uint32_t *__restrict rts,
+                            const uint16_t *__restrict slice,
+                            uint32_t n, uint32_t nbands, uint32_t rows,
+                            int logI, int log_region,
+                            uint32_t *__restrict cursor,
+                            uint8_t *__restrict out, uint32_t cap,
+                            uint32_t *__restrict overflow,
+                            int sieve_skip, uint32_t j_base,
+                            const uint32_t *__restrict gate, int gate_shift)
+{
+    const uint32_t I = 1u << logI;
+    const uint32_t offmask = (1u << log_region) - 1;
+    const uint32_t jb = SLABBED ? j_base : 0u;
+    const uint32_t ih3 = (I >> 1) % 3u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t warp = ((uint64_t)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    /* whole warps only (blockDim % 32 == 0), so this exit is warp-uniform and
+     * the full-mask ballot below stays legal */
+    if (warp >= (uint64_t)((n + 31u) >> 5) * nbands) return;
+    const uint32_t band = (uint32_t)(warp % nbands);
+    const uint32_t k = (uint32_t)(warp / nbands) * 32u + lane;
+    const uint32_t r0 = (uint32_t)((uint64_t)band * rows / nbands);
+    const uint32_t r1 = (uint32_t)((uint64_t)(band + 1) * rows / nbands);
+
+    uint32_t q = 1, rt = 0, sl = 0;
+    const bool active = k < n && rts[k] != ROWRT_NONE;
+    if (active) { q = primes[k]; rt = rts[k]; sl = slice[k]; }
+    uint32_t off = active
+        ? (uint32_t)(((uint64_t)rt * (jb + r0) + (I >> 1)) % q) : I;
+
+    for (uint32_t r = r0; r < r1; r++) {
+        const uint32_t j = jb + r;
+        /* (0,0) is the only lattice point of row 0 and is never sieved */
+        bool hit = off < I && j != 0;
+        if (hit && sieve_skip) {
+            /* row bases are multiples of I, so parity(x) == parity(off) and
+             * x & Imask == off: the same tests as k_fill_atomic */
+            if (((off | j) & 1u) == 0u) hit = false;
+            else if (sieve_skip > 1 && j % 3u == 0u && off % 3u == ih3) hit = false;
+        }
+        const uint32_t xl = (r << logI) + off;
+        if (hit && fill_gate_drops(gate, gate_shift, xl)) hit = false;
+        /* every lane runs every row (the band is warp-uniform), so the
+         * full-mask ballot is legal */
+        const uint32_t mask = __ballot_sync(0xFFFFFFFFu, hit);
+        if (hit) {
+            const uint32_t b = xl >> log_region;
+            uint32_t slot;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+            /* __match_any_sync needs sm_70; before it, one atomic per hit */
+            (void)mask; (void)lane;
+            slot = atomicAdd(&cursor[b], 1u);
+#else
+            const uint32_t peers = __match_any_sync(mask, b);
+            const uint32_t leader = __ffs(peers) - 1;
+            slot = 0;
+            if (lane == leader) slot = atomicAdd(&cursor[b], __popc(peers));
+            slot = __shfl_sync(peers, slot, leader) +
+                   __popc(peers & ((1u << lane) - 1u));
+#endif
+            if (slot >= cap) atomicAdd(overflow, 1u);
+            else *(uint32_t *)(out + ((size_t)b * cap + slot) * 4) =
+                     (xl & offmask) | (sl << 16);
+        }
+        if (active) { off += rt; if (off >= q) off -= q; }
+    }
+}
+
+/* Slabbed --fill-rows with --no-resieve-rows: k_resieve_scatter replays
+ * walk_cur for the row tier as for every other entry, so each needs the first
+ * lattice point at or past the slab end, as k_fill_atomic leaves it for the
+ * rest. Stepping row by row to it can take ~q - I rows (rt == 1), which is the
+ * single-thread tail the tier exists to remove, so pl_rows_to_hit jumps there
+ * in O(log q). row_end is the GLOBAL row after this slab. */
+__global__ void k_rows_walk_next(const uint32_t *__restrict primes,
+                                 const uint32_t *__restrict rts, uint32_t n,
+                                 uint32_t row_end, int logI,
+                                 const uint64_t *__restrict walk_cur,
+                                 uint64_t *__restrict walk_next)
+{
+    const uint32_t I = 1u << logI;
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t kk = bench_grid_thread_x(); kk < n; kk += stride) {
+        const uint32_t k = (uint32_t)kk;
+        const uint32_t rt = rts[k];
+        if (rt == ROWRT_NONE) { walk_next[k] = walk_cur[k]; continue; }
+        const uint32_t q = primes[k];
+        const uint32_t off = (uint32_t)(((uint64_t)rt * row_end + (I >> 1)) % q);
+        const uint64_t t = pl_rows_to_hit(off, rt, q, I);
+        if (t == UINT64_MAX) { walk_next[k] = UINT64_MAX; continue; }
+        const uint32_t o = (uint32_t)((off + (uint64_t)rt * (t % q)) % q);
+        walk_next[k] = (t << logI) + o;   /* x - xmax, as k_fill_atomic */
+    }
+}
+
+/* --fill-gate-shift > 0: fold the first side's survivor bitmap to one bit per
+ * 2^shift positions, set when any of them survived. A superset of the bitmap,
+ * so the gated fill stores somewhat more records than shift 0 would but the
+ * gate is 2^shift times smaller to keep in L2. One thread per gate word. */
+__global__ void k_gate_fold(const uint32_t *__restrict bits,
+                            uint32_t *__restrict gate, int shift,
+                            uint32_t ngword, uint32_t nbitword)
+{
+    const uint32_t span = 1u << shift;          /* bitmap words per gate word */
+    const uint32_t per = 32u >> shift;          /* gate bits per bitmap word */
+    const uint32_t low = span == 32u ? 0xFFFFFFFFu : (1u << span) - 1u;
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t w = bench_grid_thread_x(); w < ngword; w += stride) {
+        uint32_t g = 0;
+        for (uint32_t k = 0; k < span; k++) {
+            /* the last gate word may cover past the bitmap's end: no
+             * survivors there, so no gate bits */
+            const uint64_t wi = (w << shift) + k;
+            const uint32_t word = wi < nbitword ? bits[wi] : 0u;
+            for (uint32_t c = 0; c < per; c++)
+                if ((word >> (c << shift)) & low) g |= 1u << (k * per + c);
+        }
+        gate[w] = g;
     }
 }
 

@@ -374,6 +374,7 @@ float norm_target_host(const norm_t *N, int32_t i, uint32_t j);
 int  verify_walk(int logI, uint32_t J, int nprimes);
 int  verify_walk_slabs(int logI, uint32_t J, uint32_t slab_J, int nprimes);
 int  verify_walk_slab_cases(void);
+int  verify_rows_to_hit(void);
 
 /* Count updates the walk produces for the given FB, single-threaded.
  * This is the ground truth the GPU fill must reproduce exactly. */
@@ -592,6 +593,24 @@ typedef struct {
      * sharing forbids. Off by default, and refused with a message rather than
      * silently when the second array does not fit. */
     int      fill_concurrent; /* 0 = sides run back to back (default) */
+    /* --fill-rows N: bucketed moduli q < N*I are filled row by row in bands
+     * (k_fill_rows) instead of one thread walking all xmax/q of their hits,
+     * which is what sets k_fill_atomic's tail (finding 105 follow-up).
+     * Output-identical by construction. 0 = off; default 4 at logI <= 15
+     * (bench_main resolves -1). --fill-row-bands sets the bands per slab;
+     * 0 = one per FILL_ROW_RUN rows. */
+    int      fill_rows;
+    int      fill_row_bands;
+    /* --resieve-rows: k_resieve_scatter's walk of the same --fill-rows tier
+     * goes to k_resieve_rows, banded by row. Same (survivor, prime) pairs. */
+    int      resieve_rows;
+    /* --fill-gate: side 0's fill stores a record only where side 1 has a
+     * survivor within 2^fill_gate_shift positions (CADO's GLAS_FILL_GATE).
+     * Output-identical by construction, except that a slab which overflowed
+     * ungated may now fit. Serial sides only: default on, off under
+     * --fill-concurrent, where an explicit --fill-gate is refused. */
+    int      fill_gate;
+    int      fill_gate_shift;
     /* --qspan: bracket each special-q's GPU work with two events and report
      * the span, splitting `unaccounted` into host-with-no-GPU-work versus
      * idle-between-stages. Diagnostic; STATUS item 19 step 2. */
@@ -846,6 +865,16 @@ typedef struct {
  * data-driven (one block per super-bucket) and has no grid to tune. */
 #define FILL_BLOCKS_DEFAULT  4608
 #define FILL_THREADS_DEFAULT 32
+/* --fill-rows auto bands: rows per band. ~ the visits of an average
+ * k_fill_atomic thread, so a row-tier warp is no longer than the rest. */
+#define FILL_ROW_RUN         256
+/* Row-tier root sentinel (k_transform's rt_out): g > 1, so no plat_t walk;
+ * k_fill_rows and k_resieve_rows skip the entry exactly as the FK kernels do. */
+#define ROWRT_NONE           0xFFFFFFFFu
+/* --resieve-rows is on by default at logI <= this (finding 107). */
+#define RESIEVE_ROWS_LOGI_MAX   13
+#define BENCH_STR_(x) #x
+#define BENCH_STR(x)  BENCH_STR_(x)
 /* Concurrency test only (item 1). Each workspace is a full bucket array, so
  * the practical ceiling is memory, not this constant -- 2 and 4 fit a 12 GB
  * card at the I15e/I16 geometries, 8 does not. */

@@ -605,7 +605,7 @@ stopcheck: stoptest
 walkcheck: bench
 	@out=$$(./bench --verify-only 2>&1); st=$$?; \
 	 printf '%s\n' "$$out" \
-	   | grep -E 'Franke-Kleinjung|primes x 5 roots|FAILED' \
+	   | grep -E 'Franke-Kleinjung|primes x 5 roots|row-tier|FAILED' \
 	   | sed 's/^/  /'; \
 	 if [ $$st -ne 0 ]; then \
 	   printf '%s\n' "$$out" | tail -20 | sed 's/^/  | /'; \
