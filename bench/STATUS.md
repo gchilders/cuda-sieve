@@ -39,7 +39,19 @@ allocation**, side 1 first, and side 0's fill stores records only where side
 1's survivor bitmap (folded to 8 positions per bit) has a survivor
 (`--fill-gate`). `--fill-concurrent` is an opt-in two-stream path with a
 second bucket allocation (finding 94); it overlaps sides of the same q, so it
-turns the gate off. The production scheduler still handles one q at a time.
+turns the gate off.
+
+**Two special-q in flight by default since 2026-10-13 (finding 108,
+`--q-pipeline`).** Once a q's intersection is done, the next q is prepared
+and both its sides are sieved on a non-blocking stream, while this q's trial
+division and cofactorisation run on the legacy stream. Only `plat` and
+`rowrt` are doubled (0.05 GB at C143, 0.26 GB at c183); the bucket array is
+not. When that extra does not fit in free VRAM, or the plan has several
+slabs (C194 and larger), the run stays single-queued and the banner and run
+log say so (`# q-pipeline` line). `--fill-concurrent` and `--qspan` exclude
+it; `--no-q-pipeline` turns it off. Per-stage times then include sharing the
+card, only wall clock per q is additive, and `unaccounted` and acc/wall are
+reported as n/a; use a `--no-q-pipeline` band to diagnose host starvation.
 
 **Fill defaults since 2026-10-13 (finding 107), all output-identical:**
 `--fill-gate` on (off under `--fill-concurrent`), `--fill-rows 4` at
@@ -966,16 +978,19 @@ Cards with measured band data: **RTX 5070** (WSL2), **RTX 5090**, **RTX 4090**,
 ## Measured, and what it means
 
 - **C143 against cado-gpu, 2026-10-12/13** (findings
-  [105](RESULTS.md#finding-105) and [107](RESULTS.md#finding-107)). On the
-  first 6,983-q band, external clocks, same day, with 2026-10-13's fill
-  defaults:
+  [105](RESULTS.md#finding-105), [107](RESULTS.md#finding-107) and
+  [108](RESULTS.md#finding-108)). On the first 6,983-q band, external clocks,
+  with 2026-10-13's defaults (fill row tier, gate, two q in flight):
 
   | | µs per raw relation | raw relations/q |
   |---|---:|---:|
   | CADO (A=26, its default `p < 96` skip) | 34.2 | 118.3 |
   | CADO with the skip off | 34.8 | 153.6 |
-  | cuda-sieve I13 | 63.3 (**1.85x**) | 153.8 |
-  | cuda-sieve I14 | 56.8 (**1.66x**) | 173.7 |
+  | cuda-sieve I13 | 55.1 (**1.61x**) | 153.8 |
+  | cuda-sieve I14 | 51.0 (**1.49x**) | 173.7 |
+
+  The cuda-sieve rows ran at host load 11-13. Before findings 107-108 they
+  were 2.49x and 1.86x.
 
   CADO's lower yield is its skip: with it off, the two I13 relation sets
   overlap 99.9%. Our extras are marginal relations (87% with two algebraic
@@ -983,8 +998,9 @@ Cards with measured band data: **RTX 5070** (WSL2), **RTX 5090**, **RTX 4090**,
   completed 78M-raw campaigns (62m24s against 133m54s, before the fill fix)
   hold 54.24M and 54.35M unique relations; singleton removal on both is open.
   **Per kernel we are within ~1.4x of CADO** (5.58 against ~7.8 ms/q of GPU
-  work at one q in flight). **Most of the remaining gap is CADO's eight q in
-  flight**, worth 1.77x to it, against one here (NOW/NEXT row 14). CADO's ~8 CPUs
+  work at one q in flight). CADO's eight q in flight are worth 1.77x to it;
+  our two are worth 8-20% (finding 108), because our single-q gaps were
+  smaller to begin with. CADO's ~8 CPUs
   are GPU-feeding threads spinning in `cudaStreamSynchronize`; its real host
   work is ~1.2 cores, and ours is under one. This 2LP/2LP job does not
   establish the comparison on cofactor-heavy jobs.
@@ -1346,9 +1362,10 @@ not by size.
 | 11 | `--bkthresh` below `I` | nothing | **FIXED 2026-09-23** — silently lost relations (5,079 and 7,456 of 9,053 at 8192 / 16384, exit 0) because the Franke-Kleinjung walk needs `p >= I`; now refused at startup and again in `run_pipeline_impl`, and capped at 2^30. Defaults were never affected. Raising it is correct but not faster, so the sweep is closed |
 | 12 | Complete blocking event waits and measure host CPU use | CPU/API trace; idle and contended C143 + C183/C194 bands | **proposed 2026-10-12** — NFS@Home objective is sustained use below one logical CPU. Existing `--blocking-sync` leaves default event waits spinning. Then evaluate fewer count readbacks, CUDA graphs and a bounded queue driven by one host thread. [Item 4](#low-cpu-plan), [finding 106](RESULTS.md#finding-106). No implementation or performance result yet. **First check that a blocking wait sleeps on WSL2 at all:** CADO's sievers spin at 80-90% of a core each, mostly system time, with blocking sync on (finding 107) |
 | 13 | Fix fill's tail, gate side 0's fill | local GPU | **DONE 2026-10-13, now the defaults** — finding 107. Row-banded tier for `q < 4I` (`--fill-rows`, logI <= 15) and its resieve (`--resieve-rows`, logI <= 13), CADO's side-0 fill gate (`--fill-gate`). Relations byte-identical (`fillcheck.sh`, 44 of 44). C143 first band wall -25.7% (I13) / -10.5% (I14); c183 -6.4%, C194 -5.5% |
-| 14 | Several special-q in flight | local GPU | **open, the largest measured lever** — CADO's eight slots are worth 1.77x to it (finding 107), half from filling host gaps and half from overlapping one q's low-occupancy kernels with another's. Our per-kernel work is within ~1.4x of CADO's. This is [item 4](#low-cpu-plan)'s queue design, justified by throughput as well as CPU; whole q in flight need independent bucket state and a VRAM budget |
+| 14 | Several special-q in flight | local GPU | **DONE 2026-10-13 for one-slab plans, now the default** — finding 108. The next q's sieve runs on its own stream under this q's TD and cofactorisation; only `plat`/`rowrt` are doubled, and the run stays single-queued when that does not fit in VRAM. C143 −19.6% (I13) / −12.8% (I14), c183 −8.1%, relations byte-identical (`fillcheck.sh` 60 of 60), stop/resume with a q in flight verified. Sized first: our idle was ~15%, not CADO's 1.77x. Multi-slab plans are row 17 |
 | 15 | Filter both C143 campaigns | CPU (msieve or CADO purge) | **open** — 54.35M against 54.24M unique; our extras are marginal 2LP relations. Excess after singleton removal prices them |
-| 16 | `--fill-concurrent` against the gate on wider cards | rented card | **open** — the flag now loses the gate. On a 5070 the gate (-4 to -6% wall on c183/C194) beats finding 94's -4.3%; on a 5090 at small geometry, where the flag gained -13.7%, the row tier has probably removed part of what it repaired. Measure before recommending the flag anywhere |
+| 16 | `--fill-concurrent` against the gate on wider cards | rented card | **answered on the 5070, open elsewhere** — at C143 the flag (gate off) was 1-2% faster than finding 107's default (9.08 vs 9.26 ms/q at I13), but the two-q pipeline beats both (7.46) and the flag excludes it (finding 108). It may still matter for multi-slab jobs, where the pipeline is single-queued; not measured there or on wider cards |
+| 17 | Overlap across slabs for multi-slab plans | local GPU | **open** — C194 and larger stay single-queued under `--q-pipeline` (finding 108). The next slab's sieve under this slab's TD needs a third rotating set of walk cursors (8 bytes per entry) and the same stream discipline |
 
 **On (5), why both arms in one session.** Card-hours are the scarce resource
 and `resieve + scatter` is the same bucket-structured shape as fill: finding
@@ -2341,9 +2358,11 @@ finding 92.
       synchronizing path is not a drop-in operation. Keep watchdog-sized
       kernels. This renews investigation of historical item 4.2 for CPU use,
       without reviving its withdrawn 1.56 ms/q speedup estimate.
-   3. **Queue ahead with one submitting thread.** Now the measured
-      throughput lever as well (NOW/NEXT row 14): CADO's eight q in flight are worth
-      1.77x to it. Start with two or three work descriptors and pinned
+   3. **Queue ahead with one submitting thread.** Two q in flight with one
+      host thread is now built and the default for one-slab plans
+      (finding 108, NOW/NEXT row 14): 8-20% faster, still one host thread
+      at ~1.0 CPU, so the CPU objective still rests on the steps around it.
+      Deeper queues: start with two or three work descriptors and pinned
       staging buffers, retaining each buffer
       until its GPU consumer has completed. Prepare successors or format
       earlier output while the GPU runs; block only when space/results are

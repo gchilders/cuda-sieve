@@ -11065,3 +11065,217 @@ cuda-sieve accounting bug. Not resolved.
   `confirm.sh` (confirmation), `firstband.sh` (first band),
   `cado-ablation.sh`, and `relcmp.py` for the relation sets; `summ.py`
   produces the median tables.
+
+<a id="finding-108"></a>
+## Finding 108 — two special-q in flight: the next q's sieve runs under this q's trial division. C143 wall −19.6% (I13) / −12.8% (I14), c183 −8.1%, relations byte-identical. Now the default, falling back to one q at a time when VRAM or a multi-slab plan rules it out. The prize was sized first: ~15% GPU idle for us, not CADO's 1.77x
+
+**Date:** 2026-10-13. RTX 5070, WSL2, driver/runtime 13.4, build on top of
+`9633cde` (finding 107's commit). Host load is stated per measurement; most
+ran at 2-3, the first-band runs at 11-13. Evidence in
+[`../oracle/c143-qpipe-20261013/`](../oracle/c143-qpipe-20261013/), pinned in
+`MANIFEST.sha256`; captured scripts keep their verbatim paths.
+
+### Sizing it before building it
+
+Finding 107 measured eight q in flight as worth 1.77x to CADO. That number
+is CADO's: with one slot its GPU idles 20.8% of the span and its kernels
+compress 1.48x when overlapped. Three cheap measurements bounded ours (C143,
+quiet host):
+
+| measurement | result | bounds |
+|---|---|---|
+| `--qspan`, I13, finding 107 defaults | 9.27 ms/q wall: 0.48 ms host with nothing in flight, ~0.95 ms of gaps between stages inside the 8.80 ms span | idle to fill: ~1.4 ms/q, ~15% |
+| two `bench` processes sharing the card, 3000 q each, 3 rounds, order alternated | concurrent / sequential = 0.958, 0.903, 0.952 (I13); 0.923, 0.895, 0.905 (I14) | filling gaps by time-slicing, WSL context switches included: 4-10% |
+| `--fill-concurrent` (both sides overlapped, so no gate) vs serial without gate | I13 9.89 -> 9.08 ms/q (−8.2%), I14 9.79 -> 9.11 (−6.9%) | overlap between kernels within a q |
+
+So 10-25% was the plausible range, not 1.77x. **Side result, STATUS
+NOW/NEXT row 16:** on the 5070, `--fill-concurrent` without the gate was 1-2%
+*faster* than finding 107's default at C143 (9.08 vs 9.26 at I13, 9.11 vs
+9.22 at I14), the opposite of RUNBOOK's hedged guess. The pipeline below
+beats both.
+
+### The design: one host thread, the next q issued after this q's intersection
+
+A per-q chain was transform, both sides' fill/apply, intersection, then TD
+(rank scan, resieve, trial division, classification, acceptance), cofactor
+enqueue and emission, all on the legacy stream with several host waits. Now,
+once this q's intersection count is read:
+
+1. The next q is pulled from the source, validated and prepared. Its
+   transform, both sides' fill/apply (side 0 gated) are issued on a
+   non-blocking sieve stream, back to back, with no host wait.
+2. This q's TD and cofactor enqueue run on the legacy stream, which a
+   non-blocking stream neither waits for nor blocks. The enqueue's
+   `cudaDeviceSynchronize` becomes a legacy-stream sync when pipelined; a
+   device-wide sync would wait out the next q's sieve.
+3. At the next loop top the pre-issued q is `cur`. It goes through every
+   existing check (stop, degradation ceiling, checkpoints) before any of its
+   output is consumed, then only its joins remain.
+
+**What has to be doubled is small.** The next q's `k_transform` overwrites
+`plat` and `rowrt`, which this q's resieve still reads, so each side gets a
+second set and `pside_swap_alt` trades them at the issue point; TD gets
+copies of the side structs from before the swap. Everything else is single:
+
+- the **bucket array**: both q sieve on one stream, so the next fill starts
+  after this apply is done with the buckets;
+- **survivor bitmaps**: the intersection has consumed them before the issue
+  point;
+- the **two-sided bitmap** (`d_two`): the next intersection runs after this
+  TD has finished, in host order;
+- **small-sieve tables and their pinned staging**: this q's uploads finished
+  before its join, which precedes the next q's prepare;
+- side 0 gets its **own overflow counter**, because with the sides issued back
+  to back side 0's memset would otherwise clear side 1's flag before the host
+  reads it.
+
+Sieve timings for this q (transform included) are read before the next q
+re-records the same events.
+
+**Speculation semantics.** The source step's outcome is replayed at the loop
+top, so exhaustion and generator failure are reported where they always were.
+A q whose preparation hits the norm-width skip is skipped there without being
+prepared twice (one warning). A q issued and then not processed (stop, target
+reached, failure) is drained at `done:`, never counted, and is exactly the
+resume point the checkpoint already names. It is not issued at all if the
+count limit would be reached, or a stop has been requested.
+
+**Excluded: multi-slab plans.** There the next slab's sieve would have to
+overlap this slab's TD, which needs a third set of walk cursors. That also
+means the pipeline only ever runs in the unslabbed specialization (a plan is
+enabled only when `nslab > 1`), so there are no cursors to double. C194 (four
+slabs) therefore stays single-queued. `--fill-concurrent` and `--qspan`
+exclude it too.
+
+### VRAM: checked, and single-queued when it does not fit
+
+After every other allocation, the run computes the extra (24 bytes per
+bucketed entry for `plat`, 4 per row-tier entry) and compares it with free
+memory less the existing 512 MB margin. **If it does not fit, the run stays
+single-queued** and says so in the banner and the run log (`# q-pipeline`).
+It does not refuse: the option is a speed-up, and a job that runs today must
+keep running. Extra measured: **0.05 GB** for C143, **0.26 GB** for c183. That
+compares with 1.4 GB of buckets for c183, which is not doubled. CADO's
+per-slot buckets (1.01 GB each here) are the expensive design this avoids.
+
+**The fallback could not be forced on this box.** A helper holding all but
+2.7 GB of the card did not shrink what `bench` saw: it reported 9.36 GB free,
+and free memory *rose* during setup (`wsl-vram-holder.c183.txt`). Under WSL2,
+WDDM evicts another process's idle allocations to system memory. So on
+WSL/Windows the check sees what the driver reports, and running over means
+paging, not failure. On native Linux the helper would hold the memory. The
+single-queued branch itself is exercised by C194's multi-slab plan; VRAM only
+supplies a different reason string to it.
+
+### Correctness
+
+- `bench/fillcheck.sh` (identity gate) is extended: its base now also turns
+  the pipeline off, the explicit arms run with it at its default, a `single`
+  arm turns it off, and a one-slab c183 I15 job is added so the pipeline runs
+  on a large factor base. **60 of 60 byte-identical** (5 jobs x 12 arms;
+  `fillcheck.txt`, `fillcheck-c183-single-slab.txt`).
+- **Stop and resume with a q in flight:** a 2,500-q I13 band with
+  `--stop-file` stopped at q=2212157 with that q already issued. It was
+  drained, checkpointed as the resume point, and the resumed band's relation
+  file equals the uninterrupted single-queued one byte for byte (387,339
+  relations).
+- The first band (6,983 q) with the new defaults is byte-identical to the
+  pre-107 configuration at I13 and I14.
+
+### Measurements
+
+**Interleaved A/B**, three rotated rounds, median, load 2.1-2.9 (`qpab.txt`),
+ms/q:
+
+| job | single-queued | `--q-pipeline` | change |
+|---|---:|---:|---:|
+| C143 I13, 1500 q | 9.28 | **7.46** | **−19.6%** |
+| C143 I14, 1500 q | 9.23 | **8.05** | **−12.8%** |
+| c183 I15, 200 q | 68.34 | **62.81** | **−8.1%** |
+
+Per-stage times now include sharing the card with the other q and are no
+longer additive (c183 TD "wall" +204%). The banner says so; only wall clock
+per q is. Because the next q's sieve time overlaps this q's host-clocked TD,
+`unaccounted` would go negative and GPU-accounted / wall could pass 1.0, so
+under the pipeline the band summary, the heartbeat and the `band end` record
+print both as `n/a` rather than a number nothing measured.
+
+**Host CPU**, I13, 3000 q, `/usr/bin/time`: still one host thread at
+0.94-1.00 CPU. CPU-time per q falls with wall, from 9.3-9.7 to 7.4-7.9
+CPU-ms/q.
+
+**First band, finding 105's protocol** (6,983 q, `--relations`, external
+clock; load 11-13, so if anything pessimistic):
+
+| geometry | pre-107 | finding 107 | **finding 108** | µs per raw relation | vs CADO (34.2 µs) |
+|---|---:|---:|---:|---:|---:|
+| I13 | 91.48 s | 67.98 s | **59.21 s** | 55.1 | **1.61x** |
+| I14 | 76.99 s | 68.89 s | **61.91 s** | 51.0 | **1.49x** |
+
+Before findings 107-108 these ratios were 2.49x and 1.86x.
+
+### Defaults and flags
+
+`--q-pipeline` is on by default (`--no-q-pipeline` turns it off), resolved in
+`bench_main` with the fill defaults. It is off under `--fill-concurrent` and
+`--qspan`, where an explicit `--q-pipeline` is refused; `run_pipeline_impl`
+also declines them itself, single-queued, for callers that reach it another
+way. The run log's `# q-pipeline` line records what the run got:
+`two q in flight`, `single-queued: <reason>`, or `off`.
+
+### Review fixes (xhigh review of the first version)
+
+- An allocation that fails after the admission check passed (another
+  process, or WSL2's optimistic free figure) now undoes the partial set and
+  runs single-queued, with the reason logged, instead of failing the band.
+- A speculative q whose preparation hits the norm-width skip is prepared
+  silently and not issued. The loop top prepares it again, so the warning,
+  the skip count and the `BN_LIMBS` advice happen only for a q the band
+  actually reaches. Previously a stop or the target could leave a skip
+  warning, and a limb requirement, for a q that was never counted.
+- Trial division takes a narrow view of each side (`ptd_side_t`: `plat`,
+  `rowrt`, `walk_cur`, `primes`, `nfb`, `nrow`). A TD change that needs
+  another per-q field must add it there, and so must decide whether the
+  pipeline doubles it. It can no longer read the next q's state by accident.
+- The cofactor flush's two syncs and TD's rescatter sync wait on the legacy
+  stream, not the device, so they no longer wait out the in-flight sieve.
+  All their work is on that stream, so single-queued they are the same wait.
+- In the pre-issued join, a hard failure on side 1 no longer joins side 0
+  against a sticky error, and a fault in a q issued but never consumed is
+  checked at loop exit instead of being discarded at `done:`.
+- The watchdog names the next q while it is pulled and prepared, then this
+  q again for its TD. `norm_verbose` is saved and restored around the
+  speculative prepare, so a q prepared ahead never prints its norm setup.
+  Single-queued, the second q prints it only when the first was lost, so
+  stdout can differ in that one case; relations cannot.
+- One source step (`pull_q` plus `count_limit_before`), one preparation
+  (`prepare_sides`), one issue (`issue_side`, which owns the gate argument)
+  and one transform-time read (`pipe_read_transform`) now serve the loop top,
+  the serial and concurrent arms and the issue point, instead of two copies
+  of each.
+- `fillcheck.sh` checks every arm's output for the pipeline state it should
+  have: granted on the three one-slab jobs, single-queued on the multi-slab
+  ones and in the `single` and `concurrent` arms. A silent fallback now fails
+  the gate instead of passing without testing the pipelined path.
+
+Rerun after the fixes: `fillcheck.sh` 60 of 60 byte-identical with every
+grant as expected (`fillcheck.txt`); stop and resume with a q in flight
+(stopped at q=2209639) byte-identical to the uninterrupted band, 387,339
+relations (`stop-resume-after-review.*`); interleaved A/B at I13, three
+rounds, host load ~11 from other work, 9.87 -> 8.09 ms/q, **−18.0%**
+(`qpab-after-review.txt`), in line with the −19.6% above.
+
+### What leads now
+
+1. **Overlap across slabs** for multi-slab jobs (C194 and larger), where this
+   is single-queued. It needs a third rotating set of walk cursors
+   (8 bytes per entry) and the same stream discipline.
+2. **Host prep before TD.** The next q's host preparation (source step,
+   small-sieve tables and sort, norm setup) runs before this q's TD is
+   launched, so the legacy stream idles for it (~0.3 ms/q host per-q at
+   C143). Launching TD's first phase first, or preparing during the join
+   wait, would recover it. Not attempted.
+3. **TD's count readbacks** (finding 106 item 2) are now the host waits
+   that remain on the critical path.
+4. Kernel by kernel, CADO is still ahead on apply/region and post-sieve TD
+   (finding 107).

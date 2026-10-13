@@ -296,6 +296,10 @@ static void usage(void)
 "                   records only under side 1's survivors\n"
 "                   [on, off under --fill-concurrent, which refuses it]\n"
 "  --fill-gate-shift N  positions per gate bit = 2^N, 0..5        [3]\n"
+"  --q-pipeline / --no-q-pipeline  --pipeline only; sieve the next special-q\n"
+"                   while this one is trial-divided. Falls back to one q at a\n"
+"                   time when its extra VRAM does not fit or the plan has\n"
+"                   several slabs  [on, off under --fill-concurrent/--qspan]\n"
 "  --fill-threads N fill only; 0 = auto (32), else a multiple of 32 in\n"
 "                   [32,1024]. Independent of --threads: fill wants many\n"
 "                   narrow blocks, the other kernels do not.            [0]\n"
@@ -1004,6 +1008,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     /* -1 = resolved below once logI and --fill-concurrent are known */
     cfg.fill_rows = -1; cfg.fill_row_bands = 0; cfg.resieve_rows = -1;
     cfg.fill_gate = -1; cfg.fill_gate_shift = 3;
+    cfg.q_pipeline = -1;   /* resolved with the fill defaults below */
     cfg.qspan = 0;
     cfg.threads = 256; cfg.blocks = 0; cfg.fill_blocks = 0; cfg.fill_threads = 0;
 
@@ -1159,6 +1164,8 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         else if (!strcmp(argv[i], "--no-fill-gate")) { cfg.fill_gate = 0; }
         else if (!strcmp(argv[i], "--resieve-rows")) { cfg.resieve_rows = 1; }
         else if (!strcmp(argv[i], "--no-resieve-rows")) { cfg.resieve_rows = 0; }
+        else if (!strcmp(argv[i], "--q-pipeline")) { cfg.q_pipeline = 1; }
+        else if (!strcmp(argv[i], "--no-q-pipeline")) { cfg.q_pipeline = 0; }
         else if (!strcmp(argv[i], "--fill-gate-shift") && i + 1 < argc) {
             if (parse_int_range_arg("--fill-gate-shift", argv[++i], 0, 5,
                                     &cfg.fill_gate_shift)) return 1;
@@ -1537,6 +1544,13 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
                             cfg.logI <= RESIEVE_ROWS_LOGI_MAX) ? 1 : 0;
     if (cfg.fill_gate < 0)
         cfg.fill_gate = (cfg.pipeline && !cfg.fill_concurrent) ? 1 : 0;
+    /* --q-pipeline (finding 108): on wherever it can run. Its own VRAM and
+     * slab-plan checks happen in run_pipeline_impl and fall back to one q at
+     * a time; --fill-concurrent and --qspan exclude it, so there the default
+     * is off and an explicit --q-pipeline is refused below. */
+    if (cfg.q_pipeline < 0)
+        cfg.q_pipeline = (cfg.pipeline && !cfg.fill_concurrent && !cfg.qspan)
+                         ? 1 : 0;
     /* Refused rather than ignored: a sub-option without its option, or a gate
      * whose side 0 would be issued before side 1's bitmap exists, is a run
      * quoted as something it was not. Under --pipeline only: without it these
@@ -1553,6 +1567,12 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     if (cfg.pipeline && fill_gate_shift_set && !cfg.fill_gate) {
         fprintf(stderr, "--fill-gate-shift needs the gate; it is off"
                 " (--no-fill-gate, or --fill-concurrent)\n");
+        return 1;
+    }
+    if (cfg.pipeline && cfg.q_pipeline && (cfg.fill_concurrent || cfg.qspan)) {
+        fprintf(stderr, "--q-pipeline overlaps whole special-q; it is not"
+                " combined with %s\n", cfg.fill_concurrent ? "--fill-concurrent"
+                                                          : "--qspan");
         return 1;
     }
     if (cfg.pipeline && cfg.fill_gate && cfg.fill_concurrent) {
@@ -2168,7 +2188,8 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
             "--watchdog-kill",
             "--slab-j", "--qspan", "--fill-concurrent",
             "--fill-rows", "--fill-row-bands", "--fill-gate", "--resieve-rows",
-            "--no-fill-gate", "--no-resieve-rows",
+            "--no-fill-gate", "--no-resieve-rows", "--q-pipeline",
+            "--no-q-pipeline",
             "--fill-gate-shift", NULL
         };
         int nbad = 0;
@@ -3179,6 +3200,9 @@ resume_artifacts_ready:
                         cfg.lpb, cfg.lpb0, cfg.mfb, cfg.mfb0);
             /* Always: these are defaults now, and a log must show which ones
              * a run actually had. */
+            /* The q-pipeline's state is NOT here: what a run gets depends on
+             * VRAM and the slab plan, so run_pipeline_impl writes its own
+             * `q-pipeline` line with what was granted. */
             runlog_note("fill", "rows<%d*I bands=%d resieve-rows=%d"
                         " gate=%d shift=%d", cfg.fill_rows,
                         cfg.fill_row_bands, cfg.resieve_rows, cfg.fill_gate,

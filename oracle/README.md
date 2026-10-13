@@ -311,3 +311,27 @@ The CADO arms run the launcher with `-fb1` pointing at a copy of the
 campaign's `c143.roots1.gz` in `work/`, so glas writes its factor-base cache
 there and not into the campaign directory. The environment variables are
 the only difference between arms.
+
+## C143 two special-q in flight (2026-10-13)
+
+[`c143-qpipe-20261013/`](c143-qpipe-20261013/) holds the small evidence for
+[finding 108](../bench/RESULTS.md#finding-108), pinned in `MANIFEST.sha256`.
+Captured scripts keep their verbatim paths; the runs live in the git-ignored
+`../work/qconc/`.
+
+- `qspan-i13.txt`, `twoproc.*`, `overlap.*`: the measurements that sized the
+  prize before the build: idle time per q, two processes sharing the card,
+  and the two sides overlapped (`--fill-concurrent`).
+- `qpab.*`: the interleaved A/B, single-queued against `--q-pipeline`, on
+  C143 I13/I14 and c183.
+- `fillcheck.txt`, `fillcheck-c183-single-slab.txt`: the identity gate,
+  60 of 60 byte-identical; `identity-first-runs.txt`: the first per-job
+  checks, including C194 staying single-queued on its four-slab plan.
+- `stop-resume.*`: a band stopped with a q in flight and resumed;
+  `stop-resume-after-review.*` and `qpab-after-review.txt` repeat the stop
+  test and the I13 A/B after the review fixes.
+- `cpu.txt`: host CPU with and without the pipeline.
+- `firstband-*`: the 6,983-q first band with the new defaults.
+- `vram-holder.cu`, `wsl-vram-holder.c183.txt`: the attempt to force the
+  VRAM fallback. Under WSL2 the driver evicted the holder's memory, so the
+  run still saw ~9 GB free.

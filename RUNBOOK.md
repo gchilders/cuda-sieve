@@ -222,6 +222,23 @@ comparison with older logs. Every run log names the settings on its
 ungated can fit gated. `bench/fillcheck.sh` is the identity gate; it needs a
 card.
 
+**Two special-q in flight (`--q-pipeline`, default on) is output-identical
+as well.** The next q is sieved on its own stream while this one is
+trial-divided: C143 first band 68.0 -> 59.2 s at I13 and 68.9 -> 61.9 s at
+I14, c183 -8.1% (`bench/RESULTS.md` finding 108). It costs a second copy of
+the transform output, not a second bucket array: 0.05 GB at C143, 0.26 GB
+at c183. It **stays single-queued, and says so on the banner and in the run
+log's `# q-pipeline` line**, when that extra does not fit in free VRAM after
+setup, or when the plan has several slabs (C194 and larger). `--no-q-pipeline`
+turns it off; `--fill-concurrent` and `--qspan` exclude it. The per-stage
+times in the band report then include sharing the card with the other q; only
+wall clock per q is additive, and `unaccounted` and GPU-accounted / wall
+(`acc/wall` in the run log) print as `n/a`. If you need that ratio to diagnose
+a starved host, compare a `--no-q-pipeline` band. **Under WSL2 "free VRAM" is whatever the
+Windows driver reports:** it evicts other processes' idle allocations, and
+over-allocation pages to system memory rather than failing, so a card that
+is short of memory there gets slower rather than refusing.
+
 The remaining representation limits are:
 
 - `lpbr` or `lpba` above 64;
@@ -737,10 +754,12 @@ geometry difference is the bucket array.
 allocation *because* they sieve back to back; the flag overlaps them on two
 streams, and a second array is its entire cost. **It also turns off the fill
 gate**, which needs side 1 finished before side 0's fill (finding 107); an
-explicit `--fill-gate` with it is refused. On a 5070 the default's row tier
-plus gate (-6.4% of c183 wall) beats the -4.3% in the table below, but the
-two were not timed head to head, so the default is probably, not provably,
-the faster configuration there (`bench/STATUS.md`, NOW/NEXT table row 16). Size it as `2 x bucket + the
+explicit `--fill-gate` with it is refused, and it excludes the two-q
+pipeline. Measured on the 5070 at C143 (finding 108): the flag was 1-2%
+faster than the gate alone (9.08 against 9.26 ms/q at I13), but the default,
+with two q in flight, is 7.46. Leave it off on this card. It may still be
+worth timing for multi-slab jobs, where the pipeline is single-queued
+(`bench/STATUS.md`, NOW/NEXT table rows 16-17). Size it as `2 x bucket + the
 rest`, and note that the bullet above — "the bucket array is sized by the larger
 side, so raising the smaller side's lim is nearly free" — **stops holding under
 the flag**: both sides carry a full-size array. The run refuses at startup with

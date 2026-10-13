@@ -2136,7 +2136,11 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     k_scan_pass3<<<nb, TD_SCAN_BLK>>>(Q->d_off, n, Q->d_bsum);
     k_rel_gather<<<blocks, threads>>>(n, Q->d_flag, Q->d_off, Q->rcap,
                                       Q->d_idx, Q->d_nrel);
-    COF_FLUSH_CK(cudaDeviceSynchronize()); COF_FLUSH_CK(cudaGetLastError());
+    /* The legacy stream, not the device: every launch in this file is on it,
+     * and under --q-pipeline the next special-q is sieving on another stream
+     * that a device-wide sync would wait out (finding 108). With nothing else
+     * in flight the two are the same wait. */
+    COF_FLUSH_CK(cudaStreamSynchronize(0)); COF_FLUSH_CK(cudaGetLastError());
     COF_FLUSH_CK(cudaEventElapsedTime(&t0, e0, e1));
     COF_FLUSH_CK(cudaEventElapsedTime(&t1, e1, e2));
     Q->ms_rat += t0; Q->ms_alg += t1;
@@ -2393,7 +2397,7 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     k_rel_pack<<<blocks, threads>>>(nr, Q->d_idx, *Q, O->d_a, O->d_b,
                                     O->d_f0, O->d_fn0, O->d_f1, O->d_fn1,
                                     O->d_sp0, O->d_nsp0, O->d_sp1, O->d_nsp1);
-    COF_FLUSH_CK(cudaDeviceSynchronize()); COF_FLUSH_CK(cudaGetLastError());
+    COF_FLUSH_CK(cudaStreamSynchronize(0)); COF_FLUSH_CK(cudaGetLastError());
     h0 = host_ms();
     COF_FLUSH_CK(cudaMemcpy(O->a, O->d_a, (size_t)nr * 8, cudaMemcpyDeviceToHost));
     COF_FLUSH_CK(cudaMemcpy(O->b, O->d_b, (size_t)nr * 8, cudaMemcpyDeviceToHost));
