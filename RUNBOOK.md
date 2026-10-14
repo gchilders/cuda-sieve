@@ -1179,6 +1179,48 @@ allowance, and a job fingerprint.
   because every one of them changes which relations a run emits while leaving
   each individual line verifiable.
 
+### Several pipelines on one GPU: `--instances`
+
+```sh
+bench --pipeline --cofactor ... --qrange 300000000:300008000 \
+      --relations NAME --instances auto
+```
+
+`--instances N` (1–4) splits a **bounded** `--qrange` into N equal q ranges
+and sieves them concurrently, each on its own host thread. One pipeline leaves
+the GPU idle between kernels and between special-q; a second fills those gaps.
+On 2,1147+ (RTX 4090, 420 q) two instances sieved in 74.6 s against 80.4 s for
+one (−7%), byte-identical relations; with the ~36 s factor-base startup both
+pay once, 112.0 s against 116.4 s end to end. Three were slower than two. On
+the same card emulating 16 GB free, two instances at the default slab lost to
+one at 2^31 (89.7 s against 83.8 s), and `auto` picks one there.
+
+- **`auto`** picks two when free VRAM gives each instance the slab size one
+  would get on its own, or 2^30 where one would get 2^31 (the one step measured
+  to pay). Otherwise it picks one. The default is `--instances 1`.
+- **Output is the same file.** Instance k writes `NAME.inst<k>` with its own
+  `.part`, checkpoint and BOINC recovery counter: everything in "Stopping and
+  resuming" applies to each one unchanged. When all of them have committed,
+  they are concatenated into `NAME` in q order. That is the file one pipeline
+  writes, and `make instcheck` holds it to that byte for byte.
+- **`NAME.instances`** is written when the band starts and records N, the
+  band and the job fingerprint. A relaunch always resumes with that N,
+  whatever `--instances` says. A different `--qrange` or job is refused;
+  `--restart` discards the manifest with every instance's files. A
+  one-pipeline `NAME.part` already under way resumes as one pipeline.
+- **Stops and failures** are shared. One `^C`/`SIGTERM` or `--stop-file`
+  drains and checkpoints every instance. An instance that fails or hits a
+  policy stop (exit 3 or 5) stops the others at their next special-q, and
+  the band exits with the worst status. Each instance has its own watchdog
+  slot, so one instance's progress cannot hide another's stall. Progress lines
+  are tagged `[k]`, run-log records `instK`, and the BOINC fraction is the
+  instances' mean.
+- **VRAM:** the slab target is chosen so that N footprints plus one headroom
+  fit. Setup runs one instance at a time, and the optional second bucket array
+  reserves room for the instances not yet set up.
+- **Not split:** `--target-rels`, `--nq`, `--qlist` and `--candidates` bands
+  run one pipeline and say so. An open band has no end to divide.
+
 ### Logging an unattended run
 
 ```sh

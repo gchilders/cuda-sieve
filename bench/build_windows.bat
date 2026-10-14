@@ -197,6 +197,9 @@ for %%F in (fb_load.c verify_cpu.c poly.c primes.c rfb.c fb_cado.c platform.c) d
 
 rem runlog.c alone carries the build stamp, exactly as in the Makefile.
 cl %CFLAGS% /std:c11 -DBENCH_GIT_DESC=\"%GIT_DESC%\" -DBENCH_DEFS=\"%DEFS%\" /c runlog.c || exit /b 1
+rem watchdog.c sits beside runlog.o in the Makefile's OBJS; bench_main.cu and
+rem pipeline.cuh call its wd_* hooks unconditionally, so bench.exe needs it.
+cl %CFLAGS% /std:c11 /c watchdog.c || exit /b 1
 
 rem The main executable needs only fbgen's streaming special-q generator.
 rem FBGEN_LIBRARY excludes the standalone pthread/open_memstream writer.
@@ -204,17 +207,17 @@ cl %CFLAGS% /std:c11 -DFBGEN_LIBRARY /c fbgen.c /Fofbgen_lib.obj || exit /b 1
 cl %CXXFLAGS% /std:c++17 /c boinc_support.cpp || exit /b 1
 
 echo Building CUDA objects with cl.exe as nvcc's host compiler...
-nvcc %NVCC_ARCH% --threads 0 -O3 -std=c++17 -lineinfo -ccbin cl %CF_LMAX_DEF% %DEFS% ^
+nvcc %NVCC_ARCH% --default-stream per-thread --threads 0 -O3 -std=c++17 -lineinfo -ccbin cl %CF_LMAX_DEF% %DEFS% ^
     -Xcompiler "/O2 /W3 /EHsc /MT -D_CRT_SECURE_NO_WARNINGS" ^
     -c bench_main.cu -o bench_main.obj || exit /b 1
-nvcc %NVCC_ARCH% --threads 0 -O3 -std=c++17 -lineinfo -ccbin cl %CF_LMAX_DEF% %DEFS% ^
+nvcc %NVCC_ARCH% --default-stream per-thread --threads 0 -O3 -std=c++17 -lineinfo -ccbin cl %CF_LMAX_DEF% %DEFS% ^
     -Xcompiler "/O2 /W3 /EHsc /MT -D_CRT_SECURE_NO_WARNINGS" ^
     -c bench_kernels.cu -o bench_kernels.obj || exit /b 1
 
 rem Production bench needs the same in-process algebraic factor-base generator
 rem as the Makefile build.  FBGEN_GPU_LIBRARY removes the standalone CLI, timers
 rem and text writer, so omitting --fb1 has no extra serialization path.
-nvcc %NVCC_ARCH% --threads 0 -O3 -std=c++17 -lineinfo -ccbin cl %CF_LMAX_DEF% %DEFS% ^
+nvcc %NVCC_ARCH% --default-stream per-thread --threads 0 -O3 -std=c++17 -lineinfo -ccbin cl %CF_LMAX_DEF% %DEFS% ^
     -DFBGEN_GPU_LIBRARY ^
     -Xcompiler "/O2 /W3 /EHsc /MT -D_CRT_SECURE_NO_WARNINGS" ^
     -c fbgen_gpu.cu -o fbgen_gpu_lib.obj || exit /b 1
@@ -222,7 +225,7 @@ nvcc %NVCC_ARCH% --threads 0 -O3 -std=c++17 -lineinfo -ccbin cl %CF_LMAX_DEF% %D
 echo Linking bench.exe...
 nvcc %NVCC_ARCH% --cudart static -ccbin cl -Xlinker "/OPT:REF" -o bench.exe ^
     bench_main.obj bench_kernels.obj fbgen_gpu_lib.obj fb_load.obj verify_cpu.obj poly.obj ^
-    primes.obj rfb.obj fb_cado.obj platform.obj runlog.obj fbgen_lib.obj ^
+    primes.obj rfb.obj fb_cado.obj platform.obj runlog.obj watchdog.obj fbgen_lib.obj ^
     boinc_support.obj || exit /b 1
 
 echo Built %CD%\bench.exe (GPU_ARCH=%GPU_ARCH% CF_LMAX=%CF_LMAX% build=%GIT_DESC%)
@@ -230,7 +233,7 @@ echo Built %CD%\bench.exe (GPU_ARCH=%GPU_ARCH% CF_LMAX=%CF_LMAX% build=%GIT_DESC
 if not defined BUILD_FBGEN_GPU exit /b 0
 
 echo Building standalone fbgen_gpu.exe...
-nvcc %NVCC_ARCH% --threads 0 -O3 -std=c++17 -lineinfo -ccbin cl %CF_LMAX_DEF% %DEFS% ^
+nvcc %NVCC_ARCH% --default-stream per-thread --threads 0 -O3 -std=c++17 -lineinfo -ccbin cl %CF_LMAX_DEF% %DEFS% ^
     -Xcompiler "/O2 /W3 /EHsc /MT -D_CRT_SECURE_NO_WARNINGS" ^
     -c fbgen_gpu.cu -o fbgen_gpu.obj || exit /b 1
 nvcc %NVCC_ARCH% --cudart static -ccbin cl -Xlinker "/OPT:REF" -o fbgen_gpu.exe ^

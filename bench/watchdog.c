@@ -44,13 +44,36 @@
 #define WD_POLL_MS 500.0
 #define WD_BT_FRAMES 64
 
-static struct {
-    /* written by the sieve thread */
+/* One heartbeat per sieving thread. Slot 0 is the thread that called wd_start;
+ * --instances N gives each pipeline thread its own (wd_bind), so a stall in
+ * one instance is not masked by another instance's progress, and a finished
+ * instance -- or the main thread parked in a join -- releases its slot
+ * instead of reading as stalled. */
+#define WD_SLOTS 5
+
+#if defined(_MSC_VER)
+#define WD_TLS __declspec(thread)
+#else
+#define WD_TLS _Thread_local
+#endif
+
+typedef struct {
+    /* written by the slot's sieve thread */
     volatile unsigned long long seq;
     const char *volatile phase;
     volatile unsigned long long q, rho, nq;
     volatile unsigned slab, nslab;
+    volatile int active;
+#ifndef _WIN32
+    pthread_t thread;       /* the backtrace target */
+#endif
+} wd_slot_t;
 
+static wd_slot_t WS[WD_SLOTS];
+static WD_TLS int wd_my = 0;
+static volatile int wd_multi = 0;  /* a slot other than 0 has been used */
+
+static struct {
     /* written once at wd_start, read by both */
     double stall_ms;
     double kill_ms;
@@ -64,7 +87,6 @@ static struct {
     HANDLE th;
 #else
     pthread_t th;
-    pthread_t stalled;      /* the thread that called wd_start */
     int have_th;
 #endif
 } W;
@@ -77,8 +99,8 @@ static struct {
 void wd_phase(const char *name)
 {
     if (!W.armed) return;
-    W.phase = name;
-    W.seq++;
+    WS[wd_my].phase = name;
+    WS[wd_my].seq++;
 }
 
 void wd_arm_kill(void)
@@ -90,13 +112,36 @@ void wd_q(unsigned long long q, unsigned long long rho,
           unsigned long long nqdone)
 {
     if (!W.armed) return;
-    W.q = q; W.rho = rho; W.nq = nqdone;
+    WS[wd_my].q = q; WS[wd_my].rho = rho; WS[wd_my].nq = nqdone;
 }
 
 void wd_slab(unsigned slab, unsigned nslab)
 {
     if (!W.armed) return;
-    W.slab = slab; W.nslab = nslab;
+    WS[wd_my].slab = slab; WS[wd_my].nslab = nslab;
+}
+
+void wd_bind(int slot)
+{
+    if (slot < 0 || slot >= WD_SLOTS) slot = 0;
+    wd_my = slot;
+    if (slot) wd_multi = 1;
+    if (!W.armed) return;
+#ifndef _WIN32
+    WS[slot].thread = pthread_self();
+#endif
+    WS[slot].phase = "instance.start";
+    WS[slot].q = WS[slot].rho = WS[slot].nq = 0;
+    WS[slot].slab = WS[slot].nslab = 0;
+    WS[slot].seq++;
+    WS[slot].active = 1;
+}
+
+void wd_active(int on)
+{
+    if (!W.armed) return;
+    WS[wd_my].seq++;
+    WS[wd_my].active = on;
 }
 
 /* ---- reporting --------------------------------------------------------- */
@@ -167,22 +212,25 @@ static void wd_stamp(char *out, size_t n)
  * -- so querying it is worth the risk. But the risk is not zero, so it is taken
  * at most once per stall, and never before the phase, q and slab have reached
  * the operator. */
-static void wd_report(int nth, double stalled_s, int want_gpu)
+static void wd_report(int s, int nth, double stalled_s, int want_gpu)
 {
-    char buf[768], ts[40];
-    const char *phase = W.phase ? W.phase : "(none)";
+    char buf[768], ts[40], who[32] = "";
+    const wd_slot_t *S = &WS[s];
+    const char *phase = S->phase ? S->phase : "(none)";
 
+    if (wd_multi)
+        snprintf(who, sizeof who, s ? " instance %d" : " main thread", s - 1);
     wd_stamp(ts, sizeof ts);
     snprintf(buf, sizeof buf,
-             "\n  !! watchdog [%s]: no progress for %.0f s (report %d)\n"
+             "\n  !! watchdog [%s]%s: no progress for %.0f s (report %d)\n"
              "     phase   %s\n"
              "     q       %llu  rho %llu  (q completed this band: %llu)\n"
              "     slab    %u of %u\n"
              "     seq     %llu\n",
-             ts, stalled_s, nth, phase,
-             (unsigned long long)W.q, (unsigned long long)W.rho,
-             (unsigned long long)W.nq,
-             W.slab, W.nslab, (unsigned long long)W.seq);
+             ts, who, stalled_s, nth, phase,
+             (unsigned long long)S->q, (unsigned long long)S->rho,
+             (unsigned long long)S->nq,
+             S->slab, S->nslab, (unsigned long long)S->seq);
     wd_emit(buf);
 
     if (want_gpu) {
@@ -225,7 +273,7 @@ static void wd_sig_backtrace(int sig)
     backtrace_symbols_fd(bt, n, 2);
 }
 
-static void wd_request_backtrace(void)
+static void wd_request_backtrace(int s)
 {
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
@@ -239,10 +287,10 @@ static void wd_request_backtrace(void)
      * measuring. */
     sa.sa_flags = SA_RESTART;
     if (sigaction(SIGUSR2, &sa, NULL) == 0)
-        pthread_kill(W.stalled, SIGUSR2);
+        pthread_kill(WS[s].thread, SIGUSR2);
 }
 #else
-static void wd_request_backtrace(void) { }
+static void wd_request_backtrace(int s) { (void)s; }
 #endif
 
 /* The last thing this process does. Not abort(): a core dump of a 12 GB
@@ -284,70 +332,91 @@ static void wd_sleep_ms(double ms)
 
 static void wd_loop(void)
 {
-    unsigned long long last_seq = W.seq;
-    double t_change = bench_monotonic_ms();
-    double t_report = 0;
-    int nreport = 0, bt_done = 0;
-    const char *stalled_phase = NULL;
+    /* Per slot: the counter last seen, when it last moved, and the report
+     * state of the stall in progress. An inactive slot is held at "just
+     * moved", so a slot that is reactivated starts a fresh clock. */
+    unsigned long long last_seq[WD_SLOTS];
+    double t_change[WD_SLOTS], t_report[WD_SLOTS];
+    int nreport[WD_SLOTS];
+    const char *stalled_phase[WD_SLOTS];
+    int bt_done = 0;
+    const double t0 = bench_monotonic_ms();
 
+    for (int s = 0; s < WD_SLOTS; s++) {
+        last_seq[s] = WS[s].seq;
+        t_change[s] = t0;
+        t_report[s] = 0;
+        nreport[s] = 0;
+        stalled_phase[s] = NULL;
+    }
     while (W.run) {
-        double now, stalled;
-        unsigned long long seq;
         wd_sleep_ms(WD_POLL_MS);
-        now = bench_monotonic_ms();
-        seq = W.seq;
-        if (seq != last_seq) {
-            if (nreport) wd_resumed((now - t_change) / 1000.0, stalled_phase);
-            last_seq = seq;
-            t_change = now;
-            nreport = 0;
-            continue;
-        }
-        stalled = now - t_change;
+        const double now = bench_monotonic_ms();
+        for (int s = 0; s < WD_SLOTS; s++) {
+            const unsigned long long seq = WS[s].seq;
+            double stalled;
+            if (!WS[s].active) {
+                last_seq[s] = seq;
+                t_change[s] = now;
+                nreport[s] = 0;
+                continue;
+            }
+            if (seq != last_seq[s]) {
+                if (nreport[s])
+                    wd_resumed((now - t_change[s]) / 1000.0, stalled_phase[s]);
+                last_seq[s] = seq;
+                t_change[s] = now;
+                nreport[s] = 0;
+                continue;
+            }
+            stalled = now - t_change[s];
 
-        /* THE KILL IS TESTED FIRST, before the report and before any NVML
-         * query. Two reasons, both learned the hard way:
-         *
-         *  - Sequenced after the report, the exit inherits every way the
-         *    report can block -- a log file on a wedged mount, an
-         *    unresponsive driver. The one job the kill has is to end a
-         *    process that is already stuck, so nothing that can stick may
-         *    come before it.
-         *  - Tested below the `stalled < stall_ms` guard, a --watchdog-kill
-         *    SMALLER than --watchdog was silently raised to the report
-         *    threshold, while the startup banner still promised the value the
-         *    operator asked for. Here the two thresholds are independent. */
-        if (W.kill_ms > 0 && W.kill_armed && stalled >= W.kill_ms) {
-            /* A give-up must never be the first thing said about a stall. With
-             * a kill threshold below the report one -- which is now honoured
-             * rather than silently clamped -- no report has been printed yet,
-             * so print one here. want_gpu is 0: this path stays free of
-             * anything that could block between the decision and the exit. */
-            if (!nreport) wd_report(1, stalled / 1000.0, 0);
-            if (!bt_done) { wd_request_backtrace(); bt_done = 1;
-                            wd_sleep_ms(250.0); }
-            wd_give_up(stalled / 1000.0);
-        }
-        if (stalled < W.stall_ms) continue;
-        if (nreport && now - t_report < W.stall_ms) continue;
-        stalled_phase = W.phase;
-        t_report = now;
-        ++nreport;                     /* separate statement: reading and
+            /* THE KILL IS TESTED FIRST, before the report and before any
+             * NVML query. Two reasons, both learned the hard way:
+             *
+             *  - Sequenced after the report, the exit inherits every way the
+             *    report can block -- a log file on a wedged mount, an
+             *    unresponsive driver. The one job the kill has is to end a
+             *    process that is already stuck, so nothing that can stick
+             *    may come before it.
+             *  - Tested below the `stalled < stall_ms` guard, a
+             *    --watchdog-kill SMALLER than --watchdog was silently raised
+             *    to the report threshold, while the startup banner still
+             *    promised the value the operator asked for. Here the two
+             *    thresholds are independent. */
+            if (W.kill_ms > 0 && W.kill_armed && stalled >= W.kill_ms) {
+                /* A give-up must never be the first thing said about a
+                 * stall. With a kill threshold below the report one -- which
+                 * is now honoured rather than silently clamped -- no report
+                 * has been printed yet, so print one here. want_gpu is 0:
+                 * this path stays free of anything that could block between
+                 * the decision and the exit. */
+                if (!nreport[s]) wd_report(s, 1, stalled / 1000.0, 0);
+                if (!bt_done) { wd_request_backtrace(s); bt_done = 1;
+                                wd_sleep_ms(250.0); }
+                wd_give_up(stalled / 1000.0);
+            }
+            if (stalled < W.stall_ms) continue;
+            if (nreport[s] && now - t_report[s] < W.stall_ms) continue;
+            stalled_phase[s] = WS[s].phase;
+            t_report[s] = now;
+            ++nreport[s];              /* separate statement: reading and
                                         * modifying nreport in one call is
                                         * unsequenced, and -Wsequence-point
                                         * says so */
-        wd_report(nreport, stalled / 1000.0, nreport == 1);
-        /* One backtrace per run, from the second report, and ONLY once the
-         * kill is armed -- i.e. inside the band. During setup a slow
-         * factor-base load legitimately produces repeat reports, and
-         * backtrace() is not async-signal-safe: its first call resolves unwind
-         * machinery through the loader and malloc, so a signal landing while
-         * the sieve thread holds either lock would deadlock it. That is the
-         * watchdog causing the failure it exists to report, so it is gated by
-         * the same flag the kill is. */
-        if (nreport == 2 && !bt_done && W.kill_armed) {
-            wd_request_backtrace();
-            bt_done = 1;
+            wd_report(s, nreport[s], stalled / 1000.0, nreport[s] == 1);
+            /* One backtrace per run, from the second report, and ONLY once
+             * the kill is armed -- i.e. inside the band. During setup a slow
+             * factor-base load legitimately produces repeat reports, and
+             * backtrace() is not async-signal-safe: its first call resolves
+             * unwind machinery through the loader and malloc, so a signal
+             * landing while the sieve thread holds either lock would
+             * deadlock it. That is the watchdog causing the failure it exists
+             * to report, so it is gated by the same flag the kill is. */
+            if (nreport[s] == 2 && !bt_done && W.kill_armed) {
+                wd_request_backtrace(s);
+                bt_done = 1;
+            }
         }
     }
 }
@@ -364,15 +433,16 @@ int wd_start(double stall_s, double kill_s, const char *logpath)
     W.stall_ms = stall_s * 1000.0;
     W.kill_ms = kill_s > 0 ? kill_s * 1000.0 : 0;
     W.logpath = logpath;
-    W.phase = "startup";
-    W.seq = 1;
+    WS[0].phase = "startup";
+    WS[0].seq = 1;
+    WS[0].active = 1;
     W.run = 1;
     W.armed = 1;
 #ifdef _WIN32
     W.th = CreateThread(NULL, 0, wd_thread, NULL, 0, NULL);
     if (!W.th) { W.armed = W.run = 0; }
 #else
-    W.stalled = pthread_self();
+    WS[0].thread = pthread_self();
     if (pthread_create(&W.th, NULL, wd_thread, NULL) == 0) W.have_th = 1;
     else { W.armed = W.run = 0; }
 #endif

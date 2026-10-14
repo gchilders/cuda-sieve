@@ -487,6 +487,108 @@ static inline void ckpt_unlock(const char *path)
     if (path && *path) remove(path);
 }
 
+/* ---- --instances: the band split and its manifest ---------------------- *
+ *
+ * A band run as N instances is N ordinary bands, each with its own relation
+ * file NAME.inst<k> -- and therefore its own .part, checkpoint and BOINC
+ * recovery counter, all handled by the code above unchanged -- plus one
+ * manifest, NAME.instances, which pins what no single checkpoint can: how many
+ * instances there are and which band they split. A relaunch reads N from it,
+ * whatever it was asked for, so a resumed band is always cut the same way.
+ * The instances' files are concatenated into NAME, in q order, when all of
+ * them have committed; that is the same file one instance would have written. */
+static inline void inst_split(uint64_t qmin, uint64_t qmax, int n, int k,
+                              uint64_t *lo, uint64_t *hi)
+{
+    const uint64_t span = qmax - qmin + 1;
+    *lo = qmin + span * (uint64_t)k / (uint64_t)n;
+    *hi = qmin + span * (uint64_t)(k + 1) / (uint64_t)n - 1;
+}
+
+static inline int inst_rel_path(const char *relations, int k, char *out,
+                                size_t n)
+{
+    char suf[16];
+    snprintf(suf, sizeof suf, ".inst%d", k);
+    return ckpt_path_fmt(relations, out, n, suf);
+}
+
+static inline int inst_manifest_path(const char *relations, char *out,
+                                     size_t n)
+{
+    return ckpt_path_fmt(relations, out, n, ".instances");
+}
+
+typedef struct {
+    int      n;
+    uint64_t qmin, qmax;
+    char     fp[17];
+} inst_manifest_t;
+
+#define INST_MANIFEST_MAGIC "cuda-sieve-instances 1"
+
+/* Atomic, like ckpt_write: a temporary, fsynced, renamed, parent synced. */
+static inline int inst_manifest_write(const char *path,
+                                      const inst_manifest_t *m)
+{
+    char tmp[CKPT_PATH_MAX];
+    FILE *f;
+    if (ckpt_path_fmt(path, tmp, sizeof tmp, ".tmp")) return -1;
+    if (!(f = fopen(tmp, "wb"))) { perror(tmp); return -1; }
+    fprintf(f, "%s\n", INST_MANIFEST_MAGIC);
+    fprintf(f, "# --instances band split. Delete only together with the"
+               " NAME.inst<k> files it describes (--restart does both).\n");
+    fprintf(f, "n = %d\n", m->n);
+    fprintf(f, "qmin = %llu\n", (unsigned long long)m->qmin);
+    fprintf(f, "qmax = %llu\n", (unsigned long long)m->qmax);
+    fprintf(f, "fingerprint = %s\n", m->fp);
+    if (fflush(f) || bench_sync_stream(f) || fclose(f)) {
+        perror(tmp); remove(tmp); return -1;
+    }
+    if (bench_atomic_replace(tmp, path)) { perror(path); remove(tmp); return -1; }
+    if (bench_sync_parent(path)) { perror(path); return -1; }
+    return 0;
+}
+
+/* 0 = loaded, -1 = absent, -2 = malformed, -3 = unreadable (as ckpt_read). */
+static inline int inst_manifest_read(const char *path, inst_manifest_t *m)
+{
+    char line[256];
+    unsigned long long v;
+    int got = 0;
+    FILE *f = fopen(path, "rb");
+    memset(m, 0, sizeof *m);
+    if (!f) {
+        if (errno == ENOENT) return -1;
+        perror(path);
+        return -3;
+    }
+    if (!fgets(line, sizeof line, f) ||
+        strncmp(line, INST_MANIFEST_MAGIC, strlen(INST_MANIFEST_MAGIC))) {
+        fclose(f);
+        fprintf(stderr, "%s: not an instance manifest\n", path);
+        return -2;
+    }
+    while (fgets(line, sizeof line, f)) {
+        char fp[64];
+        if (line[0] == '#') continue;
+        if (sscanf(line, "n = %llu", &v) == 1) { m->n = (int)v; got |= 1; }
+        else if (sscanf(line, "qmin = %llu", &v) == 1) { m->qmin = v; got |= 2; }
+        else if (sscanf(line, "qmax = %llu", &v) == 1) { m->qmax = v; got |= 4; }
+        else if (sscanf(line, "fingerprint = %63s", fp) == 1 &&
+                 strlen(fp) == 16) {
+            memcpy(m->fp, fp, 17);
+            got |= 8;
+        }
+    }
+    fclose(f);
+    if (got != 15 || m->n < 2 || m->n > 4 || m->qmax < m->qmin) {
+        fprintf(stderr, "%s: malformed instance manifest\n", path);
+        return -2;
+    }
+    return 0;
+}
+
 #ifdef __cplusplus
 }
 #endif

@@ -60,6 +60,9 @@ int  runlog_active(void);
  * to record, so the console reporter and the log can run at different cadences
  * from the same loop. */
 int  runlog_due(void);
+/* Gives the calling thread its own record clock and a tag ("inst1") prefixed
+ * to its records; for --instances pipeline threads. */
+void runlog_thread_tag(const char *tag);
 
 /* Header line, commented so `grep -v '^#'` leaves the records alone. */
 void runlog_note(const char *key, const char *fmt, ...);

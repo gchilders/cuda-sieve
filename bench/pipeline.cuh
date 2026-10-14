@@ -20,6 +20,7 @@
 
 #include "td.cuh"      /* ss_magic_build, SS_KSHIFT */
 #include <thread>
+#include <mutex>
 #include <atomic>
 #include <utility>
 #include "ckpt.h"
@@ -48,17 +49,74 @@ static volatile sig_atomic_t g_pipe_stop = 0;
  * an up-sized slab plan once at the default and maps it to PIPE_RC_FAIL. */
 #define PIPE_RC_NOVRAM (-2)
 
+/* ---- --instances: what a pipeline thread knows about its siblings ------ *
+ *
+ * NULL on an ordinary run, so every hook below is a no-op there. Under
+ * --instances each pipeline thread points it at its own context: its index,
+ * and the state the instances share -- one lock that lets a single instance at
+ * a time run its setup or its end-of-band report (which also serialises their
+ * device allocations), and the per-instance progress the BOINC fraction is
+ * averaged from. */
+struct pipe_inst_shared_t {
+    std::mutex print;
+    std::mutex boinc;
+    int n;
+    double frac[PIPE_INSTANCES_MAX];
+    /* Under `print`: instances whose setup has not finished, and the modelled
+     * footprint each will need. The optional second bucket array reserves
+     * that much for them, so the first instance cannot take what a sibling
+     * needs to start at all. */
+    int setups_left;
+    size_t m_inst;
+};
+struct pipe_inst_ctx_t {
+    int k, n;
+    uint64_t qmin, qmax;
+    pipe_inst_shared_t *sh;
+};
+static thread_local pipe_inst_ctx_t *g_pinst = NULL;
+
+/* Held across run_pipeline_impl's setup and its end-of-band report, released
+ * for the band itself. A no-op without --instances. */
+struct pipe_print_guard_t {
+    bool held = false;
+    void lock()
+    {
+        if (g_pinst && !held) { g_pinst->sh->print.lock(); held = true; }
+    }
+    void unlock()
+    {
+        if (held) { g_pinst->sh->print.unlock(); held = false; }
+    }
+    ~pipe_print_guard_t() { unlock(); }
+};
+
+#ifdef HAVE_BOINC
+/* One fraction for the work unit: under --instances the mean of the
+ * instances' own, each of which is the existing estimator over its share. */
+static void pipe_report_fraction(double f)
+{
+    if (!g_pinst) { bench_boinc_fraction_done(f); return; }
+    pipe_inst_shared_t *sh = g_pinst->sh;
+    std::lock_guard<std::mutex> g(sh->boinc);
+    double sum = 0.0;
+    sh->frac[g_pinst->k] = f;
+    for (int i = 0; i < sh->n; i++) sum += sh->frac[i];
+    bench_boinc_fraction_done(sum / sh->n);
+}
+#endif
+
 /* The per-q sync of the q loop. Device-wide by default; under --cof-async the
  * loop's own work is all on the legacy stream, and a device-wide sync would
  * wait for the in-flight cofactor flush (on g_cof_stream) and undo the
  * overlap. See cofa_start. */
 static cudaError_t pipe_qsync(void)
 {
-    /* Stream 0 is the q loop's own default stream in either compile mode:
-     * the legacy stream normally, the thread's own under
-     * --default-stream per-thread (the PIPE_INSTANCES build). */
-    return g_cof_stream ? cudaStreamSynchronize(0)
-                        : cudaDeviceSynchronize();
+    /* Stream 0 is this thread's own default stream (the build uses
+     * --default-stream per-thread). Under --instances never the device-wide
+     * form, even inline: it would wait for the other instances' work. */
+    return g_cof_stream || g_pinst ? cudaStreamSynchronize(0)
+                                   : cudaDeviceSynchronize();
 }
 
 
@@ -101,7 +159,7 @@ static int pipe_checkpoint(const poly_t *P, const bench_cfg_t *cfg, ckpt_t *ck,
                            FILE *fr, FILE *fc, const qsel_t *next,
                            unsigned long long nrel, unsigned long long nqdone)
 {
-    static int warned_no_id = 0;
+    static thread_local int warned_no_id = 0;
     int64_t ro, co = 0;
     bench_file_id_t cid;
     if (!fr || !cfg->relations) return 0;
@@ -1917,9 +1975,15 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                              const poly_t *POLY, const bench_cfg_t *cfg,
                              const slab_plan_t *slab_plan)
 {
-    /* Ahead of every goto: cofasync_t's `fin`, which the memset of A below
-     * cannot hold by value. */
+    /* First, ahead of every goto: see pipe_print_guard_t, and cofasync_t's
+     * `fin`, which the memset of A below cannot hold by value. */
+    pipe_print_guard_t pg;
     std::atomic<int> cofa_fin(0);
+    pg.lock();
+    if (g_pinst)
+        printf("\n=== instance %d of %d: q [%llu, %llu] ===\n", g_pinst->k,
+               g_pinst->n, (unsigned long long)g_pinst->qmin,
+               (unsigned long long)g_pinst->qmax);
     const uint32_t I = 1u << cfg->logI;
     const uint32_t xmax_alloc = I * slab_plan->jmax;
     const uint32_t nregion_alloc = xmax_alloc >> cfg->log_region;
@@ -2301,7 +2365,10 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         PIPE_CK(cudaMemGetInfo(&f2, &t2));
         const size_t gib = (size_t)1 << 30;
         const size_t margin = t2 / 10 > gib ? t2 / 10 : gib;
-        if (need2 + margin <= f2) {
+        /* --instances: what the siblings still to set up will need. */
+        const size_t reserve = g_pinst
+            ? (size_t)(g_pinst->sh->setups_left - 1) * g_pinst->sh->m_inst : 0;
+        if (need2 + margin + reserve <= f2) {
             PIPE_CK(cudaMalloc(&d_bucket_c, need));
             PIPE_CK(cudaMalloc(&d_cursor_c, (size_t)nregion_alloc * 4));
             PIPE_CK(cudaMalloc(&d_overflow_c, 4));
@@ -2429,8 +2496,12 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
          * handler, because signal(SIGTERM) is never delivered there. A task
          * stopped with TerminateProcess still runs nothing at all, so
          * --stop-file remains the only reliable managed stop on Windows. */
-        stop_hooked = bench_stop_hook_install(pipe_request_stop) == 0;
-        g_pipe_stop = 0;
+        /* --instances: run_pipeline_instances owns the hook and the flag for
+         * all of them; one instance finishing must not unhook the others. */
+        if (!g_pinst) {
+            stop_hooked = bench_stop_hook_install(pipe_request_stop) == 0;
+            g_pipe_stop = 0;
+        }
     }
 
     /* ---- the band ---- */
@@ -2449,7 +2520,10 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
      * have silently moved from 30 s to 300 s because log_every_s defaults to
      * 300 whether or not a log exists. The run log (--log) is a separate,
      * richer stream on its own clock. */
-    const int reporting_to_tty = bench_stdout_is_tty();
+    /* --instances: whole lines, tagged, since several pipelines report. */
+    const int reporting_to_tty = bench_stdout_is_tty() && !g_pinst;
+    char ipfx[16] = "";
+    if (g_pinst) snprintf(ipfx, sizeof ipfx, "[%d] ", g_pinst->k);
     const double report_ms = reporting_to_tty ? 30000.0 : 300000.0;
 #ifdef HAVE_BOINC
     double t_boinc_report = t_band - 1000.0; /* report after the first q */
@@ -2463,6 +2537,8 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
      * resume scan sit under one coarse label and can legitimately run for
      * minutes. */
     wd_arm_kill();
+    if (g_pinst) g_pinst->sh->setups_left--;
+    pg.unlock();            /* --instances: the band runs alongside the others */
     for (uint32_t qi = 0;; qi++) {
         qsel_t generated, checked;
         const qsel_t *cur;
@@ -3339,7 +3415,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                  * successful workunit reports exactly 1.0 only after main has
                  * completed successfully. */
                 if (fraction > 0.99) fraction = 0.99;
-                bench_boinc_fraction_done(fraction);
+                pipe_report_fraction(fraction);
                 t_boinc_report = now;
             }
         }
@@ -3471,19 +3547,19 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                     const double eta_hours = floor(eta / 3600.0);
                     const int eta_minutes =
                         (int)fmod(floor(eta / 60.0), 60.0);
-                    printf("    q=%llu  %u q  %llu rel%s  %.0f rel/s  %.1f%%"
+                    printf("    %sq=%llu  %u q  %llu rel%s  %.0f rel/s  %.1f%%"
                            "  ETA %.0fh %02dm%s",
-                           (unsigned long long)cur->q, nqdone, rels, queued,
+                           ipfx, (unsigned long long)cur->q, nqdone, rels, queued,
                            rps, 100.0 * frac, eta_hours, eta_minutes, end);
                 } else if (rps > 0.0) {
-                    printf("    q=%llu  %u q  %llu rel%s  %.0f rel/s  %.1f%%"
+                    printf("    %sq=%llu  %u q  %llu rel%s  %.0f rel/s  %.1f%%"
                            "  ETA inf%s",
-                           (unsigned long long)cur->q, nqdone, rels, queued,
+                           ipfx, (unsigned long long)cur->q, nqdone, rels, queued,
                            rps, 100.0 * frac, end);
                 } else {
-                    printf("    q=%llu  %u q  %llu rel%s  -- rel/s  %.1f%%"
+                    printf("    %sq=%llu  %u q  %llu rel%s  -- rel/s  %.1f%%"
                            "  ETA --h --m%s",
-                           (unsigned long long)cur->q, nqdone, rels, queued,
+                           ipfx, (unsigned long long)cur->q, nqdone, rels, queued,
                            100.0 * frac, end);
                 }
             }
@@ -3543,6 +3619,10 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         fflush(stdout);
     }
 
+    pg.lock();
+    if (g_pinst)
+        printf("\n=== instance %d of %d: end of band ===\n", g_pinst->k,
+               g_pinst->n);
     /* A streamed source discovers its end only when the NEXT pull returns 0,
      * so the in-loop 30-second reporter cannot know that the preceding q was
      * terminal. Give it an explicit terminal line instead of leaving the last
@@ -3581,7 +3661,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         double fraction = pipe_progress_fraction(
             cfg, qgen != NULL, nq, nqdone, last_q.q, rels, base_nq);
         if (fraction > 0.99) fraction = 0.99;
-        bench_boinc_fraction_done(fraction);
+        pipe_report_fraction(fraction);
     }
 #endif
 
@@ -3684,7 +3764,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
      * remaining-time estimate both jump backwards. The 0.99 means "the band is
      * finished and only the flush, rename and cleanup remain"; a stop has the
      * whole band left. */
-    if (rc == 0 && !stopped) bench_boinc_fraction_done(0.99);
+    if (rc == 0 && !stopped) pipe_report_fraction(0.99);
 #endif
     if (rc == 0) {
         /* Query only after the scientific output is committed. Per-q buffers
@@ -4257,93 +4337,256 @@ static size_t pipe_vram_model(const fb_t *fb1, const fb_t *fb0,
     return b;
 }
 
-#ifdef PIPE_INSTANCES
-/* ---- --instances N: N whole pipelines in one process (PROTOTYPE) ------ *
+/* One run_pipeline_impl, at whichever instantiation the plan needs: a plan
+ * whose one slab covers the whole area runs unslabbed. */
+static int pipe_impl_any(const slab_plan_t *P, const fb_t *fb1,
+                         const fb_t *fbs1, const fb_t *fb0, const fb_t *fbs0,
+                         const qsel_t *qlist, uint32_t nq, sqgen_t *qgen,
+                         const poly_t *POLY, const bench_cfg_t *cfg)
+{
+    return P->enabled
+        ? run_pipeline_impl<true>(fb1, fbs1, fb0, fbs0, qlist, nq, qgen, POLY,
+                                  cfg, P)
+        : run_pipeline_impl<false>(fb1, fbs1, fb0, fbs0, qlist, nq, qgen, POLY,
+                                   cfg, P);
+}
+
+/* ---- --instances N: N whole pipelines on one GPU ----------------------- *
  *
  * Several special-q in flight without restructuring the q loop: the bounded
  * band is cut into N equal q ranges and each runs its own run_pipeline_impl on
- * its own host thread. Built with --default-stream per-thread, so each thread's
- * <<<>>> launches go to its own stream and the pipelines' kernels overlap
- * the way MPS let two processes overlap (+17% on the 2,1147+ job, RTX 4090).
- * Part i > 0 writes RELATIONS.i<i>, appended to RELATIONS at the end, so
- * the file holds the same relations in the same q order as one instance.
+ * its own host thread. The build uses --default-stream per-thread, so each
+ * thread's launches go to its own stream and the pipelines' kernels overlap
+ * on the device (2,1147+, RTX 4090: two instances 73.5 s of band against
+ * 80.5 s for one, byte-identical relations).
  *
- * Prototype limits: bounded --qrange with --relations, no resume, no
- * --target-rels/--nq. The VRAM slab target divides free memory by N. */
-template <bool SLABBED>
+ * Each instance is an ordinary band over its share, with its own relation
+ * file NAME.inst<k>: its own .part, checkpoint, BOINC recovery counter,
+ * resume and commit, all the existing code. What the instances share is set
+ * up here -- the stop hook, the watchdog and run-log slots, the BOINC
+ * fraction -- and what they produce is merged here, in q order, into NAME:
+ * the file one pipeline would have written. NAME.instances (written by
+ * run_pipeline when the band starts) pins N and the band for a relaunch. */
+static int pipe_inst_merge(const pipe_inst_plan_t *IP, const char *relations)
+{
+    static char buf[1 << 20];
+    char tmp[CKPT_PATH_MAX];
+    FILE *out;
+    if (ckpt_path_fmt(relations, tmp, sizeof tmp, ".instances.merge")) {
+        fprintf(stderr, "--instances: output path too long\n");
+        return -1;
+    }
+    if (!(out = fopen(tmp, "wb"))) { perror(tmp); return -1; }
+    for (int k = 0; k < IP->n; k++) {
+        FILE *in = fopen(IP->in[k].relations, "rb");
+        size_t m;
+        int bad = 0;
+        if (!in) { perror(IP->in[k].relations); bad = 1; }
+        while (!bad && (m = fread(buf, 1, sizeof buf, in)) > 0)
+            if (fwrite(buf, 1, m, out) != m) { perror(tmp); bad = 1; }
+        if (in) {
+            if (!bad && ferror(in)) { perror(IP->in[k].relations); bad = 1; }
+            fclose(in);
+        }
+        if (bad) { fclose(out); remove(tmp); return -1; }
+    }
+    if (fflush(out) || bench_sync_stream(out) || fclose(out)) {
+        perror(tmp); remove(tmp); return -1;
+    }
+    if (bench_atomic_replace(tmp, relations)) {
+        perror(relations); remove(tmp); return -1;
+    }
+    if (bench_sync_parent(relations)) perror(relations);
+    /* The instance files first and the manifest last. Interrupted in
+     * between, a relaunch still finds the manifest, sieves again whichever
+     * instance's file is gone, and merges again: wasted work, never a lost
+     * or doubled special-q. */
+    for (int k = 0; k < IP->n; k++)
+        if (remove(IP->in[k].relations) && errno != ENOENT)
+            perror(IP->in[k].relations);
+    if (IP->manifest[0] && remove(IP->manifest) && errno != ENOENT)
+        perror(IP->manifest);
+    return 0;
+}
+
+/* One instance, on its own thread: its configuration is the band's with its
+ * own share, relation file and resume state, and its own special-q stream. */
+static int pipe_inst_run_one(const fb_t *fb1, const fb_t *fbs1,
+                             const fb_t *fb0, const fb_t *fbs0,
+                             const poly_t *POLY, const bench_cfg_t *base,
+                             const pipe_inst_one_t *I, int k,
+                             const slab_plan_t *plan,
+                             const slab_plan_t *base_plan, int upsized)
+{
+    bench_cfg_t c = *base;
+    qsel_t first;
+    int r, have, rc;
+    c.inst = NULL;
+    c.relations = I->relations[0] ? I->relations : NULL;
+    c.qmin = I->resume ? I->resume_q : I->qmin;
+    c.qmax = I->qmax;
+    c.nq_max = 0;
+    c.restart = 0;
+    c.resume = I->resume;
+    c.resume_q = I->resume_q;
+    c.resume_rho = I->resume_rho;
+    c.resume_qmin = I->resume_qmin;
+    c.resume_rel_bytes = I->resume_rel_bytes;
+    c.resume_cand_bytes = 0;
+    c.resume_nrel = I->resume_nrel;
+    c.resume_nq = I->resume_nq;
+
+    sqgen_t *G = sqgen_create(POLY, c.sq_side, c.qmin, c.qmax, 0);
+    if (!G) return PIPE_RC_FAIL;
+    r = sqgen_next(G, &first);
+    /* As bench_main does for one pipeline: the checkpoint names the exact
+     * root, so wind forward to it rather than re-sieve the q's other roots.
+     * An instance whose checkpoint is already past its last q still runs,
+     * with nothing to sieve, so that it commits. */
+    if (r > 0 && c.resume) {
+        int guard = 0;
+        while ((first.q != c.resume_q || first.rho != c.resume_rho) &&
+               ++guard <= BENCH_NCOEFF)
+            if ((r = sqgen_next(G, &first)) <= 0) break;
+        if (r > 0 && (first.q != c.resume_q || first.rho != c.resume_rho)) {
+            fprintf(stderr, "  instance %d: the generator does not produce"
+                    " q=%llu rho=%llu at its checkpoint\n", k,
+                    (unsigned long long)c.resume_q,
+                    (unsigned long long)c.resume_rho);
+            sqgen_free(G);
+            return PIPE_RC_FAIL;
+        }
+    }
+    if (r < 0) { sqgen_free(G); return PIPE_RC_FAIL; }
+    have = r > 0;
+    rc = pipe_impl_any(plan, fb1, fbs1, fb0, fbs0, have ? &first : NULL,
+                       have ? 1u : 0u, G, POLY, &c);
+    /* Nothing is opened or consumed before the bucket admission, so this
+     * instance can retry at the default slab exactly as one pipeline does --
+     * whatever its siblings are doing. */
+    if (rc == PIPE_RC_NOVRAM && upsized) {
+        printf("  [%d] slab size from VRAM: the up-sized plan no longer fits;"
+               " retrying at the default %u rows/slab, one bucket array\n",
+               k, base_plan->jmax);
+        c.dual_bucket = 0;
+        rc = pipe_impl_any(base_plan, fb1, fbs1, fb0, fbs0,
+                           have ? &first : NULL, have ? 1u : 0u, G, POLY, &c);
+    }
+    sqgen_free(G);
+    return rc == PIPE_RC_NOVRAM ? PIPE_RC_FAIL : rc;
+}
+
+/* Worst first: a failure outranks the two policy stops, which outrank a clean
+ * stop, which outranks a finished band. */
+static int pipe_rc_rank(int rc)
+{
+    switch (rc) {
+    case PIPE_RC_OK:          return 0;
+    case PIPE_RC_STOPPED:     return 1;
+    case PIPE_RC_DEGRADED:    return 2;
+    case PIPE_RC_UNSUPPORTED: return 3;
+    default:                  return 4;
+    }
+}
+
 static int run_pipeline_instances(const fb_t *fb1, const fb_t *fbs1,
                                   const fb_t *fb0, const fb_t *fbs0,
                                   const poly_t *POLY, const bench_cfg_t *cfg,
-                                  const slab_plan_t *plan)
+                                  const pipe_inst_plan_t *IP,
+                                  const slab_plan_t *plan,
+                                  const slab_plan_t *base_plan, int upsized,
+                                  size_t m_inst)
 {
-    enum { NMAX = 4 };
-    const int NI = cfg->instances;
-    if (NI < 2 || NI > NMAX || !cfg->qmax || !cfg->relations || cfg->resume ||
-        cfg->target_rels || cfg->nq_max || cfg->qlist) {
-        fprintf(stderr, "  --instances: needs 2..%d, a bounded --qrange with"
-                " --relations, and no resume, --target-rels, --nq or --qlist\n",
-                (int)NMAX);
-        return -1;
+    const int n = IP->n;
+    pipe_inst_shared_t sh;
+    pipe_inst_ctx_t ctx[PIPE_INSTANCES_MAX];
+    int rc[PIPE_INSTANCES_MAX] = { 0 };
+    std::thread th[PIPE_INSTANCES_MAX];
+    int hooked = 0, worst = PIPE_RC_OK;
+    const double t0 = host_ms();
+
+    sh.n = n;
+    sh.m_inst = m_inst;
+    sh.setups_left = 0;
+    for (int k = 0; k < n; k++) sh.setups_left += !IP->in[k].done;
+    printf("\n=== --instances %d: q [%llu, %llu] ===\n", n,
+           (unsigned long long)cfg->qmin, (unsigned long long)cfg->qmax);
+    for (int k = 0; k < n; k++) {
+        const pipe_inst_one_t *I = &IP->in[k];
+        sh.frac[k] = I->done ? 1.0 : 0.0;
+        printf("  instance %d: q [%llu, %llu]%s", k,
+               (unsigned long long)I->qmin, (unsigned long long)I->qmax,
+               I->relations[0] ? ", " : "");
+        if (I->relations[0]) printf("%s", I->relations);
+        if (I->done)        printf(" (complete)");
+        else if (I->resume) printf(" (resuming at q=%llu)",
+                                   (unsigned long long)I->resume_q);
+        printf("\n");
+        runlog_note("instance", "%d of %d: q [%llu, %llu] %s%s", k, n,
+                    (unsigned long long)I->qmin, (unsigned long long)I->qmax,
+                    I->relations[0] ? I->relations : "(no relations)",
+                    I->done ? " complete" : I->resume ? " resumed" : "");
     }
-    bench_cfg_t c[NMAX];
-    static char relp[NMAX][4096];
-    sqgen_t *G[NMAX] = { NULL };
-    qsel_t first[NMAX];
-    int have[NMAX] = { 0 }, rc[NMAX] = { 0 };
-    const uint64_t span = cfg->qmax - cfg->qmin + 1;
-    for (int i = 0; i < NI; i++) {
-        c[i] = *cfg;
-        c[i].qmin = cfg->qmin + span * (uint64_t)i / (uint64_t)NI;
-        c[i].qmax = cfg->qmin + span * (uint64_t)(i + 1) / (uint64_t)NI - 1;
-        if (i) {
-            snprintf(relp[i], sizeof relp[i], "%s.i%d", cfg->relations, i);
-            c[i].relations = relp[i];
-        }
-        G[i] = sqgen_create(POLY, cfg->sq_side, c[i].qmin, c[i].qmax, 0);
-        if (!G[i]) return -1;
-        const int r = sqgen_next(G[i], &first[i]);
-        if (r < 0) return -1;
-        have[i] = r > 0;
-        printf("  --instances %d: #%d q [%llu, %llu]\n", NI, i,
-               (unsigned long long)c[i].qmin, (unsigned long long)c[i].qmax);
+    /* One stop hook for all of them, owned here: an instance that finishes
+     * first must not unhook the others (see the g_pinst test where
+     * run_pipeline_impl would install it). */
+    if (cfg->relations) {
+        hooked = bench_stop_hook_install(pipe_request_stop) == 0;
+        g_pipe_stop = 0;
     }
-    std::thread th[NMAX];
-    for (int i = 1; i < NI; i++)
-        th[i] = std::thread([&, i]() {
-            if (have[i])
-                rc[i] = run_pipeline_impl<SLABBED>(fb1, fbs1, fb0, fbs0,
-                                                   &first[i], 1, G[i], POLY,
-                                                   &c[i], plan);
+    for (int k = 0; k < n; k++) {
+        if (IP->in[k].done) continue;
+        ctx[k].k = k;
+        ctx[k].n = n;
+        ctx[k].qmin = IP->in[k].qmin;
+        ctx[k].qmax = IP->in[k].qmax;
+        ctx[k].sh = &sh;
+        th[k] = std::thread([&, k]() {
+            char tag[16];
+            g_pinst = &ctx[k];
+            wd_bind(k + 1);
+            snprintf(tag, sizeof tag, "inst%d", k);
+            runlog_thread_tag(tag);
+            rc[k] = pipe_inst_run_one(fb1, fbs1, fb0, fbs0, POLY, cfg,
+                                      &IP->in[k], k, plan, base_plan,
+                                      upsized);
+            /* A failure or a policy stop ends the band, so let the others
+             * drain and checkpoint at their next special-q rather than sieve
+             * on into a work unit that will not be credited. */
+            if (rc[k] != PIPE_RC_OK && rc[k] != PIPE_RC_STOPPED &&
+                !g_pipe_stop) {
+                fprintf(stderr, "  instance %d ended with status %d;"
+                        " stopping the others at their next special-q\n",
+                        k, rc[k]);
+                g_pipe_stop = 1;
+            }
+            wd_active(0);
+            g_pinst = NULL;
         });
-    if (have[0])
-        rc[0] = run_pipeline_impl<SLABBED>(fb1, fbs1, fb0, fbs0, &first[0], 1,
-                                           G[0], POLY, &c[0], plan);
-    for (int i = 1; i < NI; i++) th[i].join();
-    for (int i = 0; i < NI; i++) sqgen_free(G[i]);
-    for (int i = 0; i < NI; i++)
-        if (rc[i]) {
-            fprintf(stderr, "  --instances: instance %d rc %d\n", i, rc[i]);
-            return rc[i];
-        }
-    /* Append the later parts in q order: the file then holds what one
-     * instance would have written, in the same order. */
-    FILE *out = fopen(cfg->relations, "ab");
-    if (!out) { perror("--instances: merging relations"); return -1; }
-    for (int i = 1; i < NI; i++) {
-        if (!have[i]) continue;
-        FILE *in = fopen(relp[i], "rb");
-        if (!in) { perror("--instances: merging relations"); fclose(out); return -1; }
-        char buf[1 << 16];
-        size_t k;
-        while ((k = fread(buf, 1, sizeof buf, in)) > 0)
-            if (fwrite(buf, 1, k, out) != k) { perror("--instances"); break; }
-        fclose(in);
-        remove(relp[i]);
     }
-    if (fclose(out)) { perror("--instances"); return -1; }
-    return 0;
+    /* The main thread only waits; a parked join is not a stall. */
+    wd_active(0);
+    for (int k = 0; k < n; k++)
+        if (th[k].joinable()) th[k].join();
+    wd_active(1);
+    wd_phase("instances.merge");
+    if (hooked) bench_stop_hook_remove();
+
+    for (int k = 0; k < n; k++)
+        if (pipe_rc_rank(rc[k]) > pipe_rc_rank(worst)) worst = rc[k];
+    if (worst == PIPE_RC_OK && cfg->relations) {
+        if (pipe_inst_merge(IP, cfg->relations)) worst = PIPE_RC_FAIL;
+        else printf("\n  --instances %d: the instances' relations merged into"
+                    " %s, in q order\n", n, cfg->relations);
+    } else if (worst != PIPE_RC_OK) {
+        printf("\n  --instances %d: band not finished (status %d); each"
+               " instance's own .part and checkpoint are kept, and the same"
+               " command resumes all of them\n", n, worst);
+    }
+    printf("  --instances %d: %.1f s for the instances' bands\n", n,
+           (host_ms() - t0) / 1000.0);
+    return worst;
 }
-#endif
 
 extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                             const fb_t *fb0, const fb_t *fbs0,
@@ -4365,42 +4608,79 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     }
     const slab_plan_t base_plan = plan;
     uint32_t perf_regions = SLAB_PERF_REGIONS;
+    /* --instances: a band under way has its N; a fresh one takes the number
+     * asked for, or for auto (0) the choice below. Without a plan, one. */
+    pipe_inst_plan_t *IP = cfg->inst;
+    int ninst = IP ? (IP->n ? IP->n : cfg->instances) : 1;
+    /* The slab target: the largest of 4x, 2x the default whose modelled
+     * footprint fits free VRAM with headroom, else the default. N instances
+     * need N footprints and share ONE headroom -- the margin is for the
+     * display and the model's error, which do not multiply. The serial arm's
+     * second bucket array is decided later, in run_pipeline_impl, against the
+     * memory actually left once everything else it needs is allocated. */
+    struct choice_t {
+        slab_plan_t P;
+        uint32_t regions;
+        int idx;                /* 0 = 4x, 1 = 2x, 2 = the default */
+        size_t m;
+    };
+    choice_t ch = { plan, SLAB_PERF_REGIONS, 2, 0 };
     if (!cfg->slab_j && !cfg->slab_fixed) {
         size_t freeB = 0, totalB = 0;
         if (cudaMemGetInfo(&freeB, &totalB) == cudaSuccess) {
             const size_t gib = (size_t)1 << 30;
-            /* --instances N (PIPE_INSTANCES) runs N copies of the plan. */
-            if (cfg->instances > 1) freeB /= (size_t)cfg->instances;
             const size_t headroom = totalB / 10 > gib ? totalB / 10 : gib;
             const double inv1 = pipe_inv_sum(fb1), inv0 = pipe_inv_sum(fb0);
             const size_t m0 = pipe_vram_model(fb1, fb0, cfg, plan.jmax,
                                               inv1, inv0);
-            for (int k = 2; k >= 1; k--) {
-                slab_plan_t P2;
-                const uint32_t r = (uint32_t)SLAB_PERF_REGIONS << k;
-                if (slab_make_plan_r(cfg->logI, cfg->log_region, cfg->J, pmax,
-                                     0u, r, &P2))
-                    continue;
-                if (P2.jmax <= plan.jmax) continue;   /* a safety cap binds */
-                const size_t m = pipe_vram_model(fb1, fb0, cfg, P2.jmax,
-                                                 inv1, inv0);
-                if (m + headroom <= freeB) {
-                    printf("  slab size from VRAM: %.2f GB free, modelled"
-                           " %.2f GB at %u rows/slab (%.2f GB at the default"
-                           " %u); using %u bucket regions/slab\n",
-                           freeB / 1073741824.0, m / 1073741824.0, P2.jmax,
-                           m0 / 1073741824.0, plan.jmax, r);
-                    plan = P2;
-                    perf_regions = r;
-                    break;
+            auto choose = [&](int n, choice_t *out) {
+                *out = { plan, SLAB_PERF_REGIONS, 2, m0 };
+                for (int k = 2; k >= 1; k--) {
+                    slab_plan_t P2;
+                    const uint32_t r = (uint32_t)SLAB_PERF_REGIONS << k;
+                    if (slab_make_plan_r(cfg->logI, cfg->log_region, cfg->J,
+                                         pmax, 0u, r, &P2))
+                        continue;
+                    if (P2.jmax <= plan.jmax) continue;   /* a safety cap binds */
+                    const size_t m = pipe_vram_model(fb1, fb0, cfg, P2.jmax,
+                                                     inv1, inv0);
+                    if (m * (size_t)n + headroom > freeB) continue;
+                    *out = { P2, r, 2 - k, m };
+                    return;
                 }
+            };
+            if (ninst == 0) {
+                /* auto: two instances when each still gets the slab one
+                 * would -- or 2^30 where one would get 2^31, the one step
+                 * measured to pay (2,1147+, RTX 4090: 73.5 s of band against
+                 * 80.5 s). Three measured slower than two there, so auto
+                 * stops at two. */
+                choice_t c1, c2;
+                choose(1, &c1);
+                choose(2, &c2);
+                ninst = (c2.idx == c1.idx || (c1.idx == 0 && c2.idx == 1))
+                      ? 2 : 1;
+                printf("  --instances auto: %d (%.2f GB free)\n", ninst,
+                       freeB / 1073741824.0);
             }
-            if (perf_regions == SLAB_PERF_REGIONS)
+            choose(ninst, &ch);
+            if (ch.idx < 2)
+                printf("  slab size from VRAM: %.2f GB free, modelled"
+                       " %.2f GB at %u rows/slab%s (%.2f GB at the default"
+                       " %u); using %u bucket regions/slab\n",
+                       freeB / 1073741824.0, ch.m / 1073741824.0, ch.P.jmax,
+                       ninst > 1 ? " per instance" : "",
+                       m0 / 1073741824.0, plan.jmax, ch.regions);
+            else
                 printf("  slab size from VRAM: %.2f GB free, modelled %.2f GB"
-                       " at the default %u rows/slab; keeping it\n",
-                       freeB / 1073741824.0, m0 / 1073741824.0, plan.jmax);
+                       " at the default %u rows/slab%s; keeping it\n",
+                       freeB / 1073741824.0, m0 / 1073741824.0, plan.jmax,
+                       ninst > 1 ? " per instance" : "");
+            plan = ch.P;
+            perf_regions = ch.regions;
         }
     }
+    if (ninst == 0) ninst = 1;     /* auto without a VRAM reading */
     /* The A/B record path leaves no other trace: the stage label is the same on
      * both branches and the checkpoint job text does not carry the flag, so a
      * sweep log that mixes the two kernels would have no tell. Finding 78's
@@ -4410,48 +4690,74 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         printf("  recording pass: SCALAR (one thread per candidate,"
                " --td-record-scalar) -- the pre-finding-77 path, for A/B only\n");
 
-    auto go = [&](const slab_plan_t &P, uint32_t regions) -> int {
-        if (P.enabled) {
-            const uint32_t perf_jmax = slab_perf_jmax_r(cfg->logI,
-                                                        cfg->log_region,
-                                                        cfg->J, regions);
-            if (!cfg->slab_j && perf_jmax != 0xffffffffu)
-                printf("  j-slabbing: %u slab%s, up to %u rows/slab"
-                       " (auto target %u bucket regions at --region %d;"
-                       " safety bounds may reduce it further)\n",
-                       P.nslab, P.nslab == 1 ? "" : "s", P.jmax,
-                       (unsigned)regions, cfg->log_region);
-            else
-                printf("  j-slabbing: %u slab%s, up to %u rows/slab"
-                       " (<=2^31 local-position safety bound)\n",
-                       P.nslab, P.nslab == 1 ? "" : "s", P.jmax);
-#ifdef PIPE_INSTANCES
-            if (cfg->instances > 1)
-                return run_pipeline_instances<true>(fb1, fbs1, fb0, fbs0, POLY,
-                                                    cfg, &P);
-#endif
-            return run_pipeline_impl<true>(fb1, fbs1, fb0, fbs0, qlist, nq,
-                                           qgen, POLY, cfg, &P);
-        }
-#ifdef PIPE_INSTANCES
-        if (cfg->instances > 1)
-            return run_pipeline_instances<false>(fb1, fbs1, fb0, fbs0, POLY,
-                                                 cfg, &P);
-#endif
-        return run_pipeline_impl<false>(fb1, fbs1, fb0, fbs0, qlist, nq, qgen,
-                                        POLY, cfg, &P);
+    /* run_pipeline_impl reads the decision from the flag it already tests;
+     * its own free-memory check stays behind it as a second line. */
+    bench_cfg_t cfg_run = *cfg;
+    cfg_run.inst = NULL;
+
+    auto slab_line = [&](const slab_plan_t &P, uint32_t regions) {
+        if (!P.enabled) return;
+        const uint32_t perf_jmax = slab_perf_jmax_r(cfg->logI, cfg->log_region,
+                                                    cfg->J, regions);
+        if (!cfg->slab_j && perf_jmax != 0xffffffffu)
+            printf("  j-slabbing: %u slab%s, up to %u rows/slab"
+                   " (auto target %u bucket regions at --region %d;"
+                   " safety bounds may reduce it further)\n",
+                   P.nslab, P.nslab == 1 ? "" : "s", P.jmax,
+                   (unsigned)regions, cfg->log_region);
+        else
+            printf("  j-slabbing: %u slab%s, up to %u rows/slab"
+                   " (<=2^31 local-position safety bound)\n",
+                   P.nslab, P.nslab == 1 ? "" : "s", P.jmax);
     };
-    int rc = go(plan, perf_regions);
+    slab_line(plan, perf_regions);
+
+    if (IP && ninst >= 2) {
+        if (!IP->n) {
+            /* A fresh band: split it, and pin the split before any instance
+             * creates a file -- a relaunch reads N from here. */
+            IP->n = ninst;
+            for (int k = 0; k < ninst; k++) {
+                pipe_inst_one_t *I = &IP->in[k];
+                inst_split(cfg->qmin, cfg->qmax, ninst, k, &I->qmin, &I->qmax);
+                I->relations[0] = 0;
+                if (cfg->relations &&
+                    (inst_rel_path(cfg->relations, k, I->relations,
+                                   sizeof I->relations) ||
+                     ckpt_path_usable(I->relations,
+                                      "--relations (instance file)")))
+                    return PIPE_RC_FAIL;
+            }
+            if (IP->manifest[0]) {
+                inst_manifest_t m;
+                memset(&m, 0, sizeof m);
+                m.n = ninst;
+                m.qmin = cfg->qmin;
+                m.qmax = cfg->qmax;
+                ckpt_fingerprint(POLY, cfg, m.fp);
+                if (inst_manifest_write(IP->manifest, &m)) return PIPE_RC_FAIL;
+            }
+        }
+        return run_pipeline_instances(fb1, fbs1, fb0, fbs0, POLY, &cfg_run, IP,
+                                      &plan, &base_plan,
+                                      perf_regions != SLAB_PERF_REGIONS,
+                                      ch.m);
+    }
+
+    int rc = pipe_impl_any(&plan, fb1, fbs1, fb0, fbs0, qlist, nq, qgen, POLY,
+                           &cfg_run);
     /* An up-sized plan whose bucket array did not fit or could not be
      * allocated -- typically another task took the memory after the free-VRAM
      * reading above -- runs once more at the default, which is what this
-     * build ran before the slab target became VRAM-driven. Not under
-     * --instances: the other instances may already have written output. */
-    if (rc == PIPE_RC_NOVRAM && perf_regions != SLAB_PERF_REGIONS &&
-        cfg->instances <= 1) {
+     * build ran before the slab target became VRAM-driven. */
+    if (rc == PIPE_RC_NOVRAM && perf_regions != SLAB_PERF_REGIONS) {
         printf("  slab size from VRAM: the up-sized plan no longer fits;"
-               " retrying at the default %u rows/slab\n", base_plan.jmax);
-        rc = go(base_plan, SLAB_PERF_REGIONS);
+               " retrying at the default %u rows/slab, one bucket array\n",
+               base_plan.jmax);
+        cfg_run.dual_bucket = 0;
+        slab_line(base_plan, SLAB_PERF_REGIONS);
+        rc = pipe_impl_any(&base_plan, fb1, fbs1, fb0, fbs0, qlist, nq, qgen,
+                           POLY, &cfg_run);
     }
     return rc == PIPE_RC_NOVRAM ? PIPE_RC_FAIL : rc;
 }

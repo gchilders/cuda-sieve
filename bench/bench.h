@@ -620,7 +620,11 @@ typedef struct {
     /* Serial arm: a second bucket array when VRAM allows, so side 1 also
      * resieves from its records. On by default; --no-dual-bucket. */
     int      dual_bucket;
-    int      instances;   /* --instances N: PIPE_INSTANCES builds only (prototype) */
+    /* --instances N (1..4) or auto (0): N whole pipelines on one GPU, each
+     * on its own host thread and its own share of a bounded q range. The
+     * request; what actually runs is `inst` below (NULL = one pipeline). */
+    int      instances;
+    struct pipe_inst_plan *inst;   /* run_pipeline fills a fresh band's split */
     /* --qspan: bracket each special-q's GPU work with two events and report
      * the span, splitting `unaccounted` into host-with-no-GPU-work versus
      * idle-between-stages. Diagnostic; STATUS item 19 step 2. */
@@ -1028,6 +1032,27 @@ enum {
     /* Same reasoning, same rule: not an independent 5. */
     PIPE_RC_DEGRADED    = BENCH_EXIT_DEGRADED
 };
+
+/* --instances: the band split bench_main settled -- from the request, or from
+ * the manifest of a band already under way -- with each instance's own
+ * relation file and resume state. The rest of each instance's configuration
+ * is the band's cfg; see pipe_inst_cfg. */
+#define PIPE_INSTANCES_MAX 4
+#define PIPE_INST_PATH     2048   /* == BENCH_PATH_MAX, asserted in bench_main */
+typedef struct pipe_inst_one {
+    uint64_t qmin, qmax;          /* this instance's share of the band       */
+    int      done;                /* its relation file is already committed  */
+    char     relations[PIPE_INST_PATH];   /* NAME.inst<k>; "" without --relations */
+    /* From its checkpoint, as resume_prepare left them. */
+    int      resume;
+    uint64_t resume_q, resume_rho, resume_qmin;
+    unsigned long long resume_rel_bytes, resume_nrel, resume_nq;
+} pipe_inst_one_t;
+typedef struct pipe_inst_plan {
+    int n;                        /* 2..PIPE_INSTANCES_MAX                   */
+    pipe_inst_one_t in[PIPE_INSTANCES_MAX];
+    char manifest[PIPE_INST_PATH];        /* NAME.instances; "" without --relations */
+} pipe_inst_plan_t;
 
 int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                  const fb_t *fb0, const fb_t *fbs0,
