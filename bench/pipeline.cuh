@@ -47,7 +47,10 @@ static volatile sig_atomic_t g_pipe_stop = 0;
  * overlap. See cofa_start. */
 static cudaError_t pipe_qsync(void)
 {
-    return g_cof_stream ? cudaStreamSynchronize(cudaStreamLegacy)
+    /* Stream 0 is the q loop's own default stream in either compile mode:
+     * the legacy stream normally, the thread's own under
+     * --default-stream per-thread (the PIPE_INSTANCES build). */
+    return g_cof_stream ? cudaStreamSynchronize(0)
                         : cudaDeviceSynchronize();
 }
 
@@ -1797,7 +1800,9 @@ static void cofa_start(cofasync_t *A, cofq_t *Q, cofq_out_t *O,
     /* Full width. Launching the flush at blocks/2 or blocks/4 so the sieve
      * kept SMs to itself was measured at 278.2 and 277.0 ms/q against 276.5
      * (RTX 4090, 2,1147+, 420 q): no effect, so there is no knob. */
-    A->th = new std::thread([A, O, cfg, blocks, fr]() {
+    const cudaStream_t cs = g_cof_stream;   /* thread_local: hand it over */
+    A->th = new std::thread([A, O, cfg, blocks, fr, cs]() {
+        g_cof_stream = cs;
         A->rc = cofq_flush(&A->F, O, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
                            cfg->cof_rounds, cfg->cof_budget, cfg->cof_chunk,
                            blocks, cfg->threads, fr);
@@ -4164,6 +4169,94 @@ static size_t pipe_vram_model(const fb_t *fb1, const fb_t *fb0,
     return b;
 }
 
+#ifdef PIPE_INSTANCES
+/* ---- --instances N: N whole pipelines in one process (PROTOTYPE) ------ *
+ *
+ * Several special-q in flight without restructuring the q loop: the bounded
+ * band is cut into N equal q ranges and each runs its own run_pipeline_impl on
+ * its own host thread. Built with --default-stream per-thread, so each thread's
+ * <<<>>> launches go to its own stream and the pipelines' kernels overlap
+ * the way MPS let two processes overlap (+17% on the 2,1147+ job, RTX 4090).
+ * Part i > 0 writes RELATIONS.i<i>, appended to RELATIONS at the end, so
+ * the file holds the same relations in the same q order as one instance.
+ *
+ * Prototype limits: bounded --qrange with --relations, no resume, no
+ * --target-rels/--nq. The VRAM slab target divides free memory by N. */
+template <bool SLABBED>
+static int run_pipeline_instances(const fb_t *fb1, const fb_t *fbs1,
+                                  const fb_t *fb0, const fb_t *fbs0,
+                                  const poly_t *POLY, const bench_cfg_t *cfg,
+                                  const slab_plan_t *plan)
+{
+    enum { NMAX = 4 };
+    const int NI = cfg->instances;
+    if (NI < 2 || NI > NMAX || !cfg->qmax || !cfg->relations || cfg->resume ||
+        cfg->target_rels || cfg->nq_max || cfg->qlist) {
+        fprintf(stderr, "  --instances: needs 2..%d, a bounded --qrange with"
+                " --relations, and no resume, --target-rels, --nq or --qlist\n",
+                (int)NMAX);
+        return -1;
+    }
+    bench_cfg_t c[NMAX];
+    static char relp[NMAX][4096];
+    sqgen_t *G[NMAX] = { NULL };
+    qsel_t first[NMAX];
+    int have[NMAX] = { 0 }, rc[NMAX] = { 0 };
+    const uint64_t span = cfg->qmax - cfg->qmin + 1;
+    for (int i = 0; i < NI; i++) {
+        c[i] = *cfg;
+        c[i].qmin = cfg->qmin + span * (uint64_t)i / (uint64_t)NI;
+        c[i].qmax = cfg->qmin + span * (uint64_t)(i + 1) / (uint64_t)NI - 1;
+        if (i) {
+            snprintf(relp[i], sizeof relp[i], "%s.i%d", cfg->relations, i);
+            c[i].relations = relp[i];
+        }
+        G[i] = sqgen_create(POLY, cfg->sq_side, c[i].qmin, c[i].qmax, 0);
+        if (!G[i]) return -1;
+        const int r = sqgen_next(G[i], &first[i]);
+        if (r < 0) return -1;
+        have[i] = r > 0;
+        printf("  --instances %d: #%d q [%llu, %llu]\n", NI, i,
+               (unsigned long long)c[i].qmin, (unsigned long long)c[i].qmax);
+    }
+    std::thread th[NMAX];
+    for (int i = 1; i < NI; i++)
+        th[i] = std::thread([&, i]() {
+            if (have[i])
+                rc[i] = run_pipeline_impl<SLABBED>(fb1, fbs1, fb0, fbs0,
+                                                   &first[i], 1, G[i], POLY,
+                                                   &c[i], plan);
+        });
+    if (have[0])
+        rc[0] = run_pipeline_impl<SLABBED>(fb1, fbs1, fb0, fbs0, &first[0], 1,
+                                           G[0], POLY, &c[0], plan);
+    for (int i = 1; i < NI; i++) th[i].join();
+    for (int i = 0; i < NI; i++) sqgen_free(G[i]);
+    for (int i = 0; i < NI; i++)
+        if (rc[i]) {
+            fprintf(stderr, "  --instances: instance %d rc %d\n", i, rc[i]);
+            return rc[i];
+        }
+    /* Append the later parts in q order: the file then holds what one
+     * instance would have written, in the same order. */
+    FILE *out = fopen(cfg->relations, "ab");
+    if (!out) { perror("--instances: merging relations"); return -1; }
+    for (int i = 1; i < NI; i++) {
+        if (!have[i]) continue;
+        FILE *in = fopen(relp[i], "rb");
+        if (!in) { perror("--instances: merging relations"); fclose(out); return -1; }
+        char buf[1 << 16];
+        size_t k;
+        while ((k = fread(buf, 1, sizeof buf, in)) > 0)
+            if (fwrite(buf, 1, k, out) != k) { perror("--instances"); break; }
+        fclose(in);
+        remove(relp[i]);
+    }
+    if (fclose(out)) { perror("--instances"); return -1; }
+    return 0;
+}
+#endif
+
 extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                             const fb_t *fb0, const fb_t *fbs0,
                             const qsel_t *qlist, uint32_t nq, sqgen_t *qgen,
@@ -4187,6 +4280,8 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         size_t freeB = 0, totalB = 0;
         if (cudaMemGetInfo(&freeB, &totalB) == cudaSuccess) {
             const size_t gib = (size_t)1 << 30;
+            /* --instances N (PIPE_INSTANCES) runs N copies of the plan. */
+            if (cfg->instances > 1) freeB /= (size_t)cfg->instances;
             const size_t headroom = totalB / 10 > gib ? totalB / 10 : gib;
             const double inv1 = pipe_inv_sum(fb1), inv0 = pipe_inv_sum(fb0);
             const size_t m0 = pipe_vram_model(fb1, fb0, cfg, plan.jmax,
@@ -4239,9 +4334,19 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
             printf("  j-slabbing: %u slab%s, up to %u rows/slab"
                    " (<=2^31 local-position safety bound)\n",
                    plan.nslab, plan.nslab == 1 ? "" : "s", plan.jmax);
+#ifdef PIPE_INSTANCES
+        if (cfg->instances > 1)
+            return run_pipeline_instances<true>(fb1, fbs1, fb0, fbs0, POLY,
+                                                cfg, &plan);
+#endif
         return run_pipeline_impl<true>(fb1, fbs1, fb0, fbs0, qlist, nq, qgen,
                                        POLY, cfg, &plan);
     }
+#ifdef PIPE_INSTANCES
+    if (cfg->instances > 1)
+        return run_pipeline_instances<false>(fb1, fbs1, fb0, fbs0, POLY, cfg,
+                                             &plan);
+#endif
     return run_pipeline_impl<false>(fb1, fbs1, fb0, fbs0, qlist, nq, qgen,
                                     POLY, cfg, &plan);
 }

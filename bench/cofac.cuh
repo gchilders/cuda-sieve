@@ -1195,7 +1195,7 @@ typedef struct {
  * event record forces ordering, so this measures the FIRST slice of the first
  * round and nothing else; the rest of the flush is untouched. */
 typedef struct { cudaEvent_t a, b; int armed, fired; } cof_peak_t;
-static cof_peak_t *g_cof_peak;
+static thread_local cof_peak_t *g_cof_peak;
 
 /* The stream the cross-q queue's flush runs on. 0 is the legacy default
  * stream and the original, fully synchronous behaviour. --cof-async sets it to
@@ -1204,12 +1204,12 @@ static cof_peak_t *g_cof_peak;
  * launches, records, copies or waits on goes through it; see cof_sync and
  * cof_d2h, which fall back to the device-wide forms when it is 0 so that the
  * default path is bit-for-bit what it was. */
-static cudaStream_t g_cof_stream = 0;
+static thread_local cudaStream_t g_cof_stream = 0;
 
 /* Set while --cof-async initialises its second buffer set, so cofq_init's
  * configuration lines (width, ECM plan, method) are printed once. cofcheck.sh
  * counts them. Errors are never suppressed. */
-static int g_cofq_quiet = 0;
+static thread_local int g_cofq_quiet = 0;
 
 static cudaError_t cof_sync(void)
 {

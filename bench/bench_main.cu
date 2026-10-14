@@ -998,6 +998,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     cfg.fill_gate = 1;
     cfg.slab_fixed = 0;
     cfg.bucket_resieve = 1;
+    cfg.instances = 1;
     cfg.qspan = 0;
     cfg.threads = 256; cfg.blocks = 0; cfg.fill_blocks = 0; cfg.fill_threads = 0;
 
@@ -1145,6 +1146,10 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         else if (!strcmp(argv[i], "--no-fill-gate")) { cfg.fill_gate = 0; }
         else if (!strcmp(argv[i], "--slab-fixed")) { cfg.slab_fixed = 1; }
         else if (!strcmp(argv[i], "--no-bucket-resieve")) { cfg.bucket_resieve = 0; }
+        else if (!strcmp(argv[i], "--instances") && i + 1 < argc) {
+            if (parse_u32_range_arg("--instances", argv[++i], 1u, 4u,
+                                    (uint32_t *)&cfg.instances)) return 1;
+        }
         else if (!strcmp(argv[i], "--fill-streams") && i + 1 < argc) {
             if (parse_int_range_arg("--fill-streams", argv[++i], 0,
                                     FILL_STREAMS_MAX, &cfg.fill_streams)) return 1;
