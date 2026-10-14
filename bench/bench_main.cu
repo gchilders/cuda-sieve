@@ -1152,8 +1152,19 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         else if (!strcmp(argv[i], "--no-bucket-resieve")) { cfg.bucket_resieve = 0; }
         else if (!strcmp(argv[i], "--no-dual-bucket")) { cfg.dual_bucket = 0; }
         else if (!strcmp(argv[i], "--instances") && i + 1 < argc) {
-            if (parse_u32_range_arg("--instances", argv[++i], 1u, 4u,
-                                    (uint32_t *)&cfg.instances)) return 1;
+#ifdef PIPE_INSTANCES
+            uint32_t ni = 1;
+            if (parse_u32_range_arg("--instances", argv[++i], 1u, 4u, &ni))
+                return 1;
+            cfg.instances = (int)ni;
+#else
+            /* Refused, not ignored: a default build runs one pipeline, and
+             * accepting the flag would still have divided free VRAM by N for
+             * the slab choice. */
+            fprintf(stderr, "--instances needs a build with -DPIPE_INSTANCES"
+                    " and --default-stream per-thread (prototype)\n");
+            return 1;
+#endif
         }
         else if (!strcmp(argv[i], "--fill-streams") && i + 1 < argc) {
             if (parse_int_range_arg("--fill-streams", argv[++i], 0,

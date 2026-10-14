@@ -41,6 +41,12 @@
  * flushing stdio from a handler is not. */
 static volatile sig_atomic_t g_pipe_stop = 0;
 
+/* run_pipeline_impl -> run_pipeline only: the bucket array did not fit or
+ * could not be allocated, before anything was opened or consumed. Negative,
+ * so every `rc < 0` test treats it as the failure it is; run_pipeline retries
+ * an up-sized slab plan once at the default and maps it to PIPE_RC_FAIL. */
+#define PIPE_RC_NOVRAM (-2)
+
 /* The per-q sync of the q loop. Device-wide by default; under --cof-async the
  * loop's own work is all on the legacy stream, and a device-wide sync would
  * wait for the in-flight cofactor flush (on g_cof_stream) and undo the
@@ -76,7 +82,7 @@ static void pipe_request_stop(void)
  * pipe_side_prepare_q, whose return value is already a three-way code; the
  * alternative was an out-parameter threaded through the per-q path for a value
  * only the cap ever reads. Reset at the top of every band. */
-static int g_pipe_need_limbs = 0;
+static thread_local int g_pipe_need_limbs = 0;
 
 /* Record a resume point.
  *
@@ -441,6 +447,7 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
 {
     const uint32_t nbitword = xmax_alloc >> 5;
     uint16_t *hslice = NULL, *hlogp = NULL;
+    uint32_t *hfine = NULL, *hstart = NULL;
     int rc = -1;
 
 #define SIDE_INIT_CK(x) do { if (CUDA_CHECKED(x)) goto done; } while (0)
@@ -474,10 +481,11 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
                             cudaMemcpyHostToDevice));
 
     S->lut_shift = 16;
-    if (cfg->log_region <= (int)FINE_SHIFT) {
-        uint32_t *hfine = NULL, *hstart = NULL;
-        if (pipe_build_fine(fb, &hfine, &hstart, &hlogp, &S->nfine, &S->fineF))
-            goto done;
+    /* Fine slices when they fit; otherwise -- log_region > 14, or a base with
+     * more log-p changes than 256 coarse groups hold -- the original slices
+     * and the walking resieve, exactly as before. Never a reason to fail. */
+    if (cfg->log_region <= (int)FINE_SHIFT &&
+        !pipe_build_fine(fb, &hfine, &hstart, &hlogp, &S->nfine, &S->fineF)) {
         S->nslice_pow2 = (1u << FINE_BITS) / FINE_PER_GROUP;
         S->lut_shift = (int)(FINE_SHIFT + 10u);   /* log2(FINE_PER_GROUP) */
         SIDE_INIT_CK(cudaMalloc(&S->fine, (size_t)fb->n * 4));
@@ -487,7 +495,8 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
         SIDE_INIT_CK(cudaMemcpy(S->fine_start, hstart,
                                 (size_t)(S->nfine + 1) * 4,
                                 cudaMemcpyHostToDevice));
-        free(hfine); free(hstart);
+        free(hfine); hfine = NULL;
+        free(hstart); hstart = NULL;
     } else if (fb_build_slices(fb, &hslice, &hlogp, &S->nslice_pow2) < 0) {
         report_slice_build_error();
         goto done;
@@ -548,6 +557,8 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
 done:
     free(hslice);
     free(hlogp);
+    free(hfine);
+    free(hstart);
 #undef SIDE_INIT_CK
     return rc;
 }
@@ -562,8 +573,8 @@ enum { PIPE_Q_SKIP = 1 };
  * bucket-overflow site for why these are not static locals. Like the other
  * file statics here they are never reset, so a second band in one process
  * inherits the first band's spend and sees only the end-of-band totals. */
-static int g_warned_bucket_ovf = 0;
-static int g_warned_td_trunc   = 0;
+static thread_local int g_warned_bucket_ovf = 0;
+static thread_local int g_warned_td_trunc   = 0;
 
 /* Skips that end the run. Past this the build is simply too narrow for the job
  * and the band would emit systematically deficient output; ./normscan says so
@@ -2084,12 +2095,26 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         printf("  bucket array %u x %u x 4 B = %.2f GB, shared by both sides"
                " (%.2f GB free)\n", nregion_alloc, cap, need / 1073741824.0,
                freeB / 1073741824.0);
+        /* PIPE_RC_NOVRAM, not -1: when run_pipeline sized the slab up from
+         * free VRAM, another process may have taken that memory since (two
+         * tasks starting on one GPU), and the band can still run at the
+         * default slab. Nothing is opened or consumed before this point. */
         if (need + PIPE_VRAM_MARGIN > freeB) {
             fprintf(stderr, "  pipeline: bucket array does not fit\n");
-            rc = -1;
+            rc = PIPE_RC_NOVRAM;
             goto done;
         }
-        PIPE_CK(cudaMalloc(&d_bucket, need));
+        {
+            const cudaError_t me = cudaMalloc(&d_bucket, need);
+            if (me == cudaErrorMemoryAllocation) {
+                (void)cudaGetLastError();        /* not sticky; clear it */
+                fprintf(stderr, "  pipeline: bucket array allocation of"
+                        " %.2f GB failed\n", need / 1073741824.0);
+                rc = PIPE_RC_NOVRAM;
+                goto done;
+            }
+            PIPE_CK(me);
+        }
     }
     /* The OTHER capacity a job can undersize, reported beside the bucket array
      * because the two are the pair the per-slab soft skips fire on and the pair
@@ -3299,9 +3324,10 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         /* --target-rels: stop once enough relations exist. Under inline
          * cofactorisation the only running total the host has without a per-q
          * readback is Q.nrel, which advances at FLUSH boundaries -- so this
-         * overshoots by at most one flush (~256 q here, well under 1% of any
-         * useful target). Sieving upward until satisfied is what you actually
-         * want when the question is "enough for the matrix", since the yield
+         * overshoots by at most one flush (~256 q here; two under
+         * --cof-async, where Q.nrel also lags by the flush still in flight),
+         * well under 1% of any useful target. Sieving upward until satisfied
+         * is what you actually want when the question is "enough for the matrix", since the yield
          * per q falls as q grows and guessing the range wastes either time or
          * relations. */
         if (cfg->target_rels) {
@@ -4314,6 +4340,7 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                 cfg->logI, cfg->J, pmax, cfg->slab_j);
         return -1;
     }
+    const slab_plan_t base_plan = plan;
     uint32_t perf_regions = SLAB_PERF_REGIONS;
     if (!cfg->slab_j && !cfg->slab_fixed) {
         size_t freeB = 0, totalB = 0;
@@ -4360,34 +4387,50 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         printf("  recording pass: SCALAR (one thread per candidate,"
                " --td-record-scalar) -- the pre-finding-77 path, for A/B only\n");
 
-    if (plan.enabled) {
-        const uint32_t perf_jmax = slab_perf_jmax_r(cfg->logI, cfg->log_region,
-                                                    cfg->J, perf_regions);
-        if (!cfg->slab_j && perf_jmax != 0xffffffffu)
-            printf("  j-slabbing: %u slab%s, up to %u rows/slab"
-                   " (auto target %u bucket regions at --region %d;"
-                   " safety bounds may reduce it further)\n",
-                   plan.nslab, plan.nslab == 1 ? "" : "s", plan.jmax,
-                   (unsigned)perf_regions, cfg->log_region);
-        else
-            printf("  j-slabbing: %u slab%s, up to %u rows/slab"
-                   " (<=2^31 local-position safety bound)\n",
-                   plan.nslab, plan.nslab == 1 ? "" : "s", plan.jmax);
+    auto go = [&](const slab_plan_t &P, uint32_t regions) -> int {
+        if (P.enabled) {
+            const uint32_t perf_jmax = slab_perf_jmax_r(cfg->logI,
+                                                        cfg->log_region,
+                                                        cfg->J, regions);
+            if (!cfg->slab_j && perf_jmax != 0xffffffffu)
+                printf("  j-slabbing: %u slab%s, up to %u rows/slab"
+                       " (auto target %u bucket regions at --region %d;"
+                       " safety bounds may reduce it further)\n",
+                       P.nslab, P.nslab == 1 ? "" : "s", P.jmax,
+                       (unsigned)regions, cfg->log_region);
+            else
+                printf("  j-slabbing: %u slab%s, up to %u rows/slab"
+                       " (<=2^31 local-position safety bound)\n",
+                       P.nslab, P.nslab == 1 ? "" : "s", P.jmax);
+#ifdef PIPE_INSTANCES
+            if (cfg->instances > 1)
+                return run_pipeline_instances<true>(fb1, fbs1, fb0, fbs0, POLY,
+                                                    cfg, &P);
+#endif
+            return run_pipeline_impl<true>(fb1, fbs1, fb0, fbs0, qlist, nq,
+                                           qgen, POLY, cfg, &P);
+        }
 #ifdef PIPE_INSTANCES
         if (cfg->instances > 1)
-            return run_pipeline_instances<true>(fb1, fbs1, fb0, fbs0, POLY,
-                                                cfg, &plan);
+            return run_pipeline_instances<false>(fb1, fbs1, fb0, fbs0, POLY,
+                                                 cfg, &P);
 #endif
-        return run_pipeline_impl<true>(fb1, fbs1, fb0, fbs0, qlist, nq, qgen,
-                                       POLY, cfg, &plan);
+        return run_pipeline_impl<false>(fb1, fbs1, fb0, fbs0, qlist, nq, qgen,
+                                        POLY, cfg, &P);
+    };
+    int rc = go(plan, perf_regions);
+    /* An up-sized plan whose bucket array did not fit or could not be
+     * allocated -- typically another task took the memory after the free-VRAM
+     * reading above -- runs once more at the default, which is what this
+     * build ran before the slab target became VRAM-driven. Not under
+     * --instances: the other instances may already have written output. */
+    if (rc == PIPE_RC_NOVRAM && perf_regions != SLAB_PERF_REGIONS &&
+        cfg->instances <= 1) {
+        printf("  slab size from VRAM: the up-sized plan no longer fits;"
+               " retrying at the default %u rows/slab\n", base_plan.jmax);
+        rc = go(base_plan, SLAB_PERF_REGIONS);
     }
-#ifdef PIPE_INSTANCES
-    if (cfg->instances > 1)
-        return run_pipeline_instances<false>(fb1, fbs1, fb0, fbs0, POLY, cfg,
-                                             &plan);
-#endif
-    return run_pipeline_impl<false>(fb1, fbs1, fb0, fbs0, qlist, nq, qgen,
-                                    POLY, cfg, &plan);
+    return rc == PIPE_RC_NOVRAM ? PIPE_RC_FAIL : rc;
 }
 
 #endif  /* CUDA_SIEVE_PIPELINE_CUH */
