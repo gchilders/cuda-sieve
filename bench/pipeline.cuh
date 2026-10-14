@@ -176,6 +176,11 @@ typedef struct {
     uint64_t *walk_cur, *walk_next;
     uint32_t *survbits;
     uint32_t *gate;      /* --fill-gate: the OTHER side's folded survivors */
+    /* Fine slices (pipe_build_fine): per-entry 18-bit id, and the first entry
+     * of each id. NULL when log_region > 14 keeps the original slices. */
+    uint32_t *fine, *fine_start;
+    uint32_t  nfine, fineF;
+    int       lut_shift;   /* apply's LUT index: rec >> lut_shift */
     uint16_t *slice, *slice_logp;
     uint32_t *sp, *srt, *sg;
     uint32_t *smag;             /* ss_first reciprocals; see ss_magic_build */
@@ -200,6 +205,7 @@ static void pside_free(pside_t *S)
     cudaFree(S->primes); cudaFree(S->roots); cudaFree(S->plat);
     cudaFree(S->walk_cur); cudaFree(S->walk_next);
     cudaFree(S->survbits); cudaFree(S->gate); cudaFree(S->slice); cudaFree(S->slice_logp);
+    cudaFree(S->fine); cudaFree(S->fine_start);
     cudaFree(S->sp); cudaFree(S->srt); cudaFree(S->sg); cudaFree(S->slp);
     cudaFree(S->smag);
     cudaFree(S->d_nsurv);
@@ -292,6 +298,138 @@ static double pipe_progress_fraction(const bench_cfg_t *cfg, int streaming,
 /* Everything that does NOT depend on the special-q: the factor base upload,
  * the slice tables, and the pinned staging. Hoisted out of the per-q path so a
  * band of q measures sieving rather than allocation churn. */
+/* ---- fine slices: the bucket record names its factor-base entry -------- *
+ *
+ * A bucket record is (offset in region | slice << 16), and the slice only told
+ * apply which log p to add: up to 262,144 entries shared one. The bucket
+ * resieve (k_resieve_bucket) has to get from a record back to its prime, so
+ * the pipeline gives each record an 18-bit FINE slice id at bit 14 instead --
+ * a run of at most F consecutive entries, F chosen so the ids fit -- and apply
+ * reads log p from a 256-entry COARSE table indexed by id >> 10. A coarse
+ * group never spans a change of log p (the id skips to the next group when
+ * log p changes), so every record still adds exactly its entry's log p; only
+ * the index arithmetic moved. Needs log_region <= 14; above that the pipeline
+ * keeps the original slices and the walking resieve. */
+#define FINE_SHIFT     14u
+#define FINE_BITS      18u
+#define FINE_PER_GROUP 1024u    /* fine ids per coarse log-p group */
+
+static int pipe_build_fine(const fb_t *fb, uint32_t **fine_out,
+                           uint32_t **start_out, uint16_t **coarse_out,
+                           uint32_t *nfine_out, uint32_t *F_out)
+{
+    const uint32_t maxid = 1u << FINE_BITS;
+    const uint32_t ngroup = maxid / FINE_PER_GROUP;
+    for (uint32_t F = 32; F <= (1u << 26); F <<= 1) {
+        uint32_t id = 0, fill = 0;
+        int cur = -1, ok = 1;
+        for (uint32_t k = 0; k < fb->n && ok; k++) {
+            const int lp = fb->logp[k];
+            if (cur < 0) cur = lp;
+            else if (lp != cur) {
+                id = (id / FINE_PER_GROUP + 1) * FINE_PER_GROUP; fill = 0; cur = lp;
+            } else if (fill == F) { id++; fill = 0; }
+            if (id >= maxid) ok = 0;
+            fill++;
+        }
+        if (!ok) continue;
+        const uint32_t nfine = id + 1;
+        uint32_t *fine = (uint32_t *)malloc((size_t)fb->n * 4);
+        uint32_t *start = (uint32_t *)malloc((size_t)(nfine + 1) * 4);
+        uint16_t *coarse = (uint16_t *)calloc(ngroup, 2);
+        if (!fine || !start || !coarse) {
+            free(fine); free(start); free(coarse);
+            fprintf(stderr, "pipe_build_fine: out of memory\n");
+            return -1;
+        }
+        id = 0; fill = 0; cur = -1;
+        for (uint32_t k = 0; k < fb->n; k++) {
+            const int lp = fb->logp[k];
+            if (cur < 0) cur = lp;
+            else if (lp != cur) {
+                id = (id / FINE_PER_GROUP + 1) * FINE_PER_GROUP; fill = 0; cur = lp;
+            } else if (fill == F) { id++; fill = 0; }
+            fill++;
+            fine[k] = id;
+            coarse[id / FINE_PER_GROUP] = (uint16_t)lp;
+        }
+        for (uint32_t f = 0; f <= nfine; f++) start[f] = fb->n;
+        for (uint32_t k = fb->n; k-- > 0; ) start[fine[k]] = k;
+        for (uint32_t f = nfine; f-- > 0; )
+            if (start[f] > start[f + 1]) start[f] = start[f + 1];
+        *fine_out = fine; *start_out = start; *coarse_out = coarse;
+        *nfine_out = nfine; *F_out = F;
+        return 0;
+    }
+    fprintf(stderr, "pipe_build_fine: %u entries do not fit %u fine ids\n",
+            fb->n, maxid);
+    return -1;
+}
+
+/* Recover each bucketed prime hitting a two-sided survivor from the side's
+ * bucket records rather than by re-walking its lattice (k_resieve_scatter),
+ * after glas. One block per region. A record at a survivor names its fine
+ * slice; every entry in that slice is tested at the survivor's (a, b) --
+ * p | a - r*b for an affine root, p | r'*a - b for a projective one (the
+ * convention pl_transform_gen uses) -- skipping the lattice-degenerate entries
+ * the walk also skips. Two hitting entries in one slice are each appended once
+ * per record, i.e. twice: harmless, k_td divides a listed prime out
+ * completely, and the factor list it records is the same. */
+__device__ __forceinline__ uint32_t rb_mod(int64_t a, uint32_t p)
+{
+    int64_t m = a % (int64_t)p;
+    return (uint32_t)(m < 0 ? m + p : m);
+}
+
+__global__ void k_resieve_bucket(const uint32_t *__restrict bucket,
+                                 const uint32_t *__restrict cnt, uint32_t cap,
+                                 int log_region,
+                                 const uint32_t *__restrict bits,
+                                 const uint32_t *__restrict gbase,
+                                 const int64_t *__restrict A,
+                                 const int64_t *__restrict B,
+                                 const uint32_t *__restrict fine_start,
+                                 const uint32_t *__restrict primes,
+                                 const uint32_t *__restrict roots,
+                                 const plat_t *__restrict plat,
+                                 uint32_t *__restrict plist,
+                                 uint32_t *__restrict pcnt, uint32_t K,
+                                 unsigned long long *__restrict noverflow)
+{
+    const uint32_t b = blockIdx.x;
+    const uint32_t ncell = 1u << log_region, offmask = ncell - 1;
+    const uint32_t w0 = (b << log_region) >> 5, nw = ncell >> 5;
+    int any = 0;
+    for (uint32_t w = threadIdx.x; w < nw; w += blockDim.x)
+        any |= bits[w0 + w] != 0u;
+    if (!__syncthreads_or(any)) return;
+    uint32_t n = cnt[b];
+    if (n > cap) n = cap;
+    const uint32_t *rec = bucket + (size_t)b * cap;
+    unsigned long long ovf = 0;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        const uint32_t r = rec[i];
+        const uint32_t x = (b << log_region) | (r & offmask);
+        if (!((bits[x >> 5] >> (x & 31u)) & 1u)) continue;
+        const uint32_t f = r >> FINE_SHIFT;
+        const uint32_t idx = td_rank(bits, gbase, x);
+        const int64_t a = A[idx], bb = B[idx];
+        for (uint32_t k = fine_start[f], ke = fine_start[f + 1]; k < ke; k++) {
+            if (plat[k].inc_warp == PL_INVALID) continue;
+            const uint32_t p = primes[k], re = roots[k];
+            const uint64_t am = rb_mod(a, p), bm = rb_mod(bb, p);
+            const uint64_t t = re < p
+                ? (am + p - ((uint64_t)re * bm) % p) % p
+                : (((uint64_t)(re - p) * am) % p + p - bm) % p;
+            if (t) continue;
+            const uint32_t slot = atomicAdd(&pcnt[idx], 1u);
+            if (slot < K) plist[(size_t)idx * K + slot] = p;
+            else ovf++;
+        }
+    }
+    if (ovf) atomicAdd(noverflow, ovf);
+}
+
 template <bool SLABBED>
 static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
                           const bench_cfg_t *cfg, uint32_t bound,
@@ -332,7 +470,22 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
     SIDE_INIT_CK(cudaMemcpy(S->roots, fb->roots, (size_t)fb->n * 4,
                             cudaMemcpyHostToDevice));
 
-    if (fb_build_slices(fb, &hslice, &hlogp, &S->nslice_pow2) < 0) {
+    S->lut_shift = 16;
+    if (cfg->log_region <= (int)FINE_SHIFT) {
+        uint32_t *hfine = NULL, *hstart = NULL;
+        if (pipe_build_fine(fb, &hfine, &hstart, &hlogp, &S->nfine, &S->fineF))
+            goto done;
+        S->nslice_pow2 = (1u << FINE_BITS) / FINE_PER_GROUP;
+        S->lut_shift = (int)(FINE_SHIFT + 10u);   /* log2(FINE_PER_GROUP) */
+        SIDE_INIT_CK(cudaMalloc(&S->fine, (size_t)fb->n * 4));
+        SIDE_INIT_CK(cudaMalloc(&S->fine_start, (size_t)(S->nfine + 1) * 4));
+        SIDE_INIT_CK(cudaMemcpy(S->fine, hfine, (size_t)fb->n * 4,
+                                cudaMemcpyHostToDevice));
+        SIDE_INIT_CK(cudaMemcpy(S->fine_start, hstart,
+                                (size_t)(S->nfine + 1) * 4,
+                                cudaMemcpyHostToDevice));
+        free(hfine); free(hstart);
+    } else if (fb_build_slices(fb, &hslice, &hlogp, &S->nslice_pow2) < 0) {
         report_slice_build_error();
         goto done;
     }
@@ -351,10 +504,12 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
          * k_apply once, after both sides are initialized, to the larger value. */
         S->apply_smem = smem;
     }
-    SIDE_INIT_CK(cudaMalloc(&S->slice, (size_t)fb->n * 2));
+    if (!S->fine) {
+        SIDE_INIT_CK(cudaMalloc(&S->slice, (size_t)fb->n * 2));
+        SIDE_INIT_CK(cudaMemcpy(S->slice, hslice, (size_t)fb->n * 2,
+                                cudaMemcpyHostToDevice));
+    }
     SIDE_INIT_CK(cudaMalloc(&S->slice_logp, (size_t)S->nslice_pow2 * 2));
-    SIDE_INIT_CK(cudaMemcpy(S->slice, hslice, (size_t)fb->n * 2,
-                            cudaMemcpyHostToDevice));
     SIDE_INIT_CK(cudaMemcpy(S->slice_logp, hlogp,
                             (size_t)S->nslice_pow2 * 2,
                             cudaMemcpyHostToDevice));
@@ -778,10 +933,18 @@ static int pipe_side_sieve_issue(const fb_t *fb, const bench_cfg_t *cfg,
     SLAB_CK(cudaMemsetAsync(bk->overflow, 0, 4, st));
     if (gate_src)
         k_gate_fold<<<fblocks, 256, 0, st>>>(gate_src, nbitword, S->gate);
-    k_fill_atomic<4, SLABBED><<<fblocks, fthreads, 0, st>>>(
-        S->plat, S->slice, fb->n, xmax, cfg->logI, log_region,
-        bk->cursor, bk->bucket, bk->cap, bk->overflow, S->walk_cur, S->walk_next,
-        cfg->sieve_skip, j_base, gate_src ? S->gate : NULL);
+    if (S->fine)
+        k_fill_atomic<4, SLABBED, uint32_t><<<fblocks, fthreads, 0, st>>>(
+            S->plat, S->fine, fb->n, xmax, cfg->logI, log_region,
+            bk->cursor, bk->bucket, bk->cap, bk->overflow, S->walk_cur,
+            S->walk_next, cfg->sieve_skip, j_base,
+            gate_src ? S->gate : NULL, (int)FINE_SHIFT);
+    else
+        k_fill_atomic<4, SLABBED><<<fblocks, fthreads, 0, st>>>(
+            S->plat, S->slice, fb->n, xmax, cfg->logI, log_region,
+            bk->cursor, bk->bucket, bk->cap, bk->overflow, S->walk_cur,
+            S->walk_next, cfg->sieve_skip, j_base,
+            gate_src ? S->gate : NULL);
     SLAB_CK(cudaEventRecord(S->ev[2], st));
     SLAB_CK(cudaMemsetAsync(S->d_nsurv, 0, 4, st));
     /* Provably redundant on every production geometry: k_apply's warp-ballot
@@ -805,7 +968,7 @@ static int pipe_side_sieve_issue(const fb_t *fb, const bench_cfg_t *cfg,
         S->sp, S->srt, S->sg, S->slp, S->smag,
         S->nsmall, S->nblk, S->nwrp,
         0xFFFFFFFFu, NULL, S->survbits, cfg->not_both_even, cfg->sieve_skip,
-        j_base);
+        j_base, S->lut_shift);
     SLAB_CK(cudaEventRecord(S->ev[3], st));
     rc = 0;
 done:
@@ -1273,7 +1436,8 @@ static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
                         uint32_t j_base, int blocks, int threads, int verify,
                         uint32_t *n_out, uint32_t *nacc_out, pipe_tm_t *tm,
                         double *t_verify, int want_host, int accumulate_stats,
-                        uint32_t gate_found[2])
+                        uint32_t gate_found[2],
+                        const pbkt_t *const bkr[2] = NULL)
 {
     const pside_t *S[2];
     const uint32_t lpb[2] = {cfg->lpb0, cfg->lpb};
@@ -1334,10 +1498,20 @@ static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
         const int side = si ? 0 : 1;          /* side 1 first, as before */
         const int e = si ? 7 : 4;
         CK(cudaMemsetAsync(C->d_pcnt[side], 0, (size_t)n * 4));
-        k_resieve_scatter<4, SLABBED><<<blocks, threads>>>(
-            S[side]->plat, S[side]->primes, NULL, S[side]->nfb, xmax, cfg->logI,
-            C->d_sum, d_two, C->d_gbase, C->d_plist[side], C->d_pcnt[side],
-            PIPE_K, C->d_ovf, 6, S[side]->walk_cur);
+        if (bkr && bkr[side] && S[side]->fine)
+            /* This side's records for this slab are still in its bucket
+             * array: read the primes back from them instead of walking. */
+            k_resieve_bucket<<<xmax >> cfg->log_region, 256>>>(
+                (const uint32_t *)bkr[side]->bucket, bkr[side]->cursor,
+                bkr[side]->cap, cfg->log_region, d_two, C->d_gbase,
+                C->d_a, C->d_b, S[side]->fine_start, S[side]->primes,
+                S[side]->roots, S[side]->plat, C->d_plist[side],
+                C->d_pcnt[side], PIPE_K, C->d_ovf);
+        else
+            k_resieve_scatter<4, SLABBED><<<blocks, threads>>>(
+                S[side]->plat, S[side]->primes, NULL, S[side]->nfb, xmax,
+                cfg->logI, C->d_sum, d_two, C->d_gbase, C->d_plist[side],
+                C->d_pcnt[side], PIPE_K, C->d_ovf, 6, S[side]->walk_cur);
         CK(cudaEventRecord(E[e + 1]));
         k_td<1, 0, 0, SLABBED><<<blocks, threads>>>(
             C->d_a, C->d_b, C->d_x, NULL, n, cfg->logI, C->d_poly[side],
@@ -2753,11 +2927,17 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 const int do_verify = nqdone == 0 && cfg->td_verify && hn_s != 0 &&
                     (!td_verified || cfg->cofgate);
                 wd_phase("slab.trialdiv");
+                /* Whose bucket records survive to here: side 0's always in
+                 * the serial arm (it filled last into the shared array), both
+                 * when --fill-concurrent gave each side its own. */
+                const pbkt_t *bkr[2] = {
+                    cfg->bucket_resieve ? &bk0 : NULL,
+                    cfg->bucket_resieve && concurrent ? &bk1 : NULL };
                 const int tdrc = pipe_td_perq<SLABBED>(&C, &Lq, cfg, &S1, &S0,
                                           d_two, xmax,
                                           j_base, blocks, cfg->threads, do_verify,
                                           &n, &nacc_s, &tm, &tv, want_host,
-                                          !want_host, cofgate_found);
+                                          !want_host, cofgate_found, bkr);
                 if (tdrc < 0) { rc = -1; break; }
                 if (tdrc > 0) {
                     /* Untrustworthy TD: drop THIS slab only and carry on.
@@ -3979,7 +4159,7 @@ static size_t pipe_vram_model(const fb_t *fb1, const fb_t *fb0,
     b += 3 * (size_t)(X / 8);                           /* S1, S0, d_two     */
     b += 2 * (size_t)(X / 64);                          /* --fill-gate folds */
     b += (size_t)(fb1->n + fb0->n) *
-         (4 + 4 + sizeof(plat_t) + 8 + 8 + 2);          /* per-entry state   */
+         (4 + 4 + sizeof(plat_t) + 8 + 8 + 4);          /* per-entry state   */
     b += (size_t)768 << 20;   /* TD buffers, cofactor queue(s), small tables */
     return b;
 }

@@ -177,9 +177,9 @@ __global__ void k_gate_fold(const uint32_t *__restrict bits, uint32_t nword,
 
 /* One atomicAdd per record into a 2^log_nbuckets-way split. This is the
  * baseline the design doc says to beat. */
-template <int RECBYTES, bool SLABBED = false>
+template <int RECBYTES, bool SLABBED = false, typename SLICE_T = uint16_t>
 __global__ void k_fill_atomic(const plat_t *__restrict plat,
-                              const uint16_t *__restrict slice,
+                              const SLICE_T *__restrict slice,
                               uint32_t n, uint32_t xmax, int logI,
                               int log_region,
                               uint32_t *__restrict cursor,
@@ -188,7 +188,8 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
                               const uint64_t *__restrict walk_cur,
                               uint64_t *__restrict walk_next,
                               int sieve_skip, uint32_t j_base,
-                              const uint32_t *__restrict gate = nullptr)
+                              const uint32_t *__restrict gate = nullptr,
+                              int sl_shift = 16)
 {
     const uint32_t Imask = (1u << logI) - 1;
     const uint32_t offmask = (1u << log_region) - 1;
@@ -255,7 +256,8 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
             /* --fill-gate (glas): side 0 writes no record for a cell whose
              * 8-cell group has no side-1 survivor. k_intersect_compact ANDs
              * the two bitmaps, so such a cell cannot reach a relation, and the
-             * resieve walks the lattice rather than reading records. */
+             * bucket resieve reads records only at two-sided survivors, whose
+             * 8-cell group the gate always keeps. */
             if (gate) {
                 const uint32_t g = xl >> FILL_GATE_SHIFT;
                 if (!((gate[g >> 5] >> (g & 31u)) & 1u)) continue;
@@ -267,7 +269,7 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
             if (RECBYTES == 2) {
                 *(uint16_t *)(out + at) = (uint16_t)(xl & offmask);
             } else if (RECBYTES == 4) {
-                *(uint32_t *)(out + at) = (xl & offmask) | (sl << 16);
+                *(uint32_t *)(out + at) = (xl & offmask) | (sl << sl_shift);
             } else {
                 *(uint64_t *)(out + at) = (uint64_t)(xl & offmask) | ((uint64_t)sl << 32);
             }
@@ -664,7 +666,8 @@ void k_apply(const uint32_t *__restrict buckets,
                         uint32_t nsmall, uint32_t nblk, uint32_t nwrp,
                         uint32_t probe_x, uint32_t *__restrict probe_out,
                         uint32_t *__restrict survbits, int not_both_even,
-                        int sieve_skip, uint32_t j_base)
+                        int sieve_skip, uint32_t j_base,
+                        int lut_shift = 16)
 {
     extern __shared__ uint32_t sm[];
     const uint32_t ncell  = 1u << log_region;
@@ -798,7 +801,7 @@ report spurious cell mismatches. Pricing builds only, never for relations."
     for (uint32_t i = tid; i < n; i += nth) {
         const uint32_t r = buckets[(size_t)b * cap + i];
         const uint32_t off = r & (ncell - 1);
-        const uint32_t lp  = lut[(r >> 16) & (nslice - 1)];
+        const uint32_t lp  = lut[(r >> lut_shift) & (nslice - 1)];
         const uint32_t w   = off / CPW;
         const uint32_t sh  = (off % CPW) * CELLBITS;
         if (ATOMIC) atomicAdd(&S[w], lp << sh);

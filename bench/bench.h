@@ -604,6 +604,10 @@ typedef struct {
     /* --slab-fixed: the original fixed SLAB_PERF_REGIONS slab target instead
      * of the largest one free VRAM admits. */
     int      slab_fixed;
+    /* Resieve bucketed primes from the bucket records that survive to trial
+     * division (side 0 serial, both under --fill-concurrent) instead of
+     * re-walking their lattices. On by default; --no-bucket-resieve. */
+    int      bucket_resieve;
     /* --qspan: bracket each special-q's GPU work with two events and report
      * the span, splitting `unaccounted` into host-with-no-GPU-work versus
      * idle-between-stages. Diagnostic; STATUS item 19 step 2. */

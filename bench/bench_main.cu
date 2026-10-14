@@ -295,6 +295,9 @@ static void usage(void)
 "                   rejected (serial sides only). Relations identical [gated]\n"
 "  --slab-fixed     pipeline: keep the fixed 2^29-position slab target instead\n"
 "                   of the largest (up to 4x) that free VRAM admits [auto]\n"
+"  --no-bucket-resieve  pipeline: re-walk every bucketed lattice to find the\n"
+"                   primes at survivors, instead of reading them back from the\n"
+"                   bucket records that are still resident. Same relations\n"
 "  --fill-threads N fill only; 0 = auto (32), else a multiple of 32 in\n"
 "                   [32,1024]. Independent of --threads: fill wants many\n"
 "                   narrow blocks, the other kernels do not.            [0]\n"
@@ -994,6 +997,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     cfg.cof_async = 1;
     cfg.fill_gate = 1;
     cfg.slab_fixed = 0;
+    cfg.bucket_resieve = 1;
     cfg.qspan = 0;
     cfg.threads = 256; cfg.blocks = 0; cfg.fill_blocks = 0; cfg.fill_threads = 0;
 
@@ -1140,6 +1144,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         else if (!strcmp(argv[i], "--fill-gate")) { cfg.fill_gate = 1; }
         else if (!strcmp(argv[i], "--no-fill-gate")) { cfg.fill_gate = 0; }
         else if (!strcmp(argv[i], "--slab-fixed")) { cfg.slab_fixed = 1; }
+        else if (!strcmp(argv[i], "--no-bucket-resieve")) { cfg.bucket_resieve = 0; }
         else if (!strcmp(argv[i], "--fill-streams") && i + 1 < argc) {
             if (parse_int_range_arg("--fill-streams", argv[++i], 0,
                                     FILL_STREAMS_MAX, &cfg.fill_streams)) return 1;
@@ -2103,7 +2108,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
             "--watchdog-kill",
             "--slab-j", "--qspan", "--fill-concurrent", "--cof-async",
             "--no-cof-async", "--fill-gate", "--no-fill-gate", "--slab-fixed",
-            NULL
+            "--no-bucket-resieve", NULL
         };
         int nbad = 0;
         for (int i = 1; i < argc; i++)
