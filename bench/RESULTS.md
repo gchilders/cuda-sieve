@@ -11428,3 +11428,350 @@ started.
   fill (52 ms/q) on the NFS@Home job, then resieve (33 ms/q).
 - The host-prep-before-TD item from finding 108 matters less here for the
   same reason.
+
+<a id="finding-110"></a>
+## Finding 110 — apply at I16 is the c183 kernel four times over: issue-bound at ~88%, about the same cost per 2^29 positions. Its one I16-specific cost, the thread tier's serial L2 round trips, was mostly hidden by co-resident blocks: removing them is −2.7% of apply and −1.3% of pipelined wall, relations byte-identical, now landed. Rank apply's levers by executed instructions, not stall samples
+
+**Date:** 2026-10-14. RTX 5070, WSL2, NFS@Home client stopped, host load
+~10 (ECM on the CPU). Base `5c1ab93` (finding 109's commit). Evidence in
+[`../oracle/apply-i16-20261014/`](../oracle/apply-i16-20261014/).
+Prompted by finding 109: with the card already 92-94% busy on the NFS@Home
+lpba-34 I16 job, the remaining time is in kernels, and apply is the largest
+(80 ms of a 226 ms q). No one had profiled apply at I16 at source level:
+finding 101 profiled c183 only, and finding 104 timed C194 and AS276 by
+duration only.
+
+### The profile
+
+Finding 101's method: `ncu --set full --import-source yes` on `k_apply`,
+single-queued so the launch order is fixed, q index 3. That is all 8
+launches of one NFS@Home q (4 slabs × 2 sides) and c183's two. Both builds
+`GPU_ARCH=120` copies of `5c1ab93` (`git archive`), so `bench/bench`, which
+the client runs, was never rebuilt.
+
+Per launch, at ncu's locked base clocks (means; one NFS launch per side was a
+~5% outlier and is left in):
+
+| | NFS@Home alg | NFS@Home rat | c183 alg | c183 rat |
+|---|---:|---:|---:|---:|
+| duration, ms | 13.45 | 9.01 | 14.07 | 7.86 |
+| warp instructions | 5.69e9 | 3.83e9 | 5.44e9 | 3.51e9 |
+| SM throughput | 87-88% | 87-88% | 88% | 91% |
+| issue slots busy | 88% | 88% | 90% | 91% |
+
+Every launch covers 2^29 positions (an I16 slab of 8192 rows, a whole c183
+I15 q). So **per position, apply costs at I16 what it costs at c183**: the
+NFS@Home job just has four times the positions per q. It is compute-bound
+on both, 40 registers, no spill, 99.5% of warp slots occupied.
+
+Shares of the kernel by stage. Inlined helpers (`ss_add`, `ss_first`,
+atomics, shuffles) report their own source lines, so each SASS instruction is
+charged to the stage of the nearest preceding instruction from stage-specific
+code (`stages.txt`):
+
+| share of samples / instructions | NFS@Home alg | NFS@Home rat | c183 alg | c183 rat |
+|---|---:|---:|---:|---:|
+| norm init | 25.5 / 27.8% | 31.5 / 34.2% | 29.1 / 29.2% | 38.7 / 37.8% |
+| small: block tier (m < 64) | 30.5 / 36.1% | 15.9 / 17.8% | 35.7 / 41.4% | 21.8 / 22.6% |
+| small: warp tier (64 <= m < 1024) | 6.0 / 7.3% | 7.2 / 8.4% | 6.3 / 7.3% | 8.0 / 8.9% |
+| **small: thread tier (m >= 1024)** | **19.1** / 11.1% | **28.3** / 16.5% | 9.8 / 6.8% | 14.7 / 10.3% |
+| bucket apply | 6.6 / 2.4% | 0.6 / 0.3% | 7.7 / 2.6% | 1.1 / 0.5% |
+| threshold scan | 11.8 / 13.7% | 15.9 / 20.4% | 10.2 / 10.8% | 13.8 / 17.0% |
+
+(The rational side's bucket apply is small because `--fill-gate` stores side
+0's records only under side 1's survivors.)
+
+**Two things are specific to I16, both in the thread tier:**
+
+- **Twice the entries, and three serial L2 round trips per entry per
+  region.** The small sieve line-sieves every modulus below `bkthresh` = I,
+  so at I16 the thread tier has ~6,460 entries per side (12.6 per thread
+  × 512, from SASS execution counts), against ~3,340 at c183. Each pays its
+  setup once per 2^14-cell region, which at I16 is a quarter row. The setup's
+  loads were issued in three dependent rounds: `sp`/`sg`, then `srt`/`smag`
+  after the `g > 1` test, then `slp` after `c0`. 62% of the tier's stall
+  samples are `long_sb` (55% at c183). The tables (~118 KB per side, five
+  arrays) do not fit in the L1 left beside three ~33 KB blocks of shared
+  memory (L1 hit rate 38%), but L2 throughput is only 12-14%: latency, not
+  bandwidth.
+- **The 64-bit modulo fallback.** `ss_first` uses a magic reciprocal only
+  where the host proves `rt·j + (p << (logI−2)) − ilo < 2^31`. At J=32768 that
+  fails for every p above ~43,690, so ~30% of the thread tier's entries (the
+  `td.cuh` note above `SS_KSHIFT` says 30.4% of primes below `bkthresh` at
+  logI 16) take a 159-instruction 64-bit remainder call in every region:
+  **2.0% (alg) / 3.0% (rat) of instructions**, and none at c183.
+
+### The experiment: one round trip per entry
+
+All four `ss_setup` loads (`sp`, `sg`, `srt`, `smag`) are issued before the
+`g` test, and the thread tier loads `slp` with them (`exp.diff`, about ten
+lines). The cell sums are integer adds, so the change is output-identical by
+construction. Still 40 registers, no spill.
+
+- **Identity:** the NFS@Home job, 40 q pipelined, 2,845 relations; c183, 200
+  q, 9,053. Both byte-identical.
+- **ncu, same launches:** alg 13.30 -> 12.93 ms (−2.8%), rat 8.87 -> 8.60
+  (−3.0%). The thread tier's `long_sb` fell from 62% to 25% of its stalls, and
+  its share of samples halved (19.1 -> 9.2% alg, 28.3 -> 13.9% rat). **But
+  norm init's share rose by about as much, and instructions fell only
+  0.8-0.9%.** Issue slots busy went 88 -> 90%.
+- **Timed, single-queued, ABBA × 2, 60 q NFS@Home / 300 q c183** (`ab.txt`;
+  every exp run beat every base run on apply in both jobs):
+
+| | apply base -> exp | wall per q, COMPLETE |
+|---|---:|---:|
+| NFS@Home, I16 | 80.25 -> 78.08 ms (**−2.7%**) | 232.93 -> 231.29 (−0.7%) |
+| c183, I15 | 18.25 -> 17.88 (**−2.0%**) | 65.31 -> 64.94 (−0.6%) |
+
+- **Pipelined (the production path), NFS@Home, ABBA:** 222.57 -> 219.57
+  ms/q, **−1.3%**. That is more than single-queued, because with the card
+  busy an apply saving comes off wall more directly.
+
+**Why the stall samples overstated it.** Apply runs three blocks per SM and
+is issue-bound. While the thread tier's warps waited on L2, other blocks'
+norm and sieve warps took the issue slots, so most of that latency was
+already hidden. Removing it mostly moved samples from one phase to another.
+Duration tracked instructions and issue efficiency
+(0.992 / 1.02 ≈ 0.972, the measured −2.8%). Finding 104 found the converse:
+designs that saved 20-39% of instructions lost because issue slots went idle.
+**In `k_apply`, rank a lever by the instructions it removes, at an issue
+rate that does not drop. Stall-sample shares are not a ranking.**
+
+### Landed
+
+Same change in `bench/bench_kernels.cu`, with `SS_ROW` removed (the thread
+tier was its last user). The default fat build has 6 archs, no new warnings,
+and `k_apply` without spill on all of them; on sm_120, 40 registers (38 for
+two non-production instances), as before. Gates (`land-gate.txt`):
+
+- `--verify-only` 3 OK. `make check` passes: 105 PASS, 0 FAIL, and the
+  cofactor golden test, whose exact relation counts run through the small
+  sieve. The 3 SKIPs need a `COF_CHUNK_HARD_FLOOR` build.
+- `fillcheck.sh`: 60 of 60 byte-identical.
+- Byte-identical to the pre-change build's relation files: the NFS@Home job,
+  40 q pipelined (2,845), and c183, 200 q (9,053).
+- Production wall, NFS@Home, pipelined, ABBA, landed binary against the
+  pre-change copy (`land-recheck.txt`): 246.83 -> 243.17 ms/q, **−1.5%**.
+  Host load was ~15 by then (14 ECM processes), against ~10 for the A/B
+  above, hence the higher level.
+
+### What leads now, by instruction share at I16
+
+- **Threshold scan, 14% (alg) / 20% (rat).** Its loop is 36 warp-instructions
+  per 32 positions: a per-lane `LDS` of a word that holds two cells, used
+  for one; the both-even test (7); the ballot and store; and the probe/dump
+  checks (~5, uniform branches on null pointers). Two cells per lane (64
+  positions per iteration) and moving the probe/dump checks out of the
+  production instance are the obvious cuts. Finding 75 had the scan at ~3%
+  of instructions. Its share has grown partly because findings 100-102 made
+  the rest of the kernel cheaper.
+- **The 64-bit fallback, 2-3%.** `td.cuh` already measured a per-m
+  `SS_KSHIFT` at logI 16 (apply −0.6%) and rejected it because logI 14-15 was
+  the operating point, saying to revisit if logI 16 ever became the default.
+  It is now the NFS@Home geometry. Alternatives: a split reduction
+  (`rt·j mod p` first, both dividends then < 2^31) only for the entries the
+  host refuses today, or a 64-bit-magic fastmod. *(Done as the split
+  reduction in finding 111: apply −2.4 to −3.1% at I16, unchanged at
+  I15.)*
+- **Norm init, 28-34%** — STATUS item 10, parked by finding 104.
+- **Block tier, 36% alg** — per hit since finding 101. Finding 101 explains
+  why a pattern sieve does not pay at 16-bit cells.
+- **Not region size.** A 2^15 region would halve the thread tier's setups at
+  I16, but finding 80 measured apply +41% at region 15 (occupancy).
+
+### Method notes
+
+- `ncu --page source --csv --print-source cuda,sass`: CUDA rows carry the
+  aggregated counts; the SASS rows under each carry per-instruction
+  execution counts. In this ncu (2026.3.1), the stall-reason columns are
+  33-49 (`stall_long_sb` is 38).
+- **An edit shifts every later line**, so a stage map keyed on line numbers
+  must be remapped for the modified build (`cat2.py`). A first pass without
+  that put 4-7% of the exp kernel in the wrong stage.
+- ncu writes `.ncu-repz` (compressed) by default in this version; `--import`
+  takes the full name.
+
+<a id="finding-111"></a>
+## Finding 111 — the thread tier's 64-bit fallback replaced by a two-step reduction: apply −2.4 to −3.1% at I16, unchanged at I15, relations byte-identical. Two thread-tier loops in one kernel made ptxas compile one of them without reconvergence (apply +24%), so the tail form is a kernel template choice
+
+**Date:** 2026-10-14. RTX 5070, WSL2, NFS@Home client stopped, host load
+~10 for most of it (ECM on the CPU). Base: finding 110's working tree (the
+load hoist, landed, not yet committed). Evidence in
+[`../oracle/ss-two-step-20261014/`](../oracle/ss-two-step-20261014/).
+Finding 110's next lever: at I16/J32768, `ss_first` took a 159-instruction
+64-bit remainder call for every thread-tier modulus above ~43,690, in every
+region, because the host could not prove `rt·j + (m << 14) − ilo < 2^31`.
+
+### The arithmetic
+
+The refused entries need two reductions, not a wider one. `rt·j` alone is
+below 2^31 (rt < m < 2^16, j <= 32768), and once it is reduced,
+`r + (m << kshift) − ilo` is below `m + bias + ihalf`. So the same magic is
+applied twice (`ss_first<true>`). A power of two keeps its AND, which is
+exact even if the 32-bit sum wraps, because p divides 2^32.
+
+- **Host (`td.cuh`).** `ss_bound_ok(m, jmax, logI, two_step)` holds both
+  proofs in one place. `ss_magic_build` takes the form, and
+  `ss_two_step_from` finds the split: the first thread-tier entry whose
+  one-step proof fails at jmax = J. The table is sorted by m and the bound
+  grows with m, so the refused entries are a contiguous tail. Each entry's
+  magic is proved for the form its index gets. **The coupling is one-way:**
+  a one-step proof implies the two-step one, but a magic proved only
+  two-step, run through the one-step reduction, can give a wrong residue
+  silently. (The first draft of this finding said a disagreeing split could
+  only cost speed. That is true in one direction only; see Review fixes.)
+- **Device.** The thread tier tests `e >= nsplit` per entry: two-step at
+  or past the split, one-step below it. The test is warp-uniform except in
+  the one warp that straddles the split. At logI <= 15 (default J) the tail
+  is empty.
+
+### Two layouts that lost, and why
+
+1. **Two loops back to back**, over `[nwrp, nsplit)` and
+   `[nsplit, nsmall)`. Every gate passed, but apply went **77.97 -> 95.95
+   ms/q (+23%)** on the NFS@Home job. ncu put the algebraic launch at 16.07
+   against 12.94 ms with only 3% more instructions. Barrier stall samples
+   rose sevenfold (83k -> 614k), 94% of them at the barrier before the
+   threshold scan (`two-range-stalls.txt`). The cause was in the SASS:
+   ptxas compiled the first loop without reconvergence, with a plain `BSSY`
+   and a `YIELD` in its hit loop. That loop's exit `BSYNC` ran 2.9 times per
+   warp against 1.06 in the hoist build's single loop, so lanes left it in
+   pieces, and the rest of each block waited for them at the barrier.
+2. **One loop, with the per-entry select** (variant 2). The SASS was back to
+   the hoist's shape. ncu at I16: −1.7% per q, instructions −1.7%. Timed:
+   apply −2.6%. **But at c183, where the tail is empty and the test is
+   always true, apply was +0.8%** (18.11 -> 18.25 ms, ABBA × 3, slower in
+   every round).
+3. **A runtime branch between a one-step loop and the select loop**
+   (variant 3), to spare I15. ptxas put the plain `BSSY` + `YIELD` on the
+   select loop this time: rational launch 8.73 ms against 8.60 for the
+   hoist. Stopped.
+
+With two thread-tier loops in one kernel, ptxas compiled one of them badly,
+and which one depended on the layout. **So each kernel instance now has
+exactly one.** `k_apply` and `sieve_small` take `SSTAIL`: `false` is the
+hoist's one-step loop, `true` the select loop. The pipeline picks the
+instance per launch by `nsplit < nsmall` and sets the shared-memory
+attribute on both. The standalone harness uses `true`, which is correct with
+or without a tail, so `--verify` covers the two-step path. There are now 11
+`k_apply` instances (9 before). On sm_120 each landed instance has its
+model's exact structure: the one-step ones the hoist build's
+`YIELD`/`BSSY` counts, the tail ones variant 2's (`sass-structure.txt`).
+
+### Gates (`landed-run.txt`)
+
+- Default fat build, 6 archs, no new warnings, `k_apply` without spill on
+  every arch (40 registers on sm_120). `--verify-only` 3 OK.
+- **A new device gate** under `--verify`: 8,192 `ss_first` cases in both
+  forms, 1,590 of them two-step. The moduli are the ones `ss_magic_build`
+  routes to each form, at seven geometries from I15 to I18, with the
+  proof's corners (`rt = m−1`, `j = jmax`, `ilo = −ihalf`), against the
+  64-bit fallback's formula on the host.
+- **Apply-parity `--verify`** at I16/J32768, I17/J8192 and I15/J16384: the
+  ss_first gate OK, every region's record count matching, and 0 cells
+  differing in the CPU replay of the debug region. That replay runs the
+  small sieve on the CPU from the same tables, and at I16 and I17 its row
+  has a two-step tail.
+- `make check` 105 PASS, 0 FAIL. `fillcheck.sh` 60 of 60 byte-identical.
+  **That is not evidence for this change:** fillcheck compares fill arms
+  against a base run of the same binary, and every arm shares the small
+  sieve, so a wrong residue would move base and arms alike. The evidence is
+  the identity against pre-change relation files below and `--verify`.
+- Byte-identical to the pre-hoist relation files: the NFS@Home job, 40 q
+  pipelined (2,845), and c183, 200 q (9,053).
+- The landed binary makes **no** 64-bit remainder calls on the NFS@Home job,
+  against ~2.1M warp executions per launch before (`landed-calls.txt`).
+
+### Review fixes (xhigh review of the first version)
+
+The review found no defect in the arithmetic or the launches. It found a
+false safety claim, a gate list that overstated its coverage, and gaps in
+what `make check` and `--verify` reach. Changed:
+
+- **The coupling is guarded, not just documented.** `ss_needs_tail(nsplit,
+  nsmall)` in `td.cuh` is the one predicate for which `k_apply` instance a
+  launch needs; the pipeline and the harness both use it. The one-step
+  instance traps (`__trap()`, one `BPT.TRAP` in its SASS) if it is ever
+  launched on a table with a tail, so a launch site that skips the helper
+  fails loudly instead of corrupting relations. The comments that said a
+  disagreeing split "could only cost speed" now say which direction is safe.
+- **`--verify` checks the production instances.** The harness's production
+  configuration (16-bit cells, atomic, Horner) now picks its `SSTAIL`
+  instance with `ss_needs_tail`, as the pipeline does. That is the same
+  template instance as the unslabbed pipeline's, so the apply-parity gate
+  covers both unslabbed production instances. It previously ran the tail
+  instance everywhere and never compared the one-step instance with the CPU
+  replay.
+- **`make check` covers the proof.** `slabtest` gained `check_ss_tail`. It
+  checks the split search against a linear scan and that every entry before
+  the split is proved both ways. It restates the documented worst-case
+  numerators independently and checks them for every modulus the host
+  accepts, at seven geometries from I15 to I18. And it runs a CPU model of
+  both magic forms, built on the same `td_mod_magic`, at the proof's corners
+  against the 64-bit reference. Two deliberate mutants of the two-step proof
+  now fail it (`slabtest-mutants.txt`). The first one had passed the
+  arithmetic alone: its wrongly admitted moduli sit just past 2^31, where
+  the reciprocal is not guaranteed exact but happened to stay right.
+- **Identity on all four pipeline instances.** Slabbed with a tail (the
+  NFS@Home job), unslabbed without (c183): as before. Slabbed without a tail
+  (c183, `--slab-j 4095`, 5 slabs): byte-identical to `5c1ab93`, 2,693
+  relations. Unslabbed with a tail (c183 at I17/J4096, one slab, a tail from
+  m ~ 58,254): byte-identical to `5c1ab93`, 887 relations.
+- **The device gate's corners.** It now routes each modulus exactly as the
+  device does (the one-step bound at J), so a power of two in the tail goes
+  through the two-step AND path. Every geometry gets every corner,
+  including both sides of the two-step form's own refusal boundary (the
+  post-incremented counter used to skip geometry 0's first corner). Corner
+  moduli get the worst inputs. Both device gates now share one
+  upload/launch/readback helper, which also checks the launch error.
+- **Smaller changes.**
+  - The thread tier is one loop source: `(SSTAIL && e >= nsplit) ?
+    two-step : one-step`, folded at compile time. Each instance's
+    `YIELD`/`BSSY` counts are unchanged.
+  - Powers of two need no bound in either form, since the AND is exact even
+    if the sum wraps.
+  - The split is a binary search on the monotone one-step bound instead of
+    a per-q scan.
+  - The "one-step implies two-step" claim now states its jmax >= 1
+    condition.
+  - The `td.cuh` note no longer says "nothing is duplicated": the template
+    ships two more full `k_apply` instances per arch.
+
+Rerun (`review-run.txt`):
+
+- **Default fat build:** 6 archs, no new warnings, no spill on any arch.
+  Per-instance SASS: the one-step instances have the hoist's counts plus
+  one trap, the tail instances variant 2's.
+- **CPU gates:** `--verify-only` 3 OK. `make check` 105 PASS, 0 FAIL, with
+  the tail gate.
+- **`--verify`** at I16/J32768, I17/J8192, I15/J16384 and I17/J4096: 8,192
+  `ss_first` cases (1,599 two-step, 38 of them at the corners), every
+  region's record count matching, 0 cells differing.
+- **`fillcheck.sh`:** 60 of 60 byte-identical.
+- **Identity:** all four instances, as above.
+- **ncu, one NFS@Home q, against the hoist:** apply 86.11 -> 84.08 ms
+  (−2.4%), instructions −1.7%.
+- **Timed, fat build against fat build:** NFS@Home apply 77.82 -> 75.94
+  ms/q (**−2.4%**, ABBA × 2, every run better, spread ±0.2 ms). c183 17.85
+  against 17.87 (+0.1%, ABBA × 3, ranges overlap). The first landed version
+  measured −3.1% on a noisier day; the kernel code is the same but for the
+  trap.
+
+### Measurements, fat build against fat build (the saved hoist binary)
+
+| | hoist | two-step tail | change |
+|---|---:|---:|---:|
+| NFS@Home I16 apply, single-queued, ABBA × 2 | 79.22 ms/q | 76.78 | **−3.1%**, every run better |
+| c183 I15 apply, single-queued, ABBA × 3 | 18.04 | 18.04 | 0.0% |
+| NFS@Home I16 wall, pipelined, ABBA × 2 | 214.54 | 214.27 | −0.1%, within ±3 ms noise |
+| ncu, one NFS@Home q, warp instructions | 3.776e10 | 3.711e10 | −1.7% |
+
+The pipelined wall does not resolve an apply saving of ~2.4 ms/q, about 1%
+of wall, at this host load.
+
+**Lesson.** A change that is a few instructions in the source can be a
+reconvergence change in the SASS. When a kernel's time moves far more than
+its instruction count, count `YIELD`/`BSSY` and the loop-exit `BSYNC`
+executions before blaming the arithmetic. **Keep one hot loop per kernel
+instance, and choose between variants with a template parameter rather
+than a runtime branch.**

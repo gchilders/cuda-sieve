@@ -365,3 +365,47 @@ on the fixed build. These reruns shared the card with an NFS@Home client,
 so their timings mean nothing. The scripts' paths point into the git-ignored
 `work/slabpipe/`. The NFS@Home job's polynomial and factor base lived in the
 client's `/tmp` workdir and are not kept here.
+
+## k_apply at I16 (2026-10-14)
+
+[`apply-i16-20261014/`](apply-i16-20261014/) holds the small evidence for
+[finding 110](../bench/RESULTS.md#finding-110), pinned in `MANIFEST.sha256`.
+`prof.sh` took the source-level ncu profiles of `k_apply` (the NFS@Home
+lpba-34 I16 job and c183, q index 3, single-queued). `launches.txt` is the
+per-launch duration, instructions and issue figures for base and the
+experiment. `stages.txt` is the per-stage shares and stall mix, plus the
+64-bit-fallback share, produced by `cat.py`, `cat2.py` (line numbers
+remapped for the experiment build), `stall.py` and `catdef.py`; `agg.py`
+lists the top source lines. `exp.diff` is the experiment: the thread-tier
+load hoist, applied to a `git archive` copy of `5c1ab93` (`build.txt`).
+`ab.sh` produced `ab.txt`: relations identity on both jobs, then
+single-queued ABBA × 2 and a pipelined ABBA on the NFS@Home job. The ncu
+reports (~140 MB) and both builds stay in the git-ignored `work/applyprof/`,
+along with copies of the NFS@Home job's polynomial and factor base, which
+are not kept here. Landing it: `land-gate.sh` produced `land-gate.txt`
+(default fat build, `--verify-only`, `make check`, `fillcheck.sh` with log
+`land-fillcheck.txt`, and identity against the base copy's relation files).
+`land-recheck.txt` is the landed binary against the base copy, pipelined,
+ABBA, at host load ~15.
+
+## Two-step small-sieve tail (2026-10-14)
+
+[`ss-two-step-20261014/`](ss-two-step-20261014/) holds the evidence for
+[finding 111](../bench/RESULTS.md#finding-111), pinned in `MANIFEST.sha256`.
+`landed-run.sh` produced `landed-run.txt`: the default fat build's resources,
+`--verify-only`, apply-parity `--verify` at I16, I17 and I15 (with the new
+`ss_first` device gate), `make check`, `fillcheck.sh`, identity on the
+NFS@Home job and c183, and fat-vs-fat timing against the saved hoist
+binary. `landed-calls.txt` is the 64-bit remainder call count before and
+after. The variants that lost: `two-range-run.sh`/`.txt` (two loops back to
+back, gates passing and apply +23%) with `two-range-stalls.txt` (the barrier
+stall that explains it); `variant2-ab.sh`/`.txt` and `variant2-c183-ab.txt`
+(one loop with a per-entry select, +0.8% at c183); `variant3-ab.txt` (a
+runtime branch between two loops, stopped). `sass-structure.txt` counts each
+variant's `YIELD`/`BSSY` per `k_apply` instance. After the xhigh review:
+`review-run.sh` produced `review-run.txt` (build, per-instance SASS with the
+trap, `--verify` at four geometries, `make check` with slabtest's new tail
+gate, fillcheck, identity on all four pipeline instances against `5c1ab93`,
+ncu and timing against the hoist), and `slabtest-mutants.txt` shows two
+broken two-step proofs failing that gate. The scripts' paths point into the
+git-ignored `work/applyprof/`, where the builds and ncu reports stay.

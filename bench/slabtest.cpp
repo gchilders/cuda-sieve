@@ -271,10 +271,118 @@ static int check_magic(void)
     return 0;
 }
 
+/* ss_first's magic path, one- and two-step, written against the same
+ * td_mod_magic and SS_KSHIFT the device uses (bench_kernels.cu). A model,
+ * not the device code: the device half of this gate (--verify) runs the real
+ * ss_first. This half is what puts the host proofs into `make check`. */
+static uint32_t ss_first_model(uint32_t p, uint32_t rt, uint32_t j, int32_t ilo,
+                               uint32_t magic, uint32_t kshift, int two)
+{
+    uint32_t sh = 0;
+    while ((1u << (sh + 1)) <= p) sh++;
+    if ((p & (p - 1)) == 0)
+        return (rt * j + (p << kshift) - (uint32_t)ilo) & (p - 1);
+    if (two) {
+        const uint32_t r = td_mod_magic(rt * j, p, magic, sh);
+        return td_mod_magic(r + (p << kshift) - (uint32_t)ilo, p, magic, sh);
+    }
+    return td_mod_magic(rt * j + (p << kshift) - (uint32_t)ilo, p, magic, sh);
+}
+
+/* The thread tier's two-step tail (finding 111): the split search against a
+ * linear scan, the routing and both proofs, and the arithmetic at the
+ * proof's corners against the 64-bit fallback's formula, at the geometries
+ * where a tail exists and one where it does not. */
+static int check_ss_tail(void)
+{
+    static const uint32_t geo[][2] = {     /* {logI, J} */
+        {15, 16384}, {16, 16384}, {16, 32768}, {16, 65536}, {17, 32768},
+        {17, 65536}, {18, 65536}
+    };
+    uint32_t seed = 0x5eed2b0bu, ntwo = 0, nall = 0;
+    for (unsigned g = 0; g < sizeof geo / sizeof geo[0]; g++) {
+        const uint32_t logI = geo[g][0], J = geo[g][1], I = 1u << logI;
+        const uint32_t ihalf = I >> 1, kshift = SS_KSHIFT(logI);
+        static uint32_t hsp[1u << 18];
+        uint32_t n = 0, split, lin = 0;
+        /* A sorted table of every modulus from 1024 up: the split search
+         * must equal the first entry failing the one-step bound. */
+        for (uint32_t m = 1024; m < I; m++) hsp[n++] = m;
+        split = ss_two_step_from(hsp, n, 0, J, logI);
+        while (lin < n && ss_one_step_fits(hsp[lin], J, logI)) lin++;
+        if (split != lin) {
+            fprintf(stderr, "slabtest: ss_two_step_from %u != scan %u at logI %u"
+                    " J %u\n", split, lin, logI, J);
+            return -1;
+        }
+        for (uint32_t i = 0; i < n; i++) {
+            const uint32_t m = hsp[i];
+            const int two = i >= split;
+            uint32_t magic;
+            /* Every entry before the split is proved one-step, and a
+             * one-step proof implies the two-step one (jmax >= 1). */
+            if (!two && (!ss_bound_ok(m, J, logI, 0) || !ss_bound_ok(m, J, logI, 1))) {
+                fprintf(stderr, "slabtest: m=%u before the split is not proved"
+                        " both ways at logI %u J %u\n", m, logI, J);
+                return -1;
+            }
+            ss_magic_build(m, J, logI, two, &magic);
+            if (!magic) continue;              /* the fallback */
+            /* The documented worst-case numerators, restated here rather
+             * than taken from ss_bound_ok: every modulus the host accepts
+             * must keep each dividend its form reduces below 2^31. A wrong
+             * residue is not guaranteed past that bound, so the arithmetic
+             * below can pass an over-generous proof by luck; this cannot.
+             * Powers of two take the AND and need no bound. */
+            if (m & (m - 1)) {
+                const uint64_t lim = 1ull << 31, bias = (uint64_t)m << kshift;
+                const int ok = two
+                    ? (uint64_t)(m - 1) * J < lim && (m - 1) + bias + ihalf < lim
+                    : (uint64_t)(m - 1) * J + bias + ihalf < lim;
+                if (!ok) {
+                    fprintf(stderr, "slabtest: %s-step magic accepted for m=%u at"
+                            " logI %u J %u, past the 2^31 bound\n",
+                            two ? "two" : "one", m, logI, J);
+                    return -1;
+                }
+            }
+            /* Corners every 97th modulus, plus the ends and both sides of
+             * the split; the arithmetic is the same for the moduli between. */
+            if (i % 97 && i + 3 < n && (i + 3 < split || i > split + 3)) continue;
+            for (unsigned k = 0; k < 8; k++) {
+                uint32_t rt, j;
+                int32_t ilo;
+                seed = seed * 1664525u + 1013904223u;
+                rt  = k < 4 ? m - 1u : seed % m;
+                j   = (k & 1) ? J : (k < 4 ? 1u : seed % (J + 1u));
+                ilo = (k & 2) ? -(int32_t)ihalf : (int32_t)ihalf - 1;
+                const uint32_t ref = (uint32_t)(((uint64_t)rt * j +
+                    ((uint64_t)m << 20) - (uint64_t)(int64_t)ilo) % m);
+                const uint32_t got = ss_first_model(m, rt, j, ilo, magic, kshift, two);
+                if (got != ref) {
+                    fprintf(stderr, "slabtest: ss_first %s-step m=%u rt=%u j=%u"
+                            " ilo=%d logI %u J %u: got %u ref %u\n",
+                            two ? "two" : "one", m, rt, j, ilo, logI, J, got, ref);
+                    return -1;
+                }
+                nall++;
+                ntwo += two;
+            }
+        }
+    }
+    if (ntwo < 1000) {
+        fprintf(stderr, "slabtest: only %u two-step cases; the geometry table no"
+                " longer reaches the tail\n", ntwo);
+        return -1;
+    }
+    return 0;
+}
+
 int main(void)
 {
     if (check_plan() || check_bkthresh_integration() || check_phase() ||
-        check_magic() || check_walk_continuation()) return 1;
-    printf("slabtest: plan, bkthresh wiring, phase, reciprocal, and continued-walk gates OK\n");
+        check_magic() || check_ss_tail() || check_walk_continuation()) return 1;
+    printf("slabtest: plan, bkthresh wiring, phase, reciprocal, small-sieve tail,"
+           " and continued-walk gates OK\n");
     return 0;
 }

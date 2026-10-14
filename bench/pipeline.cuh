@@ -186,7 +186,7 @@ typedef struct {
     uint32_t *sp, *srt, *sg;
     uint32_t *smag;             /* ss_first reciprocals; see ss_magic_build */
     uint16_t *slp;
-    uint32_t  nslice_pow2, nsmall, nblk, nwrp, nfb;
+    uint32_t  nslice_pow2, nsmall, nblk, nwrp, nsplit, nfb;
     size_t    apply_smem;
     norm_t    N;
     uint32_t  CINIT, BOUND, tconst, nsurv;
@@ -580,11 +580,14 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
         }
         /* Reciprocals AFTER the sort, same as the standalone path: the sort
          * key is the modulus, so building them earlier would only mean
-         * permuting them too. */
+         * permuting them too. And after the tiers: the thread tier's
+         * two-step range starts at nsplit, and each magic is proved for the
+         * form its index gets (ss_bound_ok in td.cuh). */
+        ss_tiers(hsp, k, &S->nblk, &S->nwrp);
+        S->nsplit = ss_two_step_from(hsp, k, S->nwrp, cfg->J, cfg->logI);
         for (uint32_t i = 0; i < k; i++)
             ss_magic_build(hsp[i], hsg[i] > 1 ? cfg->J / hsg[i] : cfg->J,
-                           cfg->logI, &S->hsmag[i]);
-        ss_tiers(hsp, k, &S->nblk, &S->nwrp);
+                           cfg->logI, i >= S->nsplit, &S->hsmag[i]);
         /* ASYNC on purpose. A synchronous cudaMemcpy on the legacy default
          * stream cannot begin until prior stream work drains, so once the
          * transform sync was removed from the end of this function these
@@ -903,14 +906,24 @@ static int pipe_side_sieve_issue(const fb_t *fb, const bench_cfg_t *cfg,
      * ever shows up in a profile. */
     SLAB_CK(cudaMemsetAsync(S->survbits, 0, (size_t)nbitword * 4, st));
     wd_phase(side ? "slab.apply.side1" : "slab.apply.side0");
-    k_apply<16, 1, NORM_HORNER, SLABBED><<<nregion, athr, S->apply_smem, st>>>(
-        (const uint32_t *)bk->bucket, bk->cursor, bk->cap, cfg->logI, log_region,
-        S->slice_logp, S->nslice_pow2, S->N, S->CINIT, S->CINIT - S->BOUND,
-        S->tconst, NULL, S->d_nsurv, NULL, 0xFFFFFFFFu,
-        S->sp, S->srt, S->sg, S->slp, S->smag,
-        S->nsmall, S->nblk, S->nwrp,
-        0xFFFFFFFFu, NULL, S->survbits, cfg->not_both_even, cfg->sieve_skip,
-        j_base);
+    {   /* The instance with the two-step tail only when this q has one: at
+         * logI <= 15 it never does, and that instance's thread tier is the
+         * one-step loop alone (sieve_small, SSTAIL; finding 111). The choice
+         * is ss_needs_tail, never a geometry test: the one-step instance on a
+         * table with a tail would give silently wrong residues, and traps.
+         * Its own scope, so the SLAB_CK gotos above do not jump past it. */
+        auto *const apply_kern = ss_needs_tail(S->nsplit, S->nsmall)
+            ? k_apply<16, 1, NORM_HORNER, SLABBED, true>
+            : k_apply<16, 1, NORM_HORNER, SLABBED, false>;
+        apply_kern<<<nregion, athr, S->apply_smem, st>>>(
+            (const uint32_t *)bk->bucket, bk->cursor, bk->cap, cfg->logI, log_region,
+            S->slice_logp, S->nslice_pow2, S->N, S->CINIT, S->CINIT - S->BOUND,
+            S->tconst, NULL, S->d_nsurv, NULL, 0xFFFFFFFFu,
+            S->sp, S->srt, S->sg, S->slp, S->smag,
+            S->nsmall, S->nblk, S->nwrp, S->nsplit,
+            0xFFFFFFFFu, NULL, S->survbits, cfg->not_both_even, cfg->sieve_skip,
+            j_base);
+    }
     SLAB_CK(cudaEventRecord(S->ev[3], st));
     rc = 0;
 done:
@@ -2048,10 +2061,13 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     {
         const size_t apply_smem =
             S1.apply_smem > S0.apply_smem ? S1.apply_smem : S0.apply_smem;
-        /* MaxDynamicSharedMemorySize belongs to this k_apply specialization.
+        /* MaxDynamicSharedMemorySize belongs to each k_apply specialization.
          * Setting it independently while initializing the two sides is wrong:
-         * the second side can lower the limit required by the first. */
-        PIPE_CK(cudaFuncSetAttribute(k_apply<16, 1, NORM_HORNER, SLABBED>,
+         * the second side can lower the limit required by the first. Both
+         * SSTAIL instances, because the launch picks one per q. */
+        PIPE_CK(cudaFuncSetAttribute(k_apply<16, 1, NORM_HORNER, SLABBED, false>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)apply_smem));
+        PIPE_CK(cudaFuncSetAttribute(k_apply<16, 1, NORM_HORNER, SLABBED, true>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)apply_smem));
     }
     VRAM_MARK("factor bases + bitmaps");

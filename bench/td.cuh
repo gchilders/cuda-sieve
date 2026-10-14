@@ -155,12 +155,42 @@ TD_MOD_HD uint32_t td_mod_magic(uint32_t w, uint32_t m,
  * saves) or sieve_small's tier loops duplicated under a kernel-uniform
  * branch, which is real code bloat in a kernel whose occupancy is already
  * smem-bound. If logI 16 ever becomes the default geometry, revisit: the
- * change is confined to this macro, ss_magic_build's kshift, and ss_first. */
+ * change is confined to this macro, ss_magic_build's kshift, and ss_first.
+ *
+ * REVISITED when logI 16 became the NFS@Home geometry, and answered without
+ * touching the shift: the refused entries are a contiguous tail of the sorted
+ * table, which the thread tier reduces in two steps instead (ss_bound_ok,
+ * finding 111). The bloat argument above did land, in a different form: the
+ * tail is a k_apply template parameter (SSTAIL), so each pipeline
+ * specialisation ships twice -- 11 k_apply instances instead of 9 in every
+ * arch of a fat build -- and the source writes the magic path twice
+ * (ss_first's one- and two-step forms). That was the price of keeping one
+ * thread-tier loop per instance: two loops in one kernel lost reconvergence
+ * and cost apply +24% at I16. */
 #define SS_KSHIFT(logI)  ((uint32_t)((logI) - 2))
 
 /* Returns 0 into *magic to mean "no magic, use ss_first's 64-bit fallback" --
  * for m == 1, and, more importantly, whenever the numerator cannot be PROVEN
  * below 2^31, which is the exactness bound on td_mod_magic above.
+ *
+ * TWO FORMS, one proof each (ss_bound_ok). The ONE-STEP form reduces
+ * `rt*j + bias - ilo` in one go. The TWO-STEP form (two_step != 0, for the
+ * thread-tier entries at or past ss_two_step_from) reduces `rt*j` first and
+ * then `that residue + bias - ilo`, so each dividend only has to be below
+ * 2^31 on its own. At I16/J32768 the one-step proof fails for every m above
+ * ~43,690, about 30% of the thread tier, which then took the 64-bit fallback
+ * in every region (findings 110-111); the two-step proof holds for all of them.
+ * The device picks the form by the entry's INDEX, and the magic built here
+ * is proved for the form that index gets.
+ *
+ * THE COUPLING IS ONE-WAY. A one-step proof implies the two-step one, so an
+ * entry the device runs two-step when the host built it one-step is still
+ * exact. The converse is NOT: a magic proved only two-step, run through the
+ * one-step reduction, can give a wrong residue silently (I16/J32768,
+ * m = 60000: rt*j alone reaches ~1.97e9, and the bias takes the numerator
+ * past 2^31). So the one-step-only k_apply instance (SSTAIL = false) must
+ * never be launched on a table with a tail. Every launch site decides with
+ * ss_needs_tail, and that instance traps if it sees one.
  *
  * Takes logI rather than a precomputed shift ON PURPOSE: the shift is per-m
  * now, and a caller that derived it even slightly differently from the device
@@ -179,12 +209,26 @@ TD_MOD_HD uint32_t td_mod_magic(uint32_t w, uint32_t m,
  * expression ss_first evaluates, so it stays honest if either knob is pushed.
  *
  * Powers of two keep a non-zero magic even though ss_first ignores it for
- * them and uses an AND instead: it is the "bounds proved, take the fast path"
- * flag. m == 1 is refused here and answered by the fallback (t % 1 == 0). */
-static inline void ss_magic_build(uint32_t m, uint32_t jmax, uint32_t logI,
-                                  uint32_t *magic)
+ * them and uses an AND instead: it is the "take the fast path" flag, and they
+ * need no bound for it (ss_bound_ok). m == 1 is refused here and answered by
+ * the fallback (t % 1 == 0). */
+static inline int ss_bound_ok(uint32_t m, uint32_t jmax, uint32_t logI,
+                              int two_step);
+
+/* The one-step numerator bound alone, (m-1)*jmax + (m << kshift) + ihalf <
+ * 2^31: monotone in m, so the split search and the device gate route a
+ * modulus with exactly the predicate ss_bound_ok proves. Caller guarantees
+ * logI in [2,20] and m >= 1. */
+static inline int ss_one_step_fits(uint64_t m, uint32_t jmax, uint32_t logI)
 {
-    uint32_t mg, sh, kshift, ihalf;
+    return (m - 1) * jmax + (m << SS_KSHIFT(logI)) + (1u << (logI - 1))
+        < (1ull << 31);
+}
+
+static inline void ss_magic_build(uint32_t m, uint32_t jmax, uint32_t logI,
+                                  int two_step, uint32_t *magic)
+{
+    uint32_t mg, sh;
     /* sh is filled by td_magic_build and deliberately DISCARDED: ss_first
      * recomputes the same value on device as 31 - __clz(p), which it needs
      * anyway. That is only correct because td_magic_build's general case sets
@@ -192,7 +236,6 @@ static inline void ss_magic_build(uint32_t m, uint32_t jmax, uint32_t logI,
      * ss_first's AND branch and never reaches td_mod_magic. Assert the first
      * half here so a change to that convention cannot silently desynchronise
      * the device. */
-    uint64_t bias, wmax;
 
     *magic = 0;
     /* The header above claims there is nothing here for a caller to get
@@ -209,27 +252,13 @@ static inline void ss_magic_build(uint32_t m, uint32_t jmax, uint32_t logI,
      * worst case p == 2; beyond that the fallback's numerator goes negative
      * and wraps. Nothing reaches that today because main() caps logI at 20,
      * but a second entry point that did not would get silently wrong offsets
-     * from the fallback, not from here. */
-    if (logI < 2 || logI > 20) return;
-    if (m < 2) return;                     /* every position hits; fallback */
-
-    /* THE BOUND IS TESTED BEFORE td_magic_build, not after, because it does
+     * from the fallback, not from here. (ss_bound_ok holds both guards.)
+     *
+     * THE BOUND IS TESTED BEFORE td_magic_build, not after, because it does
      * not need the reciprocal: it depends only on m, jmax and logI. Building
      * first meant every refused entry still paid td_magic_build's 64-bit
-     * divide to have its answer thrown away. Free at logI 15, where nothing
-     * is refused; at logI 17 roughly 80% of entries are refused and skip the
-     * divide entirely. */
-    ihalf  = 1u << (logI - 1);
-    kshift = SS_KSHIFT(logI);
-    bias = (uint64_t)m << kshift;          /* a multiple of m, and >= ihalf */
-    /* Guaranteed for m >= 2 (2 << (logI-2) == 1 << (logI-1)), and checked
-     * anyway: it is the property the whole unsigned-numerator argument rests
-     * on, and the m >= 2 guard above is what makes it true. */
-    if (bias < ihalf) return;
-    /* Largest numerator the kernel can form: rt <= m-1, j <= jmax, and the
-     * -ilo term contributes at most +ihalf. */
-    wmax = (uint64_t)(m - 1) * jmax + bias + ihalf;
-    if (wmax >= (1ull << 31)) return;      /* cannot prove exactness */
+     * divide to have its answer thrown away. */
+    if (!ss_bound_ok(m, jmax, logI, two_step)) return;
 
     td_magic_build(m, &mg, &sh);
     if (!mg) return;
@@ -239,6 +268,78 @@ static inline void ss_magic_build(uint32_t m, uint32_t jmax, uint32_t logI,
         if (sh != lg) return;           /* convention changed: refuse, fall back */
     }
     *magic = mg;
+}
+
+/* The exactness proof for one form of ss_first, against the exact expression
+ * the device evaluates: rt <= m-1, j <= jmax, and the -ilo term contributes at
+ * most +ihalf. Computed in 64-bit, so it stays honest whatever --bkthresh and
+ * --J are set to.
+ *
+ *   one-step   rt*j + bias - ilo                     < 2^31
+ *   two-step   rt*j                                  < 2^31, and
+ *              (rt*j mod m) + bias - ilo  <=  m-1 + bias + ihalf  < 2^31
+ *
+ * One-step implies two-step whenever jmax >= 1, so moving such an entry from
+ * the first form to the second can never refuse it. (An entry with a row
+ * divisor g > J has jmax = J/g = 0 and can pass one and fail the other; that
+ * costs it the fallback, nothing else, and only a raised --bkthresh makes one.)
+ *
+ * A POWER OF TWO NEEDS NO BOUND in either form. ss_first answers it with an
+ * AND on the 32-bit sum, and p divides 2^32, so the residue is exact even if
+ * the sum wraps -- p < 2^30 because bkthresh is capped there. */
+static inline int ss_bound_ok(uint32_t m, uint32_t jmax, uint32_t logI,
+                              int two_step)
+{
+    uint32_t kshift, ihalf;
+    uint64_t bias;
+
+    if (logI < 2 || logI > 20) return 0;
+    if (m < 2) return 0;                   /* every position hits; fallback */
+    ihalf  = 1u << (logI - 1);
+    kshift = SS_KSHIFT(logI);
+    bias = (uint64_t)m << kshift;          /* a multiple of m, and >= ihalf */
+    /* Guaranteed for m >= 2 (2 << (logI-2) == 1 << (logI-1)), and checked
+     * anyway: it is the property the whole unsigned-numerator argument rests
+     * on, and the m >= 2 guard above is what makes it true. */
+    if (bias < ihalf) return 0;
+    if ((m & (m - 1)) == 0) return 1;      /* the AND path: exact regardless */
+    if (!two_step)
+        return ss_one_step_fits(m, jmax, logI);
+    return (uint64_t)(m - 1) * jmax < (1ull << 31)
+        && (uint64_t)(m - 1) + bias + ihalf < (1ull << 31);
+}
+
+/* First index of the thread tier's TWO-STEP range: the first entry at or past
+ * nwrp whose one-step numerator bound fails at the largest row bound, J.
+ * That bound, (m-1)*J + (m << kshift) + ihalf < 2^31, grows with m and hsp is
+ * sorted by modulus, so it is a binary search, not a scan of every entry per
+ * q per side. Every entry before the split passes ss_bound_ok one-step at any
+ * jmax <= J (a power of two passes regardless), and the range from it is the
+ * tail the one-step form refuses. Equal to n (no tail) at logI <= 15 and the
+ * default J. An invalid logI puts everything in the tail, where ss_bound_ok
+ * refuses it all: the fallback, as before. */
+static inline uint32_t ss_two_step_from(const uint32_t *hsp, uint32_t n,
+                                        uint32_t nwrp, uint32_t J,
+                                        uint32_t logI)
+{
+    uint32_t lo = nwrp, hi = n;
+    if (logI < 2 || logI > 20) return nwrp;
+    while (lo < hi) {                      /* first index failing the bound */
+        const uint32_t mid = lo + (hi - lo) / 2;
+        if (ss_one_step_fits(hsp[mid], J, logI)) lo = mid + 1;
+        else                                     hi = mid;
+    }
+    return lo;
+}
+
+/* Which k_apply instance a launch needs: the one with the two-step tail
+ * whenever this table has entries at or past nsplit. The one-step-only
+ * instance on such a table would run two-step-proved magics through the
+ * one-step reduction -- silently wrong residues (see ss_magic_build). Every
+ * launch site decides with this, so the predicate exists once. */
+static inline int ss_needs_tail(uint32_t nsplit, uint32_t nsmall)
+{
+    return nsplit < nsmall;
 }
 
 #if defined(__CUDACC__)
