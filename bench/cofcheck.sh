@@ -274,6 +274,15 @@ if [ "$got" = "1" ]; then
 else
     printf 'FAIL   %-34s did not resolve to rho / ECM\n' "auto method, 2LP and 3LP sides"; fail=1
 fi
+# ...unless the 2LP side's lpb is large: rho's sqrt(2^lpb) stops being cheap,
+# so at lpb >= COF_ECM_2LP_MIN_LPB (35) a 2LP side goes to ECM too. Same job
+# with the rational side widened to lpb 36 / mfb 72 (still 2 parts).
+got=$(run --cofactor --lpb0 36 --mfb0 72 --relations $TMP/m36.txt | grep -c 'cofactor method: side 0 ECM, side 1 ECM' || true)
+if [ "$got" = "1" ]; then
+    printf 'PASS   %-34s ECM / ECM\n' "auto method, 2LP at lpb 36"
+else
+    printf 'FAIL   %-34s did not resolve to ECM / ECM\n' "auto method, 2LP at lpb 36"; fail=1
+fi
 # Forcing must override the automatic choice in both directions.
 got=$(run --cofactor --cof-rho --relations $TMP/m.txt | grep -c 'side 0 rho, side 1 rho' || true)
 got2=$(run --cofactor --cof-ecm --relations $TMP/m.txt | grep -c 'side 0 ECM, side 1 ECM' || true)

@@ -534,9 +534,18 @@ static inline unsigned cof_parts(unsigned mfb, unsigned lpb)
     return lpb ? (mfb + lpb - 1u) / lpb : 0u;
 }
 
+/* AND BY lpb AT THE TOP: rho's sqrt(2^lpb) is what a 2LP split costs, and at
+ * large lpb it is no longer cheap. Measured on the 2,1147+ SNFS job (lpbr 36,
+ * mfbr 72, 2LP rational side), RTX 4090, 420 q: rho 31.6 ms/q on the rational
+ * queue with 3,271 records stuck, ECM 11.5 ms/q with 7 -- 215.5 -> 202.7 ms/q
+ * wall and 33 more relations, none lost. Finding 70's rho win was at lpb 33.
+ * 34 is unmeasured; 35 is the conservative cut. --cof-rho still forces rho. */
+#define COF_ECM_2LP_MIN_LPB 35u
+
 static inline int cof_auto_method(unsigned mfb, unsigned lpb)
 {
-    return cof_parts(mfb, lpb) >= 3u ? COF_METHOD_ECM : COF_METHOD_RHO;
+    if (cof_parts(mfb, lpb) >= 3u) return COF_METHOD_ECM;
+    return lpb >= COF_ECM_2LP_MIN_LPB ? COF_METHOD_ECM : COF_METHOD_RHO;
 }
 
 /* B1 for a side's lpb, from the measured optima: 200 at lpb 31-33, 300 at
