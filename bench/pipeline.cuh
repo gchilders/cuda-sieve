@@ -20,6 +20,7 @@
 
 #include "td.cuh"      /* ss_magic_build, SS_KSHIFT */
 #include <thread>
+#include <atomic>
 #include <utility>
 #include "ckpt.h"
 #include "runlog.h"
@@ -1771,6 +1772,7 @@ typedef struct {
     cofq_out_t  spare_out;  /* allocated by cofq_init alongside it, unused      */
     cofq_t      F;          /* the queue as handed to the in-flight flush       */
     std::thread *th;
+    std::atomic<int> *fin;  /* set by the flush thread as its last act         */
     int         busy, rc;
     double      ms_wait;    /* host time the q loop spent waiting on a flush    */
     /* The resume point as it stood when the in-flight flush started: the file
@@ -1808,6 +1810,7 @@ static void cofa_start(cofasync_t *A, cofq_t *Q, cofq_out_t *O,
     cofq_swap_buffers(Q, &A->spare);  /* Q now fills the spare set, n=0  */
     A->busy = 1;
     A->rc = 0;
+    A->fin->store(0, std::memory_order_relaxed);
     /* Full width. Launching the flush at blocks/2 or blocks/4 so the sieve
      * kept SMs to itself was measured at 278.2 and 277.0 ms/q against 276.5
      * (RTX 4090, 2,1147+, 420 q): no effect, so there is no knob. */
@@ -1817,6 +1820,7 @@ static void cofa_start(cofasync_t *A, cofq_t *Q, cofq_out_t *O,
         A->rc = cofq_flush(&A->F, O, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
                            cfg->cof_rounds, cfg->cof_budget, cfg->cof_chunk,
                            blocks, cfg->threads, fr);
+        A->fin->store(1, std::memory_order_release);
     });
 }
 
@@ -1913,6 +1917,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                              const poly_t *POLY, const bench_cfg_t *cfg,
                              const slab_plan_t *slab_plan)
 {
+    /* Ahead of every goto: cofasync_t's `fin`, which the memset of A below
+     * cannot hold by value. */
+    std::atomic<int> cofa_fin(0);
     const uint32_t I = 1u << cfg->logI;
     const uint32_t xmax_alloc = I * slab_plan->jmax;
     const uint32_t nregion_alloc = xmax_alloc >> cfg->log_region;
@@ -2058,6 +2065,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     memset(&C, 0, sizeof C); memset(&tm, 0, sizeof tm);
     memset(&Q, 0, sizeof Q); memset(&QO, 0, sizeof QO);
     memset(&A, 0, sizeof A);
+    A.fin = &cofa_fin;
 #define PIPE_CK(x) do { if (CUDA_CHECKED(x)) { rc = -1; goto done; } } while (0)
 /* Headroom left for the per-q buffers that grow on demand after all
  * one-time setup -- measured at 0.12 GB at 15e (finding 94). ONE constant:
@@ -3097,6 +3105,21 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 if (CUDA_CHECKED(pipe_qsync()) ||
                     CUDA_CHECKED(cudaGetLastError())) { rc = -1; break; }
                 Q.n += nacc_s;
+                /* --cof-async: a flush that has finished is joined HERE, and
+                 * its checkpoint written, rather than at the next queue-full
+                 * a whole flush interval later -- which is that much more a
+                 * kill -9 replays, and that much later --target-rels sees
+                 * the flush's relations. The join cannot wait: the thread
+                 * has already returned. */
+                if (A.busy && A.fin->load(std::memory_order_acquire)) {
+                    if (cofa_wait(&A, &Q)) { rc = -1; break; }
+                    if (A.ck_pending) {
+                        pipe_try_checkpoint(POLY, cfg, &ck, fr, fc, &A.ck_next,
+                                            base_rel + Q.nrel, A.ck_nq,
+                                            &ckpt_written, &ckpt_warned);
+                        A.ck_pending = 0;
+                    }
+                }
             }
             tm.cofac += host_ms() - cf_start;
 

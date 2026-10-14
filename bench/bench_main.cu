@@ -2499,10 +2499,20 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
                         return 1;
                     }
                 }
-                {   /* Cheap, host-only, and it catches the case the
-                     * fingerprint cannot: a .part that was hand-edited, or
-                     * concatenated from another job, under a checkpoint that
-                     * still matches. Proves the polynomial only. */
+                /* Cheap, host-only, and it catches the case the
+                 * fingerprint cannot: a .part that was hand-edited, or
+                 * concatenated from another job, under a checkpoint that
+                 * still matches. Proves the polynomial only.
+                 *
+                 * NOT when the checkpointed prefix is empty. The resume
+                 * truncates the .part to nothing, so there is nothing to
+                 * prove -- and check_relations_sample reads a limit of 0 as
+                 * "the whole file", where a kill -9 has left the first
+                 * flush's relations and a torn last line. That is a kill
+                 * between the first cofactor flush and the next checkpoint,
+                 * and it used to refuse the resume: a stuck standalone band,
+                 * a discarded and recomputed BOINC task. */
+                if (ck.rel_bytes) {
                     uint32_t nchecked = 0;
                     const int bad = check_relations_sample(part, &POLY,
                                                            cfg.lpb0, cfg.lpb,
