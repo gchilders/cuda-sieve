@@ -4623,8 +4623,9 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         uint32_t regions;
         int idx;                /* 0 = 4x, 1 = 2x, 2 = the default */
         size_t m;
+        int fits;               /* n footprints + headroom fit free VRAM */
     };
-    choice_t ch = { plan, SLAB_PERF_REGIONS, 2, 0 };
+    choice_t ch = { plan, SLAB_PERF_REGIONS, 2, 0, 1 };
     if (!cfg->slab_j && !cfg->slab_fixed) {
         size_t freeB = 0, totalB = 0;
         if (cudaMemGetInfo(&freeB, &totalB) == cudaSuccess) {
@@ -4634,7 +4635,11 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
             const size_t m0 = pipe_vram_model(fb1, fb0, cfg, plan.jmax,
                                               inv1, inv0);
             auto choose = [&](int n, choice_t *out) {
-                *out = { plan, SLAB_PERF_REGIONS, 2, m0 };
+                /* The default is the fallback whether or not it fits: one
+                 * pipeline ran it before any of this existed. `fits` says
+                 * whether it does, for auto's N and the warning below. */
+                *out = { plan, SLAB_PERF_REGIONS, 2, m0,
+                         m0 * (size_t)n + headroom <= freeB };
                 for (int k = 2; k >= 1; k--) {
                     slab_plan_t P2;
                     const uint32_t r = (uint32_t)SLAB_PERF_REGIONS << k;
@@ -4645,7 +4650,7 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                     const size_t m = pipe_vram_model(fb1, fb0, cfg, P2.jmax,
                                                      inv1, inv0);
                     if (m * (size_t)n + headroom > freeB) continue;
-                    *out = { P2, r, 2 - k, m };
+                    *out = { P2, r, 2 - k, m, 1 };
                     return;
                 }
             };
@@ -4658,12 +4663,18 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                 choice_t c1, c2;
                 choose(1, &c1);
                 choose(2, &c2);
-                ninst = (c2.idx == c1.idx || (c1.idx == 0 && c2.idx == 1))
-                      ? 2 : 1;
+                ninst = c2.fits && (c2.idx == c1.idx ||
+                                    (c1.idx == 0 && c2.idx == 1)) ? 2 : 1;
                 printf("  --instances auto: %d (%.2f GB free)\n", ninst,
                        freeB / 1073741824.0);
             }
             choose(ninst, &ch);
+            if (ninst > 1 && !ch.fits)
+                fprintf(stderr, "  warning: --instances %d: %d x %.2f GB modelled"
+                        " plus %.2f GB headroom exceeds the %.2f GB free; an"
+                        " instance may fail to allocate\n", ninst, ninst,
+                        ch.m / 1073741824.0, headroom / 1073741824.0,
+                        freeB / 1073741824.0);
             if (ch.idx < 2)
                 printf("  slab size from VRAM: %.2f GB free, modelled"
                        " %.2f GB at %u rows/slab%s (%.2f GB at the default"
