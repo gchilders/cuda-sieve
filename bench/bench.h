@@ -592,6 +592,18 @@ typedef struct {
      * sharing forbids. Off by default, and refused with a message rather than
      * silently when the second array does not fit. */
     int      fill_concurrent; /* 0 = sides run back to back (default) */
+    /* Flush the cross-q cofactor queue from a host thread on its own
+     * non-blocking stream, double-buffered, so the flush overlaps the sieving
+     * of the next special-q instead of stalling the q loop (after glas). On by
+     * default; --no-cof-async restores the inline flush. Same relations. */
+    int      cof_async;
+    /* In the serial arm, side 0's fill skips cells whose 8-cell group has no
+     * side-1 survivor (glas's gated fill). On by default; --no-fill-gate.
+     * Same relations: the intersect rejects those cells anyway. */
+    int      fill_gate;
+    /* --slab-fixed: the original fixed SLAB_PERF_REGIONS slab target instead
+     * of the largest one free VRAM admits. */
+    int      slab_fixed;
     /* --qspan: bracket each special-q's GPU work with two events and report
      * the span, splitting `unaccounted` into host-with-no-GPU-work versus
      * idle-between-stages. Diagnostic; STATUS item 19 step 2. */

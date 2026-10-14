@@ -151,6 +151,30 @@ __device__ __forceinline__ int pos_both_even(uint32_t x, uint32_t j)
 
 /* ---- stage (a): naive single-level atomic append ---------------------- */
 
+/* --fill-gate: one gate bit per 2^FILL_GATE_SHIFT cells, the OR of side 1's
+ * survivor bits over them. 3 (8 cells) is glas's default: 16 MB per 2^30 slab,
+ * small enough to stay in a large L2. k_gate_fold below assumes 3. */
+#define FILL_GATE_SHIFT 3
+
+__global__ void k_gate_fold(const uint32_t *__restrict bits, uint32_t nword,
+                            uint32_t *__restrict gate)
+{
+    const uint64_t stride = bench_grid_stride_x();
+    const uint32_t ngate = nword / 8u;     /* 8 bitmap words -> 1 gate word */
+    for (uint64_t tt = bench_grid_thread_x(); tt < ngate; tt += stride) {
+        const uint32_t g = (uint32_t)tt;
+        uint32_t out = 0;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            const uint32_t w = bits[(size_t)g * 8u + k];
+            #pragma unroll
+            for (int b = 0; b < 4; b++)
+                if ((w >> (8 * b)) & 0xFFu) out |= 1u << (4 * k + b);
+        }
+        gate[g] = out;
+    }
+}
+
 /* One atomicAdd per record into a 2^log_nbuckets-way split. This is the
  * baseline the design doc says to beat. */
 template <int RECBYTES, bool SLABBED = false>
@@ -163,7 +187,8 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
                               uint32_t *__restrict overflow,
                               const uint64_t *__restrict walk_cur,
                               uint64_t *__restrict walk_next,
-                              int sieve_skip, uint32_t j_base)
+                              int sieve_skip, uint32_t j_base,
+                              const uint32_t *__restrict gate = nullptr)
 {
     const uint32_t Imask = (1u << logI) - 1;
     const uint32_t offmask = (1u << log_region) - 1;
@@ -226,6 +251,14 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
                 if (pos_both_even(xl, j)) continue;
                 if (sieve_skip > 1 && (j % 3u) == 0u && ((xl & Imask) % 3u) == ih3)
                     continue;
+            }
+            /* --fill-gate (glas): side 0 writes no record for a cell whose
+             * 8-cell group has no side-1 survivor. k_intersect_compact ANDs
+             * the two bitmaps, so such a cell cannot reach a relation, and the
+             * resieve walks the lattice rather than reading records. */
+            if (gate) {
+                const uint32_t g = xl >> FILL_GATE_SHIFT;
+                if (!((gate[g >> 5] >> (g & 31u)) & 1u)) continue;
             }
             const uint32_t b = xl >> log_region;
             const uint32_t slot = atomicAdd(&cursor[b], 1u);

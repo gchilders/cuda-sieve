@@ -1197,6 +1197,34 @@ typedef struct {
 typedef struct { cudaEvent_t a, b; int armed, fired; } cof_peak_t;
 static cof_peak_t *g_cof_peak;
 
+/* The stream the cross-q queue's flush runs on. 0 is the legacy default
+ * stream and the original, fully synchronous behaviour. --cof-async sets it to
+ * a non-blocking stream so a flush, driven from its own host thread, overlaps
+ * the sieving of the next special-q (the glas arrangement). Everything a flush
+ * launches, records, copies or waits on goes through it; see cof_sync and
+ * cof_d2h, which fall back to the device-wide forms when it is 0 so that the
+ * default path is bit-for-bit what it was. */
+static cudaStream_t g_cof_stream = 0;
+
+/* Set while --cof-async initialises its second buffer set, so cofq_init's
+ * configuration lines (width, ECM plan, method) are printed once. cofcheck.sh
+ * counts them. Errors are never suppressed. */
+static int g_cofq_quiet = 0;
+
+static cudaError_t cof_sync(void)
+{
+    return g_cof_stream ? cudaStreamSynchronize(g_cof_stream)
+                        : cudaDeviceSynchronize();
+}
+
+static cudaError_t cof_d2h(void *dst, const void *src, size_t n)
+{
+    if (!g_cof_stream) return cudaMemcpy(dst, src, n, cudaMemcpyDeviceToHost);
+    cudaError_t e = cudaMemcpyAsync(dst, src, n, cudaMemcpyDeviceToHost,
+                                    g_cof_stream);
+    return e != cudaSuccess ? e : cudaStreamSynchronize(g_cof_stream);
+}
+
 template <int L>
 static void cf_run_rounds(const mz<L> *d_n, mz<L> lim2, uint32_t lpb, uint32_t n,
                           uint8_t *d_status, uint64_t *d_fac, uint8_t *d_nfac,
@@ -1210,11 +1238,11 @@ static void cf_run_rounds(const mz<L> *d_n, mz<L> lim2, uint32_t lpb, uint32_t n
          * function of the status array alone and the output stays reproducible
          * byte for byte. Three small kernels over the batch -- microseconds
          * against a stage that runs for tens of milliseconds. */
-        k_cof_selflags<<<blocks, threads>>>(n, d_status, W->d_flag);
-        k_scan_pass1<<<nb, TD_SCAN_BLK>>>(W->d_flag, n, W->d_off, W->d_bsum);
-        k_scan_pass2<<<1, 1024>>>(W->d_bsum, nb);
-        k_scan_pass3<<<nb, TD_SCAN_BLK>>>(W->d_off, n, W->d_bsum);
-        k_cof_selscatter<<<blocks, threads>>>(n, W->d_flag, W->d_off,
+        k_cof_selflags<<<blocks, threads, 0, g_cof_stream>>>(n, d_status, W->d_flag);
+        k_scan_pass1<<<nb, TD_SCAN_BLK, 0, g_cof_stream>>>(W->d_flag, n, W->d_off, W->d_bsum);
+        k_scan_pass2<<<1, 1024, 0, g_cof_stream>>>(W->d_bsum, nb);
+        k_scan_pass3<<<nb, TD_SCAN_BLK, 0, g_cof_stream>>>(W->d_off, n, W->d_bsum);
+        k_cof_selscatter<<<blocks, threads, 0, g_cof_stream>>>(n, W->d_flag, W->d_off,
                                               W->d_sel, W->d_nsel);
         /* One launch per record slice. chunk 0 (or any value covering the
          * batch) gives exactly one launch over [0, n) -- the original single
@@ -1232,26 +1260,26 @@ static void cf_run_rounds(const mz<L> *d_n, mz<L> lim2, uint32_t lpb, uint32_t n
             /* The flush's worst-case launch; see the safety valve above. */
             const int _peak = (r == 0 && b == 0 && g_cof_peak
                                && g_cof_peak->armed);
-            if (_peak) cudaEventRecord(g_cof_peak->a);
+            if (_peak) cudaEventRecord(g_cof_peak->a, g_cof_stream);
             if (S->method) {
                 if (S->s2nv)
-                    k_cofac<L, 1, 1><<<blocks, kth>>>(
+                    k_cofac<L, 1, 1><<<blocks, kth, 0, g_cof_stream>>>(
                         d_n, lim2, lpb, (uint32_t)(r + 1), S->curves,
                         W->d_sel, W->d_nsel, d_status, d_fac, d_nfac, d_iters,
                         S->d_s, S->ns, S->d_s2mask, S->s2vmin, S->s2nv, b, e);
                 else
-                    k_cofac<L, 1, 0><<<blocks, kth>>>(
+                    k_cofac<L, 1, 0><<<blocks, kth, 0, g_cof_stream>>>(
                         d_n, lim2, lpb, (uint32_t)(r + 1), S->curves,
                         W->d_sel, W->d_nsel, d_status, d_fac, d_nfac, d_iters,
                         S->d_s, S->ns, NULL, 0, 0, b, e);
             } else {
-                k_cofac<L, 0, 0><<<blocks, kth>>>(
+                k_cofac<L, 0, 0><<<blocks, kth, 0, g_cof_stream>>>(
                     d_n, lim2, lpb, (uint32_t)(r + 1), S->budget << r,
                     W->d_sel, W->d_nsel, d_status, d_fac, d_nfac, d_iters,
                     NULL, 0, NULL, 0, 0, b, e);
             }
             if (_peak) {
-                cudaEventRecord(g_cof_peak->b);
+                cudaEventRecord(g_cof_peak->b, g_cof_stream);
                 g_cof_peak->armed = 0; g_cof_peak->fired = 1;
             }
         }
@@ -1861,7 +1889,7 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
      * only has 3", and those are different facts when the question is whether
      * a wider job could have run at all. It is also what lets cofcheck.sh
      * discover which cases this build can even attempt. */
-    printf("  cofactor width: side 0 %d limbs (%d bits), side 1 %d limbs"
+    if (!g_cofq_quiet) printf("  cofactor width: side 0 %d limbs (%d bits), side 1 %d limbs"
            " (%d bits); this build carries %d..%d\n",
            Q->L0, 32 * Q->L0, Q->L1, 32 * Q->L1, CF_LMIN, CF_LMAX);
     if (meth0 || meth1) {          /* one plan serves whichever sides use ECM */
@@ -1887,7 +1915,7 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
                                    cudaMemcpyHostToDevice));
             free(h_s2mask); h_s2mask = NULL;
         }
-        printf("  cofactor queue: ECM B1 = %u, %u prime powers, B2 = %u"
+        if (!g_cofq_quiet) printf("  cofactor queue: ECM B1 = %u, %u prime powers, B2 = %u"
                " (%u giant steps), %u curves per round\n", ecm_b1, Q->ns,
                ecm_b2, Q->s2nv, ecm_curves);
         /* The one thing --cof-chunk cannot bound.
@@ -1924,7 +1952,7 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
     }
     {
         static const char *nm[2] = { "rho", "ECM" };
-        printf("  cofactor method: side 0 %s, side 1 %s\n",
+        if (!g_cofq_quiet) printf("  cofactor method: side 0 %s, side 1 %s\n",
                nm[Q->meth[0] ? 1 : 0], nm[Q->meth[1] ? 1 : 0]);
     }
     /* Every enqueued record can become a relation, so the readback slots have
@@ -2109,7 +2137,7 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     COF_FLUSH_CK(cudaEventCreate(&e2));
     COF_FLUSH_CK(cudaEventCreate(&pk0.a)); COF_FLUSH_CK(cudaEventCreate(&pk0.b));
     COF_FLUSH_CK(cudaEventCreate(&pk1.a)); COF_FLUSH_CK(cudaEventCreate(&pk1.b));
-    COF_FLUSH_CK(cudaEventRecord(e0));
+    COF_FLUSH_CK(cudaEventRecord(e0, g_cof_stream));
     pk0.armed = 1; g_cof_peak = &pk0;
     if (cf_run_rounds_dyn(Q->L0, Q->d_c0, lim0, lpb0, n, Q->d_st0,
                           Q->d_sp0, Q->d_nsp0, &S, &W, NULL, blocks, threads))
@@ -2117,26 +2145,26 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     /* The class-aware gate: a record whose rational side did not split is dead
      * whatever the algebraic side does, so its side-1 job is never started. */
     g_cof_peak = NULL;
-    k_cof_gate<<<blocks, threads>>>(n, Q->d_st0, Q->d_st1);
-    COF_FLUSH_CK(cudaEventRecord(e1));
+    k_cof_gate<<<blocks, threads, 0, g_cof_stream>>>(n, Q->d_st0, Q->d_st1);
+    COF_FLUSH_CK(cudaEventRecord(e1, g_cof_stream));
     pk1.armed = 1; g_cof_peak = &pk1;
     if (cf_run_rounds_dyn(Q->L1, Q->d_c1, lim1, lpb1, n, Q->d_st1,
                           Q->d_sp1, Q->d_nsp1, &S1, &W, NULL, blocks, threads))
         goto done;
     g_cof_peak = NULL;
-    COF_FLUSH_CK(cudaEventRecord(e2));
+    COF_FLUSH_CK(cudaEventRecord(e2, g_cof_stream));
 
     /* Instrumentation, not accounting: recorded after e2 so it cannot land in
      * the per-side timings this same flush reports. */
-    k_cof_status_hist<<<blocks, threads>>>(n, Q->d_st0, Q->d_st1, Q->d_nst);
+    k_cof_status_hist<<<blocks, threads, 0, g_cof_stream>>>(n, Q->d_st0, Q->d_st1, Q->d_nst);
 
-    k_rel_flags<<<blocks, threads>>>(n, Q->d_st0, Q->d_st1, Q->d_flag);
-    k_scan_pass1<<<nb, TD_SCAN_BLK>>>(Q->d_flag, n, Q->d_off, Q->d_bsum);
-    k_scan_pass2<<<1, 1024>>>(Q->d_bsum, nb);
-    k_scan_pass3<<<nb, TD_SCAN_BLK>>>(Q->d_off, n, Q->d_bsum);
-    k_rel_gather<<<blocks, threads>>>(n, Q->d_flag, Q->d_off, Q->rcap,
+    k_rel_flags<<<blocks, threads, 0, g_cof_stream>>>(n, Q->d_st0, Q->d_st1, Q->d_flag);
+    k_scan_pass1<<<nb, TD_SCAN_BLK, 0, g_cof_stream>>>(Q->d_flag, n, Q->d_off, Q->d_bsum);
+    k_scan_pass2<<<1, 1024, 0, g_cof_stream>>>(Q->d_bsum, nb);
+    k_scan_pass3<<<nb, TD_SCAN_BLK, 0, g_cof_stream>>>(Q->d_off, n, Q->d_bsum);
+    k_rel_gather<<<blocks, threads, 0, g_cof_stream>>>(n, Q->d_flag, Q->d_off, Q->rcap,
                                       Q->d_idx, Q->d_nrel);
-    COF_FLUSH_CK(cudaDeviceSynchronize()); COF_FLUSH_CK(cudaGetLastError());
+    COF_FLUSH_CK(cof_sync()); COF_FLUSH_CK(cudaGetLastError());
     COF_FLUSH_CK(cudaEventElapsedTime(&t0, e0, e1));
     COF_FLUSH_CK(cudaEventElapsedTime(&t1, e1, e2));
     Q->ms_rat += t0; Q->ms_alg += t1;
@@ -2353,14 +2381,14 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
         if (Q->chunk_cur != was) cof_report_chunk(Q->chunk_cur, n, 0);
     }
 
-    COF_FLUSH_CK(cudaMemcpy(&nr, Q->d_nrel, 4, cudaMemcpyDeviceToHost));
+    COF_FLUSH_CK(cof_d2h(&nr, Q->d_nrel, 4));
     /* The width invariant, asserted rather than trusted: cof_classify rejects
      * a residual above mfb and resolve_and_check_cofactor_config refuses an mfb above
      * 32*L, so a record that did not fit its side's limbs means one of those
      * two is wrong. Stop -- the alternative is a relation built from a
      * truncated cofactor, which reconstructs to the wrong norm and is far
      * harder to trace back here. */
-    COF_FLUSH_CK(cudaMemcpy(&novf, Q->d_ovf, 4, cudaMemcpyDeviceToHost));
+    COF_FLUSH_CK(cof_d2h(&novf, Q->d_ovf, 4));
     if (novf) {
         fprintf(stderr, "  cofac queue: %u residual(s) exceeded the %d/%d-limb"
                 " cofactor width; mfb and the width are out of step\n",
@@ -2384,27 +2412,27 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     {   /* cumulative on the device, so this is a snapshot of the total rather
          * than a per-flush delta -- assign, do not add. */
         unsigned long long h[8];
-        if (!CUDA_CHECKED(cudaMemcpy(h, Q->d_nst, sizeof h, cudaMemcpyDeviceToHost)))
+        if (!CUDA_CHECKED(cof_d2h(h, Q->d_nst, sizeof h)))
             for (int sd = 0; sd < 2; sd++)
                 for (int k = 0; k < 4; k++) Q->nst[sd][k] = h[sd * 4 + k];
     }
     if (!nr) { Q->n = 0; rc = 0; goto done; }
 
-    k_rel_pack<<<blocks, threads>>>(nr, Q->d_idx, *Q, O->d_a, O->d_b,
+    k_rel_pack<<<blocks, threads, 0, g_cof_stream>>>(nr, Q->d_idx, *Q, O->d_a, O->d_b,
                                     O->d_f0, O->d_fn0, O->d_f1, O->d_fn1,
                                     O->d_sp0, O->d_nsp0, O->d_sp1, O->d_nsp1);
-    COF_FLUSH_CK(cudaDeviceSynchronize()); COF_FLUSH_CK(cudaGetLastError());
+    COF_FLUSH_CK(cof_sync()); COF_FLUSH_CK(cudaGetLastError());
     h0 = host_ms();
-    COF_FLUSH_CK(cudaMemcpy(O->a, O->d_a, (size_t)nr * 8, cudaMemcpyDeviceToHost));
-    COF_FLUSH_CK(cudaMemcpy(O->b, O->d_b, (size_t)nr * 8, cudaMemcpyDeviceToHost));
-    COF_FLUSH_CK(cudaMemcpy(O->f0, O->d_f0, (size_t)nr * TD_FMAX * 4, cudaMemcpyDeviceToHost));
-    COF_FLUSH_CK(cudaMemcpy(O->f1, O->d_f1, (size_t)nr * TD_FMAX * 4, cudaMemcpyDeviceToHost));
-    COF_FLUSH_CK(cudaMemcpy(O->fn0, O->d_fn0, nr, cudaMemcpyDeviceToHost));
-    COF_FLUSH_CK(cudaMemcpy(O->fn1, O->d_fn1, nr, cudaMemcpyDeviceToHost));
-    COF_FLUSH_CK(cudaMemcpy(O->sp0, O->d_sp0, (size_t)nr * CF_MAXFAC * 8, cudaMemcpyDeviceToHost));
-    COF_FLUSH_CK(cudaMemcpy(O->sp1, O->d_sp1, (size_t)nr * CF_MAXFAC * 8, cudaMemcpyDeviceToHost));
-    COF_FLUSH_CK(cudaMemcpy(O->nsp0, O->d_nsp0, nr, cudaMemcpyDeviceToHost));
-    COF_FLUSH_CK(cudaMemcpy(O->nsp1, O->d_nsp1, nr, cudaMemcpyDeviceToHost));
+    COF_FLUSH_CK(cof_d2h(O->a, O->d_a, (size_t)nr * 8));
+    COF_FLUSH_CK(cof_d2h(O->b, O->d_b, (size_t)nr * 8));
+    COF_FLUSH_CK(cof_d2h(O->f0, O->d_f0, (size_t)nr * TD_FMAX * 4));
+    COF_FLUSH_CK(cof_d2h(O->f1, O->d_f1, (size_t)nr * TD_FMAX * 4));
+    COF_FLUSH_CK(cof_d2h(O->fn0, O->d_fn0, nr));
+    COF_FLUSH_CK(cof_d2h(O->fn1, O->d_fn1, nr));
+    COF_FLUSH_CK(cof_d2h(O->sp0, O->d_sp0, (size_t)nr * CF_MAXFAC * 8));
+    COF_FLUSH_CK(cof_d2h(O->sp1, O->d_sp1, (size_t)nr * CF_MAXFAC * 8));
+    COF_FLUSH_CK(cof_d2h(O->nsp0, O->d_nsp0, nr));
+    COF_FLUSH_CK(cof_d2h(O->nsp1, O->d_nsp1, nr));
     if (fo)
         for (uint32_t k = 0; k < nr; k++) {
             int64_t a = O->a[k], b = O->b[k];

@@ -19,6 +19,8 @@
 #define CUDA_SIEVE_PIPELINE_CUH
 
 #include "td.cuh"      /* ss_magic_build, SS_KSHIFT */
+#include <thread>
+#include <utility>
 #include "ckpt.h"
 #include "runlog.h"
 #include "watchdog.h"
@@ -38,6 +40,17 @@
  * older, resume point. _exit is used because it is async-signal-safe and
  * flushing stdio from a handler is not. */
 static volatile sig_atomic_t g_pipe_stop = 0;
+
+/* The per-q sync of the q loop. Device-wide by default; under --cof-async the
+ * loop's own work is all on the legacy stream, and a device-wide sync would
+ * wait for the in-flight cofactor flush (on g_cof_stream) and undo the
+ * overlap. See cofa_start. */
+static cudaError_t pipe_qsync(void)
+{
+    return g_cof_stream ? cudaStreamSynchronize(cudaStreamLegacy)
+                        : cudaDeviceSynchronize();
+}
+
 
 /* Called from signal context on POSIX and from the console-control thread on
  * Windows, so it touches nothing but the flag. The ++ is not atomic against
@@ -162,6 +175,7 @@ typedef struct {
      * walk_next; resieve replays walk_cur, then the host swaps the pointers. */
     uint64_t *walk_cur, *walk_next;
     uint32_t *survbits;
+    uint32_t *gate;      /* --fill-gate: the OTHER side's folded survivors */
     uint16_t *slice, *slice_logp;
     uint32_t *sp, *srt, *sg;
     uint32_t *smag;             /* ss_first reciprocals; see ss_magic_build */
@@ -185,7 +199,7 @@ static void pside_free(pside_t *S)
 {
     cudaFree(S->primes); cudaFree(S->roots); cudaFree(S->plat);
     cudaFree(S->walk_cur); cudaFree(S->walk_next);
-    cudaFree(S->survbits); cudaFree(S->slice); cudaFree(S->slice_logp);
+    cudaFree(S->survbits); cudaFree(S->gate); cudaFree(S->slice); cudaFree(S->slice_logp);
     cudaFree(S->sp); cudaFree(S->srt); cudaFree(S->sg); cudaFree(S->slp);
     cudaFree(S->smag);
     cudaFree(S->d_nsurv);
@@ -312,6 +326,7 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
         SIDE_INIT_CK(cudaMalloc(&S->walk_next, (size_t)fb->n * sizeof(uint64_t)));
     }
     SIDE_INIT_CK(cudaMalloc(&S->survbits, (size_t)nbitword * 4));
+    SIDE_INIT_CK(cudaMalloc(&S->gate, (size_t)(nbitword / 8 + 1) * 4));
     SIDE_INIT_CK(cudaMemcpy(S->primes, fb->primes, (size_t)fb->n * 4,
                             cudaMemcpyHostToDevice));
     SIDE_INIT_CK(cudaMemcpy(S->roots, fb->roots, (size_t)fb->n * 4,
@@ -734,7 +749,7 @@ template <bool SLABBED>
 static int pipe_side_sieve_issue(const fb_t *fb, const bench_cfg_t *cfg,
                                  int side, uint32_t xmax, uint32_t j_base,
                                  const pbkt_t *bk, int fblocks, int fthreads,
-                                 pside_t *S)
+                                 pside_t *S, const uint32_t *gate_src = NULL)
 {
     const int log_region = cfg->log_region;
     const uint32_t nregion = xmax >> log_region;
@@ -761,10 +776,12 @@ static int pipe_side_sieve_issue(const fb_t *fb, const bench_cfg_t *cfg,
     SLAB_CK(cudaEventRecord(S->ev[1], st));
     SLAB_CK(cudaMemsetAsync(bk->cursor, 0, (size_t)nregion * 4, st));
     SLAB_CK(cudaMemsetAsync(bk->overflow, 0, 4, st));
+    if (gate_src)
+        k_gate_fold<<<fblocks, 256, 0, st>>>(gate_src, nbitword, S->gate);
     k_fill_atomic<4, SLABBED><<<fblocks, fthreads, 0, st>>>(
         S->plat, S->slice, fb->n, xmax, cfg->logI, log_region,
         bk->cursor, bk->bucket, bk->cap, bk->overflow, S->walk_cur, S->walk_next,
-        cfg->sieve_skip, j_base);
+        cfg->sieve_skip, j_base, gate_src ? S->gate : NULL);
     SLAB_CK(cudaEventRecord(S->ev[2], st));
     SLAB_CK(cudaMemsetAsync(S->d_nsurv, 0, 4, st));
     /* Provably redundant on every production geometry: k_apply's warp-ballot
@@ -1423,7 +1440,7 @@ static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
         if (pipe_td_grow_cand(C, nacc)) return -1;
         k_scatter_sel<<<blocks, threads>>>(C->d_aflag, C->d_aoff, n, C->d_sel,
                                            C->ccap, C->d_nacc);
-        CK(cudaDeviceSynchronize()); CK(cudaGetLastError());
+        CK(pipe_qsync()); CK(cudaGetLastError());
     }
     *nacc_out = nacc;
 
@@ -1532,6 +1549,87 @@ static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
 /* Memory reports are telemetry, not part of the scientific result. A failed
  * query must never discard a completed band or bypass the final cofactor queue
  * flush. Admission-control queries remain fatal at their call site. */
+/* ---- --cof-async: the cofactor queue flushed off the q loop -------------- *
+ *
+ * glas overlaps its device ECM with the next special-q's sieve; cuda-sieve's
+ * queue flush used to stall the q loop for the whole of it (57 ms/q of 315 on
+ * the 2,1147+ job, RTX 4090). Under --cof-async the queue is double-buffered:
+ * when the filling set is full it is handed, whole, to a host thread that runs
+ * the unchanged cofq_flush on g_cof_stream, and the q loop carries on into the
+ * spare set. Flushes stay strictly serialised -- the next one waits for this
+ * one -- so relation order, and so the output file, is exactly what the
+ * synchronous path writes.
+ *
+ * Only the per-batch DEVICE BUFFERS move between the two sets. The schedule
+ * tables, the status histogram d_nst and every host statistic and chunk
+ * steering field belong to the canonical queue Q: the flush works on a copy
+ * (F) and cofa_wait copies them back, which is safe because nothing else
+ * writes them while a flush is in flight. */
+static void cofq_swap_buffers(cofq_t *a, cofq_t *b)
+{
+#define CQ_SW(f) std::swap(a->f, b->f)
+    CQ_SW(n);
+    CQ_SW(d_c0); CQ_SW(d_c1); CQ_SW(d_st0); CQ_SW(d_st1);
+    CQ_SW(d_sm0); CQ_SW(d_sm1); CQ_SW(d_a); CQ_SW(d_b);
+    CQ_SW(d_f0); CQ_SW(d_f1); CQ_SW(d_fn0); CQ_SW(d_fn1);
+    CQ_SW(d_sp0); CQ_SW(d_sp1); CQ_SW(d_nsp0); CQ_SW(d_nsp1);
+    CQ_SW(d_flag); CQ_SW(d_off); CQ_SW(d_bsum); CQ_SW(d_idx); CQ_SW(d_nrel);
+    CQ_SW(d_sel); CQ_SW(d_nsel); CQ_SW(d_ovf);
+#undef CQ_SW
+}
+
+typedef struct {
+    cofq_t      spare;      /* the second buffer set; only its buffers are used */
+    cofq_out_t  spare_out;  /* allocated by cofq_init alongside it, unused      */
+    cofq_t      F;          /* the queue as handed to the in-flight flush       */
+    std::thread *th;
+    int         busy, rc;
+    double      ms_wait;    /* host time the q loop spent waiting on a flush    */
+    /* The resume point as it stood when the in-flight flush started: the file
+     * holds exactly that flush's relations once it is joined, so that is the
+     * checkpoint to write then -- not the q the loop has since reached. */
+    int         ck_pending;
+    qsel_t      ck_next;
+    unsigned long long ck_nq;
+} cofasync_t;
+
+static int cofa_wait(cofasync_t *A, cofq_t *Q)
+{
+    if (!A->busy) return 0;
+    const double t0 = host_ms();
+    A->th->join();
+    delete A->th;
+    A->th = NULL;
+    A->busy = 0;
+    A->ms_wait += host_ms() - t0;
+    Q->ms_rat = A->F.ms_rat; Q->ms_alg = A->F.ms_alg; Q->ms_host = A->F.ms_host;
+    Q->nseen = A->F.nseen; Q->nrel = A->F.nrel;
+    memcpy(Q->nst, A->F.nst, sizeof Q->nst);
+    Q->chunk_cur = A->F.chunk_cur; Q->chunk_ceiling = A->F.chunk_ceiling;
+    Q->eff_prev_valve = A->F.eff_prev_valve;
+    Q->ms_prev_valve = A->F.ms_prev_valve;
+    Q->valve_parked = A->F.valve_parked;
+    A->spare.n = 0;
+    return A->rc;
+}
+
+static void cofa_start(cofasync_t *A, cofq_t *Q, cofq_out_t *O,
+                       const bench_cfg_t *cfg, int blocks, FILE *fr)
+{
+    A->F = *Q;                        /* full buffers, stats, steering   */
+    cofq_swap_buffers(Q, &A->spare);  /* Q now fills the spare set, n=0  */
+    A->busy = 1;
+    A->rc = 0;
+    /* Full width. Launching the flush at blocks/2 or blocks/4 so the sieve
+     * kept SMs to itself was measured at 278.2 and 277.0 ms/q against 276.5
+     * (RTX 4090, 2,1147+, 420 q): no effect, so there is no knob. */
+    A->th = new std::thread([A, O, cfg, blocks, fr]() {
+        A->rc = cofq_flush(&A->F, O, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
+                           cfg->cof_rounds, cfg->cof_budget, cfg->cof_chunk,
+                           blocks, cfg->threads, fr);
+    });
+}
+
 static int pipe_mem_info_optional(const char *where,
                                   size_t *free_bytes, size_t *total_bytes)
 {
@@ -1638,6 +1736,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     pipe_td_t C;
     pipe_tm_t tm;
     cofq_t Q; cofq_out_t QO;
+    cofasync_t A;
     uint8_t *d_bucket = NULL;
     double vram_prev = 0;
     size_t need = 0;
@@ -1767,6 +1866,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     memset(&S1, 0, sizeof S1); memset(&S0, 0, sizeof S0);
     memset(&C, 0, sizeof C); memset(&tm, 0, sizeof tm);
     memset(&Q, 0, sizeof Q); memset(&QO, 0, sizeof QO);
+    memset(&A, 0, sizeof A);
 #define PIPE_CK(x) do { if (CUDA_CHECKED(x)) { rc = -1; goto done; } } while (0)
 /* Headroom left for the per-q buffers that grow on demand after all
  * one-time setup -- measured at 0.12 GB at 15e (finding 94). ONE constant:
@@ -1902,6 +2002,25 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                                    cfg->cof_limbs0, cfg->cof_limbs))
         { rc = -1; goto done; }
     if (cfg->cofactor) VRAM_MARK("cofactor queue");
+    if (cfg->cofactor && cfg->cof_async) {
+        int plo = 0, phi = 0, irc;
+        g_cofq_quiet = 1;
+        irc = cofq_init(&A.spare, &A.spare_out, CQ_FLUSH,
+                        cfg->cof_meth0, cfg->cof_meth1,
+                        cfg->ecm_b1, cfg->ecm_b2, cfg->ecm_curves,
+                        cfg->cof_limbs0, cfg->cof_limbs);
+        g_cofq_quiet = 0;
+        if (irc) { rc = -1; goto done; }
+        /* Lowest priority, so the q loop's own kernels win any SM a flush
+         * frees -- what glas does with its ECM stream. The legacy stream the
+         * loop runs on is itself at the default (lowest) priority today, so
+         * on current parts this ties rather than yields. */
+        PIPE_CK(cudaDeviceGetStreamPriorityRange(&plo, &phi));
+        PIPE_CK(cudaStreamCreateWithPriority(&g_cof_stream,
+                                             cudaStreamNonBlocking, plo));
+        VRAM_MARK("cofactor queue, second buffer set");
+        printf("  cofactor queue: async, double-buffered (--no-cof-async: inline)\n");
+    }
     /* --fill-concurrent's admission check, deliberately LAST.
      *
      * It ran beside the first bucket array at first, and that was wrong: the
@@ -2270,6 +2389,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                           : "Mostly bucket overflow: check this job's bucket"
                             " array size first (the counts above separate the"
                             " two).");
+            if (cofa_wait(&A, &Q)) { rc = -1; break; }
             if (cfg->cofactor && Q.n &&
                 cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
                            cfg->cof_rounds, cfg->cof_budget, cfg->cof_chunk, blocks,
@@ -2311,6 +2431,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             printf("\n  stopping cleanly at q=%llu; draining the cofactor"
                    " queue\n", (unsigned long long)cur->q);
             wd_phase("stop.cofq_flush");
+            if (cofa_wait(&A, &Q)) { rc = -1; break; }
             if (cfg->cofactor && Q.n &&
                 cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
                            cfg->cof_rounds, cfg->cof_budget, cfg->cof_chunk, blocks,
@@ -2386,6 +2507,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                                     " no supported BN_LIMBS is wide enough for"
                                     " every skipped (q,rho). Run ./normscan"
                                     " over the band.", nqskip);
+                    if (cofa_wait(&A, &Q)) { rc = -1; break; }
                     if (cfg->cofactor && Q.n &&
                         cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim,
                                    cfg->lpb, cfg->cof_rounds, cfg->cof_budget, cfg->cof_chunk,
@@ -2514,9 +2636,11 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 if (!sv1)
                     sv1 = pipe_side_sieve_join(1, &bk1, &S1, &sf1, &sa1, concurrent);
                 if (!sv1) {
+                    /* Serial only: side 1's bitmap is complete here. */
                     sv0 = pipe_side_sieve_issue<SLABBED>(fb0, cfg, 0, xmax,
                                                j_base, &bk0, fblocks, fthreads,
-                                               &S0);
+                                               &S0,
+                                               cfg->fill_gate ? S1.survbits : NULL);
                     if (!sv0)
                         sv0 = pipe_side_sieve_join(0, &bk0, &S0, &sf0, &sa0, concurrent);
                 }
@@ -2679,7 +2803,20 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
              * truncates to the previous whole-q checkpoint, so a crash still
              * replays the q atomically. */
             if (cfg->cofactor && nacc_s) {
-                if (Q.n + nacc_s > Q.cap) {
+                if (Q.n + nacc_s > Q.cap && cfg->cof_async) {
+                    wd_phase("slab.cofq_flush_async");
+                    if (cofa_wait(&A, &Q)) { rc = -1; break; }
+                    if (A.ck_pending)
+                        pipe_try_checkpoint(POLY, cfg, &ck, fr, fc, &A.ck_next,
+                                            base_rel + Q.nrel, A.ck_nq,
+                                            &ckpt_written, &ckpt_warned);
+                    A.ck_pending = fr && slab == 0;
+                    if (A.ck_pending) {
+                        A.ck_next = *cur;
+                        A.ck_nq = base_nq + nqdone;
+                    }
+                    cofa_start(&A, &Q, &QO, cfg, blocks, fr);
+                } else if (Q.n + nacc_s > Q.cap) {
                     wd_phase("slab.cofq_flush");
                     if (cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0,
                                    cfg->lim, cfg->lpb, cfg->cof_rounds,
@@ -2708,7 +2845,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                                 nacc_s, Q.n, cfg->lpb0, cfg->lpb, &Q)) {
                     rc = -1; break;
                 }
-                if (CUDA_CHECKED(cudaDeviceSynchronize()) ||
+                if (CUDA_CHECKED(pipe_qsync()) ||
                     CUDA_CHECKED(cudaGetLastError())) { rc = -1; break; }
                 Q.n += nacc_s;
             }
@@ -3203,13 +3340,19 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
      * in acc_wall. On a band shorter than one flush that is the ENTIRE
      * cofactorisation, which is why it is carried separately and added back
      * rather than folded into the per-q average. */
+    {
+        /* Joined whatever rc is: the thread writes fr, which done: closes. */
+        const double cfw = host_ms();
+        if (cofa_wait(&A, &Q) && rc == 0) rc = -1;
+        cofac_tail += host_ms() - cfw;
+    }
     if (rc == 0 && cfg->cofactor && Q.n) {
         const double cf0 = host_ms();
         wd_phase("band.final_cofq_flush");
         if (cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
                        cfg->cof_rounds, cfg->cof_budget, cfg->cof_chunk, blocks, cfg->threads, fr))
             rc = -1;
-        cofac_tail = host_ms() - cf0;
+        cofac_tail += host_ms() - cf0;
     }
     if (rc == 0 && !stopped && cfg->target_rels && !target_reached) {
         const unsigned long long have = base_rel + (cfg->cofactor
@@ -3718,12 +3861,17 @@ done:
      * finalized exactly once above; an early jump closes and discards here --
      * but still honours a written checkpoint, since a .part that a sidecar
      * describes is resumable work whatever killed this session. */
+    /* An error path can leave a flush in flight; it writes fr, so join it
+     * before the outputs are closed below. */
+    if (cofa_wait(&A, &Q)) rc = -1;
     if (!outputs_finalized) {
         if (pipe_finalize_outputs(&fr, &fc, cfg, rtmp, ctmp, 0, ckpt_written))
             rc = -1;
     }
     pipe_td_free(&C);
     cofq_free(&Q, &QO);
+    if (A.spare.cap) cofq_free(&A.spare, &A.spare_out);
+    if (g_cof_stream) { cudaStreamDestroy(g_cof_stream); g_cof_stream = 0; }
     pside_free(&S1); pside_free(&S0);
     cudaFree(d_bucket); cudaFree(d_cursor); cudaFree(d_overflow);
     cudaFree(d_bucket_c); cudaFree(d_cursor_c); cudaFree(d_overflow_c);
@@ -3794,6 +3942,48 @@ done:
     return rc;
 }
 
+/* ---- the slab target from free VRAM ------------------------------------ *
+ *
+ * SLAB_PERF_REGIONS (2^29 positions at --region 14) was tuned on factor bases
+ * of a few million entries. Every slab re-walks every bucketed entry's lattice
+ * state, so with a large factor base that per-slab cost dominates: on the
+ * 2,1147+ SNFS job (31M entries a side, I16, RTX 4090) going from four 2^29
+ * slabs to one 2^31 slab cut fill 120.8 -> 79.9 ms/q and resieve 47.5 ->
+ * 33.3 ms/q, byte-identical relations, for 5.5 -> 9.4 GB of device memory.
+ *
+ * Small cards cannot pay that, so the target is chosen at run time: the
+ * largest of 4x, 2x the default whose modelled footprint fits the free memory
+ * with headroom, else the default exactly as before. The model mirrors the
+ * allocations pipe_side_init and run_pipeline_impl make, and errs high; the
+ * per-allocation admission checks there still stand behind it. */
+static double pipe_inv_sum(const fb_t *fb)
+{
+    double acc = 0;
+    for (uint32_t i = 0; i < fb->n; i++) acc += 1.0 / fb->primes[i];
+    return acc;
+}
+
+static size_t pipe_vram_model(const fb_t *fb1, const fb_t *fb0,
+                              const bench_cfg_t *cfg, uint32_t jmax,
+                              double inv1, double inv0)
+{
+    const uint64_t X = ((uint64_t)1 << cfg->logI) * jmax;
+    const uint64_t nregion = X >> cfg->log_region;
+    const double inv = inv1 > inv0 ? inv1 : inv0;
+    const uint64_t est = (uint64_t)((double)X * inv * 1.15) + 4096; /* pipe_est_records */
+    const uint64_t cap = est / nregion + 256;
+    const size_t narr = cfg->fill_concurrent ? 2 : 1;
+    size_t b = 0;
+    b += narr * (size_t)nregion * cap * 4;              /* bucket array(s)   */
+    b += narr * (size_t)nregion * 4;                    /* cursors           */
+    b += 3 * (size_t)(X / 8);                           /* S1, S0, d_two     */
+    b += 2 * (size_t)(X / 64);                          /* --fill-gate folds */
+    b += (size_t)(fb1->n + fb0->n) *
+         (4 + 4 + sizeof(plat_t) + 8 + 8 + 2);          /* per-entry state   */
+    b += (size_t)768 << 20;   /* TD buffers, cofactor queue(s), small tables */
+    return b;
+}
+
 extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                             const fb_t *fb0, const fb_t *fbs0,
                             const qsel_t *qlist, uint32_t nq, sqgen_t *qgen,
@@ -3812,6 +4002,41 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                 cfg->logI, cfg->J, pmax, cfg->slab_j);
         return -1;
     }
+    uint32_t perf_regions = SLAB_PERF_REGIONS;
+    if (!cfg->slab_j && !cfg->slab_fixed) {
+        size_t freeB = 0, totalB = 0;
+        if (cudaMemGetInfo(&freeB, &totalB) == cudaSuccess) {
+            const size_t gib = (size_t)1 << 30;
+            const size_t headroom = totalB / 10 > gib ? totalB / 10 : gib;
+            const double inv1 = pipe_inv_sum(fb1), inv0 = pipe_inv_sum(fb0);
+            const size_t m0 = pipe_vram_model(fb1, fb0, cfg, plan.jmax,
+                                              inv1, inv0);
+            for (int k = 2; k >= 1; k--) {
+                slab_plan_t P2;
+                const uint32_t r = (uint32_t)SLAB_PERF_REGIONS << k;
+                if (slab_make_plan_r(cfg->logI, cfg->log_region, cfg->J, pmax,
+                                     0u, r, &P2))
+                    continue;
+                if (P2.jmax <= plan.jmax) continue;   /* a safety cap binds */
+                const size_t m = pipe_vram_model(fb1, fb0, cfg, P2.jmax,
+                                                 inv1, inv0);
+                if (m + headroom <= freeB) {
+                    printf("  slab size from VRAM: %.2f GB free, modelled"
+                           " %.2f GB at %u rows/slab (%.2f GB at the default"
+                           " %u); using %u bucket regions/slab\n",
+                           freeB / 1073741824.0, m / 1073741824.0, P2.jmax,
+                           m0 / 1073741824.0, plan.jmax, r);
+                    plan = P2;
+                    perf_regions = r;
+                    break;
+                }
+            }
+            if (perf_regions == SLAB_PERF_REGIONS)
+                printf("  slab size from VRAM: %.2f GB free, modelled %.2f GB"
+                       " at the default %u rows/slab; keeping it\n",
+                       freeB / 1073741824.0, m0 / 1073741824.0, plan.jmax);
+        }
+    }
     /* The A/B record path leaves no other trace: the stage label is the same on
      * both branches and the checkpoint job text does not carry the flag, so a
      * sweep log that mixes the two kernels would have no tell. Finding 78's
@@ -3822,14 +4047,14 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                " --td-record-scalar) -- the pre-finding-77 path, for A/B only\n");
 
     if (plan.enabled) {
-        const uint32_t perf_jmax = slab_perf_jmax(cfg->logI, cfg->log_region,
-                                                  cfg->J);
+        const uint32_t perf_jmax = slab_perf_jmax_r(cfg->logI, cfg->log_region,
+                                                    cfg->J, perf_regions);
         if (!cfg->slab_j && perf_jmax != 0xffffffffu)
             printf("  j-slabbing: %u slab%s, up to %u rows/slab"
                    " (auto target %u bucket regions at --region %d;"
                    " safety bounds may reduce it further)\n",
                    plan.nslab, plan.nslab == 1 ? "" : "s", plan.jmax,
-                   (unsigned)SLAB_PERF_REGIONS, cfg->log_region);
+                   (unsigned)perf_regions, cfg->log_region);
         else
             printf("  j-slabbing: %u slab%s, up to %u rows/slab"
                    " (<=2^31 local-position safety bound)\n",

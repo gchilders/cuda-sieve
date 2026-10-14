@@ -118,7 +118,8 @@ static inline int slab_region_ok(int log_region)
  * exceeds the target -- SLAB_PERF_REGIONS << log_region positions, so 2^29 at
  * the default --region 14 but 2^27 at region 12 -- one row is the smallest
  * representable slab and the correctness caps still apply. */
-static inline uint32_t slab_perf_jmax(int logI, int log_region, uint32_t J)
+static inline uint32_t slab_perf_jmax_r(int logI, int log_region, uint32_t J,
+                                        uint32_t perf_regions)
 {
     uint64_t I, area, rows;
     if (logI < 0 || logI > 30 || !J) return 0;
@@ -131,12 +132,18 @@ static inline uint32_t slab_perf_jmax(int logI, int log_region, uint32_t J)
      * "correcting" it to `area < target`. An area of 1.9 targets stays
      * unsplit on purpose. */
     {
-        const uint64_t target = ((uint64_t)SLAB_PERF_REGIONS) << log_region;
+        const uint64_t target = ((uint64_t)perf_regions) << log_region;
         if (area < target * 2u) return 0xffffffffu;   /* the hysteresis */
         rows = target / I;
     }
     if (!rows) rows = 1u;
     return rows > 0xffffffffull ? 0xffffffffu : (uint32_t)rows;
+}
+
+/* The fixed-target form every existing caller and slabtest.cpp use. */
+static inline uint32_t slab_perf_jmax(int logI, int log_region, uint32_t J)
+{
+    return slab_perf_jmax_r(logI, log_region, J, SLAB_PERF_REGIONS);
 }
 
 /* The direct small-prime predicate uses
@@ -163,9 +170,10 @@ static inline uint32_t slab_td_jmax(int logI, uint32_t max_prime)
 /* Build the host-side schedule. forced_j == 0 means auto. A nonzero value is
  * deliberately strict: it is a regression/testing knob, not permission to
  * violate either the position or direct-TD arithmetic bound. */
-static inline int slab_make_plan(int logI, int log_region, uint32_t J,
-                                 uint32_t max_small_prime,
-                                 uint32_t forced_j, slab_plan_t *P)
+static inline int slab_make_plan_r(int logI, int log_region, uint32_t J,
+                                   uint32_t max_small_prime,
+                                   uint32_t forced_j, uint32_t perf_regions,
+                                   slab_plan_t *P)
 {
     uint32_t amax, tmax, perf_jmax, jmax, quantum;
     uint64_t n;
@@ -186,7 +194,7 @@ static inline int slab_make_plan(int logI, int log_region, uint32_t J,
         if (requested > jmax || !slab_rows_shape_ok(logI, requested)) return -1;
         jmax = requested;
     } else {
-        perf_jmax = slab_perf_jmax(logI, log_region, J);
+        perf_jmax = slab_perf_jmax_r(logI, log_region, J, perf_regions);
         if (!perf_jmax) return -1;
         if (perf_jmax < jmax) jmax = perf_jmax;
         jmax -= jmax % quantum;
@@ -199,6 +207,15 @@ static inline int slab_make_plan(int logI, int log_region, uint32_t J,
     P->nslab = (uint32_t)n;
     P->enabled = (P->nslab > 1u);
     return 0;
+}
+
+/* The fixed-target form: SLAB_PERF_REGIONS, the policy slabtest.cpp pins. */
+static inline int slab_make_plan(int logI, int log_region, uint32_t J,
+                                 uint32_t max_small_prime,
+                                 uint32_t forced_j, slab_plan_t *P)
+{
+    return slab_make_plan_r(logI, log_region, J, max_small_prime, forced_j,
+                            SLAB_PERF_REGIONS, P);
 }
 
 SLAB_HD uint32_t slab_rows_at(const slab_plan_t *P, uint32_t J, uint32_t slab)

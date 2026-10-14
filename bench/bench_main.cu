@@ -286,6 +286,15 @@ static void usage(void)
 "  --fill-concurrent  --pipeline only; sieve the two sides of a slab on two\n"
 "                   streams instead of back to back. Costs a second bucket\n"
 "                   array and is refused if it does not fit [off]\n"
+"  --no-cof-async   --pipeline --cofactor; flush the cofactor queue inline,\n"
+"                   stalling the q loop, instead of on its own stream from a\n"
+"                   host thread (double-buffered, overlapping the next q's\n"
+"                   sieve). Relations are identical either way [async]\n"
+"  --no-fill-gate   --pipeline; side 0's fill writes records for every cell,\n"
+"                   instead of skipping cells whose 8-cell group side 1 already\n"
+"                   rejected (serial sides only). Relations identical [gated]\n"
+"  --slab-fixed     pipeline: keep the fixed 2^29-position slab target instead\n"
+"                   of the largest (up to 4x) that free VRAM admits [auto]\n"
 "  --fill-threads N fill only; 0 = auto (32), else a multiple of 32 in\n"
 "                   [32,1024]. Independent of --threads: fill wants many\n"
 "                   narrow blocks, the other kernels do not.            [0]\n"
@@ -982,6 +991,9 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
      * prevent. Non-deterministic across builds, so it passes locally and fires
      * on a rented card. */
     cfg.fill_concurrent = 0;
+    cfg.cof_async = 1;
+    cfg.fill_gate = 1;
+    cfg.slab_fixed = 0;
     cfg.qspan = 0;
     cfg.threads = 256; cfg.blocks = 0; cfg.fill_blocks = 0; cfg.fill_threads = 0;
 
@@ -1123,6 +1135,11 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         }
         else if (!strcmp(argv[i], "--qspan")) { cfg.qspan = 1; }
         else if (!strcmp(argv[i], "--fill-concurrent")) { cfg.fill_concurrent = 1; }
+        else if (!strcmp(argv[i], "--cof-async")) { cfg.cof_async = 1; }
+        else if (!strcmp(argv[i], "--no-cof-async")) { cfg.cof_async = 0; }
+        else if (!strcmp(argv[i], "--fill-gate")) { cfg.fill_gate = 1; }
+        else if (!strcmp(argv[i], "--no-fill-gate")) { cfg.fill_gate = 0; }
+        else if (!strcmp(argv[i], "--slab-fixed")) { cfg.slab_fixed = 1; }
         else if (!strcmp(argv[i], "--fill-streams") && i + 1 < argc) {
             if (parse_int_range_arg("--fill-streams", argv[++i], 0,
                                     FILL_STREAMS_MAX, &cfg.fill_streams)) return 1;
@@ -2084,7 +2101,9 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
              * still freeze forever. --watchdog itself is NOT here; its
              * reporting works in any mode. */
             "--watchdog-kill",
-            "--slab-j", "--qspan", "--fill-concurrent", NULL
+            "--slab-j", "--qspan", "--fill-concurrent", "--cof-async",
+            "--no-cof-async", "--fill-gate", "--no-fill-gate", "--slab-fixed",
+            NULL
         };
         int nbad = 0;
         for (int i = 1; i < argc; i++)
