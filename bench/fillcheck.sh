@@ -2,23 +2,23 @@
 # fillcheck.sh -- identity gate for --fill-rows, --resieve-rows, --fill-gate
 # and --q-pipeline.
 #
-# Both options change WHO writes a bucket record, never which records the
-# sieve needs: --fill-rows moves the smallest bucketed moduli to a row-banded
-# kernel (same lattice points, another order inside each bucket), and
-# --fill-gate drops side-0 records only at positions side 1 already rejected,
-# which k_intersect_compact discards anyway; --resieve-rows finds the same
-# (survivor, prime) pairs in another order; --q-pipeline only moves the next
-# q's sieve under this q's trial division. So every arm must reproduce the
-# old configuration's relation file (all four off) byte for byte. The
-# explicit arms run with the pipeline at its default (on, where the plan and
-# VRAM allow), `single` turns it off, and `concurrent` excludes it.
+# None of the four changes which records the sieve needs. --fill-rows moves
+# the smallest bucketed moduli to a row-banded kernel (same lattice points,
+# another order inside each bucket); --fill-gate drops side-0 records only at
+# positions side 1 already rejected, which k_intersect_compact discards
+# anyway; --resieve-rows finds the same (survivor, prime) pairs in another
+# order; --q-pipeline only moves the next slab's or q's sieve under this one's
+# trial division. So every arm must reproduce the old configuration's
+# relation file (all four off) byte for byte. The explicit arms run with the
+# pipeline at its default (on, where VRAM allows), `single` turns it off, and
+# `concurrent` excludes it.
 #
 # The jobs cover the shapes the kernels branch on: C143 at I13 (the row tier
 # starts at q = I, one region per row) and I14 (two regions per row), c183 I15
-# in one slab (the pipeline on a large factor base) and slabbed (the row
-# tier's next-slab handoff, which resieve replays; single-queued), and c194
-# I16/J32768 (slabbed by default, so single-queued). One exception
-# is legitimate and reported rather than failed: an arm that changes how many
+# in one slab (the pipeline on a large factor base) and in five slabs (the row
+# tier's next-slab handoff, which resieve replays, with each slab issued under
+# the previous slab's TD), and c194 I16/J32768 (four slabs by default). One
+# exception is legitimate and reported rather than failed: an arm that changes how many
 # records are written (the gate, or another --sieve-skip level) can overflow a
 # bucket array where the base did not, or fit where it did, and a skipped slab
 # changes the relations. Only those arms get the exemption, and only when a
@@ -45,14 +45,14 @@ c194-i16|--poly ../oracle/c194.job --fb1 ../oracle/c194.roots1.m16 --logI 16 --J
 
 # The fill arms state all three fill options, so the fill defaults cannot
 # change what they test. They leave --q-pipeline at its default ON on
-# purpose, and every arm's output is checked for what it actually got: two q
-# in flight on the one-slab jobs (QPIPE_JOBS), single-queued on the multi-slab
-# ones and in the `single` and `concurrent` arms. A run that silently fell
-# back -- VRAM, a plan that grew slabs, a changed default -- fails here rather
-# than passing without testing the pipelined path. On a card too small for the
-# pipeline on these jobs this gate fails by design; that card cannot certify
-# it. `default` is the configuration of record (findings 107-108).
-QPIPE_JOBS='c143-i13 c143-i14 c183-i15'
+# purpose, and every arm's output is checked for what it actually got: the
+# pipeline granted everywhere except the `single` and `concurrent` arms, and
+# then really used -- at least one q issued ahead, and on a slabbed plan at
+# least one slab (the band summary's `issued ahead` line). A run that silently
+# fell back (VRAM, a changed default) or stopped overlapping slabs fails here
+# rather than passing without testing the pipelined path. On a card too small
+# for the pipeline on these jobs this gate fails by design; that card cannot
+# certify it. `default` is the configuration of record (findings 107-109).
 OFF='--fill-rows 0 --no-fill-gate --no-q-pipeline'
 ARMS='rows4|--fill-rows 4 --no-resieve-rows --no-fill-gate
 rows16|--fill-rows 16 --no-resieve-rows --no-fill-gate
@@ -88,13 +88,28 @@ echo "$JOBS" | while IFS='|' read -r job jargs; do
             *" --fill-gate "*|*" --sieve-skip "*) counts=1 ;;
             *) [ "$arm" = default ] && counts=1 || counts=0 ;;
         esac
-        case " $QPIPE_JOBS " in *" $job "*) want=1 ;; *) want=0 ;; esac
+        want=1
         case "$arm" in single|concurrent) want=0 ;; esac
-        if grep -q "two special-q in flight" "$TMP/$job.$arm.out"; then got=1; else got=0; fi
+        if grep -q -- "--q-pipeline: " "$TMP/$job.$arm.out" &&
+           ! grep -q "staying single-queued" "$TMP/$job.$arm.out"; then got=1; else got=0; fi
         if [ $got -ne $want ]; then
             echo "  FAIL $arm: q-pipeline $([ $got -eq 1 ] && echo granted || echo not granted), expected $([ $want -eq 1 ] && echo granted || echo single-queued)"
             grep -h "q-pipeline:" "$TMP/$job.$arm.out"
             exit 1
+        fi
+        if [ $want -eq 1 ]; then
+            ah=$(grep -h "issued ahead (--q-pipeline)" "$TMP/$job.$arm.out")
+            nsl=$(echo "$ah" | grep -oE '[0-9]+ slab' | grep -oE '[0-9]+')
+            nqa=$(echo "$ah" | grep -oE '[0-9]+ q$' | grep -oE '[0-9]+')
+            if [ "${nqa:-0}" -eq 0 ]; then
+                echo "  FAIL $arm: the pipeline was granted but no q was issued ahead ($ah)"
+                exit 1
+            fi
+            if grep -q "j-slabbing: [0-9]* slabs" "$TMP/$job.$arm.out" &&
+               [ "${nsl:-0}" -eq 0 ]; then
+                echo "  FAIL $arm: slabbed plan, but no slab was issued ahead ($ah)"
+                exit 1
+            fi
         fi
         if cmp -s "$TMP/$job.base.rel" "$TMP/$job.$arm.rel"; then
             echo "  ok   $arm"

@@ -227,9 +227,13 @@ as well.** The next q is sieved on its own stream while this one is
 trial-divided: C143 first band 68.0 -> 59.2 s at I13 and 68.9 -> 61.9 s at
 I14, c183 -8.1% (`bench/RESULTS.md` finding 108). It costs a second copy of
 the transform output, not a second bucket array: 0.05 GB at C143, 0.26 GB
-at c183. It **stays single-queued, and says so on the banner and in the run
-log's `# q-pipeline` line**, when that extra does not fit in free VRAM after
-setup, or when the plan has several slabs (C194 and larger). `--no-q-pipeline`
+at c183. On a slabbed plan (C194 and larger) each slab's sieve also runs
+under the previous slab's trial division (finding 109); that adds a third
+walk-cursor buffer, 0.66 GB in all at C194 and 0.81 GB for an lpba-34 I16
+job, and gains only 2.6% at C194 and 4.2% on that job, because those jobs
+already keep the card 92-94% busy. It **stays single-queued, and says so on the banner and in the run
+log's `# q-pipeline` line**, when its extra does not fit in free VRAM after
+setup. `--no-q-pipeline`
 turns it off; `--fill-concurrent` and `--qspan` exclude it. The per-stage
 times in the band report then include sharing the card with the other q; only
 wall clock per q is additive, and `unaccounted` and GPU-accounted / wall
@@ -757,9 +761,9 @@ gate**, which needs side 1 finished before side 0's fill (finding 107); an
 explicit `--fill-gate` with it is refused, and it excludes the two-q
 pipeline. Measured on the 5070 at C143 (finding 108): the flag was 1-2%
 faster than the gate alone (9.08 against 9.26 ms/q at I13), but the default,
-with two q in flight, is 7.46. Leave it off on this card. It may still be
-worth timing for multi-slab jobs, where the pipeline is single-queued
-(`bench/STATUS.md`, NOW/NEXT table rows 16-17). Size it as `2 x bucket + the
+with two q in flight, is 7.46. Leave it off on this card at that size.
+Slabbed jobs (C194 and larger), which are pipelined too now (finding 109),
+and wider cards are not measured (`bench/STATUS.md`, NOW/NEXT row 16). Size it as `2 x bucket + the
 rest`, and note that the bullet above — "the bucket array is sized by the larger
 side, so raising the smaller side's lim is nearly free" — **stops holding under
 the flag**: both sides carry a full-size array. The run refuses at startup with

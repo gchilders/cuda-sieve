@@ -296,10 +296,10 @@ static void usage(void)
 "                   records only under side 1's survivors\n"
 "                   [on, off under --fill-concurrent, which refuses it]\n"
 "  --fill-gate-shift N  positions per gate bit = 2^N, 0..5        [3]\n"
-"  --q-pipeline / --no-q-pipeline  --pipeline only; sieve the next special-q\n"
-"                   while this one is trial-divided. Falls back to one q at a\n"
-"                   time when its extra VRAM does not fit or the plan has\n"
-"                   several slabs  [on, off under --fill-concurrent/--qspan]\n"
+"  --q-pipeline / --no-q-pipeline  --pipeline only; sieve the next slab or\n"
+"                   special-q while this one is trial-divided. Falls back to\n"
+"                   one at a time when its extra VRAM does not fit\n"
+"                   [on, off under --fill-concurrent/--qspan]\n"
 "  --fill-threads N fill only; 0 = auto (32), else a multiple of 32 in\n"
 "                   [32,1024]. Independent of --threads: fill wants many\n"
 "                   narrow blocks, the other kernels do not.            [0]\n"
@@ -1544,10 +1544,10 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
                             cfg.logI <= RESIEVE_ROWS_LOGI_MAX) ? 1 : 0;
     if (cfg.fill_gate < 0)
         cfg.fill_gate = (cfg.pipeline && !cfg.fill_concurrent) ? 1 : 0;
-    /* --q-pipeline (finding 108): on wherever it can run. Its own VRAM and
-     * slab-plan checks happen in run_pipeline_impl and fall back to one q at
-     * a time; --fill-concurrent and --qspan exclude it, so there the default
-     * is off and an explicit --q-pipeline is refused below. */
+    /* --q-pipeline (findings 108-109): on wherever it can run. Its VRAM check
+     * happens in run_pipeline_impl and falls back to one q at a time;
+     * --fill-concurrent and --qspan exclude it, so there the default is off
+     * and an explicit --q-pipeline is refused below. */
     if (cfg.q_pipeline < 0)
         cfg.q_pipeline = (cfg.pipeline && !cfg.fill_concurrent && !cfg.qspan)
                          ? 1 : 0;
@@ -1570,9 +1570,9 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         return 1;
     }
     if (cfg.pipeline && cfg.q_pipeline && (cfg.fill_concurrent || cfg.qspan)) {
-        fprintf(stderr, "--q-pipeline overlaps whole special-q; it is not"
-                " combined with %s\n", cfg.fill_concurrent ? "--fill-concurrent"
-                                                          : "--qspan");
+        fprintf(stderr, "--q-pipeline overlaps slabs and special-q on its own"
+                " stream; it is not combined with %s\n",
+                cfg.fill_concurrent ? "--fill-concurrent" : "--qspan");
         return 1;
     }
     if (cfg.pipeline && cfg.fill_gate && cfg.fill_concurrent) {
@@ -3201,7 +3201,7 @@ resume_artifacts_ready:
             /* Always: these are defaults now, and a log must show which ones
              * a run actually had. */
             /* The q-pipeline's state is NOT here: what a run gets depends on
-             * VRAM and the slab plan, so run_pipeline_impl writes its own
+             * free VRAM after setup, so run_pipeline_impl writes its own
              * `q-pipeline` line with what was granted. */
             runlog_note("fill", "rows<%d*I bands=%d resieve-rows=%d"
                         " gate=%d shift=%d", cfg.fill_rows,

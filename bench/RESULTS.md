@@ -11269,7 +11269,8 @@ rounds, host load ~11 from other work, 9.87 -> 8.09 ms/q, **−18.0%**
 
 1. **Overlap across slabs** for multi-slab jobs (C194 and larger), where this
    is single-queued. It needs a third rotating set of walk cursors
-   (8 bytes per entry) and the same stream discipline.
+   (8 bytes per entry) and the same stream discipline. *(Built in finding
+   109: −2.6% at C194, −4.2% on an lpba-34 I16 NFS@Home job.)*
 2. **Host prep before TD.** The next q's host preparation (source step,
    small-sieve tables and sort, norm setup) runs before this q's TD is
    launched, so the legacy stream idles for it (~0.3 ms/q host per-q at
@@ -11279,3 +11280,151 @@ rounds, host load ~11 from other work, 9.87 -> 8.09 ms/q, **−18.0%**
    that remain on the critical path.
 4. Kernel by kernel, CADO is still ahead on apply/region and post-sieve TD
    (finding 107).
+
+<a id="finding-109"></a>
+## Finding 109 — the pipeline extended to slabbed plans: each slab's sieve runs under the previous slab's trial division. Relations byte-identical, but only −2.6% (C194) and −4.2% (an lpba-34 I16 NFS@Home job), because those jobs already keep the card ~94% busy
+
+**Date:** 2026-10-13. RTX 5070, WSL2, build on top of `f01fe6c` (finding
+108's commit). Host load ~9.3 during the timing (other work on the CPU).
+Evidence in [`../oracle/qpipe-slabs-20261013/`](../oracle/qpipe-slabs-20261013/).
+Prompted by an NFS@Home job (lpbr 33 / lpba 34, mfba 96, I16/J32768, four
+slabs) reporting `staying single-queued, because the plan has 4 slabs` with
+7.8 GB free.
+
+### The design
+
+Finding 108 issued the next **q** after a q's intersection. A slabbed q now
+also issues its next **slab** at the same point, and the step from a q's last
+slab to the next q's first is the same issue point with the next q's
+preparation in front.
+
+**Three walk-cursor buffers.** A slab's trial division reads the cursor it
+started from (`walk_cur`, for the FK resieve). The next slab's fill reads
+this slab's output cursor (`walk_next`) and writes its own. So three buffers
+are live, and `pside_rotate_walk` turns them at every issue point:
+`cur <- next`, `next <- spare`, `spare <- cur`. TD's `ptd_side_t` view is
+taken before the turn.
+
+- When the next slab was issued ahead, the end-of-slab advance only moves TD's
+  small-prime origin (`pipe_td_advance_small`, legacy stream); the
+  single-queued two-buffer swap is skipped. A per-slab flag, `rotated`, set
+  at the issue point and cleared at the top of every slab, says which.
+- At the cross-q issue point the cursors turn as well, because the next q's
+  `k_transform` writes `walk_cur`, which the last slab's resieve still reads.
+- `plat`/`rowrt` belong to the whole q and are swapped only across q.
+
+A soft skip (bucket overflow) is detected at the next slab's join, before
+anything else is issued, and abandons the q as before. A TD skip (a truncated
+large-prime list) drops one slab and carries on, also as before.
+
+**VRAM:** the spare cursors add 8 bytes per bucketed entry, so 0.66 GB in all
+at C194 and 0.81 GB for the NFS@Home job (27.3M entries). The admission check
+and its single-queued fallback are unchanged; the multi-slab exclusion is
+gone.
+
+### Correctness
+
+- `fillcheck.sh`: all five jobs are now expected to be granted the pipeline,
+  including c183 at five slabs (row tier on, so the row-tier cursor handoff
+  feeds the FK resieve across slabs) and C194 at four. **60 of 60
+  byte-identical**, every grant as expected.
+- **The NFS@Home job**, 40 q from q=296847000: single-queued and pipelined
+  relation files byte-identical (2,845).
+- **Stop and resume, C194, 400 q:** stopped after 192 q at q=80003687 with
+  the next q already issued, resumed; byte-identical to the uninterrupted
+  single-queued band (44,846 relations). A first attempt at 120 q was
+  vacuous: the stop file is read every 64 q and the band ended first.
+- **TD skips across slabs:** on a `PIPE_K=8` build, a five-slab c183 band
+  (`--slab-j 4095`, 150 q) dropped 11 slabs in each arm (the band summary's
+  count; the per-slab warning is rate-limited and prints 4 times);
+  pipelined and single-queued relation files are byte-identical (6,875).
+  This is the one path where the next slab is in flight while this slab's TD
+  is abandoned.
+
+### Measurements
+
+Three rounds of 60 q, order alternated, median of `wall clock per q,
+COMPLETE` (which includes the band-end cofactor flush, amortised over 60 q,
+in both arms):
+
+| job | single-queued | pipelined | change |
+|---|---:|---:|---:|
+| C194, I16/J32768, 4 slabs | 249.83 ms/q | 243.23 | **−2.6%** |
+| NFS@Home lpba 34, I16/J32768, 4 slabs | 236.78 | 226.81 | **−4.2%** |
+
+Every pipelined run beat every single-queued run on both jobs.
+
+**Why so little, and why the expectation was wrong.** Before building, the
+guess was that a three-large-prime job would gain more than C143, because
+trial division is a bigger share of each q (49.5 of 199 ms/q here). That is
+the wrong predictor. Single-queued, the NFS@Home job's GPU-accounted / wall
+is **0.917–0.925** in the three timed runs (0.936 in the 40-q identity run)
+and C194's is 0.921–0.934: the card is already busy 92–94% of the time, and
+2^29-position slab kernels leave little room for TD kernels beside them. The
+overlap can only reclaim idle time, which was ~15% of a C143 q and 6–8%
+here. **Predict the gain from single-queued acc/wall, not from TD's share.**
+
+### Review fixes (xhigh review of the first version)
+
+The review found no correctness bug. It changed:
+
+- **Two flags where there was one.** `ahead` says this slab was issued ahead
+  and is consumed at the top of the slab. `rotated` says the next slab's
+  cursors were already turned at this slab's issue point, so the end-of-slab
+  advance must not swap them again. It is set only at that issue point and
+  cleared at the top of every slab.
+- **One issue path.** `issue_ahead(sl)` issues both sides of slab `sl` for
+  the within-q and the cross-q issue points, and drains `st_sv` if an issue
+  fails.
+- **What was overlapped, not just granted.** The band summary prints
+  `issued ahead (--q-pipeline)  N slab(s), M q`. `fillcheck.sh` now fails a
+  granted run that issued no q ahead, and a slabbed plan that issued no slab
+  ahead, so a pipeline that is granted and then never used cannot pass.
+- Stale text: the `--fill-concurrent`/`--qspan` refusal now says the pipeline
+  "overlaps slabs and special-q on its own stream", the run-log comment says
+  the grant depends on free VRAM, the `pside_t` walk-cursor comment names
+  the third buffer, and the cofactor sync comment says the next slab or q may
+  be sieving on `st_sv`.
+
+Rerun after the fixes:
+
+- **Norm-width skips on a four-slab plan** (`skipslab.sh`, `BN_LIMBS=4`
+  build, `skipcheck.sh`'s generated jobs at `--slab-j 2048`, logI 14). Side 1
+  skipping: 16 skips, side 0: 12, the same q skipped single-queued and
+  pipelined, summary equal to the warnings, 306 and 312 slabs issued ahead,
+  relations byte-identical (49,914 and 32,606). This is the speculative
+  next-q skip after a slabbed rotation.
+- Default build: `--verify-only` 3 OK. `fillcheck.sh` **60 of 60**
+  byte-identical, every grant and every issued-ahead check as expected.
+- C194 400-q stop and resume: stopped after 128 q at q=80002567 with work in
+  flight, resumed, byte-identical to the uninterrupted single-queued band
+  (44,846).
+- The NFS@Home job, 40 q: byte-identical (2,845), 120 slabs and 39 q issued
+  ahead, and the same file as before the fixes.
+
+These reruns shared the card with an NFS@Home client that started at 18:27,
+so they give no timings. The measurements above ran 17:29-17:33, before it
+started.
+
+### What is not tested
+
+- **A bucket overflow on a slab issued ahead within its q.** It is detected
+  at that slab's join and abandons the q. Nothing else is in flight then
+  (the next q goes out only after a q's last slab), and the next q's
+  transform rewrites the cursors, so what follows is the single-queued path.
+  No job here overflows at the default build and there is no test-only knob
+  to force it, so this path has been read, not run.
+- The norm-width skip after a slabbed rotation is exercised by
+  `skipslab.sh` (Review fixes, above).
+
+### What leads now
+
+- **The next slab is issued late.** It goes out only after this slab's join
+  and intersect have come back to the host, so the card sits through that
+  round trip. Double-buffering the survivor bitmaps would let the next slab
+  queue right behind this slab's apply. Not attempted; at 92–94% busy it can
+  only be worth a few percent.
+- On large jobs the GPU kernels themselves are the cost: apply (80 ms/q) and
+  fill (52 ms/q) on the NFS@Home job, then resieve (33 ms/q).
+- The host-prep-before-TD item from finding 108 matters less here for the
+  same reason.

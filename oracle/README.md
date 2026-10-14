@@ -326,7 +326,7 @@ Captured scripts keep their verbatim paths; the runs live in the git-ignored
   C143 I13/I14 and c183.
 - `fillcheck.txt`, `fillcheck-c183-single-slab.txt`: the identity gate,
   60 of 60 byte-identical; `identity-first-runs.txt`: the first per-job
-  checks, including C194 staying single-queued on its four-slab plan.
+  checks; C194 stayed single-queued on its four-slab plan until finding 109.
 - `stop-resume.*`: a band stopped with a q in flight and resumed;
   `stop-resume-after-review.*` and `qpab-after-review.txt` repeat the stop
   test and the I13 A/B after the review fixes.
@@ -335,3 +335,33 @@ Captured scripts keep their verbatim paths; the runs live in the git-ignored
 - `vram-holder.cu`, `wsl-vram-holder.c183.txt`: the attempt to force the
   VRAM fallback. Under WSL2 the driver evicted the holder's memory, so the
   run still saw ~9 GB free.
+
+## Multi-slab --q-pipeline (2026-10-13)
+
+[`qpipe-slabs-20261013/`](qpipe-slabs-20261013/) holds the small evidence for
+[finding 109](../bench/RESULTS.md#finding-109), pinned in `MANIFEST.sha256`.
+`tests.sh` is the plan that produced `tests.txt` (identity gate, the
+NFS@Home lpba-34 job single-queued against pipelined, and the interleaved
+C194/NFS@Home timing); `fillcheck.txt` is that gate's log. **Section 3 of
+`tests.txt` is vacuous:** the stop file is read every 64 q and that 120-q
+band ended before a check saw it, so its IDENTICAL (13,487) compares two
+uninterrupted runs. The real test was run by hand with the same C194
+arguments at 400 q: `stop-resume-c194.base.txt` is the uninterrupted
+single-queued band (44,846 relations), and `stop-resume-c194.stopped.txt` /
+`.resumed.txt` are the pipelined run stopped after 192 q at q=80003687 with
+work in flight and its resume, byte-identical to the base. `tdskip.*` is
+the `PIPE_K=8` run in which slabs are dropped for truncated trial division,
+pipelined against single-queued.
+
+After the code review: `review-rerun.sh` produced `review-rerun.txt`. It
+runs `skipslab.sh` on a `BN_LIMBS=4` build (log `skipslab.txt`: norm-width
+skips on a four-slab plan, both sides, single-queued against pipelined),
+rebuilds the default, runs `fillcheck.sh` (log
+`fillcheck-after-review.txt`, now with the issued-ahead checks), and repeats
+the 400-q stop and resume against the same base, asserting that the band
+really stopped (`stop-resume-c194.after-review.*`: stopped after 128 q at
+q=80002567). `nfs-after-review.txt` is the NFS@Home job's 40-q identity run
+on the fixed build. These reruns shared the card with an NFS@Home client,
+so their timings mean nothing. The scripts' paths point into the git-ignored
+`work/slabpipe/`. The NFS@Home job's polynomial and factor base lived in the
+client's `/tmp` workdir and are not kept here.

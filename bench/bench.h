@@ -611,13 +611,14 @@ typedef struct {
      * --fill-concurrent, where an explicit --fill-gate is refused. */
     int      fill_gate;
     int      fill_gate_shift;
-    /* --q-pipeline: two special-q in flight. The next q's sieve is issued on
-     * its own stream after this q's intersection, so it runs under this q's
-     * trial division, cofactorisation and host work. Needs a second copy of
-     * the per-entry transform output (plat, rowrt); run_pipeline_impl stays
-     * single-queued, and says so, when that does not fit in free VRAM or the
-     * plan has several slabs. Output-identical by construction. Default on
-     * (bench_main resolves -1); off under --fill-concurrent and --qspan. */
+    /* --q-pipeline: the next unit of sieving is issued on its own stream
+     * after this one's intersection -- the next slab of a slabbed q, or the
+     * next q -- so it runs under this one's trial division, cofactorisation
+     * and host work. Needs a second copy of the per-entry transform output
+     * (plat, rowrt) and, slabbed, a third walk-cursor buffer; run_pipeline_impl
+     * stays single-queued, and says so, when that does not fit in free VRAM.
+     * Output-identical by construction. Default on (bench_main resolves -1);
+     * off under --fill-concurrent and --qspan. */
     int      q_pipeline;
     /* --qspan: bracket each special-q's GPU work with two events and report
      * the span, splitting `unaccounted` into host-with-no-GPU-work versus

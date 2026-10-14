@@ -41,14 +41,15 @@ allocation**, side 1 first, and side 0's fill stores records only where side
 second bucket allocation (finding 94); it overlaps sides of the same q, so it
 turns the gate off.
 
-**Two special-q in flight by default since 2026-10-13 (finding 108,
-`--q-pipeline`).** Once a q's intersection is done, the next q is prepared
-and both its sides are sieved on a non-blocking stream, while this q's trial
-division and cofactorisation run on the legacy stream. Only `plat` and
-`rowrt` are doubled (0.05 GB at C143, 0.26 GB at c183); the bucket array is
-not. When that extra does not fit in free VRAM, or the plan has several
-slabs (C194 and larger), the run stays single-queued and the banner and run
-log say so (`# q-pipeline` line). `--fill-concurrent` and `--qspan` exclude
+**Two units of work in flight by default since 2026-10-13 (findings
+108-109, `--q-pipeline`).** Once a slab's intersection is done, the next
+slab -- or, after a q's last slab, the next q -- is prepared and both its
+sides are sieved on a non-blocking stream, while this slab's trial division
+and cofactorisation run on the legacy stream. Only `plat` and `rowrt` are
+doubled, plus a third walk-cursor buffer on slabbed plans (0.05 GB at C143,
+0.26 GB at c183, 0.66 GB at C194); the bucket array is not. When that extra
+does not fit in free VRAM the run stays single-queued, and the banner and
+run log say so (`# q-pipeline` line). `--fill-concurrent` and `--qspan` exclude
 it; `--no-q-pipeline` turns it off. Per-stage times then include sharing the
 card, only wall clock per q is additive, and `unaccounted` and acc/wall are
 reported as n/a; use a `--no-q-pipeline` band to diagnose host starvation.
@@ -1362,10 +1363,10 @@ not by size.
 | 11 | `--bkthresh` below `I` | nothing | **FIXED 2026-09-23** — silently lost relations (5,079 and 7,456 of 9,053 at 8192 / 16384, exit 0) because the Franke-Kleinjung walk needs `p >= I`; now refused at startup and again in `run_pipeline_impl`, and capped at 2^30. Defaults were never affected. Raising it is correct but not faster, so the sweep is closed |
 | 12 | Complete blocking event waits and measure host CPU use | CPU/API trace; idle and contended C143 + C183/C194 bands | **proposed 2026-10-12** — NFS@Home objective is sustained use below one logical CPU. Existing `--blocking-sync` leaves default event waits spinning. Then evaluate fewer count readbacks, CUDA graphs and a bounded queue driven by one host thread. [Item 4](#low-cpu-plan), [finding 106](RESULTS.md#finding-106). No implementation or performance result yet. **First check that a blocking wait sleeps on WSL2 at all:** CADO's sievers spin at 80-90% of a core each, mostly system time, with blocking sync on (finding 107) |
 | 13 | Fix fill's tail, gate side 0's fill | local GPU | **DONE 2026-10-13, now the defaults** — finding 107. Row-banded tier for `q < 4I` (`--fill-rows`, logI <= 15) and its resieve (`--resieve-rows`, logI <= 13), CADO's side-0 fill gate (`--fill-gate`). Relations byte-identical (`fillcheck.sh`, 44 of 44). C143 first band wall -25.7% (I13) / -10.5% (I14); c183 -6.4%, C194 -5.5% |
-| 14 | Several special-q in flight | local GPU | **DONE 2026-10-13 for one-slab plans, now the default** — finding 108. The next q's sieve runs on its own stream under this q's TD and cofactorisation; only `plat`/`rowrt` are doubled, and the run stays single-queued when that does not fit in VRAM. C143 −19.6% (I13) / −12.8% (I14), c183 −8.1%, relations byte-identical (`fillcheck.sh` 60 of 60), stop/resume with a q in flight verified. Sized first: our idle was ~15%, not CADO's 1.77x. Multi-slab plans are row 17 |
+| 14 | Several special-q in flight | local GPU | **DONE 2026-10-13 for one-slab plans, now the default** — finding 108. The next q's sieve runs on its own stream under this q's TD and cofactorisation; only `plat`/`rowrt` are doubled, and the run stays single-queued when that does not fit in VRAM. C143 −19.6% (I13) / −12.8% (I14), c183 −8.1%, relations byte-identical (`fillcheck.sh` 60 of 60), stop/resume with a q in flight verified. Sized first: our idle was ~15%, not CADO's 1.77x. Multi-slab plans: row 17 |
 | 15 | Filter both C143 campaigns | CPU (msieve or CADO purge) | **open** — 54.35M against 54.24M unique; our extras are marginal 2LP relations. Excess after singleton removal prices them |
-| 16 | `--fill-concurrent` against the gate on wider cards | rented card | **answered on the 5070, open elsewhere** — at C143 the flag (gate off) was 1-2% faster than finding 107's default (9.08 vs 9.26 ms/q at I13), but the two-q pipeline beats both (7.46) and the flag excludes it (finding 108). It may still matter for multi-slab jobs, where the pipeline is single-queued; not measured there or on wider cards |
-| 17 | Overlap across slabs for multi-slab plans | local GPU | **open** — C194 and larger stay single-queued under `--q-pipeline` (finding 108). The next slab's sieve under this slab's TD needs a third rotating set of walk cursors (8 bytes per entry) and the same stream discipline |
+| 16 | `--fill-concurrent` against the gate on wider cards | rented card | **answered on the 5070 at C143, open elsewhere** — at C143 the flag (gate off) was 1-2% faster than finding 107's default (9.08 vs 9.26 ms/q at I13), but the two-q pipeline beats both (7.46) and the flag excludes it (finding 108). Not measured on slabbed jobs (C194 and larger), which are pipelined too now (finding 109), nor on wider cards |
+| 17 | Overlap across slabs for multi-slab plans | local GPU | **DONE 2026-10-13, default** — finding 109. Each slab's sieve runs under the previous slab's TD, and the next q's first slab under the last slab's; three walk-cursor buffers rotate at every issue point. Relations byte-identical (`fillcheck.sh` 60 of 60 with the pipeline granted on all five jobs, the NFS@Home lpba-34 I16 job, c194 stop/resume with work in flight). Only −2.6% (C194) / −4.2% (that job): single-queued they already keep the card 92–94% busy |
 
 **On (5), why both arms in one session.** Card-hours are the scarce resource
 and `resieve + scatter` is the same bucket-structured shape as fill: finding
@@ -2359,8 +2360,9 @@ finding 92.
       kernels. This renews investigation of historical item 4.2 for CPU use,
       without reviving its withdrawn 1.56 ms/q speedup estimate.
    3. **Queue ahead with one submitting thread.** Two q in flight with one
-      host thread is now built and the default for one-slab plans
-      (finding 108, NOW/NEXT row 14): 8-20% faster, still one host thread
+      host thread is now built and the default (findings 108-109,
+      NOW/NEXT rows 14 and 17): 8-20% faster on one-slab plans, 2.6-4.2% on
+      slabbed ones, still one host thread
       at ~1.0 CPU, so the CPU objective still rests on the steps around it.
       Deeper queues: start with two or three work descriptors and pinned
       staging buffers, retaining each buffer

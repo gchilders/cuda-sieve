@@ -159,7 +159,9 @@ typedef struct {
     uint32_t *primes, *roots;
     plat_t   *plat;
     /* Present only in the slabbed specialization. fill advances walk_cur into
-     * walk_next; resieve replays walk_cur, then the host swaps the pointers. */
+     * walk_next; resieve replays walk_cur. Then, single-queued, the host swaps
+     * the two pointers after the slab; under --q-pipeline the three buffers
+     * (with walk_spare) turn at the issue point instead (pside_rotate_walk). */
     uint64_t *walk_cur, *walk_next;
     /* --fill-rows: the first nrow bucketed entries (q < fill_rows * I) are
      * filled by k_fill_rows from their transformed roots, written here by
@@ -168,12 +170,17 @@ typedef struct {
     uint32_t  nrow;
     /* --q-pipeline: the next q's transform output, written while this q's
      * trial division still reads plat/rowrt. pside_swap_alt trades the two
-     * sets at the point the next q is issued. NULL when single-queued. There
-     * are no walk cursors to double: the pipeline needs a one-slab plan, and
-     * a one-slab plan is the unslabbed specialization (slab.h: enabled iff
-     * nslab > 1). */
+     * sets at the point the next q is issued. NULL when single-queued.
+     *
+     * walk_spare is the third walk-cursor buffer a slabbed plan needs once
+     * the next slab is sieved under this slab's trial division: this slab's
+     * TD reads the cursor it started from (walk_cur), the next slab's fill
+     * reads this slab's output (walk_next) and writes its own, so three are
+     * live. pside_rotate_walk turns them at every issue point. NULL unless
+     * the pipeline was granted on a slabbed plan. */
     plat_t   *plat_alt;
     uint32_t *rowrt_alt;
+    uint64_t *walk_spare;
     uint32_t *survbits;
     uint16_t *slice, *slice_logp;
     uint32_t *sp, *srt, *sg;
@@ -199,7 +206,7 @@ static void pside_free(pside_t *S)
     cudaFree(S->primes); cudaFree(S->roots); cudaFree(S->plat);
     cudaFree(S->walk_cur); cudaFree(S->walk_next);
     cudaFree(S->rowrt);
-    cudaFree(S->plat_alt); cudaFree(S->rowrt_alt);
+    cudaFree(S->plat_alt); cudaFree(S->rowrt_alt); cudaFree(S->walk_spare);
     cudaFree(S->survbits); cudaFree(S->slice); cudaFree(S->slice_logp);
     cudaFree(S->sp); cudaFree(S->srt); cudaFree(S->sg); cudaFree(S->slp);
     cudaFree(S->smag);
@@ -221,6 +228,19 @@ static void pside_swap_alt(pside_t *S)
 {
     std::swap(S->plat, S->plat_alt);
     std::swap(S->rowrt, S->rowrt_alt);
+}
+
+/* --q-pipeline on a slabbed plan, at an issue point: the next slab (or the
+ * next q's first) starts from this slab's output cursor and writes into the
+ * spare, while the cursor this slab started from stays with its trial
+ * division. The caller takes TD's view of the side BEFORE turning them. The
+ * single-queued advance is the two-buffer swap in run_pipeline_impl. */
+static void pside_rotate_walk(pside_t *S)
+{
+    uint64_t *const started = S->walk_cur;
+    S->walk_cur = S->walk_next;
+    S->walk_next = S->walk_spare;
+    S->walk_spare = started;
 }
 
 /* The walk and line-sieve preconditions, checked where the factor bases are
@@ -1357,8 +1377,8 @@ out:
  * and only plat and rowrt are doubled to allow it (finding 108). A TD change
  * that needs another per-q field has to add it here, and with it decide
  * whether the pipeline must double that field too. primes and nfb are fixed
- * for the band; walk_cur is only read under slabbing, which the pipeline
- * never runs. */
+ * for the band; walk_cur, read only under slabbing, is the cursor this slab
+ * started from, which pside_rotate_walk keeps out of the next slab's way. */
 typedef struct {
     const plat_t   *plat;
     const uint32_t *primes, *rowrt;
@@ -1806,6 +1826,8 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     cudaStream_t st_sv = 0;
     uint32_t *d_overflow0 = NULL;
     int qpipe = 0;
+    /* Slabs and q actually issued ahead, for the band summary. */
+    unsigned long long n_ahead_slab = 0, n_ahead_q = 0;
     /* Second bucket workspace, allocated only under --fill-concurrent. The
      * two sides share one today because they run back to back; overlapping
      * them is exactly what that sharing forbids. */
@@ -2127,23 +2149,22 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
      *
      * It needs a second copy of what the next q's k_transform writes while
      * this q's resieve still reads it: plat for every bucketed entry and
-     * rowrt for the row tier. NOT a second
-     * bucket array -- sieves stay ordered on one stream, so the next q's fill
-     * starts only after this q's apply is done with the buckets.
+     * rowrt for the row tier. On a slabbed plan, where the next SLAB is also
+     * sieved under this slab's TD, a third walk-cursor buffer per entry
+     * (walk_spare; see pside_rotate_walk). NOT a second bucket array --
+     * sieves stay ordered on one stream, so the next fill starts only after
+     * this apply is done with the buckets.
      *
      * SINGLE-QUEUED, NOT REFUSED, when it does not fit: the flag asks for a
      * speed-up, and a job that runs today must keep running. The banner and
-     * the run log say which happened. A multi-slab plan also stays single:
-     * there the next slab's sieve would have to overlap this slab's TD, which
-     * needs a third set of walk cursors and is not built. That makes the
-     * SLABBED instantiation always single-queued (slab.h: a plan is enabled
-     * only when nslab > 1). */
+     * the run log say which happened. */
     if (cfg->q_pipeline) {
         char why[160] = "";
         size_t extra = 4;   /* side 0's overflow counter */
         for (int side = 0; side < 2; side++) {
             const pside_t *S = side ? &S1 : &S0;
             extra += (size_t)S->nfb * sizeof(plat_t) + (size_t)S->nrow * 4;
+            if (SLABBED) extra += (size_t)S->nfb * sizeof(uint64_t);
         }
         /* bench_main refuses these combinations on the command line; a caller
          * reaching this public entry point another way gets the same answer
@@ -2151,8 +2172,6 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         if (concurrent || cfg->qspan) {
             snprintf(why, sizeof why, "%s excludes it",
                      concurrent ? "--fill-concurrent" : "--qspan");
-        } else if (slab_plan->nslab > 1) {
-            snprintf(why, sizeof why, "the plan has %u slabs", slab_plan->nslab);
         } else {
             size_t f3 = 0, t3 = 0;
             PIPE_CK(cudaMemGetInfo(&f3, &t3));
@@ -2172,6 +2191,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 e = cudaMalloc(&S->plat_alt, (size_t)S->nfb * sizeof(plat_t));
                 if (e == cudaSuccess && S->nrow)
                     e = cudaMalloc(&S->rowrt_alt, (size_t)S->nrow * 4);
+                if (e == cudaSuccess && SLABBED)
+                    e = cudaMalloc(&S->walk_spare,
+                                   (size_t)S->nfb * sizeof(uint64_t));
             }
             if (e == cudaSuccess) e = cudaMalloc(&d_overflow0, 4);
             if (e == cudaSuccess)
@@ -2180,8 +2202,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 cudaGetLastError();
                 for (int side = 0; side < 2; side++) {
                     pside_t *S = side ? &S1 : &S0;
-                    cudaFree(S->plat_alt);  S->plat_alt = NULL;
-                    cudaFree(S->rowrt_alt); S->rowrt_alt = NULL;
+                    cudaFree(S->plat_alt);   S->plat_alt = NULL;
+                    cudaFree(S->rowrt_alt);  S->rowrt_alt = NULL;
+                    cudaFree(S->walk_spare); S->walk_spare = NULL;
                 }
                 cudaFree(d_overflow0); d_overflow0 = NULL;
                 if (st_sv) { cudaStreamDestroy(st_sv); st_sv = 0; }
@@ -2194,12 +2217,19 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             runlog_note("q-pipeline", "single-queued: %s", why);
         } else {
             qpipe = 1;
-            printf("  --q-pipeline: two special-q in flight, a second transform"
-                   " set (%.2f GB)\n", extra / 1073741824.0);
+            if (SLABBED)
+                printf("  --q-pipeline: each slab's sieve under the previous"
+                       " slab's trial division, across q too; a second"
+                       " transform set and a third walk-cursor set (%.2f GB)\n",
+                       extra / 1073741824.0);
+            else
+                printf("  --q-pipeline: two special-q in flight, a second"
+                       " transform set (%.2f GB)\n", extra / 1073741824.0);
             printf("  NOTE: stage times now include sharing the card with the"
                    " other q; only wall clock per q is additive, and"
                    " `unaccounted` and GPU-accounted / wall are not reported\n");
-            runlog_note("q-pipeline", "two q in flight, +%.2f GB",
+            runlog_note("q-pipeline", "%s, +%.2f GB",
+                        SLABBED ? "slabs and q overlapped" : "two q in flight",
                         extra / 1073741824.0);
             VRAM_MARK("q-pipeline transform set");
         }
@@ -2422,6 +2452,20 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                                              fblocks, fthreads, &S0,
                                              cfg->fill_gate ? S1.survbits : NULL,
                                              d_gate);
+    };
+    /* --q-pipeline: both sides of slab `sl` (of the q currently prepared)
+     * issued back to back on st_sv, with no host wait; the joins come at the
+     * loop top that consumes it. A failed issue leaves launches in flight, so
+     * the stream is drained before the caller unwinds. Counted (n_ahead_*),
+     * so a band shows how often each kind of overlap actually happened. */
+    auto issue_ahead = [&](uint32_t sl) -> int {
+        const uint32_t xm = I * slab_rows_at(slab_plan, cfg->J, sl);
+        const uint32_t jb = slab_jbase_at(slab_plan, sl);
+        if (issue_side(1, xm, jb) || issue_side(0, xm, jb)) {
+            cudaStreamSynchronize(st_sv);
+            return -1;
+        }
+        return 0;
     };
     for (uint32_t qi = 0;; qi++) {
         qsel_t generated, checked;
@@ -2750,18 +2794,32 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
          * removes every continuation-state operation from device code. */
         if (cfg->qspan) { tdprep_q = host_ms() - hreg; hreg = host_ms(); }
         uint32_t nslab_skipped_q = 0;   /* soft-skipped slabs, THIS q */
+        /* --q-pipeline: the slab about to be processed was already issued,
+         * at the previous slab's issue point (or, for slab 0, the previous
+         * q's). Only its joins remain, and its walk cursors were turned
+         * there. */
+        int ahead = pre_issued;
+        /* The next slab's cursors were already turned at THIS slab's issue
+         * point, so the end-of-slab advance must not swap them again. Set
+         * only at that issue point, cleared at the top of every slab: one
+         * meaning, one slab. */
+        int rotated = 0;
         /* The per-q continuation advance, factored out because THREE paths
          * must run it and one of them is a skip: the ordinary end of the slab
          * loop, and the trial-division skip that keeps going. Returns -1 on a
          * device failure. Skipping it leaves the next slab reading the
-         * previous slab's walk positions against its own j_base. */
+         * previous slab's walk positions against its own j_base. When the
+         * next slab was issued ahead, its cursors were already rotated at the
+         * issue point; only trial division's small-prime origin moves here. */
         auto advance_slab = [&](uint32_t sl, uint32_t rows) -> int {
             if constexpr (SLABBED) {
                 if (sl + 1 < slab_plan->nslab) {
                     if (pipe_td_advance_small(&C, rows, blocks, cfg->threads))
                         return -1;
-                    std::swap(S1.walk_cur, S1.walk_next);
-                    std::swap(S0.walk_cur, S0.walk_next);
+                    if (!rotated) {
+                        std::swap(S1.walk_cur, S1.walk_next);
+                        std::swap(S0.walk_cur, S0.walk_next);
+                    }
                 }
             } else {
                 (void)sl; (void)rows;
@@ -2784,9 +2842,12 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
              * side 1 is unusable there is no point sieving side 0, and the
              * skip below means neither side's survbits are ever read. */
             int sv1, sv0 = 0;
-            if (pre_issued) {   /* the pipeline's plans have one slab */
+            rotated = 0;
+            if (ahead) {
+                ahead = 0;
                 /* --q-pipeline: both sides were issued back to back on st_sv
-                 * at the previous q's issue point, so only the joins remain.
+                 * at the previous slab's or q's issue point, so only the joins
+                 * remain.
                  * On a soft skip this behaves like the concurrent arm: side 0
                  * ran anyway, and the q is abandoned below either way. */
                 sv1 = pipe_side_sieve_join(1, &bk1, &S1, &sf1, &sa1, 1);
@@ -2945,29 +3006,53 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
 
             /* ---- --q-pipeline issue point ----
              *
-             * This q's sieve and intersection are complete and nothing reads
-             * its survbits again, so the next q can be prepared and sieved on
-             * st_sv while this one is trial-divided on the legacy stream. Its
-             * k_transform would overwrite the plat/rowrt that this q's
-             * resieve reads, so the sides swap to their other set first, and
-             * TD gets copies of the structs from before the swap.
+             * This slab's sieve and intersection are complete and nothing
+             * reads its survbits again, so the next unit of work -- the next
+             * slab of this q, or after the last slab the next q -- can be
+             * sieved on st_sv while this slab is trial-divided on the legacy
+             * stream. TD gets its view of each side (tdS1/tdS0) before
+             * anything moves. A next slab turns the walk cursors
+             * (pside_rotate_walk); a next q also swaps plat/rowrt, which its
+             * k_transform would otherwise overwrite under this q's resieve.
              *
              * Everything the loop top checks for the next q -- stop, ceiling,
              * checkpoints -- still runs there, before any of its output is
              * consumed; a q issued here and then not processed is simply
-             * drained at `done:` and resumed from, never counted. */
+             * drained at the loop exit and resumed from, never counted. */
             ptd_side_t tdS1 = pipe_td_side(&S1), tdS0 = pipe_td_side(&S0);
-            /* qpipe was only granted for a one-slab plan, so this is always
-             * the q's last slab. */
-            if (qpipe && !g_pipe_stop && !count_limit_before(qi + 1, nqdone + 1)) {
-                /* This q's transform time first: preparing the next q records
-                 * the same two events again. */
+            if (qpipe && slab + 1 < slab_plan->nslab) {
+                /* The next slab of this q. Its fill starts from this slab's
+                 * output cursor; the cursor this slab started from stays with
+                 * its TD (tdS1/tdS0 above), so the three turn. plat and rowrt
+                 * belong to the whole q and are not touched. No stop or
+                 * budget check: a q is never left half-sieved, single-queued
+                 * or not. */
+                pside_rotate_walk(&S1);
+                pside_rotate_walk(&S0);
+                rotated = 1;
+                wd_phase("slab.issue_next");
+                if (issue_ahead(slab + 1)) { rc = -1; break; }
+                ahead = 1;
+                n_ahead_slab++;
+            } else if (qpipe && !g_pipe_stop &&
+                       !count_limit_before(qi + 1, nqdone + 1)) {
+                /* The next q, after this q's last slab. This q's transform
+                 * time first: preparing the next q records the same two
+                 * events again. */
                 if (pipe_read_transform(&S1, &S0, &ts1[0], &ts0[0])) {
                     rc = -1; break;
                 }
                 ts_read = 1;
                 pside_swap_alt(&S1);
                 pside_swap_alt(&S0);
+                /* Slabbed: the next q's k_transform writes walk_cur, which
+                 * this last slab's TD still reads; turn the cursors as for a
+                 * next slab. The new walk_cur is this slab's output, which
+                 * nothing needs once the q is over. */
+                if (SLABBED) {
+                    pside_rotate_walk(&S1);
+                    pside_rotate_walk(&S0);
+                }
                 spec_have = 1; spec_issued = 0;
                 spec_th1 = spec_th0 = 0;
                 wd_phase("q.select_next");
@@ -2994,14 +3079,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                          * again, warns and counts it if it gets that far. */
                         if (pn == 0) {
                             wd_phase("q.issue_next");
-                            const uint32_t xmax_n = I * slab_rows_at(slab_plan, cfg->J, 0);
-                            const uint32_t jb_n = slab_jbase_at(slab_plan, 0);
-                            if (issue_side(1, xmax_n, jb_n) ||
-                                issue_side(0, xmax_n, jb_n)) {
-                                cudaStreamSynchronize(st_sv);
-                                rc = -1; break;
-                            }
+                            if (issue_ahead(0)) { rc = -1; break; }
                             spec_issued = 1;
+                            n_ahead_q++;
                         }
                         wd_q((unsigned long long)cur->q, (unsigned long long)cur->rho,
                              (unsigned long long)nqdone);
@@ -3103,9 +3183,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                                 nacc_s, Q.n, cfg->lpb0, cfg->lpb, &Q)) {
                     rc = -1; break;
                 }
-                /* Under --q-pipeline the next q is sieving on st_sv, which a
-                 * device-wide sync would wait out; the enqueue is all on the
-                 * legacy stream, so that is the stream to drain. */
+                /* Under --q-pipeline the next slab or q is usually sieving on
+                 * st_sv, which a device-wide sync would wait out; the enqueue
+                 * is all on the legacy stream, so that is the stream to drain. */
                 if (CUDA_CHECKED(qpipe ? cudaStreamSynchronize(0)
                                        : cudaDeviceSynchronize()) ||
                     CUDA_CHECKED(cudaGetLastError())) { rc = -1; break; }
@@ -3954,6 +4034,12 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         if (qpipe) snprintf(gpu_acc_s, sizeof gpu_acc_s, "n/a");
         else snprintf(gpu_acc_s, sizeof gpu_acc_s, "%.3f", gpu_acc);
         printf("  %-34s %8s\n", "GPU-accounted / wall (excl cofac)", gpu_acc_s);
+        /* What --q-pipeline actually overlapped, as against what it was
+         * granted: fillcheck.sh reads this line to tell a band that issued
+         * slabs ahead from one that only ever issued whole q. */
+        if (qpipe)
+            printf("  %-34s %llu slab(s), %llu q\n", "issued ahead (--q-pipeline)",
+                   n_ahead_slab, n_ahead_q);
         printf("  %-34s %8.1f\n", "two-sided primitive survivors/q",
                (double)acc_surv / N);
         printf("  %-34s %8.2f\n", "cofactorisation candidates/q",
