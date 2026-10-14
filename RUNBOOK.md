@@ -126,6 +126,17 @@ read as the job file's lambda flowing through into the bound. It does not; see
 "Lambda: we ignore it, on purpose" below. The `reported only` suffix is what
 the binary actually prints, and it is there to stop exactly that misreading.
 
+**The file's `n:` is checked against its polynomials on load.** The two
+polynomials must share a root modulo n: with m = −Y0/Y1, f(m) ≡ 0 (mod n).
+A file that pairs one job's algebraic polynomial with another job's rational
+one, or carries the wrong n, sieves normally, and every relation verifies,
+against polynomials that cannot factor n. Nothing downstream notices until the
+linear algebra yields only trivial dependencies. So `bench`, `fbgen`,
+`fbgen_gpu` and `normscan` refuse such a file at startup with "the two
+polynomials have no common root mod n" and exit before anything is generated
+or written. A file with no `n:` line loads with a warning that it cannot be
+checked.
+
 Anything you state explicitly wins over the file; anything the file carries
 wins over the derivation. A CADO `.poly` carries none of these keys, so there
 you either state them or let them derive.

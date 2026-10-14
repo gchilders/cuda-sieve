@@ -2236,6 +2236,16 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     if (poly_load(polypath, &POLY) != 0) return 1;
     printf("polynomial %s: algebraic degree %d, skew %.4g\n",
            polypath, POLY.deg, POLY.skew);
+    /* poly_load has already refused a file whose n is not a common root of
+     * the two polynomials (poly_check_n). Say which of the two cases this is:
+     * a file without n cannot be checked at all. */
+    if (POLY.has_n)
+        printf("  the two polynomials share a root mod n (%zu digits)\n",
+               strlen(POLY.ns));
+    else
+        fprintf(stderr, "warning: %s has no n: line, so whether its two"
+                " polynomials belong to the same number cannot be checked\n",
+                polypath);
 
     /* ---- sieve parameters: explicit flag > job file > derived > refuse ----
      *

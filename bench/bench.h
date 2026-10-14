@@ -264,6 +264,11 @@ typedef struct {
                               /* the exact integer F(a,b), not its log. c0 is */
                               /* 147 bits on this job, so the double is only  */
                               /* good to 53 of them. See bigint.cuh.          */
+    /* The number being factored, exactly, when the file carries an n: line
+     * (CADO and GGNFS files both do). poly_load refuses a file whose two
+     * polynomials do not share a root modulo it -- see poly_check_n. */
+    char   ns[1280];
+    int    has_n;
 
     /* Sieve parameters carried by a GGNFS .job file. Zero means ABSENT, which
      * is the normal case for a CADO .poly -- the caller then falls back to a
@@ -312,6 +317,9 @@ double job_allowance_bits(double lambda, uint32_t lim);
  * algebraic norm and a factor base without p = 2 is truncated. 0 if it cannot,
  * in which case the absence of p = 2 is correct and not a missing --cadofb. */
 int poly_has_root_mod2(const poly_t *P);
+/* 0 when n is a root of both polynomials mod n (or the file has no n), -1
+ * when it is not, -2 when n itself is unusable. poly_load runs it. */
+int poly_check_n(const poly_t *P);
 
 /* Build the rational factor base: G(x) = Y1*x + Y0 has one root per prime,
  * r = -Y0/Y1 mod p, with p | Y1 encoded as r == p. Nothing on disk holds this

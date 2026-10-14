@@ -345,6 +345,147 @@ static int parse_exact_integer(const char *value, char *exact, size_t exact_cap,
     return 0;
 }
 
+/* n: is hundreds of digits -- past strtod, and only the digits are wanted. */
+static int parse_natural(const char *value, char *exact, size_t exact_cap)
+{
+    const char *s;
+    size_t n;
+    if (token_span(value, &s, &n) || !n || n >= exact_cap) return -1;
+    if (*s == '+') { s++; n--; }
+    if (!n) return -1;
+    for (size_t i = 0; i < n; i++)
+        if (s[i] < '0' || s[i] > '9') return -1;
+    memcpy(exact, s, n);
+    exact[n] = '\0';
+    return 0;
+}
+
+/* ---- n is a common root ------------------------------------------------ *
+ *
+ * The two polynomials of an NFS job share a root m modulo n: G(m) = Y1*m + Y0
+ * = 0 and f(m) = 0. A file that pairs one job's algebraic polynomial with
+ * another's rational one, or carries the wrong n, sieves happily and every
+ * relation verifies -- against polynomials that cannot factor n. Nothing
+ * downstream notices until the linear algebra has produced only trivial
+ * dependencies, days later (it happened on NFS@Home). So check it on load:
+ * with m = -Y0/Y1, f(m) = 0 (mod n) is, for Y1 prime to n, the homogeneous
+ *
+ *     F(-Y0, Y1) = sum c_i (-Y0)^i Y1^(d-i) = 0 (mod n).
+ *
+ * Plain schoolbook arithmetic on 32-bit limbs, run once: speed is no concern,
+ * and the only operations needed are add, subtract and compare modulo n. */
+#define PB_LIMBS 140   /* 4480 bits; n of up to 1279 digits needs <= 4249 */
+typedef struct { uint32_t v[PB_LIMBS]; } pbig_t;
+
+static int pb_cmp(const pbig_t *a, const pbig_t *b)
+{
+    for (int i = PB_LIMBS - 1; i >= 0; i--)
+        if (a->v[i] != b->v[i]) return a->v[i] < b->v[i] ? -1 : 1;
+    return 0;
+}
+
+static void pb_sub(pbig_t *a, const pbig_t *b)          /* a -= b; a >= b */
+{
+    uint64_t borrow = 0;
+    for (int i = 0; i < PB_LIMBS; i++) {
+        const uint64_t d = (uint64_t)a->v[i] - b->v[i] - borrow;
+        a->v[i] = (uint32_t)d;
+        borrow = (d >> 63) & 1u;
+    }
+}
+
+/* a = (a + b) mod n, for a, b < n. n has a free top limb, so a + b fits. */
+static void pb_addmod(pbig_t *a, const pbig_t *b, const pbig_t *n)
+{
+    uint64_t carry = 0;
+    for (int i = 0; i < PB_LIMBS; i++) {
+        const uint64_t t = (uint64_t)a->v[i] + b->v[i] + carry;
+        a->v[i] = (uint32_t)t;
+        carry = t >> 32;
+    }
+    if (pb_cmp(a, n) >= 0) pb_sub(a, n);
+}
+
+static void pb_mulmod(pbig_t *r, const pbig_t *a, const pbig_t *b,
+                      const pbig_t *n)
+{
+    pbig_t acc;
+    memset(&acc, 0, sizeof acc);
+    for (int i = PB_LIMBS - 1; i >= 0; i--)
+        for (int bit = 31; bit >= 0; bit--) {
+            pbig_t d = acc;
+            pb_addmod(&acc, &d, n);
+            if ((b->v[i] >> bit) & 1u) pb_addmod(&acc, a, n);
+        }
+    *r = acc;
+}
+
+/* The decimal string `s` (optionally signed) reduced modulo n; n == NULL
+ * reads it exactly, failing if it does not leave the top limb free. */
+static int pb_from_dec(pbig_t *x, const char *s, const pbig_t *n)
+{
+    int neg = 0;
+    memset(x, 0, sizeof *x);
+    if (*s == '+' || *s == '-') neg = *s++ == '-';
+    for (; *s; s++) {
+        const uint32_t dig = (uint32_t)(*s - '0');
+        if (n) {
+            pbig_t x2, x8, dv;
+            x2 = *x; pb_addmod(&x2, x, n);             /* 2x  */
+            x8 = x2; pb_addmod(&x8, &x2, n);           /* 4x  */
+            { pbig_t t = x8; pb_addmod(&x8, &t, n); }  /* 8x  */
+            *x = x8; pb_addmod(x, &x2, n);             /* 10x */
+            memset(&dv, 0, sizeof dv);
+            dv.v[0] = dig;
+            if (pb_cmp(&dv, n) >= 0) pb_sub(&dv, n);   /* n > 9 is checked */
+            pb_addmod(x, &dv, n);
+        } else {
+            uint64_t carry = dig;
+            for (int i = 0; i < PB_LIMBS; i++) {
+                const uint64_t t = (uint64_t)x->v[i] * 10u + carry;
+                x->v[i] = (uint32_t)t;
+                carry = t >> 32;
+            }
+            if (carry || x->v[PB_LIMBS - 1]) return -1;
+        }
+    }
+    if (neg && n) {
+        pbig_t z;
+        memset(&z, 0, sizeof z);
+        if (pb_cmp(x, &z)) { pbig_t t = *n; pb_sub(&t, x); *x = t; }
+    }
+    return 0;
+}
+
+int poly_check_n(const poly_t *P)
+{
+    pbig_t n, a, b, acc, bp, c, t, ten;
+    if (!P->has_n) return 0;
+    if (pb_from_dec(&n, P->ns, NULL)) return -2;
+    memset(&ten, 0, sizeof ten);
+    ten.v[0] = 10;
+    if (pb_cmp(&n, &ten) <= 0) return -2;
+    pb_from_dec(&t, P->y0s, &n);              /* Y0 mod n      */
+    memset(&a, 0, sizeof a);
+    if (pb_cmp(&t, &a)) { a = n; pb_sub(&a, &t); }   /* a = -Y0 mod n */
+    pb_from_dec(&b, P->y1s, &n);              /* b = Y1 mod n  */
+    pb_from_dec(&acc, P->cs[P->deg], &n);
+    memset(&bp, 0, sizeof bp);
+    bp.v[0] = 1;
+    for (int i = P->deg - 1; i >= 0; i--) {
+        pb_mulmod(&t, &bp, &b, &n);  bp = t;   /* Y1^(d-i)          */
+        pb_mulmod(&t, &acc, &a, &n); acc = t;  /* acc * (-Y0)       */
+        pb_from_dec(&c, P->cs[i], &n);         /* "" (absent) is 0 */
+        pb_mulmod(&t, &c, &bp, &n);
+        pb_addmod(&acc, &t, &n);
+    }
+    {
+        pbig_t z;
+        memset(&z, 0, sizeof z);
+        return pb_cmp(&acc, &z) ? -1 : 0;
+    }
+}
+
 int poly_load(const char *path, poly_t *P)
 {
     FILE *f = NULL;
@@ -354,6 +495,7 @@ int poly_load(const char *path, poly_t *P)
     unsigned seen_skew = 0, seen_y0 = 0, seen_y1 = 0;
     unsigned seen_rlim = 0, seen_alim = 0, seen_lpbr = 0, seen_lpba = 0;
     unsigned seen_mfbr = 0, seen_mfba = 0, seen_rlambda = 0, seen_alambda = 0;
+    unsigned seen_n = 0;
     int rc = -1;
 
     if (!P || !path) {
@@ -495,6 +637,12 @@ int poly_load(const char *path, poly_t *P)
         } else if (KEY_IS("mfba")) {
             DUP_GUARD(seen_mfba, "mfba");
             if (parse_u32_value(value, &P->mfba)) goto bad_u32;
+        } else if (KEY_IS("n")) {
+            DUP_GUARD(seen_n, "n");
+            if (parse_natural(value, P->ns, sizeof P->ns))
+                VALUE_FAIL("n must be a positive decimal integer of at most"
+                           " %zu digits", sizeof P->ns - 1u);
+            P->has_n = 1;
         } else if (KEY_IS("rlambda")) {
             DUP_GUARD(seen_rlambda, "rlambda");
             if (parse_finite_value(value, &P->rlambda) || P->rlambda < 0.0)
@@ -542,6 +690,20 @@ bad_u32:
     if (P->deg < 1) {
         poly_diag(path, 0, "algebraic polynomial must have degree at least 1");
         goto done;
+    }
+    {
+        const int nr = poly_check_n(P);
+        if (nr == -2) {
+            poly_diag(path, 0, "n must be greater than 10 and fit in %d bits",
+                      32 * (PB_LIMBS - 1));
+            goto done;
+        }
+        if (nr) {
+            poly_diag(path, 0, "the two polynomials have no common root mod n:"
+                      " f(-Y0/Y1) is not 0 mod n. The file pairs polynomials"
+                      " from different jobs, or carries the wrong n");
+            goto done;
+        }
     }
     if (fclose(f)) {
         f = NULL;
