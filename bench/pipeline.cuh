@@ -1927,6 +1927,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     uint32_t *d_cursor_c = NULL, *d_overflow_c = NULL;
     cudaStream_t st_side[2] = { 0, 0 };
     int concurrent = 0;         /* the option as GRANTED, not as requested */
+    int dual = 0;               /* serial arm with a second bucket array      */
     pbkt_t bk1, bk0;
     uint32_t *d_n = NULL;
     unsigned long long *d_pre = NULL;
@@ -2251,6 +2252,36 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                " subtracts the overlap\n");
         VRAM_MARK("second bucket array");
     }
+    /* The SERIAL arm's second bucket array, when VRAM allows (default on,
+     * --no-dual-bucket). Side 0 then fills its own array instead of
+     * overwriting side 1's, so side 1's records are still resident at trial
+     * division and k_resieve_bucket covers both sides instead of side 1
+     * re-walking every lattice (measured under --fill-concurrent: resieve
+     * 28.8 -> 21.9 ms/q, RTX 4090). Same launches, same stream, same caps --
+     * the relations cannot change. Optional, so never fatal: a card without
+     * the room (margin max(1 GiB, 10%), since a volunteer's card may also be
+     * driving a display) keeps the one shared array exactly as before. */
+    if (!concurrent && cfg->bucket_resieve && cfg->dual_bucket &&
+        cfg->log_region <= (int)FINE_SHIFT) {
+        const size_t need2 = need + (size_t)nregion_alloc * 4 + 4;
+        size_t f2 = 0, t2 = 0;
+        PIPE_CK(cudaMemGetInfo(&f2, &t2));
+        const size_t gib = (size_t)1 << 30;
+        const size_t margin = t2 / 10 > gib ? t2 / 10 : gib;
+        if (need2 + margin <= f2) {
+            PIPE_CK(cudaMalloc(&d_bucket_c, need));
+            PIPE_CK(cudaMalloc(&d_cursor_c, (size_t)nregion_alloc * 4));
+            PIPE_CK(cudaMalloc(&d_overflow_c, 4));
+            dual = 1;
+            printf("  second bucket array (%.2f GB): side 1's records kept for"
+                   " the bucket resieve\n", need / 1073741824.0);
+            VRAM_MARK("second bucket array (serial)");
+        } else {
+            printf("  one bucket array: %.2f GB free is short of a second"
+                   " (%.2f GB + margin); side 1 resieves by walking\n",
+                   f2 / 1073741824.0, need2 / 1073741824.0);
+        }
+    }
 #undef VRAM_MARK
 
     /* Serial mode points BOTH sides at the one workspace on the legacy default
@@ -2265,6 +2296,13 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         bk0.bucket = d_bucket_c; bk0.cursor = d_cursor_c;
         bk0.overflow = d_overflow_c; bk0.cap = cap;
         bk0.stream = st_side[0];
+    } else if (dual) {
+        /* Serial, on the legacy stream like the one-array arm; only the
+         * workspace differs. */
+        bk0 = bk1;
+        bk0.bucket = d_bucket_c; bk0.cursor = d_cursor_c;
+        bk0.overflow = d_overflow_c;
+        bk0.stream = 0;
     } else {
         bk0 = bk1;
         /* Redundant today -- bk1.stream is provably 0 on this branch -- and
@@ -2934,10 +2972,11 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 wd_phase("slab.trialdiv");
                 /* Whose bucket records survive to here: side 0's always in
                  * the serial arm (it filled last into the shared array), both
-                 * when --fill-concurrent gave each side its own. */
+                 * when each side has its own (--fill-concurrent, or the
+                 * serial arm's second array). */
                 const pbkt_t *bkr[2] = {
                     cfg->bucket_resieve ? &bk0 : NULL,
-                    cfg->bucket_resieve && concurrent ? &bk1 : NULL };
+                    cfg->bucket_resieve && (concurrent || dual) ? &bk1 : NULL };
                 const int tdrc = pipe_td_perq<SLABBED>(&C, &Lq, cfg, &S1, &S0,
                                           d_two, xmax,
                                           j_base, blocks, cfg->threads, do_verify,

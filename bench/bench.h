@@ -617,6 +617,9 @@ typedef struct {
      * division (side 0 serial, both under --fill-concurrent) instead of
      * re-walking their lattices. On by default; --no-bucket-resieve. */
     int      bucket_resieve;
+    /* Serial arm: a second bucket array when VRAM allows, so side 1 also
+     * resieves from its records. On by default; --no-dual-bucket. */
+    int      dual_bucket;
     int      instances;   /* --instances N: PIPE_INSTANCES builds only (prototype) */
     /* --qspan: bracket each special-q's GPU work with two events and report
      * the span, splitting `unaccounted` into host-with-no-GPU-work versus

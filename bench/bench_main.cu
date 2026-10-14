@@ -298,6 +298,9 @@ static void usage(void)
 "  --no-bucket-resieve  pipeline: re-walk every bucketed lattice to find the\n"
 "                   primes at survivors, instead of reading them back from the\n"
 "                   bucket records that are still resident. Same relations\n"
+"  --no-dual-bucket pipeline, serial sides: share one bucket array between the\n"
+"                   sides even when VRAM has room for a second, which lets side\n"
+"                   1 resieve from its records too. Same relations [dual]\n"
 "  --fill-threads N fill only; 0 = auto (32), else a multiple of 32 in\n"
 "                   [32,1024]. Independent of --threads: fill wants many\n"
 "                   narrow blocks, the other kernels do not.            [0]\n"
@@ -998,6 +1001,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     cfg.fill_gate = 1;
     cfg.slab_fixed = 0;
     cfg.bucket_resieve = 1;
+    cfg.dual_bucket = 1;
     cfg.instances = 1;
     cfg.qspan = 0;
     cfg.threads = 256; cfg.blocks = 0; cfg.fill_blocks = 0; cfg.fill_threads = 0;
@@ -1146,6 +1150,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         else if (!strcmp(argv[i], "--no-fill-gate")) { cfg.fill_gate = 0; }
         else if (!strcmp(argv[i], "--slab-fixed")) { cfg.slab_fixed = 1; }
         else if (!strcmp(argv[i], "--no-bucket-resieve")) { cfg.bucket_resieve = 0; }
+        else if (!strcmp(argv[i], "--no-dual-bucket")) { cfg.dual_bucket = 0; }
         else if (!strcmp(argv[i], "--instances") && i + 1 < argc) {
             if (parse_u32_range_arg("--instances", argv[++i], 1u, 4u,
                                     (uint32_t *)&cfg.instances)) return 1;
@@ -2113,7 +2118,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
             "--watchdog-kill",
             "--slab-j", "--qspan", "--fill-concurrent", "--cof-async",
             "--no-cof-async", "--fill-gate", "--no-fill-gate", "--slab-fixed",
-            "--no-bucket-resieve", NULL
+            "--no-bucket-resieve", "--no-dual-bucket", NULL
         };
         int nbad = 0;
         for (int i = 1; i < argc; i++)
