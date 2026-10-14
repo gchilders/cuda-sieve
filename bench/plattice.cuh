@@ -328,6 +328,29 @@ PL_FN uint32_t pl_gcd32(uint32_t a, uint32_t b)
     return a;
 }
 
+/* Extended Euclid by division: returns a^-1 mod m when gcd(a, m) == 1 (else 0),
+ * and gcd(a, m) through *g. Requires a < m. One loop of ~0.84 ln m divisions
+ * yields both the gcd and the inverse -- the transform used to run pl_gcd32
+ * and then pl_invmod_any's binary extended gcd, ~64 branchy iterations, on
+ * every entry of every special-q (glas uses this same form). Any modulus,
+ * odd or a power of two; the inverse is unique, so the result is exact.
+ * |q_k * t_k| <= m throughout, so int64 cannot overflow. */
+PL_FN uint32_t pl_inv_euclid(uint32_t a, uint32_t m, uint32_t *g)
+{
+    int64_t t = 0, nt = 1;
+    uint32_t r = m, nr = a;
+    while (nr) {
+        const uint32_t qq = r / nr;
+        const int64_t t2 = t - (int64_t)qq * nt;
+        t = nt; nt = t2;
+        const uint32_t r2 = r - qq * nr;
+        r = nr; nr = r2;
+    }
+    *g = r;
+    if (r != 1) return 0;
+    return (uint32_t)(t < 0 ? t + (int64_t)m : t);
+}
+
 /* Returns the modulus m; writes the root and the row divisor g. */
 PL_FN uint32_t pl_transform_gen(uint32_t q, uint32_t r, int is_proj,
                                 int64_t a0, int64_t a1, int64_t b0, int64_t b1,
@@ -339,7 +362,17 @@ PL_FN uint32_t pl_transform_gen(uint32_t q, uint32_t r, int is_proj,
     uint32_t g, m, dg;
     if (D < 0) D += Q;
     if (N < 0) N += Q;
-    g = pl_gcd32((uint32_t)D, q);
+    {
+        /* The common case, gcd 1: one Euclid gives g and the inverse, and
+         * m = q, dg = D, N < q make the general expression below reduce to
+         * exactly this. Otherwise fall through with g already in hand. */
+        const uint32_t inv = pl_inv_euclid((uint32_t)D, q, &g);
+        if (g == 1u) {
+            *rt_out = (uint32_t)(((uint64_t)(uint32_t)N * inv) % (uint64_t)q);
+            *g_out = 1u;
+            return q;
+        }
+    }
     m = q / g;
     if (m == 1) { *rt_out = 0; *g_out = g; return 1; }
     dg = (uint32_t)((uint64_t)D / g);
