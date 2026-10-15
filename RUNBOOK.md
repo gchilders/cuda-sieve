@@ -1199,18 +1199,24 @@ bench --pipeline --cofactor ... --qrange 300000000:300008000 \
 
 `--instances N` (1–4) splits a **bounded** `--qrange` into N equal q ranges
 and sieves them concurrently, each on its own host thread. One pipeline leaves
-the GPU idle between kernels and between special-q; a second fills those gaps.
-On 2,1147+ (RTX 4090, 420 q) two instances sieved in 74.6 s against 80.4 s for
-one (−7%), byte-identical relations; with the ~36 s factor-base startup both
-pay once, 112.0 s against 116.4 s end to end. Three were slower than two. On
-the same card emulating 16 GB free, two instances at the default slab lost to
-one at 2^31 (89.7 s against 83.8 s), and `auto` picks one there. Smaller jobs
-gain much more: a c187 GNFS (logI 15, alim 180M, 540 q) took 33.9 s with two
-against 42.7 s with one (−21%), and −22% with only ~7 GB free.
+the GPU partly idle between kernels and between special-q; a second fills
+those gaps. Measured on an RTX 4090 with the relation files on local disk:
+
+| job | one | two |
+|---|---|---|
+| c187 GNFS, logI 15, alim 180M, 540 q (default slab either way) | 33.8 s | 30.1 s (−11%) |
+| 2,1147+ SNFS, logI 16, 420 q (2^31 slab alone, 2^30 each as two) | 108.2 s | 110.0 s (+1.6%) |
+
+Relations are byte-identical in every case. Three instances were slower than
+two. A second instance pays only when it does not cost the slab size: on
+2,1147+ the smaller slab eats the whole gain, so `auto` keeps one there.
+(Earlier figures of −7% and −21% were taken with the relation files on a
+network filesystem, where each checkpoint's fsync stalled the q loop and a
+second instance hid that stall. The flush thread now writes the checkpoint
+itself, so neither pays it.)
 
 - **`auto`** picks two when two modelled footprints plus the headroom fit
-  free VRAM, and each instance still gets the slab size one would get on its
-  own, or 2^30 where one would get 2^31 (the one step measured to pay).
+  free VRAM and each instance still gets the slab size one would get alone.
   Otherwise it picks one. The model runs ~0.6 GB per instance high on the
   c187, so on an 8 GB card `auto` says one where two would have fit; an
   explicit `--instances 2` runs there with a warning. The default is

@@ -1833,6 +1833,22 @@ typedef struct {
     std::atomic<int> *fin;  /* set by the flush thread as its last act         */
     int         busy, rc;
     double      ms_wait;    /* host time the q loop spent waiting on a flush    */
+    /* Each async flush's own wall time, and the spacing of their starts: a
+     * flush that takes longer than the interval is what ms_wait pays for. */
+    double      t_start, t_last, ms_flush, ms_interval;
+    int         nflush;
+    /* The checkpoint the flush writes when it is done (ck_pending), from the
+     * flush thread itself: its relations are then in the file, and the q loop
+     * never waits on the fsync. Measured on a network filesystem (CephFS) at
+     * ~0.6 s a flush -- 16-19 ms/q, a quarter of c187's wall -- against
+     * nothing on local disk; a volunteer's slow disk pays it the same way.
+     * Every other checkpoint is written by the q loop only after cofa_wait,
+     * so ck and its flags are never touched by both threads at once. */
+    const poly_t *ck_P;
+    ckpt_t      *ck;
+    FILE        *ck_fc;
+    unsigned long long ck_base_rel;
+    int         *ck_written, *ck_warned;
     /* The resume point as it stood when the in-flight flush started: the file
      * holds exactly that flush's relations once it is joined, so that is the
      * checkpoint to write then -- not the q the loop has since reached. */
@@ -1869,15 +1885,28 @@ static void cofa_start(cofasync_t *A, cofq_t *Q, cofq_out_t *O,
     A->busy = 1;
     A->rc = 0;
     A->fin->store(0, std::memory_order_relaxed);
-    /* Full width. Launching the flush at blocks/2 or blocks/4 so the sieve
-     * kept SMs to itself was measured at 278.2 and 277.0 ms/q against 276.5
-     * (RTX 4090, 2,1147+, 420 q): no effect, so there is no knob. */
+    A->t_start = host_ms();
+    if (A->nflush) A->ms_interval += A->t_start - A->t_last;
+    A->t_last = A->t_start;
+    A->nflush++;
+    /* Full width. Launching the flush narrower so the sieve kept SMs to
+     * itself was measured twice: blocks/2, /4 at 278.2, 277.0 ms/q against
+     * 276.5 (2,1147+, RTX 4090), and 256/128/64 blocks against 768 at
+     * 196.8/195.6/203.5 vs 192.5 (and c187 68.6/70.5/69.8 vs 66.9). No
+     * effect, so there is no knob. */
     const cudaStream_t cs = g_cof_stream;   /* thread_local: hand it over */
     A->th = new std::thread([A, O, cfg, blocks, fr, cs]() {
         g_cof_stream = cs;
         A->rc = cofq_flush(&A->F, O, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
                            cfg->cof_rounds, cfg->cof_budget, cfg->cof_chunk,
                            blocks, cfg->threads, fr);
+        if (A->rc == 0 && A->ck_pending) {
+            pipe_try_checkpoint(A->ck_P, cfg, A->ck, fr, A->ck_fc, &A->ck_next,
+                                A->ck_base_rel + A->F.nrel, A->ck_nq,
+                                A->ck_written, A->ck_warned);
+            A->ck_pending = 0;
+        }
+        A->ms_flush += host_ms() - A->t_start;
         A->fin->store(1, std::memory_order_release);
     });
 }
@@ -3139,15 +3168,14 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 if (Q.n + nacc_s > Q.cap && cfg->cof_async) {
                     wd_phase("slab.cofq_flush_async");
                     if (cofa_wait(&A, &Q)) { rc = -1; break; }
-                    if (A.ck_pending)
-                        pipe_try_checkpoint(POLY, cfg, &ck, fr, fc, &A.ck_next,
-                                            base_rel + Q.nrel, A.ck_nq,
-                                            &ckpt_written, &ckpt_warned);
                     A.ck_pending = fr && slab == 0;
                     if (A.ck_pending) {
                         A.ck_next = *cur;
                         A.ck_nq = base_nq + nqdone;
                     }
+                    A.ck_P = POLY; A.ck = &ck; A.ck_fc = fc;
+                    A.ck_base_rel = base_rel;
+                    A.ck_written = &ckpt_written; A.ck_warned = &ckpt_warned;
                     cofa_start(&A, &Q, &QO, cfg, blocks, fr);
                 } else if (Q.n + nacc_s > Q.cap) {
                     wd_phase("slab.cofq_flush");
@@ -3181,21 +3209,12 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 if (CUDA_CHECKED(pipe_qsync()) ||
                     CUDA_CHECKED(cudaGetLastError())) { rc = -1; break; }
                 Q.n += nacc_s;
-                /* --cof-async: a flush that has finished is joined HERE, and
-                 * its checkpoint written, rather than at the next queue-full
-                 * a whole flush interval later -- which is that much more a
-                 * kill -9 replays, and that much later --target-rels sees
-                 * the flush's relations. The join cannot wait: the thread
-                 * has already returned. */
-                if (A.busy && A.fin->load(std::memory_order_acquire)) {
+                /* --cof-async: a flush that has finished (and checkpointed
+                 * itself) is joined HERE rather than at the next queue-full,
+                 * so --target-rels sees its relations a whole flush interval
+                 * sooner. The join cannot wait: the thread has returned. */
+                if (A.busy && A.fin->load(std::memory_order_acquire))
                     if (cofa_wait(&A, &Q)) { rc = -1; break; }
-                    if (A.ck_pending) {
-                        pipe_try_checkpoint(POLY, cfg, &ck, fr, fc, &A.ck_next,
-                                            base_rel + Q.nrel, A.ck_nq,
-                                            &ckpt_written, &ckpt_warned);
-                        A.ck_pending = 0;
-                    }
-                }
             }
             tm.cofac += host_ms() - cf_start;
 
@@ -4082,6 +4101,14 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             printf("  %-34s %8.2f ms\n", "  = device time per q",
                    (Q.ms_rat + Q.ms_alg + Q.ms_host) / N);
             printf("  %-34s %8.2f ms\n", "wall: in-loop flushes", tm.cofac / N);
+            if (cfg->cof_async && A.nflush) {
+                printf("  %-34s %8.2f ms\n", "  of which waiting on a flush",
+                       A.ms_wait / N);
+                printf("  %-34s %8.0f ms each, one every %.0f ms (%d)\n",
+                       "async flushes", A.ms_flush / A.nflush,
+                       A.nflush > 1 ? A.ms_interval / (A.nflush - 1) : 0.0,
+                       A.nflush);
+            }
             printf("  %-34s %8.2f ms\n", "wall: final flush after the band",
                    cofac_tail / N);
             /* Everything joint-accepted is enqueued, INCLUDING the records
@@ -4655,16 +4682,16 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                 }
             };
             if (ninst == 0) {
-                /* auto: two instances when each still gets the slab one
-                 * would -- or 2^30 where one would get 2^31, the one step
-                 * measured to pay (2,1147+, RTX 4090: 73.5 s of band against
-                 * 80.5 s). Three measured slower than two there, so auto
-                 * stops at two. */
+                /* auto: two instances only when each still gets the slab
+                 * one would, and two footprints fit. A smaller slab does not
+                 * pay for the second instance: on 2,1147+ (RTX 4090) two at
+                 * 2^30 took 110.0 s against 108.2 s for one at 2^31, while on
+                 * c187 two at the same default slab took 30.1 s against 33.8.
+                 * Three measured slower than two, so auto stops at two. */
                 choice_t c1, c2;
                 choose(1, &c1);
                 choose(2, &c2);
-                ninst = c2.fits && (c2.idx == c1.idx ||
-                                    (c1.idx == 0 && c2.idx == 1)) ? 2 : 1;
+                ninst = c2.fits && c2.idx == c1.idx ? 2 : 1;
                 printf("  --instances auto: %d (%.2f GB free)\n", ninst,
                        freeB / 1073741824.0);
             }
