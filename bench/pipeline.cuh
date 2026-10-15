@@ -449,6 +449,20 @@ __device__ __forceinline__ uint32_t rb_mod(int64_t a, uint32_t p)
     return (uint32_t)(m < 0 ? m + p : m);
 }
 
+/* One block per region. The region's slice of the two-sided survivor bitmap
+ * (2 KB at --region 14) is staged in shared memory once, so the test every
+ * record faces is a shared-memory read rather than a global load that waits
+ * on the record just loaded.
+ *
+ * A HIT IS HANDLED BY THE WHOLE WARP. Most of this kernel's time was never
+ * the record scan: it was the hits, each one walking its fine slice -- ~120
+ * factor-base entries on 2,1147+ -- in ONE lane, three dependent random loads
+ * per entry, while the rest of the warp waited. The warp now finds its hits
+ * with a ballot and takes them one at a time, lane l testing entries
+ * start+l, start+l+32, ...: the slice is contiguous, so the loads coalesce,
+ * and 120 serial steps become 4. Several primes of one slice can land in the
+ * same survivor's list in any order; the emitters sort, so the relations do
+ * not change. */
 __global__ void k_resieve_bucket(const uint32_t *__restrict bucket,
                                  const uint32_t *__restrict cnt, uint32_t cap,
                                  int log_region,
@@ -464,35 +478,50 @@ __global__ void k_resieve_bucket(const uint32_t *__restrict bucket,
                                  uint32_t *__restrict pcnt, uint32_t K,
                                  unsigned long long *__restrict noverflow)
 {
-    const uint32_t b = blockIdx.x;
+    __shared__ uint32_t sbits[(1u << FINE_SHIFT) >> 5];  /* log_region <= 14 */
+    const uint32_t b = blockIdx.x, nth = blockDim.x;     /* a multiple of 32 */
+    const uint32_t lane = threadIdx.x & 31u, nwarp = nth >> 5;
     const uint32_t ncell = 1u << log_region, offmask = ncell - 1;
     const uint32_t w0 = (b << log_region) >> 5, nw = ncell >> 5;
     int any = 0;
-    for (uint32_t w = threadIdx.x; w < nw; w += blockDim.x)
-        any |= bits[w0 + w] != 0u;
+    for (uint32_t w = threadIdx.x; w < nw; w += nth) {
+        const uint32_t v = bits[w0 + w];
+        sbits[w] = v;
+        any |= v != 0u;
+    }
     if (!__syncthreads_or(any)) return;
     uint32_t n = cnt[b];
     if (n > cap) n = cap;
     const uint32_t *rec = bucket + (size_t)b * cap;
     unsigned long long ovf = 0;
-    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
-        const uint32_t r = rec[i];
-        const uint32_t x = (b << log_region) | (r & offmask);
-        if (!((bits[x >> 5] >> (x & 31u)) & 1u)) continue;
-        const uint32_t f = r >> FINE_SHIFT;
-        const uint32_t idx = td_rank(bits, gbase, x);
-        const int64_t a = A[idx], bb = B[idx];
-        for (uint32_t k = fine_start[f], ke = fine_start[f + 1]; k < ke; k++) {
-            if (plat[k].inc_warp == PL_INVALID) continue;
-            const uint32_t p = primes[k], re = roots[k];
-            const uint64_t am = rb_mod(a, p), bm = rb_mod(bb, p);
-            const uint64_t t = re < p
-                ? (am + p - ((uint64_t)re * bm) % p) % p
-                : (((uint64_t)(re - p) * am) % p + p - bm) % p;
-            if (t) continue;
-            const uint32_t slot = atomicAdd(&pcnt[idx], 1u);
-            if (slot < K) plist[(size_t)idx * K + slot] = p;
-            else ovf++;
+    /* Warp-uniform trip count: every lane takes part in every ballot. */
+    for (uint32_t base = (threadIdx.x >> 5) * 32u; base < n; base += nwarp * 32u) {
+        const uint32_t i = base + lane;
+        const uint32_t r = i < n ? rec[i] : 0u;
+        const uint32_t off = r & offmask;
+        const bool hit = i < n && ((sbits[off >> 5] >> (off & 31u)) & 1u);
+        uint32_t m = __ballot_sync(0xffffffffu, hit);
+        while (m) {
+            const int src = __ffs((int)m) - 1;
+            m &= m - 1u;
+            const uint32_t rr = __shfl_sync(0xffffffffu, r, src);
+            const uint32_t x = (b << log_region) | (rr & offmask);
+            const uint32_t f = rr >> FINE_SHIFT;
+            const uint32_t idx = td_rank(bits, gbase, x);
+            const int64_t a = A[idx], bb = B[idx];
+            for (uint32_t k = fine_start[f] + lane, ke = fine_start[f + 1];
+                 k < ke; k += 32u) {
+                if (plat[k].inc_warp == PL_INVALID) continue;
+                const uint32_t p = primes[k], re = roots[k];
+                const uint64_t am = rb_mod(a, p), bm = rb_mod(bb, p);
+                const uint64_t t = re < p
+                    ? (am + p - ((uint64_t)re * bm) % p) % p
+                    : (((uint64_t)(re - p) * am) % p + p - bm) % p;
+                if (t) continue;
+                const uint32_t slot = atomicAdd(&pcnt[idx], 1u);
+                if (slot < K) plist[(size_t)idx * K + slot] = p;
+                else ovf++;
+            }
         }
     }
     if (ovf) atomicAdd(noverflow, ovf);
@@ -1174,6 +1203,7 @@ done:
 
 typedef struct {
     double rank, emit, summary, resieve, td, classify, compact, record;
+    double resieve0;    /* side 0's share of resieve, reported beside it */
     double readback, join, hostq, cofac;
 } pipe_tm_t;
 
@@ -1613,6 +1643,7 @@ static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
     tm->emit     += time_kernel(E[2], E[3]);
     tm->summary  += time_kernel(E[3], E[4]);
     tm->resieve  += time_kernel(E[4], E[5]) + time_kernel(E[7], E[8]);
+    tm->resieve0 += time_kernel(E[7], E[8]);
     tm->td       += time_kernel(E[5], E[6]) + time_kernel(E[8], E[9]);
     tm->classify += time_kernel(E[6], E[7]) + time_kernel(E[9], E[10]);
     tm->compact  += time_kernel(E[10], E[11]);
@@ -3983,6 +4014,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         printf("      %-30s %8.3f ms\n", "survivor filter (shared)", tm.summary / N);
         printf("      %-30s %8.3f ms\n", "resieve + scatter, both sides",
                tm.resieve / N);
+        printf("      %-30s %8.3f ms\n", "  of which side 0", tm.resieve0 / N);
         printf("      %-30s %8.3f ms\n", "norms + trial division, both sides",
                tm.td / N);
         printf("      %-30s %8.3f ms\n", "classify, both sides", tm.classify / N);
