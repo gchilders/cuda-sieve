@@ -84,6 +84,10 @@ __pycache__/
 *.poly
 *.log
 
+# Frozen C143 comparison input; full relation outputs remain local.
+!oracle/c143.poly
+/c143-timing.*/
+
 
 # Frozen measurement binaries. A finding that quotes ms/q is only reproducible
 # against the binary that produced it, so those get copied aside as

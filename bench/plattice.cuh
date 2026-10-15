@@ -193,6 +193,47 @@ PL_FN uint64_t pl_first64(const plat_t *P, int logI)
     return pl_next64((uint64_t)1 << (logI - 1), P, (1u << logI) - 1);
 }
 
+/* Rows from a row whose strip offset is `off` to the first row that holds a
+ * strip point: the least t >= 0 with (off + t*rt) mod q < I, for off, rt < q
+ * and q >= I (the row tier's lattice i + I/2 == (rt*j + I/2) mod q). The
+ * offsets run through I/2 + gcd(rt,q)Z (mod q), which contains I/2 < I, so a
+ * row-tier entry always has a solution; UINT64_MAX means none (rt == 0 with
+ * off >= I).
+ *
+ * Stepping row by row costs up to ~q - I iterations (rt == 1, or rt near a
+ * fraction of q), so this is Euclid on (rt, q), O(log q). For t > 0 the
+ * condition is (rt*t) mod q in [q - off, q - off + I - 1], an interval inside
+ * [1, q) when off >= I. The least x >= 0 with (A*x) mod M in [L, R],
+ * 0 < L <= R < M, is ceil(L/A) when that multiple of A is <= R. Otherwise no
+ * multiple of A lies in [L, R], and the least y >= 1 with A*x - M*y in [L, R]
+ * is the same problem one Euclid step down -- (M mod A)*y mod A in
+ * [(-R) mod A, (-L) mod A], which again excludes 0 -- after which
+ * x = ceil((L + M*y)/A). verify_rows_to_hit checks it against brute force. */
+PL_FN uint64_t pl_rows_to_hit(uint32_t off, uint32_t rt, uint32_t q, uint32_t I)
+{
+    uint32_t sA[48], sM[48], sL[48];   /* Euclid on 32-bit inputs: < 47 levels */
+    uint64_t A = rt, M = q, L, R, x;
+    int d = 0;
+    if (off < I) return 0;
+    L = (uint64_t)q - off;
+    R = L + I - 1;
+    for (;;) {
+        if (A == 0) return UINT64_MAX;
+        x = (L + A - 1) / A;
+        if (A * x <= R) break;
+        if (d == 48) return UINT64_MAX;
+        sA[d] = (uint32_t)A; sM[d] = (uint32_t)M; sL[d] = (uint32_t)L; d++;
+        {
+            const uint64_t nA = M % A, nM = A;
+            const uint64_t nL = (A - R % A) % A, nR = (A - L % A) % A;
+            A = nA; M = nM; L = nL; R = nR;
+        }
+    }
+    while (d-- > 0)
+        x = ((uint64_t)sL[d] + (uint64_t)sM[d] * x + sA[d] - 1) / sA[d];
+    return x;
+}
+
 /* ---- modular arithmetic used by the root transform ------------------- */
 
 /* Binary extended Euclid. p odd, 0 < a < p. Returns a^-1 mod p, or 0 if

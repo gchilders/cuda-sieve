@@ -1211,10 +1211,13 @@ static thread_local cudaStream_t g_cof_stream = 0;
  * counts them. Errors are never suppressed. */
 static thread_local int g_cofq_quiet = 0;
 
+/* This thread's stream, never the device: under --q-pipeline the next
+ * special-q is sieving on another stream that a device-wide sync would wait
+ * out (finding 108), and under --instances so are the other pipelines. With
+ * nothing else in flight the two are the same wait. */
 static cudaError_t cof_sync(void)
 {
-    return g_cof_stream ? cudaStreamSynchronize(g_cof_stream)
-                        : cudaDeviceSynchronize();
+    return cudaStreamSynchronize(g_cof_stream ? g_cof_stream : 0);
 }
 
 static cudaError_t cof_d2h(void *dst, const void *src, size_t n)

@@ -27,6 +27,12 @@
 # energy, and target crossing all use those normalized samples.
 
 set -u
+# Every number this script parses comes from the binary in C-locale form.
+# Under a comma-decimal locale awk read "7.50" as 7, so the memory footer
+# printed truncated integers ("7,00 GB in use", "setup 6,00 GB" from parts
+# summing to 7.36), the busy-card spread check could never fire, and a
+# board-watts average came out as "143,0", which float() then rejects.
+export LC_ALL=C
 usage() {
     cat <<'EOF'
 usage: ./testsieve.sh --poly JOB.job [--fb1 FB] [options]

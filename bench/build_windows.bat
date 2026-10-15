@@ -191,7 +191,7 @@ set "CFLAGS=/nologo /O2 /W3 /MT -D_CRT_SECURE_NO_WARNINGS %CF_LMAX_DEF% %DEFS%"
 set "CXXFLAGS=/nologo /O2 /W3 /MT /EHsc -D_CRT_SECURE_NO_WARNINGS %CF_LMAX_DEF% %DEFS%"
 
 echo Building host C objects with cl.exe... (GPU_ARCH=%GPU_ARCH% CF_LMAX=%CF_LMAX% build=%GIT_DESC%)
-for %%F in (fb_load.c verify_cpu.c poly.c primes.c rfb.c fb_cado.c platform.c) do (
+for %%F in (fb_load.c verify_cpu.c poly.c primes.c rfb.c fb_cado.c platform.c watchdog.c) do (
     cl %CFLAGS% /std:c11 /c %%F || exit /b 1
 )
 

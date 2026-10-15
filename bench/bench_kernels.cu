@@ -104,13 +104,18 @@ __global__ void k_transform(const uint32_t *__restrict primes,
                             int64_t a0, int64_t a1, int64_t b0, int64_t b1,
                             uint32_t *__restrict nproj,
                             unsigned long long *__restrict nlost,
-                            uint64_t *__restrict walk_cur)
+                            uint64_t *__restrict walk_cur,
+                            uint32_t *__restrict rt_out = nullptr,
+                            uint32_t n_rt = 0)
 {
     const uint64_t stride = bench_grid_stride_x();
     for (uint64_t kk = bench_grid_thread_x(); kk < n; kk += stride) {
         const uint32_t k = (uint32_t)kk;
         const uint32_t q = primes[k];
         uint32_t rt, g, m = pl_transform_enc(q, roots[k], a0, a1, b0, b1, &rt, &g);
+        /* --fill-rows: the row tier walks i == rt*j (mod q) row by row, which
+         * is the same lattice pl_make reduces whenever g == 1 (then m == q). */
+        if (k < n_rt) rt_out[k] = (g > 1) ? ROWRT_NONE : rt;
         if (g > 1) {                         /* rows only: emit an empty walk */
             plat_t P; P.inc_warp = PL_INVALID; P.inc_step = PL_VERTICAL;
             P.bound_warp = 0; P.bound_step = 0;
@@ -149,31 +154,20 @@ __device__ __forceinline__ int pos_both_even(uint32_t x, uint32_t j)
     return ((x | j) & 1u) == 0u;
 }
 
-/* ---- stage (a): naive single-level atomic append ---------------------- */
-
-/* --fill-gate: one gate bit per 2^FILL_GATE_SHIFT cells, the OR of side 1's
- * survivor bits over them. 3 (8 cells) is glas's default: 16 MB per 2^30 slab,
- * small enough to stay in a large L2. k_gate_fold below assumes 3. */
-#define FILL_GATE_SHIFT 3
-
-__global__ void k_gate_fold(const uint32_t *__restrict bits, uint32_t nword,
-                            uint32_t *__restrict gate)
+/* --fill-gate: the side filled SECOND stores a record only where the side
+ * filled first has a survivor within the same 2^gate_shift positions. A
+ * position the first side rejected is dropped by k_intersect_compact whatever
+ * the second side's sum is, so the records that matter are all still written
+ * and the relations are unchanged. gate == NULL is the ungated fill. */
+__device__ __forceinline__ int fill_gate_drops(const uint32_t *__restrict gate,
+                                               int gate_shift, uint32_t x)
 {
-    const uint64_t stride = bench_grid_stride_x();
-    const uint32_t ngate = nword / 8u;     /* 8 bitmap words -> 1 gate word */
-    for (uint64_t tt = bench_grid_thread_x(); tt < ngate; tt += stride) {
-        const uint32_t g = (uint32_t)tt;
-        uint32_t out = 0;
-        #pragma unroll
-        for (int k = 0; k < 8; k++) {
-            const uint32_t w = bits[(size_t)g * 8u + k];
-            #pragma unroll
-            for (int b = 0; b < 4; b++)
-                if ((w >> (8 * b)) & 0xFFu) out |= 1u << (4 * k + b);
-        }
-        gate[g] = out;
-    }
+    if (!gate) return 0;
+    const uint32_t g = x >> gate_shift;
+    return !((gate[g >> 5] >> (g & 31u)) & 1u);
 }
+
+/* ---- stage (a): naive single-level atomic append ---------------------- */
 
 /* One atomicAdd per record into a 2^log_nbuckets-way split. This is the
  * baseline the design doc says to beat. */
@@ -189,6 +183,7 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
                               uint64_t *__restrict walk_next,
                               int sieve_skip, uint32_t j_base,
                               const uint32_t *__restrict gate = nullptr,
+                              int gate_shift = 0,
                               int sl_shift = 16)
 {
     const uint32_t Imask = (1u << logI) - 1;
@@ -253,15 +248,10 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
                 if (sieve_skip > 1 && (j % 3u) == 0u && ((xl & Imask) % 3u) == ih3)
                     continue;
             }
-            /* --fill-gate (glas): side 0 writes no record for a cell whose
-             * 8-cell group has no side-1 survivor. k_intersect_compact ANDs
-             * the two bitmaps, so such a cell cannot reach a relation, and the
-             * bucket resieve reads records only at two-sided survivors, whose
-             * 8-cell group the gate always keeps. */
-            if (gate) {
-                const uint32_t g = xl >> FILL_GATE_SHIFT;
-                if (!((gate[g >> 5] >> (g & 31u)) & 1u)) continue;
-            }
+            /* The bucket resieve reads records only at two-sided survivors,
+             * whose gate group always has a side-1 survivor, so it loses
+             * nothing to the gate either. */
+            if (fill_gate_drops(gate, gate_shift, xl)) continue;
             const uint32_t b = xl >> log_region;
             const uint32_t slot = atomicAdd(&cursor[b], 1u);
             if (slot >= cap) { atomicAdd(overflow, 1u); continue; }
@@ -276,6 +266,151 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
         }
         /* x is already the exact first hit at/after the slab end. */
         if constexpr (SLABBED) walk_next[k] = x - xmax;
+    }
+}
+
+/* ---- --fill-rows: the smallest bucketed moduli, row by row ------------ *
+ *
+ * k_fill_atomic gives each modulus ONE thread, and that thread visits all of
+ * its xmax/q hits in sequence, each a cursor atomic whose returned slot the
+ * store must wait for. The smallest bucketed modulus is ~I, so its thread
+ * runs xmax/I = J dependent atomic->store steps while the average thread
+ * runs a few hundred: the kernel's tail is a handful of warps on an
+ * otherwise idle card. (C143: fill +60% from I14 to I13 for +14% records.)
+ *
+ * For q >= I a row holds at most one hit, at i + I/2 == (rt*j + I/2) mod q,
+ * so the strip can be enumerated by row instead of by FK step, and the rows
+ * split into bands that start independently. A warp takes 32 consecutive
+ * moduli over one band of rows; its hits in a row land in one or two
+ * regions, so one atomic per region per row reserves slots for all of them
+ * (CADO's fill_row_kernel does the same). Same records as the FK walk; only
+ * their order inside a bucket changes, which k_apply's sum does not see.
+ *
+ * rts[k] is k_transform's rt_out: the root, or ROWRT_NONE where k_fill_atomic
+ * would skip the entry (PL_INVALID). The row tier needs no walk state; when
+ * k_resieve_scatter still walks it (--no-resieve-rows), k_rows_walk_next
+ * supplies the cursor. j_base counts only under SLABBED, as in pos_row. */
+template <bool SLABBED, typename SLICE_T = uint16_t>
+__global__ void k_fill_rows(const uint32_t *__restrict primes,
+                            const uint32_t *__restrict rts,
+                            const SLICE_T *__restrict slice,
+                            uint32_t n, uint32_t nbands, uint32_t rows,
+                            int logI, int log_region,
+                            uint32_t *__restrict cursor,
+                            uint8_t *__restrict out, uint32_t cap,
+                            uint32_t *__restrict overflow,
+                            int sieve_skip, uint32_t j_base,
+                            const uint32_t *__restrict gate, int gate_shift,
+                            int sl_shift = 16)
+{
+    const uint32_t I = 1u << logI;
+    const uint32_t offmask = (1u << log_region) - 1;
+    const uint32_t jb = SLABBED ? j_base : 0u;
+    const uint32_t ih3 = (I >> 1) % 3u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t warp = ((uint64_t)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    /* whole warps only (blockDim % 32 == 0), so this exit is warp-uniform and
+     * the full-mask ballot below stays legal */
+    if (warp >= (uint64_t)((n + 31u) >> 5) * nbands) return;
+    const uint32_t band = (uint32_t)(warp % nbands);
+    const uint32_t k = (uint32_t)(warp / nbands) * 32u + lane;
+    const uint32_t r0 = (uint32_t)((uint64_t)band * rows / nbands);
+    const uint32_t r1 = (uint32_t)((uint64_t)(band + 1) * rows / nbands);
+
+    uint32_t q = 1, rt = 0, sl = 0;
+    const bool active = k < n && rts[k] != ROWRT_NONE;
+    if (active) { q = primes[k]; rt = rts[k]; sl = slice[k]; }
+    uint32_t off = active
+        ? (uint32_t)(((uint64_t)rt * (jb + r0) + (I >> 1)) % q) : I;
+
+    for (uint32_t r = r0; r < r1; r++) {
+        const uint32_t j = jb + r;
+        /* (0,0) is the only lattice point of row 0 and is never sieved */
+        bool hit = off < I && j != 0;
+        if (hit && sieve_skip) {
+            /* row bases are multiples of I, so parity(x) == parity(off) and
+             * x & Imask == off: the same tests as k_fill_atomic */
+            if (((off | j) & 1u) == 0u) hit = false;
+            else if (sieve_skip > 1 && j % 3u == 0u && off % 3u == ih3) hit = false;
+        }
+        const uint32_t xl = (r << logI) + off;
+        if (hit && fill_gate_drops(gate, gate_shift, xl)) hit = false;
+        /* every lane runs every row (the band is warp-uniform), so the
+         * full-mask ballot is legal */
+        const uint32_t mask = __ballot_sync(0xFFFFFFFFu, hit);
+        if (hit) {
+            const uint32_t b = xl >> log_region;
+            uint32_t slot;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+            /* __match_any_sync needs sm_70; before it, one atomic per hit */
+            (void)mask; (void)lane;
+            slot = atomicAdd(&cursor[b], 1u);
+#else
+            const uint32_t peers = __match_any_sync(mask, b);
+            const uint32_t leader = __ffs(peers) - 1;
+            slot = 0;
+            if (lane == leader) slot = atomicAdd(&cursor[b], __popc(peers));
+            slot = __shfl_sync(peers, slot, leader) +
+                   __popc(peers & ((1u << lane) - 1u));
+#endif
+            if (slot >= cap) atomicAdd(overflow, 1u);
+            else *(uint32_t *)(out + ((size_t)b * cap + slot) * 4) =
+                     (xl & offmask) | (sl << sl_shift);
+        }
+        if (active) { off += rt; if (off >= q) off -= q; }
+    }
+}
+
+/* Slabbed --fill-rows with --no-resieve-rows: k_resieve_scatter replays
+ * walk_cur for the row tier as for every other entry, so each needs the first
+ * lattice point at or past the slab end, as k_fill_atomic leaves it for the
+ * rest. Stepping row by row to it can take ~q - I rows (rt == 1), which is the
+ * single-thread tail the tier exists to remove, so pl_rows_to_hit jumps there
+ * in O(log q). row_end is the GLOBAL row after this slab. */
+__global__ void k_rows_walk_next(const uint32_t *__restrict primes,
+                                 const uint32_t *__restrict rts, uint32_t n,
+                                 uint32_t row_end, int logI,
+                                 const uint64_t *__restrict walk_cur,
+                                 uint64_t *__restrict walk_next)
+{
+    const uint32_t I = 1u << logI;
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t kk = bench_grid_thread_x(); kk < n; kk += stride) {
+        const uint32_t k = (uint32_t)kk;
+        const uint32_t rt = rts[k];
+        if (rt == ROWRT_NONE) { walk_next[k] = walk_cur[k]; continue; }
+        const uint32_t q = primes[k];
+        const uint32_t off = (uint32_t)(((uint64_t)rt * row_end + (I >> 1)) % q);
+        const uint64_t t = pl_rows_to_hit(off, rt, q, I);
+        if (t == UINT64_MAX) { walk_next[k] = UINT64_MAX; continue; }
+        const uint32_t o = (uint32_t)((off + (uint64_t)rt * (t % q)) % q);
+        walk_next[k] = (t << logI) + o;   /* x - xmax, as k_fill_atomic */
+    }
+}
+
+/* --fill-gate-shift > 0: fold the first side's survivor bitmap to one bit per
+ * 2^shift positions, set when any of them survived. A superset of the bitmap,
+ * so the gated fill stores somewhat more records than shift 0 would but the
+ * gate is 2^shift times smaller to keep in L2. One thread per gate word. */
+__global__ void k_gate_fold(const uint32_t *__restrict bits,
+                            uint32_t *__restrict gate, int shift,
+                            uint32_t ngword, uint32_t nbitword)
+{
+    const uint32_t span = 1u << shift;          /* bitmap words per gate word */
+    const uint32_t per = 32u >> shift;          /* gate bits per bitmap word */
+    const uint32_t low = span == 32u ? 0xFFFFFFFFu : (1u << span) - 1u;
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t w = bench_grid_thread_x(); w < ngword; w += stride) {
+        uint32_t g = 0;
+        for (uint32_t k = 0; k < span; k++) {
+            /* the last gate word may cover past the bitmap's end: no
+             * survivors there, so no gate bits */
+            const uint64_t wi = (w << shift) + k;
+            const uint32_t word = wi < nbitword ? bits[wi] : 0u;
+            for (uint32_t c = 0; c < per; c++)
+                if ((word >> (c << shift)) & low) g |= 1u << (k * per + c);
+        }
+        gate[w] = g;
     }
 }
 
@@ -316,7 +451,10 @@ __device__ __forceinline__ void ss_add(uint32_t *S, uint32_t c, uint32_t lp)
     else        S[c / CPW] += v;
 }
 
-/* First offset within [0,width) whose i is congruent to rt*j (mod p). */
+/* First offset within [0,width) whose i is congruent to rt*j (mod p). TWO
+ * selects the two-step reduction, for the thread tier's tail range only (see
+ * the magic path below and ss_bound_ok in td.cuh). */
+template <bool TWO = false>
 __device__ __forceinline__ uint32_t ss_first(uint32_t p, uint32_t rt,
                                              uint32_t j, int32_t ilo,
                                              uint32_t magic, uint32_t kshift)
@@ -353,6 +491,20 @@ __device__ __forceinline__ uint32_t ss_first(uint32_t p, uint32_t rt,
      * it could not prove that, matching tdsmall_t's convention in td.cuh.
      * td_mod_magic is exact only for dividends < 2^31, which is that bound. */
     if (magic) {
+        if constexpr (TWO) {
+            /* TWO-STEP: the host could not prove rt*j + bias - ilo < 2^31
+             * (at I16/J32768, every p above ~43,690), but did prove rt*j and
+             * (rt*j mod p) + bias - ilo each are. Same magic, applied twice:
+             * a few instructions, against the 64-bit remainder call below
+             * that these entries took in every region (findings 110-111). A power
+             * of two needs no bound at all -- p divides 2^32, so the AND is
+             * exact even if the 32-bit sum wraps. */
+            if ((p & (p - 1)) == 0)
+                return (rt * j + (p << kshift) - (uint32_t)ilo) & (p - 1);
+            const uint32_t sh = 31u - (uint32_t)__clz((int)p);
+            const uint32_t r  = td_mod_magic(rt * j, p, magic, sh);
+            return td_mod_magic(r + (p << kshift) - (uint32_t)ilo, p, magic, sh);
+        }
         const uint32_t w = rt * j + (p << kshift) - (uint32_t)ilo;
         if ((p & (p - 1)) == 0) return w & (p - 1);
         return td_mod_magic(w, p, magic, 31u - (uint32_t)__clz((int)p));
@@ -380,6 +532,7 @@ __device__ __forceinline__ uint32_t ss_first(uint32_t p, uint32_t rt,
  * the first hit c0 (< 2m) and sets *mm_out to the step, or to 0 when the entry
  * has no hits in this row -- g does not divide j, or under --sieve-skip an even
  * modulus whose hits in an even row all fall on even i. */
+template <bool TWO = false>
 __device__ __forceinline__ uint32_t ss_setup(uint32_t e,
                                              const uint32_t *__restrict sp,
                                              const uint32_t *__restrict srt,
@@ -389,11 +542,16 @@ __device__ __forceinline__ uint32_t ss_setup(uint32_t e,
                                              uint32_t kshift, int evenrow,
                                              uint32_t *mm_out)
 {
-    const uint32_t m = sp[e], g = sg[e];
+    /* All four loads before the g test, so they go out together: an entry
+     * costs one L2 round trip, not two. The tables do not fit in the L1 left
+     * beside apply's shared memory, and the thread tier pays this once per
+     * entry per region (finding 110). An entry with g not dividing j loads
+     * two words it does not use; they share its lines anyway. */
+    const uint32_t m = sp[e], g = sg[e], rt = srt[e];
+    const uint32_t mg = smag ? smag[e] : 0u;
     *mm_out = 0;
     if (g > 1 && (j % g)) return 0;
-    uint32_t c0 = ss_first(m, srt[e], g > 1 ? j / g : j, ilo,
-                           smag ? smag[e] : 0u, kshift);
+    uint32_t c0 = ss_first<TWO>(m, rt, g > 1 ? j / g : j, ilo, mg, kshift);
     uint32_t mm = m;
     if (evenrow) {
         if (m & 1u) { if (!(c0 & 1u)) c0 += m; mm = 2u * m; }
@@ -418,7 +576,7 @@ static inline void ss_tiers(const uint32_t *hsp, uint32_t n,
     *nblk = b; *nwrp = w;
 }
 
-template <int CELLBITS, int ATOMIC, bool SLABBED = false>
+template <int CELLBITS, int ATOMIC, bool SLABBED = false, bool SSTAIL = true>
 __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_region,
                             const uint32_t *__restrict sp,
                             const uint32_t *__restrict srt,
@@ -426,6 +584,7 @@ __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_regi
                             const uint16_t *__restrict slp,
                             const uint32_t *__restrict smag,
                             uint32_t nsmall, uint32_t nblk, uint32_t nwrp,
+                            uint32_t nsplit,
                             uint32_t tid, uint32_t nth, uint32_t j_base,
                             int skipeven)
 {
@@ -460,15 +619,6 @@ __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_regi
      * setup, shared by all three tiers so they cannot sieve different position
      * sets. */
     #define SS_SETUP(e, MM) ss_setup((e), sp, srt, sg, smag, j, ilo, kshift, evenrow, &(MM))
-    #define SS_ROW(e, first, step)                                            \
-        do {                                                                  \
-            uint32_t mm;                                                      \
-            const uint32_t c0 = SS_SETUP(e, mm);                              \
-            if (!mm) break;                                                   \
-            const uint32_t lp = slp[e];                                       \
-            for (uint32_t c = c0 + (first) * mm; c < width; c += (step) * mm) \
-                ss_add<CELLBITS,ATOMIC>(S, c, lp);                            \
-        } while (0)
 
     /* WHOLE-BLOCK TIER (m < SS_BLOCK_CUT), setup shared by shuffle. An entry's
      * setup is the same for every thread in the block, and the per-warp form
@@ -539,10 +689,50 @@ __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_regi
     }
 
     /* THREAD TIER (m >= SS_WARP_CUT): one thread per entry, so the setup is
-     * already lane-parallel. */
-    for (uint32_t e = nwrp + tid; e < nsmall; e += nth)
-        SS_ROW(e, 0u, 1u);
-    #undef SS_ROW
+     * already lane-parallel. The log is loaded with the setup's four words,
+     * not after c0 is known: three dependent L2 round trips per entry became
+     * one. At I16 this tier has ~6,500 entries per side, each paid in every
+     * quarter-row region; the hoist is apply -2.7% there, -2.0% at c183, and
+     * no more because apply is issue-bound and co-resident blocks were
+     * already hiding most of the wait (finding 110).
+     *
+     * THE TWO-STEP TAIL. Entries at or past nsplit (ss_two_step_from) are
+     * the large moduli whose one-step numerator the host could not bound --
+     * at I16/J32768 every m above ~43,690 -- and take the two-step setup
+     * instead of the 64-bit fallback. SSTAIL is a template constant: false
+     * (no tail, nsplit == nsmall: every geometry up to logI 15 at the default
+     * J) folds the select away and runs the one-step loop alone; true tests
+     * e >= nsplit per entry, which is warp-uniform except in the one warp
+     * that straddles it.
+     *
+     * One thread-tier loop per kernel instance, ON PURPOSE. Two loops in one
+     * kernel -- back to back over [nwrp, nsplit) and [nsplit, nsmall), or as
+     * the two arms of a runtime branch -- made ptxas compile one of them
+     * without reconvergence (a YIELD and a plain BSSY in its hit loop): lanes
+     * drifted apart and the block waited at the scan's barrier, apply +24%
+     * at I16 for the same instructions. And testing e < nsplit in the I15
+     * loop, where it is always true, cost apply +0.8% at c183 (finding 111).
+     * An edit here should recount YIELD/BSSY per k_apply instance
+     * (oracle/ss-two-step-20261014/sass-structure.txt).
+     *
+     * The one-step instance TRAPS on a table with a tail. Its entries past
+     * nsplit carry magics proved only for the two-step form, and the
+     * one-step reduction would give them silently wrong residues
+     * (ss_magic_build); a launch site that skipped ss_needs_tail must fail
+     * loudly instead. */
+    if constexpr (!SSTAIL) {
+        if (nsplit < nsmall) __trap();
+    }
+    for (uint32_t e = nwrp + tid; e < nsmall; e += nth) {
+        const uint32_t lp = slp[e];
+        uint32_t mm;
+        const uint32_t c0 = (SSTAIL && e >= nsplit)
+            ? ss_setup<true>(e, sp, srt, sg, smag, j, ilo, kshift, evenrow, &mm)
+            : SS_SETUP(e, mm);
+        if (!mm) continue;
+        for (uint32_t c = c0; c < width; c += mm)
+            ss_add<CELLBITS,ATOMIC>(S, c, lp);
+    }
     #undef SS_SETUP
 }
 
@@ -613,7 +803,8 @@ __device__ __forceinline__ int apply_keep(uint32_t x, uint32_t v,
  * price what correctness costs, since a byte cell overflows into its
  * neighbour (accumulated logs do exceed 255) and cannot be used for real.
  */
-template <int CELLBITS, int ATOMIC, int NORMMODE, bool SLABBED = false>
+template <int CELLBITS, int ATOMIC, int NORMMODE, bool SLABBED = false,
+          bool SSTAIL = true>
 /* __launch_bounds__(512, 3): ptxas otherwise settles on 45-46 registers, which
  * fits only TWO 512-thread blocks per SM and pins theoretical occupancy at
  * 66.67%. ncu on a 5070 (sm_120) reports the limiter explicitly -- Block Limit
@@ -664,6 +855,7 @@ void k_apply(const uint32_t *__restrict buckets,
                         const uint32_t *__restrict sg, const uint16_t *__restrict slp,
                         const uint32_t *__restrict smag,
                         uint32_t nsmall, uint32_t nblk, uint32_t nwrp,
+                        uint32_t nsplit,
                         uint32_t probe_x, uint32_t *__restrict probe_out,
                         uint32_t *__restrict survbits, int not_both_even,
                         int sieve_skip, uint32_t j_base,
@@ -790,9 +982,10 @@ report spurious cell mismatches. Pricing builds only, never for relations."
 
     /* ---- small primes: line-sieved straight into the same shared region ---- */
     if (nsmall)
-        sieve_small<CELLBITS, ATOMIC, SLABBED>(S, b, logI, log_region, sp, srt, sg, slp,
+        sieve_small<CELLBITS, ATOMIC, SLABBED, SSTAIL>(S, b, logI, log_region, sp, srt, sg, slp,
                                                smag,
-                                               nsmall, nblk, nwrp, tid, nth, j_base,
+                                               nsmall, nblk, nwrp, nsplit, tid, nth,
+                                               j_base,
                                                sieve_skip);
 
     /* ---- apply ---- */
@@ -2196,6 +2389,35 @@ done:
     return rc;
 }
 
+/* The scaffold both device arithmetic gates share: upload n host-built cases,
+ * run the check kernel, and read back the first failing index (UINT32_MAX if
+ * none). Returns -1 on a CUDA error, leaving *first_bad untouched. One copy,
+ * so an error-path fix reaches both gates. */
+template <typename Case>
+static int run_device_cases(void (*kern)(const Case *, uint32_t, uint32_t *),
+                            const Case *h, uint32_t n, uint32_t blocks,
+                            uint32_t *first_bad)
+{
+    Case *d = NULL;
+    uint32_t *d_bad = NULL, bad = UINT32_MAX;
+    int rc = -1;
+#define DEVCASE_CK(x) do { if (CUDA_CHECKED(x)) goto out; } while (0)
+    DEVCASE_CK(cudaMalloc(&d, sizeof(*h) * n));
+    DEVCASE_CK(cudaMalloc(&d_bad, sizeof(*d_bad)));
+    DEVCASE_CK(cudaMemcpy(d, h, sizeof(*h) * n, cudaMemcpyHostToDevice));
+    DEVCASE_CK(cudaMemcpy(d_bad, &bad, sizeof(bad), cudaMemcpyHostToDevice));
+    kern<<<blocks, 256>>>(d, n, d_bad);
+    DEVCASE_CK(cudaGetLastError());
+    DEVCASE_CK(cudaDeviceSynchronize());
+    DEVCASE_CK(cudaMemcpy(&bad, d_bad, sizeof(bad), cudaMemcpyDeviceToHost));
+    *first_bad = bad;
+    rc = 0;
+out:
+    cudaFree(d); cudaFree(d_bad);
+#undef DEVCASE_CK
+    return rc;
+}
+
 typedef struct {
     uint32_t w, m, magic, sh, ref;
 } td_mod_case_t;
@@ -2219,9 +2441,8 @@ __global__ void k_verify_td_mod_cases(const td_mod_case_t *__restrict v,
 static int verify_td_mod_device(void)
 {
     enum { NCASE = 4096 };
-    td_mod_case_t *h = NULL, *d = NULL;
-    uint32_t *d_bad = NULL, bad = UINT32_MAX, seed = 0x7f4a7c15u;
-    int rc = -1;
+    td_mod_case_t *h = NULL;
+    uint32_t bad = UINT32_MAX, seed = 0x7f4a7c15u;
 
     h = (td_mod_case_t *)malloc(sizeof(*h) * NCASE);
     if (!h) return -1;
@@ -2243,28 +2464,148 @@ static int verify_td_mod_device(void)
         h[k].w = w; h[k].m = m; h[k].magic = magic; h[k].sh = sh;
         h[k].ref = w % m;
     }
-#define MODDEV_CK(x) do { if (CUDA_CHECKED(x)) goto out; } while (0)
-    MODDEV_CK(cudaMalloc(&d, sizeof(*h) * NCASE));
-    MODDEV_CK(cudaMalloc(&d_bad, sizeof(*d_bad)));
-    MODDEV_CK(cudaMemcpy(d, h, sizeof(*h) * NCASE, cudaMemcpyHostToDevice));
-    MODDEV_CK(cudaMemcpy(d_bad, &bad, sizeof(bad), cudaMemcpyHostToDevice));
-    k_verify_td_mod_cases<<<16, 256>>>(d, NCASE, d_bad);
-    MODDEV_CK(cudaDeviceSynchronize());
-    MODDEV_CK(cudaGetLastError());
-    MODDEV_CK(cudaMemcpy(&bad, d_bad, sizeof(bad), cudaMemcpyDeviceToHost));
+    if (run_device_cases(k_verify_td_mod_cases, h, NCASE, 16, &bad)) {
+        free(h);
+        return -1;
+    }
     if (bad != UINT32_MAX) {
         const td_mod_case_t c = h[bad];
         fprintf(stderr,
                 "[verify] device td_mod mismatch case %u: w=%u m=%u"
                 " magic=%u sh=%u ref=%u\n",
                 bad, c.w, c.m, c.magic, c.sh, c.ref);
-        goto out;
+        free(h);
+        return -1;
     }
-    rc = 0;
-out:
-    cudaFree(d); cudaFree(d_bad); free(h);
-#undef MODDEV_CK
-    return rc;
+    free(h);
+    return 0;
+}
+
+typedef struct {
+    uint32_t p, rt, j, magic, kshift, two, ref;
+    int32_t  ilo;
+} ss_first_case_t;
+
+__global__ void k_verify_ss_first_cases(const ss_first_case_t *__restrict v,
+                                        uint32_t n, uint32_t *__restrict first_bad)
+{
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t kk = bench_grid_thread_x(); kk < n; kk += stride) {
+        const uint32_t k = (uint32_t)kk;
+        const ss_first_case_t c = v[k];
+        const uint32_t got = c.two
+            ? ss_first<true>(c.p, c.rt, c.j, c.ilo, c.magic, c.kshift)
+            : ss_first<false>(c.p, c.rt, c.j, c.ilo, c.magic, c.kshift);
+        if (got != c.ref) atomicMin(first_bad, k);
+    }
+}
+
+/* Device gate for ss_first's two magic forms, against the 64-bit fallback's
+ * own formula computed on the host. Each modulus is routed the way the
+ * device routes it -- two-step exactly when it fails the one-step bound at J
+ * (ss_one_step_fits, the predicate ss_two_step_from splits on), powers of two
+ * included -- and gets the magic ss_magic_build builds for that form. Every
+ * geometry gets the corners: both sides of the split, both sides of the
+ * two-step form's own refusal boundary (the largest modulus it accepts),
+ * m = I-1, I-2, a power of two; then random moduli. Each case's inputs come
+ * at the proof's corners (rt = m-1, j = jmax, ilo = -ihalf) or at random.
+ * Relations would catch a wrong residue too, but only as a smaller relation
+ * count; this names the case. Runs only under --verify; slabtest runs the
+ * same routing and corners on the CPU, inside `make check`. */
+static int verify_ss_first_device(void)
+{
+    enum { NCASE = 8192, NCORNER = 12 };
+    static const uint32_t geo[][2] = {     /* {logI, J} */
+        {15, 16384}, {16, 16384}, {16, 32768}, {16, 65536}, {17, 32768},
+        {17, 65536}, {18, 65536}
+    };
+    const uint32_t NG = (uint32_t)(sizeof geo / sizeof geo[0]);
+    ss_first_case_t *h = NULL;
+    uint32_t bad = UINT32_MAX, seed = 0x2545f491u, n = 0;
+    uint32_t ntwo = 0, ncorner2 = 0;
+    uint32_t splits[sizeof geo / sizeof geo[0]], tmax[sizeof geo / sizeof geo[0]];
+
+    /* Per geometry: the first modulus the one-step bound refuses (where the
+     * device's two-step range starts), and the largest non-power-of-two
+     * modulus the two-step proof still accepts (0 if none). */
+    for (uint32_t g = 0; g < NG; g++) {
+        const uint32_t logI = geo[g][0], J = geo[g][1], I = 1u << logI;
+        uint32_t s = 2, t = I - 1;
+        while (s < I && ss_one_step_fits(s, J, logI)) s++;
+        while (t >= s && ((t & (t - 1)) == 0 || !ss_bound_ok(t, J, logI, 1))) t--;
+        splits[g] = s;
+        tmax[g] = t >= s ? t : 0;
+    }
+    h = (ss_first_case_t *)malloc(sizeof(*h) * NCASE);
+    if (!h) return -1;
+    for (uint32_t tries = 0; n < NCASE && tries < 64u * NCASE; tries++) {
+        const uint32_t g = tries % NG, logI = geo[g][0], J = geo[g][1];
+        const uint32_t I = 1u << logI, ihalf = I >> 1, k = tries / NG;
+        const uint32_t split = splits[g];
+        uint32_t m, magic, two;
+        seed = seed * 1664525u + 1013904223u;
+        switch (k < NCORNER ? k : NCORNER) {    /* the corners first */
+        case 0:  m = split - 2; break;
+        case 1:  m = split - 1; break;
+        case 2:  m = split;     break;
+        case 3:  m = split + 1; break;
+        case 4:  m = split + 2; break;
+        case 5:  m = tmax[g] ? tmax[g] - 1 : 0; break;
+        case 6:  m = tmax[g];   break;
+        case 7:  m = tmax[g] ? tmax[g] + 1 : 0; break;   /* refused: skipped */
+        case 8:  m = I - 1;     break;
+        case 9:  m = I - 2;     break;
+        case 10: m = I >> 1;    break;                   /* a power of two */
+        case 11: m = split | 1u; break;
+        default: m = 2u + seed % (I - 2u); break;
+        }
+        if (m < 2 || m >= I) continue;
+        two = !ss_one_step_fits(m, J, logI);
+        ss_magic_build(m, J, logI, (int)two, &magic);
+        if (!magic) continue;               /* the fallback; not this gate's */
+        ss_first_case_t c;
+        seed = seed * 1664525u + 1013904223u;
+        c.rt = (k & 3u) == 0 ? m - 1u : seed % m;
+        seed = seed * 1664525u + 1013904223u;
+        c.j = (k % 3u) == 0 ? J : seed % (J + 1u);
+        seed = seed * 1664525u + 1013904223u;
+        c.ilo = (k % 5u) == 0 ? -(int32_t)ihalf
+              : (k % 5u) == 1 ? (int32_t)ihalf - 1
+              : (int32_t)(seed % I) - (int32_t)ihalf;
+        if (k < NCORNER) {                  /* corner moduli: worst inputs */
+            c.rt = m - 1u; c.j = J; c.ilo = -(int32_t)ihalf;
+            ncorner2 += two;
+        }
+        c.p = m; c.magic = magic; c.kshift = SS_KSHIFT(logI); c.two = two;
+        c.ref = (uint32_t)(((uint64_t)c.rt * c.j + ((uint64_t)m << 20)
+                            - (uint64_t)(int64_t)c.ilo) % m);
+        h[n++] = c;
+        ntwo += two;
+    }
+    if (n < NCASE || ntwo < NCASE / 8 || ncorner2 < 3) {
+        fprintf(stderr, "[verify] ss_first gate built %u cases (%u two-step,"
+                " %u two-step corners); the geometry table no longer reaches"
+                " the two-step range\n", n, ntwo, ncorner2);
+        free(h);
+        return -1;
+    }
+    if (run_device_cases(k_verify_ss_first_cases, h, NCASE, 32, &bad)) {
+        free(h);
+        return -1;
+    }
+    if (bad != UINT32_MAX) {
+        const ss_first_case_t c = h[bad];
+        fprintf(stderr,
+                "[verify] device ss_first mismatch case %u: p=%u rt=%u j=%u"
+                " ilo=%d kshift=%u two=%u ref=%u\n",
+                bad, c.p, c.rt, c.j, c.ilo, c.kshift, c.two, c.ref);
+        free(h);
+        return -1;
+    }
+    printf("[verify] OK: %u device ss_first cases, %u of them two-step"
+           " (%u at the corners)\n", n, ntwo, ncorner2);
+    free(h);
+    return 0;
 }
 
 extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
@@ -2328,6 +2669,8 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
         printf("[verify] direct-TD reciprocal on device (__umulhi path)...\n");
         if (verify_td_mod_device()) return -1;
         printf("[verify] OK: 4096 device reciprocal cases through w=0x7fffffff\n");
+        printf("[verify] small-sieve first offset, one- and two-step forms...\n");
+        if (verify_ss_first_device()) return -1;
     }
 
     int td_failed = 0;      /* a failed gate must reach the exit status */
@@ -2362,7 +2705,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     /* ---- small primes: transform on the host (a few thousand entries) and
      * split into the three load-balance tiers. Entries arrive sorted by p, so
      * the tier boundaries are just two indices. ---- */
-    uint32_t nsmall = 0, nblk = 0, nwrp = 0;
+    uint32_t nsmall = 0, nblk = 0, nwrp = 0, nsplit = 0;
     uint32_t *hsp = NULL, *hsrt = NULL, *hsg = NULL; uint16_t *hslp = NULL;
     uint32_t *hsmag = NULL;
     /* per-q HOST work, billed separately: it is invisible to cudaEvent timing
@@ -2433,13 +2776,17 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
         h_ms_sort = host_ms() - h_ms_sort;
 
         /* Reciprocals AFTER the sort: the key is the modulus itself, so
-         * building them earlier would mean permuting them too, for no gain. */
+         * building them earlier would mean permuting them too, for no gain.
+         * And after the tiers, because the thread tier's two-step range
+         * starts at nsplit and each magic is proved for the form its index
+         * gets (ss_bound_ok). */
+        ss_tiers(hsp, nsmall, &nblk, &nwrp);
+        nsplit = ss_two_step_from(hsp, nsmall, nwrp, cfg->J, cfg->logI);
         for (i = 0; i < nsmall; i++)
             ss_magic_build(hsp[i],
                            hsg[i] > 1 ? cfg->J / hsg[i] : cfg->J,
-                           cfg->logI, &hsmag[i]);
+                           cfg->logI, i >= nsplit, &hsmag[i]);
 
-        ss_tiers(hsp, nsmall, &nblk, &nwrp);
         CK(cudaMalloc(&D.smag, (size_t)nsmall * 4));
         CK(cudaMalloc(&D.sp,  (size_t)nsmall * 4));
         CK(cudaMalloc(&D.srt, (size_t)nsmall * 4));
@@ -2915,23 +3262,28 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                 goto after_apply;
             }
 
-#define LAUNCH_APPLY(CBV, AT, NM)                                              \
+            /* ST: the SSTAIL instance. The production configuration (16-bit
+             * cells, atomic, Horner) picks it with ss_needs_tail exactly as
+             * the pipeline does, so --verify checks the instances the
+             * pipeline runs, tail and no tail; the other configurations keep
+             * the tail instance, which is right with or without one. */
+#define LAUNCH_APPLY(CBV, AT, NM, ST)                                          \
             do {                                                               \
-                CK(cudaFuncSetAttribute(k_apply<CBV, AT, NM, false>,                  \
+                CK(cudaFuncSetAttribute(k_apply<CBV, AT, NM, false, ST>,       \
                     cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));  \
                 cudaEventRecord(e3);                                           \
                 for (int rep = 0; rep < cfg->reps; rep++) {                    \
                     CK(cudaMemset(D.nsurv, 0, 4));                             \
                     if (D.survbits)                                            \
                         CK(cudaMemset(D.survbits, 0, (size_t)nbitword * 4));   \
-                    k_apply<CBV, AT, NM, false><<<nregion, athr, smem>>>(             \
+                    k_apply<CBV, AT, NM, false, ST><<<nregion, athr, smem>>>(  \
                         (const uint32_t *)D.out, D.cursor, cap,                \
                         cfg->logI, log_region, D.slice_logp, nslice_pow2,      \
                         N, CINIT, CINIT - BOUND, tconst, D.dumpbuf,            \
                         D.nsurv,                                               \
                         D.dbg, dbgreg, D.sp, D.srt, D.sg, D.slp,             \
                         D.smag,                                               \
-                        nsmall, nblk, nwrp, probe_x, D.probe,                  \
+                        nsmall, nblk, nwrp, nsplit, probe_x, D.probe,          \
                         D.survbits, cfg->not_both_even, 0, 0u);                   \
                 }                                                              \
                 cudaEventRecord(e4);                                           \
@@ -2942,19 +3294,21 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
 
             if (CB == 16) {
                 if (cfg->apply_atomic) {
-                    if (cfg->norm_mode == NORM_CONST) LAUNCH_APPLY(16, 1, NORM_CONST);
-                    else                              LAUNCH_APPLY(16, 1, NORM_HORNER);
+                    if (cfg->norm_mode == NORM_CONST) LAUNCH_APPLY(16, 1, NORM_CONST, true);
+                    else if (ss_needs_tail(nsplit, nsmall))
+                                                      LAUNCH_APPLY(16, 1, NORM_HORNER, true);
+                    else                              LAUNCH_APPLY(16, 1, NORM_HORNER, false);
                 } else {
-                    if (cfg->norm_mode == NORM_CONST) LAUNCH_APPLY(16, 0, NORM_CONST);
-                    else                              LAUNCH_APPLY(16, 0, NORM_HORNER);
+                    if (cfg->norm_mode == NORM_CONST) LAUNCH_APPLY(16, 0, NORM_CONST, true);
+                    else                              LAUNCH_APPLY(16, 0, NORM_HORNER, true);
                 }
             } else {
                 if (cfg->apply_atomic) {
-                    if (cfg->norm_mode == NORM_CONST) LAUNCH_APPLY(8, 1, NORM_CONST);
-                    else                              LAUNCH_APPLY(8, 1, NORM_HORNER);
+                    if (cfg->norm_mode == NORM_CONST) LAUNCH_APPLY(8, 1, NORM_CONST, true);
+                    else                              LAUNCH_APPLY(8, 1, NORM_HORNER, true);
                 } else {
-                    if (cfg->norm_mode == NORM_CONST) LAUNCH_APPLY(8, 0, NORM_CONST);
-                    else                              LAUNCH_APPLY(8, 0, NORM_HORNER);
+                    if (cfg->norm_mode == NORM_CONST) LAUNCH_APPLY(8, 0, NORM_CONST, true);
+                    else                              LAUNCH_APPLY(8, 0, NORM_HORNER, true);
                 }
             }
 #undef LAUNCH_APPLY
