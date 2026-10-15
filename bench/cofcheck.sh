@@ -351,7 +351,7 @@ if [ "$LMAX" -ge 4 ]; then
     # asymmetry: side 1 wide, side 0 narrow, chosen by nobody.
     out=$(run --cofactor --cof-rounds 2 --cof-budget 65536 --lpb 33 --mfb 99 \
               --relations $TMP/w99.txt || true)
-    got=$(printf '%s' "$out" | grep -c 'side 0 3 limbs (96 bits), side 1 4 limbs (128 bits)' || true)
+    got=$(printf '%s' "$out" | grep -c 'side 0 2 limbs (64 bits), side 1 4 limbs (128 bits)' || true)
     n99=$(printf '%s' "$out" | grep 'total relations' | tail -1 | awk '{print $NF}')
     # Not pinned to a number: mfb 99 admits candidates the pinned lpb-33 case
     # (mfb 92) never saw, so the count is a property of the wider gate and not
@@ -361,7 +361,7 @@ if [ "$LMAX" -ge 4 ]; then
     if [ "$got" = "1" ] && [ "${n99:-0}" -ge 59 ] && \
        ./bench --check-relations $TMP/w99.txt --poly $POLY --lpb 33 --lpb0 31 2>&1 \
        | grep -q 'PASS'; then
-        printf 'PASS   %-34s 4/3 derived, %s relations, all reconstruct\n' \
+        printf 'PASS   %-34s 4/2 derived, %s relations, all reconstruct\n' \
                "lpb 33 / mfb 99 needs 4 limbs" "$n99"
     else
         printf 'FAIL   %-34s width line %s, %s relations\n' \
@@ -372,6 +372,20 @@ if [ "$LMAX" -ge 4 ]; then
     expect_refused "cof-limbs below what mfb needs" --cofactor --lpb 33 --mfb 99 --cof-limbs 3
 else
     printf 'SKIP   %-34s build is 3-limb only\n' "4-limb width cases"
+fi
+
+# The rational side of this job has mfbr 60, so its width DERIVES to 2 limbs;
+# forcing it back to 3 must change the cost and nothing else -- the same
+# Montgomery-domain argument as the 3 -> 4 cases above.
+run --cofactor --cof-rho --cof-rounds 2 --cof-budget 65536 --relations $TMP/n2.txt \
+    > $TMP/n2.out 2>&1 || true
+run --cofactor --cof-rho --cof-rounds 2 --cof-budget 65536 --cof-limbs0 3 \
+    --relations $TMP/n3.txt >/dev/null 2>&1 || true
+if grep -q 'side 0 2 limbs (64 bits)' $TMP/n2.out && [ -s $TMP/n2.txt ] && \
+   cmp -s $TMP/n2.txt $TMP/n3.txt; then
+    printf 'PASS   %-34s identical to the 3-limb run\n' "side 0 derived at 2 limbs"
+else
+    printf 'FAIL   %-34s width not 2, or output differs from 3 limbs\n' "side 0 derived at 2 limbs"; fail=1
 fi
 
 expect_refused "zero rho budget"              --cofactor --cof-budget 0

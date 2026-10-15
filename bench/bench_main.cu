@@ -2091,8 +2091,11 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
      *   - the gate whenever the sides run back to back. --fill-concurrent
      *     overlaps them, so there the default is off and an explicit
      *     --fill-gate is refused below. */
+    /* logI 16 is the device's call (FILL_ROWS_I16_MIN_SMS): -2 here, settled
+     * once the card is known, below. */
     if (cfg.fill_rows < 0)
-        cfg.fill_rows = (cfg.pipeline && cfg.logI <= 15) ? 4 : 0;
+        cfg.fill_rows = !cfg.pipeline ? 0 : cfg.logI <= 15 ? 4
+                      : cfg.logI == 16 ? -2 : 0;
     if (cfg.resieve_rows < 0)
         cfg.resieve_rows = (cfg.fill_rows &&
                             cfg.logI <= RESIEVE_ROWS_LOGI_MAX) ? 1 : 0;
@@ -2648,6 +2651,20 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         fprintf(stderr, "BOINC: running on CUDA device %d of %d: %s\n",
                 dev, ndev, prop.name);
 #endif
+        /* --fill-rows at logI 16: the tail the row tier removes is one
+         * thread's walk of xmax/I dependent steps -- the same time on any card
+         * -- while the bulk of the fill finishes sooner the more SMs there
+         * are. So the tier pays at logI 16 on a wide card and not a narrow
+         * one: measured neutral to +1-3% fill on a 48-SM RTX 5070 (c194,
+         * finding 107) and -15% fill, -8.7% band on a 128-SM RTX 4090
+         * (2,1147+). Between the two is unmeasured; see the define. */
+        if (cfg.fill_rows == -2) {
+            cfg.fill_rows = prop.multiProcessorCount >= FILL_ROWS_I16_MIN_SMS
+                          ? 4 : 0;
+            printf("--fill-rows %d at logI 16 (%d SMs; on from %d)\n",
+                   cfg.fill_rows, prop.multiProcessorCount,
+                   FILL_ROWS_I16_MIN_SMS);
+        }
         {
             const uint64_t ab = (uint64_t)prop.multiProcessorCount * 6u;
             if (!ab || ab > BENCH_BLOCKS_MAX ||

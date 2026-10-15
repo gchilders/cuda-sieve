@@ -1339,6 +1339,7 @@ static int cf_run_rounds_dyn(int L, const uint32_t *d_n, uint64_t lim,
         return 0;                                                             \
     } while (0)
     switch (L) {
+    case 2: CF_RR(2);
     case 3: CF_RR(3);
 #if CF_LMAX >= 4
     case 4: CF_RR(4);
@@ -1694,8 +1695,13 @@ static int cof_enqueue(int blocks, int threads,
         return 0;                                                             \
     } while (0)
     switch (Q->L0 * 8 + Q->L1) {
+    case 2 * 8 + 2: CF_ENQ(2, 2);
+    case 2 * 8 + 3: CF_ENQ(2, 3);
+    case 3 * 8 + 2: CF_ENQ(3, 2);
     case 3 * 8 + 3: CF_ENQ(3, 3);
 #if CF_LMAX >= 4
+    case 2 * 8 + 4: CF_ENQ(2, 4);
+    case 4 * 8 + 2: CF_ENQ(4, 2);
     case 3 * 8 + 4: CF_ENQ(3, 4);
     case 4 * 8 + 3: CF_ENQ(4, 3);
     case 4 * 8 + 4: CF_ENQ(4, 4);
@@ -2669,6 +2675,9 @@ static int cf_run_side_dyn(int L, const mz<CF_LMAX> *h_n, uint32_t nj,
                            const cf_sched_t *S, const char *side_name)
 {
     switch (L) {
+    case 2: return cf_run_side_at<2>(h_n, nj, lim, lpb, h_status, h_fac,
+                                     h_nfac, blocks, threads, verbose, ms_out,
+                                     S, side_name);
     case 3: return cf_run_side_at<3>(h_n, nj, lim, lpb, h_status, h_fac,
                                      h_nfac, blocks, threads, verbose, ms_out,
                                      S, side_name);

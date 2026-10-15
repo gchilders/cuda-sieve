@@ -502,15 +502,19 @@ int  bench_boinc_finish(enum bench_outcome outcome, int status);
 #if CF_LMAX != 3 && CF_LMAX != 4
 #error "CF_LMAX must be 3 (96-bit cofactors) or 4 (128-bit)"
 #endif
-#define CF_LMIN 3
+/* 2 limbs is back for a side whose mfb fits 64 bits -- the rational side of
+ * most GNFS jobs (lpbr <= 32, mfbr <= 64). It was the rational side's width
+ * until lpb 33 needed a third limb; keeping 3 for everything cost those jobs
+ * a Montgomery multiply half again as wide on every rho step. */
+#define CF_LMIN 2
 
 /* Narrowest width that can hold an mfb-bit residual, or 0 if this build has
- * none. Not `(mfb + 31) / 32` clamped up: below 96 bits there is no narrower
- * instantiation to fall to, so the answer is CF_LMIN and the caller does not
- * get to think it has a 1- or 2-limb path. */
+ * none. Not `(mfb + 31) / 32` clamped up: there is no 1-limb instantiation,
+ * so the answer is never below CF_LMIN. */
 static inline int cf_limbs_for_mfb(uint32_t mfb)
 {
     if (mfb <= 32u * CF_LMIN) return CF_LMIN;
+    if (mfb <= 32u * 3u) return 3;
     if (mfb <= 32u * CF_LMAX) return CF_LMAX;
     return 0;
 }
@@ -919,6 +923,10 @@ typedef struct {
 #define ROWRT_NONE           0xFFFFFFFFu
 /* --resieve-rows is on by default at logI <= this (finding 107). */
 #define RESIEVE_ROWS_LOGI_MAX   13
+/* The fewest SMs at which --fill-rows defaults on at logI 16 (see bench_main).
+ * Measured off-side at 48 (RTX 5070) and on-side at 128 (RTX 4090); 64 is a
+ * guess between them, to be moved when a card in between is measured. */
+#define FILL_ROWS_I16_MIN_SMS   64
 #define BENCH_STR_(x) #x
 #define BENCH_STR(x)  BENCH_STR_(x)
 /* Concurrency test only (item 1). Each workspace is a full bucket array, so
