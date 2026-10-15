@@ -11775,3 +11775,348 @@ its instruction count, count `YIELD`/`BSSY` and the loop-exit `BSYNC`
 executions before blaming the arithmetic. **Keep one hot loop per kernel
 instance, and choose between variants with a template parameter rather
 than a runtime branch.**
+
+<a id="finding-112"></a>
+## Finding 112 — C143 against cado-gpu again, at equal yield: the gap is now 1.38x per raw relation (was 1.66-1.85x). Per kernel we are within 1.12x and ahead on apply. The rest is overlap: CADO's 8 q in flight compress its kernel time 1.30x, our 2 compress ours ~1.05x
+
+**Date:** 2026-10-14. RTX 5070, WSL2, NFS@Home client stopped, host load
+1.5-10 (ECM on the CPU, recorded per arm). cuda-sieve `3e79628` (findings
+108-111); cado-gpu as in finding 105. Evidence in
+[`../oracle/c143-h2h-20261014/`](../oracle/c143-h2h-20261014/).
+Finding 105's first band `[2200000, 2300000)`, 6,983 q, both programs on
+the same polynomial and parameters, with finding 107's protocols:
+`las-glas` with 16 workers, and `bench --relations` under `/usr/bin/time`.
+Two interleaved end-to-end rounds, then per-kernel arms one q at a time.
+CADO at equal yield means `GLAS_SKIP_BOUND=0`, which turns off its `p < 96`
+skip (finding 107).
+
+> **Corrected by [finding 113](#finding-113), same day.** The "overlap"
+> term below is mostly our card sitting idle (1.3 ms/q in three host waits:
+> synchronous readbacks and next-q preparation), not weaker compression.
+> Measured by timeline, compression is 1.19x ours against 1.27x CADO's. The
+> end-to-end and per-kernel tables stand.
+
+### End to end, external clock (`run.txt`)
+
+| | relations | ms/q | µs per raw relation | CPU-s |
+|---|---:|---:|---:|---:|
+| CADO default, 2 runs | 826,086 | 3.94 / 4.23 | 33.3 / 35.7 | 241 / 258 |
+| CADO skip off, 2 runs | 1,072,775 | 5.18 / 5.50 | 33.7 / 35.8 | 324 / 245 |
+| cuda-sieve I13, 2 runs | 1,073,878 | 7.30 / 7.46 | 47.5 / 48.5 | 51 / 52 |
+| cuda-sieve I14, 2 runs | 1,213,236 | 7.99 / 8.31 | 46.0 / 47.8 | 55 / 57 |
+
+Means: **I13 1.38x and I14 1.35x CADO skip-off's time per raw relation**
+(48.0 and 46.9 against 34.8 µs). Finding 107 had 1.85x and 1.66x. The two
+CADO forms cost the same per relation, as before. Yields are unchanged on
+both sides, relation counts exact. cuda-sieve uses about a fifth of
+CADO's CPU (51-57 CPU-s against 241-324).
+
+### Per kernel at equal yield, one q at a time (ms/q)
+
+CADO with `GLAS_GPU_SLOTS=1 GLAS_GPU_STATS=1`, band totals divided by
+6,983; cuda-sieve `--no-q-pipeline`, band report.
+
+| stage | cuda-sieve I13 | CADO skip off | CADO skip on |
+|---|---:|---:|---:|
+| transform | 0.54 | 0.27 | 0.26 |
+| fill | 2.48 | 2.24 | 2.18 |
+| apply / region | **2.72** | **3.16** | 2.13 |
+| post-sieve: resieve + TD + classify / tiny + resieve + filter | 1.95 | 1.24 | 1.09 |
+| intersect | 0.04 | — | — |
+| **GPU kernels** | **7.73** | **6.92** | 5.68 |
+| cofactorisation | 0.87 in-loop, on the GPU | on the CPU | on the CPU |
+| wall, one q at a time | 9.56 | 7.47 | 6.14 |
+
+**Finding 107's per-kernel comparison was against CADO with its skip.**
+At equal work CADO's region kernel costs 3.16 ms/q, and our apply is
+**0.44 ms/q cheaper**. The kernel deficit is post-sieve (0.71 ms/q),
+transform (0.27) and fill (0.24): 1.12x in all.
+
+### Overlap is the larger part
+
+With 8 slots and the skip off, CADO's GPU is busy for 100% of its span
+(34.43 s, 4.93 ms/q). That compresses its 6.92 ms/q of one-at-a-time kernel
+work by **1.40x** (1.30x against external wall, 5.34 ms/q). Our two q in
+flight turn 7.73 ms/q of kernels, plus the GPU part of cofactorisation,
+into 7.38 ms/q of wall: about 1.05x. So the 1.38x gap is roughly
+**1.12x kernel work × 1.24x overlap**.
+
+Finding 107 described CADO's compression as low-occupancy phases and
+kernel tails of one q filled by another. Our pipeline overlaps only the
+next q's sieve with this q's TD. Its fill, apply and transform kernels
+never run beside another q's fill, apply or transform. Whether our kernels
+would compress the same way under deeper concurrency is not measured. Two
+processes sharing the card under WSL2 are time-sliced, not concurrent
+(`work/qconc`, 4-10%), so that test does not answer it.
+
+### What leads now
+
+1. *(Done in finding 113: the overlap term is mostly our card idling in
+   three host waits per q, 1.3 ms/q; compression itself is about equal.)*
+   **Measure where CADO's compression comes from, and whether ours would
+   compress.** An Nsight Systems timeline of both at C143: which kernels
+   overlap in CADO's 8 slots, and where our two-q pipeline leaves the
+   card idle or runs one kernel at a time. That prices a deeper queue (3+ q,
+   STATUS item 4.3) or overlapping fill with apply across q before either
+   is built.
+2. **Post-sieve, 1.95 against 1.24 ms/q** (~10% of our wall). The
+   resieve + scatter is 1.29 of it. The kernel-by-kernel contrast with
+   CADO's tiny / resieve / filter split has not been made.
+3. **Transform, 0.54 against 0.27** (~4% of wall).
+4. Not apply: at equal work it is already ahead.
+
+<a id="finding-113"></a>
+## Finding 113 — Nsight Systems at C143: about half our gap to cado-gpu is the card idle (1.3 ms/q, CADO 0.02), in three host waits per q. Two are synchronous readbacks (35-70 µs each under WSL2), the third is next-q preparation the host could do during a 4.7 ms wait it already makes. Overlap compression is about the same in both programs
+
+**Date:** 2026-10-14. RTX 5070, WSL2, client stopped, **host load 9.5-10.6**
+(ECM), which starves CADO's CPU feeding (438% CPU against its usual 885%)
+and slows our host thread too. Treat the absolute figures as loaded. Same
+build as finding 112 (`3e79628`). Evidence in
+[`../oracle/nsys-c143-20261014/`](../oracle/nsys-c143-20261014/).
+Finding 112's lead 1. `nsys profile --trace=cuda --sample=none` on C143 at
+equal yield: cuda-sieve I13 for 800 q from the first band, pipelined and
+single-queued; CADO skip-off for q in [2200000, 2212000), with 8 slots and
+with 1. Each analysis window is the middle 80% of kernel launches
+(`analyze.py`, `gaps.py`): 642 q for cuda-sieve and 710 for CADO, counted
+from transform launches.
+
+### Busy, idle and overlap, per q
+
+| | cuda-sieve single | cuda-sieve 2 q | CADO 1 slot | CADO 8 slots |
+|---|---:|---:|---:|---:|
+| wall in window, ms/q | 9.43 | **7.57** | 6.94 | **5.07** |
+| card busy (any kernel), ms/q | 7.45 | 6.25 | 6.43 | 5.05 |
+| **card idle, ms/q** | 1.98 | **1.32** (17.4%) | 0.51 | **0.02** (0.3%) |
+| time at 2 / 3+ kernels | 0 / 0 | 23.3% / 0 | 0 / 0 | 21.6% / 22.5% |
+
+Overlap compresses busy time about equally: ours 7.45 -> 6.25 (1.19x),
+CADO's 6.43 -> 5.05 (1.27x). One q at a time our kernels need 1.16x
+CADO's busy time (finding 112 has 1.12x from stage timers). **So of the
+2.5 ms/q between us here, 1.3 is idle and 1.2 is busy.** Finding 112
+attributed the whole overlap term to compression; it is mostly idle.
+
+### Where the card idles (`gaps-qp.txt`, `gap-detail.txt`)
+
+Each idle gap is charged to the last kernel to finish and the next to
+start, and the host's CUDA calls inside it are listed:
+
+| gap | ms/q | mean | what the host is doing |
+|---|---:|---:|---|
+| end of TD (`k_cof_enqueue`) -> next q's intersect | **0.50** | 581 µs | four synchronous `cudaMemcpy` readbacks (216 µs), memsets, and 227 µs of host work outside any CUDA call (cofactor flush, output) |
+| intersect -> next q's transform | **0.39** | 386 µs | preparing the next q: 53% host work outside CUDA (small-prime tables, norm setup), plus its uploads |
+| `k_scatter_sel` -> `k_gather_ab`, inside TD | **0.21** | 326 µs | three back-to-back synchronous count readbacks (150 µs), nothing else |
+
+Together 1.1 of the 1.32 ms/q. **A synchronous D2H `cudaMemcpy` costs 35-70
+µs under WSL2.** In the example q, the host had already spent 4.7 ms
+blocked in `cudaEventSynchronize` waiting for this q's sieve before the
+second gap, where the next q's preparation could have run. CADO, with 8 q
+in flight, keeps 0.3% idle. Its gaps are a handful of 1-2 ms holes at
+chunk boundaries (`gaps-cado-slots8.txt`).
+
+These are per-q fixed costs: ~1.1 ms on a 7.6 ms C143 q (~15%), and under
+1% of the 226 ms lpba-34 I16 q. **The C143 gap is mostly a small-job
+latency gap.** It does not say CADO would win by the same margin at the
+NFS@Home geometry.
+
+### What leads now
+
+1. *(Leads 1 and 2 done in finding 114: C143 −3.6% to −5.5%.)*
+   **Prepare the next q during the join wait** (finding 108's lead 2, now
+   priced at ~0.39 ms/q). The host sits in `cudaEventSynchronize` for the
+   current q's sieve, and the next q's pull, small-prime tables and norm
+   setup could run there.
+2. **One readback per sync point.** Gather each point's counts into one
+   pinned buffer with one `cudaMemcpyAsync` + event, instead of three or
+   four synchronous `cudaMemcpy` calls (~0.15 ms/q of readbacks at the TD
+   point and ~0.2 at the q boundary, from the table above). STATUS row 12 / finding 106 item 2 is the same
+   work for CPU reasons.
+3. **Take the q-boundary host work** (~0.23 ms/q outside CUDA calls) off
+   the critical path: issue the next GPU work first.
+4. Then kernels: post-sieve and transform (finding 112).
+5. **Re-trace on a quiet host** before quoting absolute figures. The
+   structure here, three host waits and equal compression, does not depend
+   on the load.
+
+<a id="finding-114"></a>
+## Finding 114 — two of finding 113's host waits removed: readbacks folded into async copies, and the next q prepared while the host waits for this q's sieve. As landed after review, at host load 11: C143 −8.0%, the NFS@Home I16 job −2.6%, C194 −1.1%, relations byte-identical everywhere (the first version: −3.6% to −5.5% and −0.4% to −1.4%). Card idle at C143 10.7% -> 6.5%
+
+**Date:** 2026-10-14. RTX 5070, WSL2, client stopped, host load 2-11 (ECM,
+recorded per run). Base `3e79628`. Evidence in
+[`../oracle/hostwait-20261014/`](../oracle/hostwait-20261014/). Finding
+113's leads 1 and 2, landed together. Kyle's condition: no slower on the
+larger jobs.
+
+### What changed (`pipeline.diff`, `pipeline.cuh` only)
+
+- **One wait per sync point, not one round trip per count.** Each count
+  the host needs is now copied by `cudaMemcpyAsync` into pinned memory,
+  queued behind the kernel that produces it. The wait the host already
+  makes then delivers it, through a trailing event (`ev[5]`, `E[14]`,
+  `E[15]`, `ec`) placed after the timing event so no stage timer changes.
+  That replaces ten synchronous `cudaMemcpy` calls per one-slab q:
+  - the sieve join: survivors and bucket overflow, per side;
+  - TD's rank scan: base and count;
+  - after `k_scatter_sel`: flags, accepted count, overflow;
+  - the intersect's count.
+
+  The join's copies were also a whole-device barrier (a synchronous copy on
+  the legacy stream waits for every blocking stream). Now each side's join
+  waits for its own side only, and every caller joins both sides before
+  using either.
+- **The next q is prepared during the wait for this q's last slab.**
+  Before, the host prepared the next q after this q's intersect: pulling
+  it, building the small-prime tables, setting up the norms, uploading and
+  launching its transform. The card waited for that. Now, at the top of the
+  last slab, before joining its sieve, the host does the same work in the
+  same order the issue point used, through one shared helper:
+  1. take this q's TD views;
+  2. read its transform time (this wait also frees the pinned staging
+     buffers);
+  3. swap `plat`/`rowrt`, and on slabbed plans turn the walk cursors;
+  4. pull the next q once, validate it, and prepare it quietly.
+
+  The issue point then only checks the stop flag again and issues. A q
+  prepared early and not issued (stop, a norm-width skip, or a bucket
+  overflow of this q's last slab) is consumed at the loop top like any
+  other. Single-queued runs never take this path. (As first landed it ran
+  only when the last slab was issued ahead, and nothing drained a prepared
+  q that was not issued; see Review fixes.)
+
+### Identity and gates (`gates.txt`, `ab.txt`, `skipslab.txt`)
+
+- Byte-identical to `3e79628` / the pre-change files, for both the
+  readback-only and the full version: the NFS@Home job 40 q (2,845), c183
+  200 q (9,053), C143 1,000 q (155,108), C194 60 q (6,730). Overlap counts
+  unchanged (C194: 180 slabs, 59 q issued ahead).
+- Default fat build: 6 archs, no new warnings. `--verify-only` 3 OK.
+  `make check` 105 PASS, 0 FAIL. `fillcheck.sh` 60 of 60, every
+  issued-ahead check passing.
+- **Stop and resume with work in flight**, both really stopping:
+  - C194, 400 q: stopped after 192 q, resumed, identical to the
+    uninterrupted band (44,846).
+  - C143, 4,000 q, where the early prep runs on every q: stopped after
+    1,536, resumed, identical to `3e79628`'s uninterrupted band (618,656).
+- **`skipslab`** (`BN_LIMBS=4`, norm-width skips of the speculative next q
+  on a four-slab plan): every case passes with the same counts as before.
+- **TD skips** (`PIPE_K=8`, c183 at five slabs): 11 slabs dropped,
+  pipelined identical to single-queued (6,875, as in finding 109).
+
+### Speed
+
+Pipelined, `wall clock per q, COMPLETE`, interleaved. Arms are `3e79628`,
+A (readbacks only) and B (both changes):
+
+| job | `3e79628` | A | B | B, fat build vs fat build, load ~11 |
+|---|---:|---:|---:|---:|
+| C143 I13 | 6.81 | 6.63 (−2.6%) | **6.57 (−3.6%)** | 7.36 -> 6.95 (**−5.5%**) |
+| C194 I16 | 222.96 | 221.00 (−0.9%) | **222.02 (−0.4%)** | 227.72 -> 224.44 (**−1.4%**) |
+| NFS@Home I16 | 209.07 | 206.76 (−1.1%) | **206.88 (−1.0%)** | 212.20 -> 209.44 (**−1.3%**) |
+
+The first three columns are sm_120 copies at host load 2-3, means of 3-4
+runs. Four runs in the middle of that session were throttled on the card
+(software power cap, every stage +18-21%). They hit all three arms and are
+excluded. The last column is the fat builds at load ~11 with the SM clock
+logged at ~2900 MHz after every run (`final-fat.txt`); every new-build run
+beat every base run on all three jobs. The waits are host latency, so the
+heavier the host load, the more they cost and the more removing them gains.
+**The larger jobs are not slower: 0.4-1.4% faster.**
+
+### Review fixes (xhigh review of the first version)
+
+No defect changed today's output, but one path was correct only by luck.
+If this q's last slab overflowed its bucket array after the next q was
+prepared, nothing waited for that preparation's uploads. The loop top then
+prepared the same q again into the same pinned staging buffers, possibly
+while the first DMA was still reading them. The result was correct only
+because the same q wrote the same bytes, and no gate could reach the path.
+Changed:
+
+- **One preparation point, every arm.** Once this slab is fully issued and
+  before its last join: before both joins in the pipelined arm, between
+  side 0's issue and its join in the serial arm. TD's views are taken at the
+  same point. The issue point only issues. The first q of a band, and a q
+  after one that was not issued, now prepare early too. The fallback path
+  and its `early_next` flag are gone.
+- **End-of-q drain.** A next q prepared and not issued has its ev[4],
+  recorded after its uploads, waited for before the loop top prepares it
+  again. It is the fourth drain in `pipe_side_prepare_q`'s list.
+- **Attribution.** A failure during the preparation, which runs while this
+  slab's sieve is in flight, drains the stream and says that the in-flight
+  slab may be its source. The watchdog names the next q while it is issued.
+- **Fewer copies, typed slots.**
+  - TD's flags, accepted count and overflow word are one device block
+    (`td_ctr_t`), read with one copy instead of three. The rank scan's two
+    values live in different arrays and stay two copies.
+  - The pinned slots are typed structs instead of array indices.
+  - The legacy-stream waits are `cudaStreamSynchronize(0)`, which retires
+    three timing events, and `ev[5]` is created without timing.
+  - Per one-slab q: 6 device-to-host copies, not 10.
+- **`d_overflow0` retired.** Side 1's overflow count is now copied in stream
+  order before side 0 clears the shared counter, as in the serial arm.
+  `pipe_side_sieve_join`'s dead `bk` parameter is gone.
+- Stale invariant comments rewritten: the drain list, the `spec_*` and
+  issue-point comments, three `ev[3]` references and the overflow
+  counter. Finding 113's lead numbers were swapped; STATUS row 19
+  repeated a label and mixed loaded and quiet figures.
+- **A way to force bucket overflow.** `PIPE_CAP_PCT` (100 in every shipping
+  build) scales the bucket capacity. A build that sets it goes through
+  `DEFS`, is a pricing build and refuses `--relations`, and also reads
+  `BENCH_TEST_CAP_PERMILLE` for finer steps. The window where only some
+  slabs overflow is narrow: 850 overflows everything, 880-890 overflows a
+  few, 900 overflows nothing on these jobs.
+
+Rerun (`review-gates.txt`, `ovf2.txt`):
+
+- **Build and gates.** Default fat build, 6 archs, no new warnings.
+  `--verify-only` 3 OK. `make check` 105 PASS, 0 FAIL. `fillcheck.sh` 60 of
+  60.
+- **Identity.** Byte-identical to `3e79628` on the NFS@Home job (2,845),
+  c183 (9,053), C143 (155,108) and C194 (6,730).
+- **Stop and resume, both really stopping.** C194 stopped after 128 q and
+  resumed identical (44,846). C143 stopped after 704 q and resumed
+  identical (618,656).
+- **Skip paths.** `skipslab` passes with the same counts as before. The
+  `PIPE_K=8` TD-skip test is identical (6,875).
+- **Bucket overflow, forced**, single-queued against pipelined, with the
+  same skipped slabs, candidates and relations in both arms:
+
+| job | per mille | slabs skipped | relations | q issued ahead |
+|---|---:|---:|---:|---:|
+| C143 I13, 1,000 q | 880 | 16 | 152,556 | 983 |
+| c183 I15, 200 q | 890 | 3 | 8,905 | 196 |
+| C194 I16, 60 q, four slabs | 887 | 38 | 5,836 | 43 (and 158 slabs) |
+
+  On C143 every q is a last slab. Its 16 overflowed q each had the next q
+  prepared and then not issued (999 - 16 = 983 issued ahead), so the
+  end-of-q drain and the loop top's second preparation ran 16 times with
+  identical output.
+- **Timing**, two sessions:
+  - During the gate run the card was shared with GPU ECM (C143 at ~16-17
+    ms/q against its usual ~7), so the numbers are only relative.
+    Interleaved, the new build still beat `3e79628` in every pair.
+  - Rerun with the card free, host load ~11 (CPU ECM), fat build against
+    fat build, SM clock ~2900 MHz throughout (`real-timing.txt`):
+
+| job | `3e79628` | landed | change |
+|---|---:|---:|---:|
+| C143 I13, 6 runs each | 7.99 ms/q | 7.35 | **−8.0%**, every run better |
+| NFS@Home I16, 4 each | 229.91 | 223.98 | **−2.6%**, every run better |
+| C194 I16, 4 each | 244.39 | 241.75 | **−1.1%** |
+
+  Both C194 runs of the first pair came out high (248.02 and 247.70);
+  across the other three pairs the landed build is ahead each time. The
+  review version gains more than the first one did at the same load (C143
+  −5.5%, the I16 jobs −1.3% to −1.4%). Fewer copies per q, and early
+  preparation on every q including the first of a band and those after an
+  unissued q, account for that.
+
+### What is left (`trace-quiet.txt`, quiet host)
+
+Card idle at C143 fell from 10.7% to 6.5% of the window (0.74 -> 0.43
+ms/q). The intersect -> transform gap is gone, and the post-scatter
+readback gap halved. The one large gap left, 3.9%, is end of TD -> the
+next-but-one q's transform. In those q the next q's sieve had already
+finished, so there is nothing for the prep to hide under, and the card
+waits for end-of-q host work and the prep. Closing it needs TD split into
+asynchronous phases, or the host preparation on a second thread. Neither
+was attempted.

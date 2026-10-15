@@ -409,3 +409,47 @@ gate, fillcheck, identity on all four pipeline instances against `5c1ab93`,
 ncu and timing against the hoist), and `slabtest-mutants.txt` shows two
 broken two-step proofs failing that gate. The scripts' paths point into the
 git-ignored `work/applyprof/`, where the builds and ncu reports stay.
+
+## C143 against cado-gpu, equal yield (2026-10-14)
+
+[`c143-h2h-20261014/`](c143-h2h-20261014/) holds the evidence for
+[finding 112](../bench/RESULTS.md#finding-112), pinned in `MANIFEST.sha256`.
+`run.sh` produced `run.txt`: two interleaved end-to-end rounds of CADO
+(default and `GLAS_SKIP_BOUND=0`) and cuda-sieve (I13, I14), then
+per-kernel arms (CADO one slot with and without the skip, CADO 8 slots with
+GPU stats, cuda-sieve `--no-q-pipeline` at I13 and I14). Each arm's CADO
+stderr and `/usr/bin/time`, or cuda-sieve band output and time, is kept
+here as `cado-<arm>.*` / `cuda-<arm>.*`. `build.txt` names both builds. The
+relation files stay in the git-ignored `work/h2h-20261014/`.
+
+## Nsight Systems at C143 (2026-10-14)
+
+[`nsys-c143-20261014/`](nsys-c143-20261014/) holds the evidence for
+[finding 113](../bench/RESULTS.md#finding-113), pinned in `MANIFEST.sha256`.
+`trace.sh` captured the four timelines (`trace.txt`); `analyze.py` produced
+`analysis.txt` (busy, idle, concurrency depth and per-kernel overlap for each);
+`gaps.py` produced `gaps-*.txt` (idle charged to kernel transitions, with the
+host CUDA calls inside); `gap-detail.txt` breaks down the three cuda-sieve
+gaps. The `.nsys-rep` captures and their SQLite exports (~40 MB) stay in the
+git-ignored `work/nsys-20261014/`. Recorded at host load 9.5-10.6.
+
+## Host waits removed (2026-10-14)
+
+[`hostwait-20261014/`](hostwait-20261014/) holds the evidence for
+[finding 114](../bench/RESULTS.md#finding-114), pinned in `MANIFEST.sha256`.
+`pipeline.diff` is the change. `ab.sh` produced `ab.txt` (identity on four
+jobs and interleaved timing of `3e79628`, A and B). `gates.sh` produced
+`gates.txt` (fat build, `make check`, fillcheck, stop/resume on C194 and C143,
+skipslab with its log `skipslab.txt`, the `PIPE_K=8` TD-skip identity).
+`final-fat.txt` is fat build against fat build with the SM clock logged.
+`trace-quiet.txt` is the quiet-host Nsight Systems comparison (analyze.py and
+gaps.py from `nsys-c143-20261014/`). `build.txt` names the binaries.
+After the xhigh review: `pipeline-final.diff` is the change as landed
+(`pipeline.diff` is the first version). `review-gates.sh` produced
+`review-gates.txt`: fat build, `make check`, fillcheck, identity on four
+jobs, stop/resume on C194 and C143, relative timing with the card shared
+with GPU ECM, `skipslab` and the `PIPE_K=8` TD-skip test. Its forced-overflow
+block used whole-percent capacities that either overflowed everything (85%) or
+nothing (95-99%). `ovf2.sh` produced `ovf2.txt`, the forced-overflow
+comparison at the per-mille settings where only some slabs overflow. `real-timing.txt`
+is the clean fat-vs-fat timing of the landed build, with the card free.
