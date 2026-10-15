@@ -221,12 +221,16 @@ slabs the two outputs can differ legitimately. Per-side survivor counts also
 differ between levels by design; only the relations are identical.
 
 **The fill defaults (2026-10-13) are output-identical too; leave them on.**
-`--fill-rows 4` (at logI <= 15) fills the bucketed primes below `4I` row by
-row in bands, and `--resieve-rows` (at logI <= 13) resieves them the same
+`--fill-rows 4` (at logI <= 15, and at logI 16 on a card with at least 64
+SMs) fills the bucketed primes below `4I` row by row in bands, and `--resieve-rows` (at logI <= 13) resieves them the same
 way. `--fill-gate` (everywhere except under `--fill-concurrent`) stores side
 0's fill records only where side 1 has a survivor. Together they took the
 C143 first band from 91.5 to 68.0 s at I13 and from 77.0 to 68.9 s at I14,
 with c183 -6.4% and C194 -5.5% of wall (`bench/RESULTS.md` finding 107).
+At logI 16 the tier pays only on a wide card: the tail it removes is one
+thread's walk, the same time on any card, while the rest of the fill
+finishes sooner with more SMs. Neutral on a 48-SM RTX 5070; on a 128-SM RTX
+4090, 2,1147+ went from 153.5 to 139.5 ms/q (-9.1%).
 `--fill-rows 0 --no-fill-gate` restores the old fill, for A/B timing and
 comparison with older logs. Every run log names the settings on its
 `# fill` line. The same overflow caveat applies: a slab that overflows
