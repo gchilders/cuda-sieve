@@ -12120,3 +12120,101 @@ finished, so there is nothing for the prep to hide under, and the card
 waits for end-of-q host work and the prep. Closing it needs TD split into
 asynchronous phases, or the host preparation on a second thread. Neither
 was attempted.
+
+## Finding 115 — ECM device time: stage 2 at D=210 lands (−22% ECM device time, −4.5% wall on 2,1147+, byte-identical); PRAC stage 1 parked; a faster multiply, a dedicated square and finer rounds all ruled out
+
+RTX 4090, `main` at `00e2c8a` unless stated. The jobs are 2,1147+ (logI 16,
+q 300M–300.008M, 420 q) and c187 (logI 15, q 100M–100.01M, 570 q). ECM device
+times are "clean": `--no-q-pipeline --no-cof-async`, so nothing shares the card.
+
+### Where ECM's time goes (`--cofac` on the band's 1.8M candidates)
+
+With `--ecm-b2 0`, every ECM work unit is a ladder bit, at 12 modmuls each.
+That gives the kernel's real multiply rate, set against `mz_mul`'s rate in a
+microbenchmark of a plain chain:
+
+| stage 1 only | achieved | `mz_mul` peak | efficiency |
+|---|---:|---:|---:|
+| 2,1147+ algebraic, 4 limbs | 55 Gmul/s | 157 | 35% |
+| 2,1147+ rational, 3 limbs | 146 | 257 | 57% |
+| c187 algebraic, 3 limbs | 128 | 257 | 50% |
+
+The microbenchmarks, built against `cofac.cuh` itself, and a per-record work
+dump account for most of the gap:
+
+- **The multiply is already good.** An inline-PTX CIOS with `madc` carry
+  chains matched `mz_mul` bit for bit over 19M results and was within ±2% at
+  2, 3 and 4 limbs. A dedicated `mz_sqr` was 0.98–1.02× `mz_mul(a, a)`.
+- **Occupancy is not the limit.** Capping the benchmark at 2 blocks/SM, as
+  k_cofac's 122 registers do, cost it 6%.
+- **The ladder overhead is small.** A ladder step costs 14.1–14.8
+  multiply-equivalents for its 12 multiplies.
+- **Lanes idle.** Records in the same warp run different numbers of curves.
+  With one round and stage 1 only, warp efficiency is 72.2% (2,1147+
+  algebraic), 75.9% (rational) and 85.4% (c187 algebraic).
+
+Stage 2 was 45% of the algebraic ECM time on 2,1147+, and 34% on c187.
+
+### Landed: stage 2 at D=210 (`0e98c00`)
+
+`CF_ECM_D` (bench.h) is now 210, which takes the giant steps from 483 to 70 at
+B2 = 15000. The 24 baby points come from one walk of odd multiples instead of
+one ladder each. Relations are byte-identical to `main` at every D tried, and
+`cofcheck` passes 62/0 at each:
+
+| clean ECM device ms/q | 2,1147+ rational | 2,1147+ algebraic | c187 algebraic |
+|---|---:|---:|---:|
+| `main` (D=30, ladders) | 9.95 | 32.41 | 6.74 |
+| D=30, walk | 9.19 | 29.23 | 6.18 |
+| D=60 | 8.34 | 26.35 | 5.81 |
+| D=120 | 7.93 | 25.43 | 5.55 |
+| D=210 | 7.68 | 25.25 | 5.50 |
+
+Default wall clock: 2,1147+ went from 139.5–140.0 to 133.4–134.0 ms/q, and
+c187 (one pipeline) from 35.7 to 34.7.
+
+### Parked: PRAC stage 1 (`attic/prac_stage1.patch`)
+
+These are GMP-ECM's Lucas chains. The host picks each prime's multiplier and
+proves the chain by replaying it on integer multiples; 2 of the 78,497 primes
+below 10^6 fall back to the ladder. The patch passed these checks:
+
+- No projective mismatches against the ladder, over 262,144 random curves ×
+  every chain × 2/3/4 limbs × B1 200/500/1000.
+- Stage 1 alone was 17–20% faster.
+- Relations were identical on both bands.
+
+But it does not pay:
+
+- **Wall clock barely moves.** 2,1147+ went from 133.4–134.0 to 132.5 ms/q
+  (about −1%), and c187 from 34.7 to 34.5. On 2,1147+ the clean algebraic
+  queue fell 25.25 → 22.60, while the rational queue rose 7.68 → 7.99.
+- **It is not curve-for-curve equivalent.** `cofcheck`'s "ECM stage 2
+  control, disabled" found 37 relations where 36 are pinned. The chains form
+  different intermediate multiples, so a point of small order mod p can make
+  one of them find a factor the other misses.
+- **It needs more stack.** k_cofac<4,ECM,stage2>'s frame grows to 1,104 bytes.
+
+### Ruled out: finer rounds at the same curve budget
+
+These runs keep the default 48 curves per record but split them into more,
+shorter rounds:
+
+| curves × rounds | 2,1147+ wall | algebraic ECM | relations |
+|---|---:|---:|---:|
+| 12 × 4 (default) | 140.4 | 37.6 | 25,376 |
+| 6 × 8 | 136.2 | 37.1 | −7 |
+| 4 × 12 | 134.6 | 39.8 | −31 |
+| 2 × 24 | 130.2 | 46.7 | −160 |
+
+ECM device time rises and relations fall: `mz_split` restarts at each round,
+so a cofactor that needs two factors peeled loses chances. The lower wall
+clock is a yield trade, not a free win.
+
+### What is left
+
+The largest remaining ECM inefficiency is lanes idling inside a round. A
+scheduler that runs one curve per launch and compacts in between could recover
+some of it. It would have to carry `mz_split`'s factor stack between launches,
+because changing the curves or the rounds changes the relations (above). Not
+attempted.
