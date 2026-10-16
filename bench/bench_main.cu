@@ -246,7 +246,8 @@ static void usage(void)
 "  --cof-ecm        ECM instead of Pollard-Brent rho; stage 1 alone loses,\n"
 "                   while tuned stage 2 is near rho at matched yield\n"
 "  --ecm-b1 N       ECM stage-1 bound                              [1000]\n"
-"  --ecm-b2 N       ECM D=30 stage-2 bound; 0 disables stage 2         [0]\n"
+"  --ecm-b2 N       ECM stage-2 bound, baby-step/giant-step at D=210, so\n"
+"                   it needs B1 >= 105; 0 disables stage 2              [0]\n"
 "  --ecm-curves N   ECM curves attempted per round                 [16]\n"
 "  --candidates F   write the cofactorisation batch here\n"
 "  --cofac FILE     cofactorise a batch written by --candidates and emit the\n"
@@ -500,14 +501,15 @@ static int resolve_and_check_cofactor_config(bench_cfg_t *cfg, uint32_t alim,
          * --ecm-curves 0 must stay a refusal, so neither may be filled in
          * merely because it is zero. */
         /* 30*B1, CLAMPED INTO THE VALIDATOR'S OWN RANGE. A derived value must
-         * never be able to fail the check that follows it: B1 below 30 is
-         * outside the D=30 continuation's domain, and 30*B1 above 10^7 exceeds
+         * never be able to fail the check that follows it: B1 below
+         * CF_ECM_B1_MIN is outside the continuation's domain (q > D/2 for its
+         * first giant step), and 30*B1 above 10^7 exceeds
          * the B2 ceiling -- so an unclamped rule turned `--ecm-b1 2` and every
          * `--ecm-b1` above 333,333 into a hard refusal citing an --ecm-b2 the
          * user never passed. Two thirds of --ecm-b1's own documented range was
          * unusable. Clamp, do not refuse: the user asked for a B1, not a B2. */
         if (!cfg->ecm_b2_set) {
-            if (cfg->ecm_b1 < 30u)               cfg->ecm_b2 = 0u;
+            if (cfg->ecm_b1 < CF_ECM_B1_MIN)     cfg->ecm_b2 = 0u;
             else if (cfg->ecm_b1 > 10000000u / 30u) cfg->ecm_b2 = 10000000u;
             else                                 cfg->ecm_b2 = 30u * cfg->ecm_b1;
         }
@@ -592,11 +594,12 @@ static int resolve_and_check_cofactor_config(bench_cfg_t *cfg, uint32_t alim,
             fprintf(stderr, "--ecm-b1 %u: must be 2..1000000\n", cfg->ecm_b1);
             bad = 1;
         }
-        if (cfg->ecm_b2 && (cfg->ecm_b1 < 30u ||
+        if (cfg->ecm_b2 && (cfg->ecm_b1 < CF_ECM_B1_MIN ||
                             cfg->ecm_b2 <= cfg->ecm_b1 ||
                             cfg->ecm_b2 > 10000000u)) {
             fprintf(stderr, "--ecm-b2 %u: want 0 (disabled), or B1 < B2 <="
-                    " 10000000 with B1 >= 30\n", cfg->ecm_b2);
+                    " 10000000 with B1 >= %u\n", cfg->ecm_b2,
+                    (unsigned)CF_ECM_B1_MIN);
             bad = 1;
         }
     } else if (cfg->ecm_b2_set) {

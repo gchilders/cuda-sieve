@@ -1093,6 +1093,25 @@ enum {
  * relation file and resume state. The rest of each instance's configuration
  * is the band's cfg; see pipe_inst_cfg. */
 #define PIPE_INSTANCES_MAX 4
+/* ECM stage 2's baby-step/giant-step modulus (cofac.cuh): 30, 60, 120 or 210.
+ * The baby steps are the odd u < D/2 coprime to D, phi(D)/2 of them, and a
+ * curve walks (B2-B1)/D giant steps. 210 measured best -- RTX 4090, ECM device
+ * time vs 30: -22% on 2,1147+ (483 -> 70 giant steps), -18% on c187's
+ * algebraic side, relations byte-identical on both. */
+#ifndef CF_ECM_D
+#define CF_ECM_D       210u
+#endif
+#if CF_ECM_D == 30 || CF_ECM_D == 60 || CF_ECM_D == 120
+#define CF_ECM_NBABY   (CF_ECM_D / 30u * 4u)          /* phi(D)/2: 4, 8, 16 */
+#elif CF_ECM_D == 210
+#define CF_ECM_NBABY   24u
+#else
+#error "CF_ECM_D must be 30, 60, 120 or 210"
+#endif
+/* A stage-2 prime q in (B1,B2] must be coprime to D (q > 7 is enough) and lie
+ * past the first giant step (q > D/2, so v >= 1): stage 2 needs B1 >= this.
+ * D=30 keeps its old floor of 30. */
+#define CF_ECM_B1_MIN  (CF_ECM_D / 2u > 30u ? CF_ECM_D / 2u : 30u)
 /* --instances auto picks two only for a band of at least this many expected
  * special-q (see run_pipeline). */
 #define PIPE_INST_AUTO_MIN_Q 256

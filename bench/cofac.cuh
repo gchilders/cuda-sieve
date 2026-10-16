@@ -499,25 +499,35 @@ found:
  * once per curve per record. At tens of curves per record that trade is clearly
  * the right way round, and it keeps a binary extended GCD out of the file.
  *
- * Stage 2 is the small-table Montgomery-XZ continuation below. It deliberately
- * uses D=30: the four unsigned baby residues {1,7,11,13} keep one curve's
- * private table small enough for this first GPU experiment. The host supplies
- * one four-bit mask per giant step; bit u is set when vD-u or vD+u is prime in
- * (B1,B2]. Thus every lane follows the same giant-step walk and only the cheap
- * product-of-differences loop is masked.
+ * Stage 2 is the baby-step/giant-step Montgomery-XZ continuation below, at a
+ * compile-time D (CF_ECM_D: 30, 60, 120 or 210). The baby residues are the odd
+ * u < D/2 coprime to D -- phi(D)/2 of them. The host supplies one mask per
+ * giant step; bit k is set when vD-u_k or vD+u_k is prime in (B1,B2]. Thus
+ * every lane follows the same giant-step walk and only the cheap
+ * product-of-differences loop is masked. A larger D trades a larger baby table
+ * for fewer giant steps: (B2-B1)/D of them, at one differential addition each.
  */
 
-#define CF_ECM_D       30u
-#define CF_ECM_NBABY    4u
+/* CF_ECM_D, CF_ECM_NBABY and CF_ECM_B1_MIN live in bench.h: bench_main's
+ * B1/B2 validation needs the same floor. */
+typedef uint32_t cf_s2mask_t;            /* one bit per baby residue */
 #define CF_ECM_MAX_B1   1000000u
 #define CF_ECM_MAX_B2  10000000u
 
 /* One definition supplies both the host mask-bit mapping and the device baby
- * scalar. A duplicated host/device table can compile and test cleanly while
- * silently assigning different meanings to the same mask bit. */
-CF_HD uint8_t cf_ecm_baby(uint32_t k)
+ * order. A duplicated host/device table can compile and test cleanly while
+ * silently assigning different meanings to the same mask bit: the device
+ * builds its table by walking the odd m < D/2 and keeping those this accepts,
+ * and cf_ecm_baby numbers them in the same walk. */
+CF_HD int cf_ecm_coprime(uint32_t m)
 {
-    return k == 0 ? 1u : k == 1 ? 7u : k == 2 ? 11u : 13u;
+    return (m & 1u) && m % 3u && m % 5u && (CF_ECM_D % 7u || m % 7u);
+}
+CF_HD uint32_t cf_ecm_baby(uint32_t k)
+{
+    for (uint32_t m = 1, i = 0; m < CF_ECM_D / 2u; m += 2)
+        if (cf_ecm_coprime(m) && i++ == k) return m;
+    return 0;
 }
 
 /* Shared composite sieve for both ECM plans. Bounds live here as well as in
@@ -574,11 +584,12 @@ static uint32_t cf_ecm_plan(uint32_t b1, uint32_t **out)
  * the device can advance with one differential addition rather than restart a
  * scalar multiplication at every populated v. */
 static uint32_t cf_ecm_stage2_plan(uint32_t b1, uint32_t b2, uint32_t *vmin_out,
-                                   uint8_t **mask_out)
+                                   cf_s2mask_t **mask_out)
 {
-    uint8_t *composite = NULL, *mask = NULL;
+    uint8_t *composite = NULL;
+    cf_s2mask_t *mask = NULL;
     uint32_t qlo, qhi, vmin, vmax, nv;
-    if (b2 <= b1 || b1 < CF_ECM_D || b1 > CF_ECM_MAX_B1 ||
+    if (b2 <= b1 || b1 < CF_ECM_B1_MIN || b1 > CF_ECM_MAX_B1 ||
         b2 > CF_ECM_MAX_B2) {
         *vmin_out = 0; *mask_out = NULL; return 0;
     }
@@ -592,7 +603,7 @@ static uint32_t cf_ecm_stage2_plan(uint32_t b1, uint32_t b2, uint32_t *vmin_out,
     vmin = (qlo + CF_ECM_D / 2) / CF_ECM_D;
     vmax = (qhi + CF_ECM_D / 2) / CF_ECM_D;
     nv = vmax - vmin + 1;
-    mask = (uint8_t *)calloc(nv, 1);
+    mask = (cf_s2mask_t *)calloc(nv, sizeof *mask);
     if (!mask) { free(composite); *vmin_out = 0; *mask_out = NULL; return 0; }
     for (uint32_t q = b1 + 1; q <= b2; q++) if (!composite[q]) {
         const uint32_t v = (q + CF_ECM_D / 2) / CF_ECM_D;
@@ -600,7 +611,7 @@ static uint32_t cf_ecm_stage2_plan(uint32_t b1, uint32_t b2, uint32_t *vmin_out,
         const uint32_t u = q > vd ? q - vd : vd - q;
         for (uint32_t k = 0; k < CF_ECM_NBABY; k++)
             if (u == cf_ecm_baby(k)) {
-                mask[v - vmin] |= (uint8_t)(1u << k); break;
+                mask[v - vmin] |= (cf_s2mask_t)1u << k; break;
             }
     }
     free(composite);
@@ -701,7 +712,7 @@ CF_NOINLINE void x_mul_s2(mpt<L> *p, uint32_t k, const mz<L> *an,
     x_mul<L>(p, k, an, ad, n, n0inv, work);
 }
 
-/* One pass over the D=30 baby-step/giant-step continuation. All selected
+/* One pass over the baby-step/giant-step continuation (D = CF_ECM_D). All selected
  * cross-products are accumulated and normally only one gcd is paid. If hits
  * for different prime factors make that gcd equal n, replay the same curve and
  * gcd each selected difference. The replay is rare, preserves the fast common
@@ -711,7 +722,7 @@ CF_NOINLINE int mz_ecm_stage2_pass(mz<L> *fac, const mpt<L> *Q,
                                     const mz<L> *an, const mz<L> *ad,
                                     const mz<L> *one, const mz<L> *n,
                                     uint32_t n0inv,
-                                    const uint8_t *__restrict masks,
+                                    const cf_s2mask_t *__restrict masks,
                                     uint32_t vmin, uint32_t nv,
                                     uint64_t *work)
 {
@@ -785,12 +796,28 @@ CF_NOINLINE int mz_ecm_stage2_pass(mz<L> *fac, const mpt<L> *Q,
              * x_mul_s2 is __noinline__, and unrolling its call sites widens
              * the live range of every argument across all NBABY calls. */
             mz<L> bzs[CF_ECM_NBABY], acc, t;
-            for (uint32_t k = 0; k < CF_ECM_NBABY; k++) {
-                const uint32_t scalar = cf_ecm_baby(k);
-                mpt<L> p = *Q;
-                if (scalar != 1)
-                    x_mul_s2<L>(&p, scalar, an, ad, n, n0inv, work);
-                bx[k] = p.X; bzs[k] = p.Z;
+            {
+                /* The odd multiples [m]Q, m < D/2, by one differential
+                 * addition each: [m+2]Q = [m]Q + [2]Q, difference [m-2]Q.
+                 * Those coprime to D are the baby steps, in cf_ecm_baby's
+                 * order. One ladder per baby would cost ~log2(m) ladder steps
+                 * each -- at D=210, 24 of them -- for what this walk does in
+                 * 52 additions. */
+                mpt<L> q2, pm, cm, nm;
+                uint32_t kk = 0;
+                x_dbl<L>(&q2, Q, an, ad, n, n0inv);
+                pm = *Q;
+                bx[kk] = pm.X; bzs[kk] = pm.Z; kk++;        /* m = 1 */
+                x_add<L>(&cm, &q2, Q, Q, n, n0inv);         /* m = 3 */
+                (*work)++;
+                for (uint32_t m = 3; m < CF_ECM_D / 2u; m += 2) {
+                    if (cf_ecm_coprime(m)) { bx[kk] = cm.X; bzs[kk] = cm.Z; kk++; }
+                    if (m + 2 < CF_ECM_D / 2u) {
+                        x_add<L>(&nm, &cm, &q2, &pm, n, n0inv);
+                        pm = cm; cm = nm;
+                        (*work)++;
+                    }
+                }
             }
             /* Forward: bx[k] = X_k * prod_{j<k} Z_j, acc ends at prod_j Z_j. */
             acc = *one;
@@ -816,16 +843,15 @@ CF_NOINLINE int mz_ecm_stage2_pass(mz<L> *fac, const mpt<L> *Q,
 
         for (uint32_t vi = 0; vi < nv; vi++) {
             const mpt<L> *G = vi ? &cur : &prev;
-            const uint32_t mask = masks[vi];
+            const cf_s2mask_t mask = masks[vi];
             if (mask) {
                 /* One denominator for every baby step, so this term is the
                  * same for all k -- hoisted out of the loop below, and not
                  * computed at all on a giant step that selects nothing. */
                 mz<L> gx;
                 mz_mul<L>(&gx, &G->X, &bz, n, n0inv);
-                #pragma unroll
                 for (uint32_t k = 0; k < CF_ECM_NBABY; k++)
-                    if (mask & (1u << k)) {
+                    if (mask & ((cf_s2mask_t)1u << k)) {
                         mz<L> b, d;
                         mz_mul<L>(&b, &bx[k], &G->Z, n, n0inv);
                         d = gx; mz_sub_mod<L>(&d, &b, n);
@@ -859,7 +885,7 @@ CF_NOINLINE int mz_ecm_stage2_pass(mz<L> *fac, const mpt<L> *Q,
 template <int L, int STAGE2>
 CF_FN int mz_ecm(mz<L> *fac, const mz<L> *n, uint32_t sigma,
                  const uint32_t *__restrict s, uint32_t ns,
-                 const uint8_t *__restrict s2mask, uint32_t s2vmin,
+                 const cf_s2mask_t *__restrict s2mask, uint32_t s2vmin,
                  uint32_t s2nv, uint64_t *work)
 {
     const uint32_t n0inv = mz_n0inv(n->v[0]);
@@ -928,7 +954,7 @@ template <int L, int METHOD, int STAGE2>
 CF_FN int mz_split(const mz<L> *n0, const mz<L> *lim2, uint32_t lpb,
                    uint32_t c0, uint32_t budget, uint64_t *out, int *nout,
                    uint64_t *acc, const uint32_t *__restrict s, uint32_t ns,
-                   const uint8_t *__restrict s2mask, uint32_t s2vmin,
+                   const cf_s2mask_t *__restrict s2mask, uint32_t s2vmin,
                    uint32_t s2nv)
 {
     mz<L> st[CF_MAXFAC];
@@ -1022,7 +1048,7 @@ void k_cofac(const mz<L> *__restrict n, mz<L> lim2, uint32_t lpb,
                         uint64_t *__restrict fac, uint8_t *__restrict nfac,
                         unsigned long long *__restrict iters,
                         const uint32_t *__restrict s, uint32_t ns,
-                        const uint8_t *__restrict s2mask, uint32_t s2vmin,
+                        const cf_s2mask_t *__restrict s2mask, uint32_t s2vmin,
                         uint32_t s2nv, uint32_t ibeg, uint32_t iend)
 {
     /* [ibeg, iend) is this launch's slice of the compacted list; cf_sched_t's
@@ -1102,7 +1128,7 @@ typedef struct {
     uint32_t curves;        /* ECM curves attempted per round                */
     const uint32_t *d_s;    /* ECM stage-1 prime powers, on device           */
     uint32_t ns;
-    const uint8_t *d_s2mask;/* D=30 stage-2 prime-pair mask per giant step   */
+    const cf_s2mask_t *d_s2mask;/* stage-2 prime-pair mask per giant step  */
     uint32_t s2vmin, s2nv;
     /* Records per launch. ALWAYS A CONCRETE COUNT, never a sentinel: a value
      * at or above the batch means one launch (the original behaviour,
@@ -1583,7 +1609,7 @@ typedef struct {
      * 2-4x at 3LP (RESULTS finding 70). A per-job choice would get one of the
      * two sides wrong on nearly every job. */
     int meth[2];
-    uint8_t  *d_s2mask; uint32_t s2vmin, s2nv;/* ECM stage-2 schedule      */
+    cf_s2mask_t *d_s2mask; uint32_t s2vmin, s2nv;/* ECM stage-2 schedule   */
     double ms_rat, ms_alg, ms_host;
     unsigned long long nseen, nrel;
     /* Per side, per CF_* status, accumulated over flushes. `ndead`/`nstuck`
@@ -1877,7 +1903,7 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
 {
     const uint32_t nb = (cap + TD_SCAN_BLK - 1) / TD_SCAN_BLK;
     uint32_t *h_s = NULL;
-    uint8_t *h_s2mask = NULL;
+    cf_s2mask_t *h_s2mask = NULL;
     int rc = -1;
 
 #define COF_INIT_CK(x) do { if (CUDA_CHECKED(x)) goto done; } while (0)
@@ -1919,8 +1945,9 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
                         " B1=%u B2=%u\n", ecm_b1, ecm_b2);
                 goto done;
             }
-            COF_INIT_CK(cudaMalloc(&Q->d_s2mask, Q->s2nv));
-            COF_INIT_CK(cudaMemcpy(Q->d_s2mask, h_s2mask, Q->s2nv,
+            COF_INIT_CK(cudaMalloc(&Q->d_s2mask, Q->s2nv * sizeof *h_s2mask));
+            COF_INIT_CK(cudaMemcpy(Q->d_s2mask, h_s2mask,
+                                   Q->s2nv * sizeof *h_s2mask,
                                    cudaMemcpyHostToDevice));
             free(h_s2mask); h_s2mask = NULL;
         }
@@ -1932,7 +1959,7 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
          * Chunking splits the RECORD list, so the smallest launch it can make
          * is one record per thread. A launch therefore never gets shorter than
          * ONE record's own splitting work, and stage 2 is where that can grow
-         * without limit: the giant-step count is B2/30, so a large B2 buys a
+         * without limit: the giant-step count is B2/D, so a large B2 buys a
          * per-record cost no slice size can divide.
          *
          * The auto-derived configuration is nowhere near this -- cof_auto_b1
@@ -3138,7 +3165,7 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
 {
     FILE *f = fopen(path, "rb");
     uint32_t *h_s = NULL, *d_s = NULL, ns = 0;
-    uint8_t *h_s2mask = NULL, *d_s2mask = NULL;
+    cf_s2mask_t *h_s2mask = NULL, *d_s2mask = NULL;
     uint32_t s2vmin = 0, s2nv = 0;
     cf_sched_t sched;
     char *buf = NULL;
@@ -3275,8 +3302,9 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
                 free(st0); free(nf0); free(fac0);
                 return -1;
             }
-            CK(cudaMalloc(&d_s2mask, s2nv));
-            CK(cudaMemcpy(d_s2mask, h_s2mask, s2nv, cudaMemcpyHostToDevice));
+            CK(cudaMalloc(&d_s2mask, s2nv * sizeof *h_s2mask));
+            CK(cudaMemcpy(d_s2mask, h_s2mask, s2nv * sizeof *h_s2mask,
+                          cudaMemcpyHostToDevice));
             free(h_s2mask);
         }
         printf("  ECM: B1 = %u, %u prime powers, B2 = %u (%u giant steps),"
