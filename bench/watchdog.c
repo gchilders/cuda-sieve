@@ -98,7 +98,7 @@ static struct {
 
 void wd_phase(const char *name)
 {
-    if (!W.armed) return;
+    if (!W.armed || wd_my < 0) return;
     WS[wd_my].phase = name;
     WS[wd_my].seq++;
 }
@@ -111,19 +111,20 @@ void wd_arm_kill(void)
 void wd_q(unsigned long long q, unsigned long long rho,
           unsigned long long nqdone)
 {
-    if (!W.armed) return;
+    if (!W.armed || wd_my < 0) return;
     WS[wd_my].q = q; WS[wd_my].rho = rho; WS[wd_my].nq = nqdone;
 }
 
 void wd_slab(unsigned slab, unsigned nslab)
 {
-    if (!W.armed) return;
+    if (!W.armed || wd_my < 0) return;
     WS[wd_my].slab = slab; WS[wd_my].nslab = nslab;
 }
 
 void wd_bind(int slot)
 {
-    if (slot < 0 || slot >= WD_SLOTS) slot = 0;
+    if (slot < 0) { wd_my = -1; return; }      /* a helper: no heartbeat */
+    if (slot >= WD_SLOTS) slot = 0;
     wd_my = slot;
     if (slot) wd_multi = 1;
     if (!W.armed) return;
@@ -139,7 +140,7 @@ void wd_bind(int slot)
 
 void wd_active(int on)
 {
-    if (!W.armed) return;
+    if (!W.armed || wd_my < 0) return;
     WS[wd_my].seq++;
     WS[wd_my].active = on;
 }

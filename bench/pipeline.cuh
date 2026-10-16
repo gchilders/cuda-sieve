@@ -64,9 +64,9 @@ struct pipe_inst_shared_t {
     int n;
     double frac[PIPE_INSTANCES_MAX];
     /* Under `print`: instances whose setup has not finished, and the modelled
-     * footprint each will need. The optional second bucket array reserves
-     * that much for them, so the first instance cannot take what a sibling
-     * needs to start at all. */
+     * footprint each will need. The optional second bucket array and
+     * --q-pipeline's transform set reserve that much for them, so the first
+     * instance cannot take what a sibling needs to start at all. */
     int setups_left;
     size_t m_inst;
 };
@@ -76,6 +76,14 @@ struct pipe_inst_ctx_t {
     pipe_inst_shared_t *sh;
 };
 static thread_local pipe_inst_ctx_t *g_pinst = NULL;
+
+/* What an optional allocation must leave free for the siblings still to set
+ * up: 0 without --instances. Read during setup, under `print`. */
+static size_t pipe_inst_reserve()
+{
+    return g_pinst
+        ? (size_t)(g_pinst->sh->setups_left - 1) * g_pinst->sh->m_inst : 0;
+}
 
 /* Held across run_pipeline_impl's setup and its end-of-band report, released
  * for the band itself. A no-op without --instances. */
@@ -2195,6 +2203,7 @@ static void cofa_start(cofasync_t *A, cofq_t *Q, cofq_out_t *O,
     const cudaStream_t cs = g_cof_stream;   /* thread_local: hand it over */
     A->th = new std::thread([A, O, cfg, blocks, fr, cs]() {
         g_cof_stream = cs;
+        wd_bind(-1);    /* the sieve thread's slot stays the sieve thread's */
         A->rc = cofq_flush(&A->F, O, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
                            cfg->cof_rounds, cfg->cof_budget, cfg->cof_chunk,
                            blocks, cfg->threads, fr);
@@ -2741,10 +2750,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         PIPE_CK(cudaMemGetInfo(&f2, &t2));
         const size_t gib = (size_t)1 << 30;
         const size_t margin = t2 / 10 > gib ? t2 / 10 : gib;
-        /* --instances: what the siblings still to set up will need. */
-        const size_t reserve = g_pinst
-            ? (size_t)(g_pinst->sh->setups_left - 1) * g_pinst->sh->m_inst : 0;
-        if (need2 + margin + reserve <= f2) {
+        if (need2 + margin + pipe_inst_reserve() <= f2) {
             PIPE_CK(cudaMalloc(&d_bucket_c, need));
             PIPE_CK(cudaMalloc(&d_cursor_c, (size_t)nregion_alloc * 4));
             PIPE_CK(cudaMalloc(&d_overflow_c, 4));
@@ -2766,9 +2772,14 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
      * this q's resieve still reads it: plat for every bucketed entry and
      * rowrt for the row tier. On a slabbed plan, where the next SLAB is also
      * sieved under this slab's TD, a third walk-cursor buffer per entry
-     * (walk_spare; see pside_rotate_walk). NOT a second bucket array --
-     * sieves stay ordered on one stream, so the next fill starts only after
-     * this apply is done with the buckets.
+     * (walk_spare; see pside_rotate_walk). NOT another bucket array: the
+     * next q's fills reuse this q's one or two, and pipe_td_perq issues them
+     * only after both sides' bucket resieve has recorded C.ev[14] (st_sv
+     * waits on it), so a fill never overwrites records still being read.
+     *
+     * Under --instances the siblings still to set up are held back
+     * (pipe_inst_reserve), as for the second bucket array above; their
+     * modelled footprint already prices this transform set.
      *
      * SINGLE-QUEUED, NOT REFUSED, when it does not fit: the flag asks for a
      * speed-up, and a job that runs today must keep running. The banner and
@@ -2790,9 +2801,11 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         } else {
             size_t f3 = 0, t3 = 0;
             PIPE_CK(cudaMemGetInfo(&f3, &t3));
-            if (extra + PIPE_VRAM_MARGIN > f3)
+            const size_t reserve = pipe_inst_reserve();
+            if (extra + PIPE_VRAM_MARGIN + reserve > f3)
                 snprintf(why, sizeof why, "it needs %.2f GB more and %.2f GB"
-                         " is free", extra / 1073741824.0, f3 / 1073741824.0);
+                         " is free%s", extra / 1073741824.0, f3 / 1073741824.0,
+                         reserve ? " after the other instances' share" : "");
         }
         if (!why[0]) {
             /* An allocation that fails AFTER the check passed -- another
@@ -3890,6 +3903,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                         A.ck_next = *cur;
                         A.ck_nq = base_nq + nqdone;
                     }
+                    /* fc's offset is safe to take from this thread: under
+                     * --cofactor (the only mode with a cofactor queue) the
+                     * join loop writes no candidates, so it does not move. */
                     A.ck_P = POLY; A.ck = &ck; A.ck_fc = fc;
                     A.ck_base_rel = base_rel;
                     A.ck_written = &ckpt_written; A.ck_warned = &ckpt_warned;
@@ -5128,6 +5144,8 @@ static size_t pipe_vram_model(const fb_t *fb1, const fb_t *fb0,
     b += 2 * (size_t)(X / 64);                          /* --fill-gate folds */
     b += (size_t)(fb1->n + fb0->n) *
          (4 + 4 + sizeof(plat_t) + 8 + 8 + 4);          /* per-entry state   */
+    if (cfg->q_pipeline)        /* plat_alt, rowrt_alt (nrow <= n), walk_spare */
+        b += (size_t)(fb1->n + fb0->n) * (sizeof(plat_t) + 4 + 8);
     b += (size_t)768 << 20;   /* TD buffers, cofactor queue(s), small tables */
     return b;
 }
@@ -5393,6 +5411,11 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     uint32_t pmax0 = fb_max_td_prime(fbs0);
     uint32_t pmax = pmax1 > pmax0 ? pmax1 : pmax0;
 
+    if (cfg->fill_rows < 0) {   /* FILL_ROWS_UNSET / _BY_DEVICE: a caller bug */
+        fprintf(stderr, "  pipeline: --fill-rows was not resolved (%d)\n",
+                cfg->fill_rows);
+        return -1;
+    }
     if (slab_make_plan(cfg->logI, cfg->log_region, cfg->J, pmax,
                        cfg->slab_j, &plan)) {
         fprintf(stderr,

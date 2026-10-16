@@ -637,7 +637,8 @@ int poly_load(const char *path, poly_t *P)
         } else if (KEY_IS("mfba")) {
             DUP_GUARD(seen_mfba, "mfba");
             if (parse_u32_value(value, &P->mfba)) goto bad_u32;
-        } else if (KEY_IS("n")) {
+        } else if (KEY_IS("n") || KEY_IS("N")) {
+            /* msieve-style files spell it N:; either is the one field. */
             DUP_GUARD(seen_n, "n");
             if (parse_natural(value, P->ns, sizeof P->ns))
                 VALUE_FAIL("n must be a positive decimal integer of at most"

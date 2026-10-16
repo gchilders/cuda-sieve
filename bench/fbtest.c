@@ -581,7 +581,9 @@ static int verify_poly_parser_strict(void)
         "n:12345\nskew:1\nc0:-1\nc1:2\nY0:0\nY1:1\n",      /* n not a common root */
         "n:12x45\nskew:1\nc0:-12345\nc1:2\nY0:0\nY1:1\n",  /* n not an integer */
         "n:7\nskew:1\nc0:-7\nc1:2\nY0:0\nY1:1\n",          /* n too small to mean anything */
-        "n:5\nn:5\nskew:1\nc0:-5\nc1:2\nY0:0\nY1:1\n"     /* duplicate n */
+        "n:5\nn:5\nskew:1\nc0:-5\nc1:2\nY0:0\nY1:1\n",    /* duplicate n */
+        "N:12345\nskew:1\nc0:-1\nc1:2\nY0:0\nY1:1\n",      /* N: is checked too */
+        "n:5\nN:5\nskew:1\nc0:-5\nc1:2\nY0:0\nY1:1\n"     /* n: and N: are one field */
     };
     /* Unicode pasted from a web page must be named, not blamed on the
      * value's syntax. The field-name cases loaded before, silently dropping
@@ -614,6 +616,7 @@ static int verify_poly_parser_strict(void)
         "\xEF\xBB\xBFn: 12345\nskew:1\nc0:-12345\nc1:2\nY0:0\nY1:1\n",
         /* A root other than 0: G = x - 13 and f = 2x - 1, f(13) = 25. */
         "n: 25\nskew:1\nc0:-1\nc1:2\nY0:-13\nY1:1\n",
+        "N: 25\nskew:1\nc0:-1\nc1:2\nY0:-13\nY1:1\n",
         "\xEF\xBB\xBFskew:1\nc0:-1\nc1:2\nY0:0\nY1:1\n",
         "skew:1\nc0:-1\nc0000000000000001:2\nY0:0\nY1:1\n",
         "skew:1 # caf\xC3\xA9\nc0:-1\nc1:2\nY0:0\nY1:1\n",

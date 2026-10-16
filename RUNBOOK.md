@@ -1284,8 +1284,11 @@ itself, so neither pays it.)
   are tagged `[k]`, run-log records `instK`, and the BOINC fraction is the
   instances' mean.
 - **VRAM:** the slab target is chosen so that N footprints plus one headroom
-  fit. Setup runs one instance at a time, and the optional second bucket array
-  reserves room for the instances not yet set up.
+  fit; the footprint includes `--q-pipeline`'s second transform set. Setup
+  runs one instance at a time. Each optional extra (the second bucket array,
+  then the q-pipeline set) is admitted only if the instances not yet set up
+  still have their modelled footprint left. An extra that is refused leaves
+  that instance slower, never failed, and the banner says which extras it got.
 - **Not split:** `--target-rels`, `--nq`, `--qlist` and `--candidates` bands
   run one pipeline and say so. An open band has no end to divide.
 

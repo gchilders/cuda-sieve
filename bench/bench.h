@@ -638,7 +638,7 @@ typedef struct {
      * (k_fill_rows) instead of one thread walking all xmax/q of their hits,
      * which is what sets k_fill_atomic's tail (finding 105 follow-up).
      * Output-identical by construction. 0 = off; default 4 at logI <= 15
-     * (bench_main resolves -1). --fill-row-bands sets the bands per slab;
+     * (bench_main resolves FILL_ROWS_UNSET). --fill-row-bands sets the bands per slab;
      * 0 = one per FILL_ROW_RUN rows. */
     int      fill_rows;
     int      fill_row_bands;
@@ -927,6 +927,11 @@ typedef struct {
  * Measured off-side at 48 (RTX 5070) and on-side at 128 (RTX 4090); 64 is a
  * guess between them, to be moved when a card in between is measured. */
 #define FILL_ROWS_I16_MIN_SMS   64
+/* cfg.fill_rows before it is settled. bench_main resolves UNSET from logI
+ * after parsing and BY_DEVICE from the SM count once the card is known;
+ * run_pipeline refuses either, so neither can reach a kernel as a count. */
+#define FILL_ROWS_UNSET         (-1)
+#define FILL_ROWS_BY_DEVICE     (-2)
 #define BENCH_STR_(x) #x
 #define BENCH_STR(x)  BENCH_STR_(x)
 /* Concurrency test only (item 1). Each workspace is a full bucket array, so

@@ -387,6 +387,18 @@ if grep -q 'side 0 2 limbs (64 bits)' $TMP/n2.out && [ -s $TMP/n2.txt ] && \
 else
     printf 'FAIL   %-34s width not 2, or output differs from 3 limbs\n' "side 0 derived at 2 limbs"; fail=1
 fi
+# The same for ECM, whose 2-limb curve arithmetic is a separate instantiation
+# (cf_run_side_dyn case 2) that the rho case above never runs.
+run --cofactor --cof-ecm --ecm-b1 1000 --ecm-b2 10000 --ecm-curves 16 \
+    --relations $TMP/ne2.txt > $TMP/ne2.out 2>&1 || true
+run --cofactor --cof-ecm --ecm-b1 1000 --ecm-b2 10000 --ecm-curves 16 \
+    --cof-limbs0 3 --relations $TMP/ne3.txt >/dev/null 2>&1 || true
+if grep -q 'side 0 2 limbs (64 bits)' $TMP/ne2.out && [ -s $TMP/ne2.txt ] && \
+   cmp -s $TMP/ne2.txt $TMP/ne3.txt; then
+    printf 'PASS   %-34s identical to the 3-limb run\n' "ECM side 0 derived at 2 limbs"
+else
+    printf 'FAIL   %-34s width not 2, or output differs from 3 limbs\n' "ECM side 0 derived at 2 limbs"; fail=1
+fi
 
 expect_refused "zero rho budget"              --cofactor --cof-budget 0
 expect_refused "rho rounds overflowing shift" --cofactor --cof-rounds 40

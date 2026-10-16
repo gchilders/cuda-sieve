@@ -1548,7 +1548,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     cfg.dual_bucket = 1;
     cfg.instances = 1;
     /* -1 = resolved below once logI and --fill-concurrent are known */
-    cfg.fill_rows = -1; cfg.fill_row_bands = 0; cfg.resieve_rows = -1;
+    cfg.fill_rows = FILL_ROWS_UNSET; cfg.fill_row_bands = 0; cfg.resieve_rows = -1;
     cfg.fill_gate = -1; cfg.fill_gate_shift = 3;
     cfg.q_pipeline = -1;   /* resolved with the fill defaults below */
     cfg.qspan = 0;
@@ -2092,11 +2092,12 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
      *   - the gate whenever the sides run back to back. --fill-concurrent
      *     overlaps them, so there the default is off and an explicit
      *     --fill-gate is refused below. */
-    /* logI 16 is the device's call (FILL_ROWS_I16_MIN_SMS): -2 here, settled
-     * once the card is known, below. */
-    if (cfg.fill_rows < 0)
+    /* logI 16 is the device's call (FILL_ROWS_I16_MIN_SMS): BY_DEVICE here,
+     * settled once the card is known, below. It reads as on until then, so
+     * the two checks that need the tier are repeated there. */
+    if (cfg.fill_rows == FILL_ROWS_UNSET)
         cfg.fill_rows = !cfg.pipeline ? 0 : cfg.logI <= 15 ? 4
-                      : cfg.logI == 16 ? -2 : 0;
+                      : cfg.logI == 16 ? FILL_ROWS_BY_DEVICE : 0;
     if (cfg.resieve_rows < 0)
         cfg.resieve_rows = (cfg.fill_rows &&
                             cfg.logI <= RESIEVE_ROWS_LOGI_MAX) ? 1 : 0;
@@ -2659,12 +2660,19 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
          * one: measured neutral to +1-3% fill on a 48-SM RTX 5070 (c194,
          * finding 107) and -15% fill, -8.7% band on a 128-SM RTX 4090
          * (2,1147+). Between the two is unmeasured; see the define. */
-        if (cfg.fill_rows == -2) {
+        if (cfg.fill_rows == FILL_ROWS_BY_DEVICE) {
             cfg.fill_rows = prop.multiProcessorCount >= FILL_ROWS_I16_MIN_SMS
                           ? 4 : 0;
             printf("--fill-rows %d at logI 16 (%d SMs; on from %d)\n",
                    cfg.fill_rows, prop.multiProcessorCount,
                    FILL_ROWS_I16_MIN_SMS);
+            if (!cfg.fill_rows && (fill_row_bands_set || cfg.resieve_rows)) {
+                fprintf(stderr, "%s needs the row tier, which is off on this"
+                        " card at logI 16; give --fill-rows N as well\n",
+                        fill_row_bands_set ? "--fill-row-bands"
+                                           : "--resieve-rows");
+                return 1;
+            }
         }
         {
             const uint64_t ab = (uint64_t)prop.multiProcessorCount * 6u;

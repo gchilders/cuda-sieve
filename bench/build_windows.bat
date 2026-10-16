@@ -197,9 +197,6 @@ for %%F in (fb_load.c verify_cpu.c poly.c primes.c rfb.c fb_cado.c platform.c wa
 
 rem runlog.c alone carries the build stamp, exactly as in the Makefile.
 cl %CFLAGS% /std:c11 -DBENCH_GIT_DESC=\"%GIT_DESC%\" -DBENCH_DEFS=\"%DEFS%\" /c runlog.c || exit /b 1
-rem watchdog.c sits beside runlog.o in the Makefile's OBJS; bench_main.cu and
-rem pipeline.cuh call its wd_* hooks unconditionally, so bench.exe needs it.
-cl %CFLAGS% /std:c11 /c watchdog.c || exit /b 1
 
 rem The main executable needs only fbgen's streaming special-q generator.
 rem FBGEN_LIBRARY excludes the standalone pthread/open_memstream writer.
