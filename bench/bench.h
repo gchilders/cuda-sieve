@@ -1093,6 +1093,9 @@ enum {
  * relation file and resume state. The rest of each instance's configuration
  * is the band's cfg; see pipe_inst_cfg. */
 #define PIPE_INSTANCES_MAX 4
+/* --instances auto picks two only for a band of at least this many expected
+ * special-q (see run_pipeline). */
+#define PIPE_INST_AUTO_MIN_Q 256
 #define PIPE_INST_PATH     2048   /* == BENCH_PATH_MAX, asserted in bench_main */
 typedef struct pipe_inst_one {
     uint64_t qmin, qmax;          /* this instance's share of the band       */

@@ -1239,7 +1239,7 @@ allowance, and a job fingerprint.
 
 ```sh
 bench --pipeline --cofactor ... --qrange 300000000:300008000 \
-      --relations NAME --instances auto
+      --relations NAME            # --instances auto is the default
 ```
 
 `--instances N` (1–4) splits a **bounded** `--qrange` into N equal q ranges
@@ -1260,12 +1260,29 @@ network filesystem, where each checkpoint's fsync stalled the q loop and a
 second instance hid that stall. The flush thread now writes the checkpoint
 itself, so neither pays it.)
 
-- **`auto`** picks two when two modelled footprints plus the headroom fit
-  free VRAM and each instance still gets the slab size one would get alone.
-  Otherwise it picks one. The model runs ~0.6 GB per instance high on the
-  c187, so on an 8 GB card `auto` says one where two would have fit; an
-  explicit `--instances 2` runs there with a warning. The default is
-  `--instances 1`.
+- **`auto` is the default.** It picks two when all three hold, and one
+  otherwise:
+  - two modelled footprints plus the headroom fit free VRAM;
+  - each instance still gets the slab size one would get alone;
+  - the band holds at least 256 expected special-q (`PIPE_INST_AUTO_MIN_Q`).
+
+  A second instance costs its own setup, so a short band loses. Measured on
+  c187 (RTX 4090), whole process, one against two:
+
+  | special-q | one | two |
+  |---|---|---|
+  | 65 | 7.24 s | 7.55 s |
+  | 109 | 8.77 s | 8.69 s |
+  | 281 | 14.83 s | 14.13 s |
+  | 570 | 24.95 s | 23.12 s |
+
+  On c187 it picks two on cards from about 12 GB up, and one at 8 GB and 4 GB.
+  On 2,1147+ it picks one everywhere, because two would cost slab size. The
+  model runs ~0.6 GB per instance high on the c187, so on an 8 GB card `auto`
+  says one where two would have fit; an explicit `--instances 2` runs there
+  with a warning. `--instances 1` restores the single pipeline.
+- **A band is never split into more shares than it has q values;** an
+  explicit N larger than that is lowered and said so.
 - **Output is the same file.** Instance k writes `NAME.inst<k>` with its own
   `.part`, checkpoint and BOINC recovery counter: everything in "Stopping and
   resuming" applies to each one unchanged. When all of them have committed,

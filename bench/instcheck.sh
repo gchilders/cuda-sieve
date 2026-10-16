@@ -70,7 +70,7 @@ echo
 echo "[instances] q $Q, c183"
 
 clean
-if run "$TMP/o.ref" --qrange $Q --relations "$R"; then
+if run "$TMP/o.ref" --qrange $Q --instances 1 --relations "$R"; then
     cp "$R" "$TMP/ref.txt"
     pass "one pipeline (reference)" "$(wc -l < "$R" | tr -d ' ') relations"
 else
@@ -154,6 +154,35 @@ if [ $st -eq 0 ] && grep -q "running one pipeline" "$TMP/o.open" &&
     pass "--target-rels runs one pipeline" ""
 else
     bad "--target-rels runs one pipeline" "exit $st"; tail -3 "$TMP/o.open"
+fi
+
+# A band with fewer q values than instances: split into as many as it has.
+# Before the cap, instance 0 got the empty range [q, q-1] and the band failed.
+Q1=120000053:120000053
+clean
+st=0; run "$TMP/o.r1" --qrange $Q1 --instances 1 --relations "$R" || st=$?
+if [ $st -eq 0 ] && [ -s "$R" ]; then
+    cp "$R" "$TMP/ref1.txt"
+    clean
+    st=0; run "$TMP/o.s1" --qrange $Q1 --instances 2 --relations "$R" || st=$?
+    if [ $st -eq 0 ] && cmp -s "$TMP/ref1.txt" "$R" &&
+       grep -q "has only 1 value" "$TMP/o.s1" && [ -z "$(leftovers)" ]; then
+        pass "--instances 2 on a one-q band" "$(wc -l < "$R" | tr -d ' ') relations, identical"
+    else
+        bad "--instances 2 on a one-q band" "exit $st"; tail -3 "$TMP/o.s1"
+    fi
+else
+    bad "one-q reference" "exit $st"; tail -3 "$TMP/o.r1"
+fi
+
+# The default is auto, and a band too short to pay a second setup runs one.
+clean
+st=0; run "$TMP/o.d1" --qrange $Q1 --relations "$R" || st=$?
+if [ $st -eq 0 ] && cmp -s "$TMP/ref1.txt" "$R" && [ ! -f "$R.instances" ] &&
+   ! grep -q "=== --instances" "$TMP/o.d1"; then
+    pass "default on a short band: one pipeline" "$(grep -o 'instances auto: 1[^)]*' "$TMP/o.d1" | head -1)"
+else
+    bad "default on a short band: one pipeline" "exit $st"; tail -3 "$TMP/o.d1"
 fi
 
 echo

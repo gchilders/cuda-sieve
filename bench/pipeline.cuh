@@ -5430,6 +5430,22 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
      * asked for, or for auto (0) the choice below. Without a plan, one. */
     pipe_inst_plan_t *IP = cfg->inst;
     int ninst = IP ? (IP->n ? IP->n : cfg->instances) : 1;
+    /* A fresh band never has more shares than q values: inst_split would
+     * hand the extra instances an empty range, which sqgen refuses, and the
+     * whole band would fail. */
+    const uint64_t qspan_all = cfg->qmax - cfg->qmin + 1;
+    if (IP && !IP->n && ninst > 1 && (uint64_t)ninst > qspan_all) {
+        printf("  --instances %d: q [%llu, %llu] has only %llu value%s;"
+               " running %llu\n", ninst, (unsigned long long)cfg->qmin,
+               (unsigned long long)cfg->qmax, (unsigned long long)qspan_all,
+               qspan_all == 1 ? "" : "s", (unsigned long long)qspan_all);
+        ninst = (int)qspan_all;
+    }
+    /* auto only: the expected special-q in the band, primes in it at one
+     * root each on average. */
+    const double nq_est = IP && !IP->n && ninst == 0
+        ? (double)qspan_all / log(0.5 * ((double)cfg->qmin + (double)cfg->qmax))
+        : 0.0;
     /* The slab target: the largest of 4x, 2x the default whose modelled
      * footprint fits free VRAM with headroom, else the default. N instances
      * need N footprints and share ONE headroom -- the margin is for the
@@ -5483,8 +5499,18 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                 choose(1, &c1);
                 choose(2, &c2);
                 ninst = c2.fits && c2.idx == c1.idx ? 2 : 1;
-                printf("  --instances auto: %d (%.2f GB free)\n", ninst,
-                       freeB / 1073741824.0);
+                /* A second instance costs its own setup and pays back a
+                 * share of the band, so a short band loses. Whole process,
+                 * c187, RTX 4090, one against two: 12 q 5.23/5.76 s, 65 q
+                 * 7.24/7.55, 109 q 8.77/8.69, 281 q 14.83/14.13, 570 q
+                 * 24.95/23.12 -- even near 100 q. PIPE_INST_AUTO_MIN_Q
+                 * leaves margin for a host whose setup costs more. */
+                const int short_band = ninst == 2 &&
+                                       nq_est < PIPE_INST_AUTO_MIN_Q;
+                if (short_band) ninst = 1;
+                printf("  --instances auto: %d (%.2f GB free%s)\n", ninst,
+                       freeB / 1073741824.0,
+                       short_band ? "; the band is too short for two" : "");
             }
             choose(ninst, &ch);
             if (ninst > 1 && !ch.fits)

@@ -302,8 +302,9 @@ static void usage(void)
 "                   and sieve the shares concurrently on the one GPU, each with\n"
 "                   its own NAME.inst<k> .part and checkpoint, merged into NAME\n"
 "                   in q order at the end -- the same file. auto: two when two\n"
-"                   fit in VRAM at the slab one would get alone, else one. A\n"
-"                   band under way keeps its N (NAME.instances)          [1]\n"
+"                   fit in VRAM at the slab one would get alone and the band\n"
+"                   holds >= " BENCH_STR(PIPE_INST_AUTO_MIN_Q) " special-q, else one. A band under way\n"
+"                   keeps its N (NAME.instances)                     [auto]\n"
 "  --fill-rows N    --pipeline only; fill bucketed q < N*I row by row in\n"
 "                   bands rather than one thread per q. 0 = off\n"
 "                   [4 at logI <= 15, and at logI 16 on a card with\n"
@@ -1331,6 +1332,10 @@ static int inst_any_artifact(const char *rel, char *which, size_t n)
  * whatever --instances says, and a NAME.part means one pipeline. A fresh band
  * leaves plan->n at 0 for run_pipeline, which picks N against the VRAM model
  * (--instances auto) or takes the number given, and writes the manifest. */
+/* --instances was given on the command line. The default is auto (0) too, but
+ * a band that cannot be split says so only to someone who asked for one. */
+static int g_instances_set = 0;
+
 static int inst_prepare(bench_cfg_t *cfg, const poly_t *POLY, int qrange_set,
                         pipe_inst_plan_t *plan, int *scale_restored)
 {
@@ -1391,7 +1396,7 @@ static int inst_prepare(bench_cfg_t *cfg, const poly_t *POLY, int qrange_set,
         plan->n = m.n;
     } else {
         if (!bounded) {
-            if (cfg->instances != 1)
+            if (cfg->instances != 1 && g_instances_set)
                 printf("instances: --instances needs a bounded --qrange"
                        " without --target-rels, --nq, --qlist or"
                        " --candidates; running one pipeline\n");
@@ -1546,7 +1551,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     cfg.slab_fixed = 0;
     cfg.bucket_resieve = 1;
     cfg.dual_bucket = 1;
-    cfg.instances = 1;
+    cfg.instances = 0;      /* auto: two when they fit, see run_pipeline */
     /* -1 = resolved below once logI and --fill-concurrent are known */
     cfg.fill_rows = FILL_ROWS_UNSET; cfg.fill_row_bands = 0; cfg.resieve_rows = -1;
     cfg.fill_gate = -1; cfg.fill_gate_shift = 3;
@@ -1700,6 +1705,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         else if (!strcmp(argv[i], "--no-dual-bucket")) { cfg.dual_bucket = 0; }
         else if (!strcmp(argv[i], "--instances") && i + 1 < argc) {
             uint32_t ni = 1;
+            g_instances_set = 1;
             if (!strcmp(argv[++i], "auto")) cfg.instances = 0;
             else if (parse_u32_range_arg("--instances", argv[i], 1u,
                                          (uint32_t)PIPE_INSTANCES_MAX, &ni))
@@ -2095,6 +2101,9 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     /* logI 16 is the device's call (FILL_ROWS_I16_MIN_SMS): BY_DEVICE here,
      * settled once the card is known, below. It reads as on until then, so
      * the two checks that need the tier are repeated there. */
+    /* Only a --pipeline band can be split; --instances itself is refused
+     * outside one (pipeline_only), so this only settles the default. */
+    if (!cfg.pipeline) cfg.instances = 1;
     if (cfg.fill_rows == FILL_ROWS_UNSET)
         cfg.fill_rows = !cfg.pipeline ? 0 : cfg.logI <= 15 ? 4
                       : cfg.logI == 16 ? FILL_ROWS_BY_DEVICE : 0;
