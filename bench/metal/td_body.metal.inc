@@ -7,6 +7,10 @@ constant bool mtl_bound_16 = (mtl_bound_mask & (1u << 16)) != 0;
 constant bool mtl_bound_17 = (mtl_bound_mask & (1u << 17)) != 0;
 constant bool mtl_bound_18 = (mtl_bound_mask & (1u << 18)) != 0;
 
+#ifndef ROWRT_NONE
+#define ROWRT_NONE 0xFFFFFFFFu
+#endif
+
 
 /* Move the direct-test congruence origin forward by delta_j global rows. This
  * is deliberately a separate tiny kernel: it performs one 64-bit modulo per
@@ -615,6 +619,147 @@ kernel void k_resieve_scatter_4_1(
     device const uint64_t * walk_cur_opt = nullptr;
     if (mtl_bound_14) walk_cur_opt = walk_cur;
     k_resieve_scatter_body<4, true>(plat, primes, ispow_opt, n, xmax, logI, summary, bits, gbase, plist, pcnt, K, noverflow, log_gran, walk_cur_opt, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+}
+
+
+/* ---- --resieve-rows: the row tier of k_resieve_scatter ------------------ *
+ *
+ * k_resieve_scatter has k_fill_rows' problem: one thread per modulus, so the
+ * smallest bucketed modulus (~I) probes xmax/I positions on one thread while
+ * the average thread probes a few hundred. For q >= I a row holds at most one
+ * lattice point, at i + I/2 == (rt*j + I/2) mod q, so the rows split into bands
+ * that start independently. Thread t takes entry t % n over band t / n, so a
+ * warp's lanes share their rows. UNROLL rows are probed before any is acted
+ * on, for the memory-level parallelism the note above k_resieve_scatter
+ * measured. Same (survivor, prime) pairs as the FK walk; the order of primes
+ * inside a survivor's list may differ, and k_td divides them in any order.
+ *
+ * Row 0 needs no test: its only lattice point is (0,0), never a survivor.
+ * j_base counts only under SLABBED, as in pos_row. */
+template <int UNROLL, bool SLABBED>
+static inline void k_resieve_rows_body(
+    device const uint32_t * primes,
+    device const uint32_t * rts,
+    device const uint8_t * ispow,
+    constant uint32_t &n,
+    constant uint32_t &nbands,
+    constant uint32_t &rows,
+    constant int &logI,
+    device const uint32_t * summary,
+    device const uint32_t * bits,
+    device const uint32_t * gbase,
+    device uint32_t * plist,
+    device uint32_t * pcnt,
+    constant uint32_t &K,
+    device uint32_t * noverflow,
+    constant int &log_gran,
+    constant uint32_t &j_base,
+    uint _tid,
+    uint _ntid,
+    uint _bid,
+    uint _lid,
+    uint _bdim,
+    uint _gdim)
+{
+    CUDA_KERNEL_IDS
+
+    const uint32_t I = 1u << logI;
+    const uint32_t NONE = 0xFFFFFFFFu;      /* local x < 2^31, cannot collide */
+    const uint64_t t = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= (uint64_t)n * nbands) return;
+    const uint32_t k = (uint32_t)(t % n);
+    const uint32_t band = (uint32_t)(t / n);
+    const uint32_t rt = rts[k];
+    if (rt == ROWRT_NONE) return;
+    if (ispow && ispow[k]) return;
+    const uint32_t q = primes[k];
+    const uint32_t r0 = (uint32_t)((uint64_t)band * rows / nbands);
+    const uint32_t r1 = (uint32_t)((uint64_t)(band + 1) * rows / nbands);
+    /* the offset follows the GLOBAL row; positions are slab-local */
+    const uint32_t jb = SLABBED ? j_base : 0u;
+    uint32_t off = (uint32_t)(((uint64_t)rt * (jb + r0) + (I >> 1)) % q);
+    ulong ovf = 0;
+
+    for (uint32_t r = r0; r < r1; ) {
+        uint32_t xs[UNROLL], hit[UNROLL];
+        #pragma unroll
+        for (int u = 0; u < UNROLL; u++) {
+            xs[u] = (r < r1 && off < I) ? (r << logI) + off : NONE;
+            if (r < r1) { off += rt; if (off >= q) off -= q; r++; }
+        }
+        /* every one of these is independent, so they issue together */
+        #pragma unroll
+        for (int u = 0; u < UNROLL; u++) {
+            const uint32_t sb = xs[u] >> log_gran;
+            hit[u] = (xs[u] == NONE) ? 0u
+                                     : ((summary[sb >> 5] >> (sb & 31u)) & 1u);
+        }
+        #pragma unroll
+        for (int u = 0; u < UNROLL; u++) {
+            if (!hit[u]) continue;
+            const uint32_t xv = xs[u];
+            if (!((bits[xv >> 5] >> (xv & 31u)) & 1u)) continue;
+            const uint32_t idx = td_rank(bits, gbase, xv);
+            const uint32_t slot = atomicAdd(&pcnt[idx], 1u);
+            if (slot < K) plist[(size_t)idx * K + slot] = q;
+            else ovf++;
+        }
+    }
+    if (ovf) atomicAdd64(noverflow, ovf);
+}
+
+kernel void k_resieve_rows_4_0(
+    device const uint32_t * primes [[buffer(0)]],
+    device const uint32_t * rts [[buffer(1)]],
+    device const uint8_t * ispow [[buffer(2)]],
+    constant uint32_t &n [[buffer(3)]],
+    constant uint32_t &nbands [[buffer(4)]],
+    constant uint32_t &rows [[buffer(5)]],
+    constant int &logI [[buffer(6)]],
+    device const uint32_t * summary [[buffer(7)]],
+    device const uint32_t * bits [[buffer(8)]],
+    device const uint32_t * gbase [[buffer(9)]],
+    device uint32_t * plist [[buffer(10)]],
+    device uint32_t * pcnt [[buffer(11)]],
+    constant uint32_t &K [[buffer(12)]],
+    device uint32_t * noverflow [[buffer(13)]],
+    constant int &log_gran [[buffer(14)]],
+    constant uint32_t &j_base [[buffer(15)]],
+    uint _tid [[thread_position_in_grid]],
+    uint _ntid [[threads_per_grid]],
+    uint _bid [[threadgroup_position_in_grid]],
+    uint _lid [[thread_position_in_threadgroup]],
+    uint _bdim [[threads_per_threadgroup]],
+    uint _gdim [[threadgroups_per_grid]])
+{
+    k_resieve_rows_body<4, false>(primes, rts, ispow, n, nbands, rows, logI, summary, bits, gbase, plist, pcnt, K, noverflow, log_gran, j_base, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+}
+
+kernel void k_resieve_rows_4_1(
+    device const uint32_t * primes [[buffer(0)]],
+    device const uint32_t * rts [[buffer(1)]],
+    device const uint8_t * ispow [[buffer(2)]],
+    constant uint32_t &n [[buffer(3)]],
+    constant uint32_t &nbands [[buffer(4)]],
+    constant uint32_t &rows [[buffer(5)]],
+    constant int &logI [[buffer(6)]],
+    device const uint32_t * summary [[buffer(7)]],
+    device const uint32_t * bits [[buffer(8)]],
+    device const uint32_t * gbase [[buffer(9)]],
+    device uint32_t * plist [[buffer(10)]],
+    device uint32_t * pcnt [[buffer(11)]],
+    constant uint32_t &K [[buffer(12)]],
+    device uint32_t * noverflow [[buffer(13)]],
+    constant int &log_gran [[buffer(14)]],
+    constant uint32_t &j_base [[buffer(15)]],
+    uint _tid [[thread_position_in_grid]],
+    uint _ntid [[threads_per_grid]],
+    uint _bid [[threadgroup_position_in_grid]],
+    uint _lid [[thread_position_in_threadgroup]],
+    uint _bdim [[threads_per_threadgroup]],
+    uint _gdim [[threadgroups_per_grid]])
+{
+    k_resieve_rows_body<4, true>(primes, rts, ispow, n, nbands, rows, logI, summary, bits, gbase, plist, pcnt, K, noverflow, log_gran, j_base, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 
@@ -1530,4 +1675,123 @@ kernel void k_gather_ab(
     }
 }
 
+
+
+#ifndef FINE_SHIFT
+#define FINE_SHIFT     14u
+#endif
+#ifndef FINE_BITS
+#define FINE_BITS      18u
+#endif
+#ifndef FINE_PER_GROUP
+#define FINE_PER_GROUP 1024u
+#endif    /* fine ids per coarse log-p group */
+
+/* pipe_build_fine: host-side, see pipeline.cuh */
+
+
+/* Recover each bucketed prime hitting a two-sided survivor from the side's
+ * bucket records rather than by re-walking its lattice (k_resieve_scatter),
+ * after glas. One block per region. A record at a survivor names its fine
+ * slice; every entry in that slice is tested at the survivor's (a, b) --
+ * p | a - r*b for an affine root, p | r'*a - b for a projective one (the
+ * convention pl_transform_gen uses) -- skipping the lattice-degenerate entries
+ * the walk also skips. Two hitting entries in one slice are each appended once
+ * per record, i.e. twice: harmless, k_td divides a listed prime out
+ * completely, and the factor list it records is the same. */
+static inline uint32_t rb_mod(int64_t a, uint32_t p)
+{
+    int64_t m = a % (int64_t)p;
+    return (uint32_t)(m < 0 ? m + p : m);
+}
+
+/* One block per region. The region's slice of the two-sided survivor bitmap
+ * (2 KB at --region 14) is staged in shared memory once, so the test every
+ * record faces is a shared-memory read rather than a global load that waits
+ * on the record just loaded.
+ *
+ * A HIT IS HANDLED BY THE WHOLE WARP. Most of this kernel's time was never
+ * the record scan: it was the hits, each one walking its fine slice -- ~120
+ * factor-base entries on 2,1147+ -- in ONE lane, three dependent random loads
+ * per entry, while the rest of the warp waited. The warp now finds its hits
+ * with a ballot and takes them one at a time, lane l testing entries
+ * start+l, start+l+32, ...: the slice is contiguous, so the loads coalesce,
+ * and 120 serial steps become 4. Several primes of one slice can land in the
+ * same survivor's list in any order; the emitters sort, so the relations do
+ * not change. */
+kernel void k_resieve_bucket(
+    device const uint32_t * bucket [[buffer(0)]],
+    device const uint32_t * cnt [[buffer(1)]],
+    constant uint32_t &cap [[buffer(2)]],
+    constant int &log_region [[buffer(3)]],
+    device const uint32_t * bits [[buffer(4)]],
+    device const uint32_t * gbase [[buffer(5)]],
+    device const int64_t * A [[buffer(6)]],
+    device const int64_t * B [[buffer(7)]],
+    device const uint32_t * fine_start [[buffer(8)]],
+    device const uint32_t * primes [[buffer(9)]],
+    device const uint32_t * roots [[buffer(10)]],
+    device const plat_t * plat [[buffer(11)]],
+    device uint32_t * plist [[buffer(12)]],
+    device uint32_t * pcnt [[buffer(13)]],
+    constant uint32_t &K [[buffer(14)]],
+    device uint32_t * noverflow [[buffer(15)]],
+    uint _tid [[thread_position_in_grid]],
+    uint _ntid [[threads_per_grid]],
+    uint _bid [[threadgroup_position_in_grid]],
+    uint _lid [[thread_position_in_threadgroup]],
+    uint _bdim [[threads_per_threadgroup]],
+    uint _gdim [[threadgroups_per_grid]])
+{
+    CUDA_KERNEL_IDS
+    threadgroup uint _sync_or_flag[1];
+
+    threadgroup uint32_t sbits[(1u << FINE_SHIFT) >> 5];  /* log_region <= 14 */
+    const uint32_t b = blockIdx.x, nth = blockDim.x;     /* a multiple of 32 */
+    const uint32_t lane = threadIdx.x & 31u, nwarp = nth >> 5;
+    const uint32_t ncell = 1u << log_region, offmask = ncell - 1;
+    const uint32_t w0 = (b << log_region) >> 5, nw = ncell >> 5;
+    int any = 0;
+    for (uint32_t w = threadIdx.x; w < nw; w += nth) {
+        const uint32_t v = bits[w0 + w];
+        sbits[w] = v;
+        any |= v != 0u;
+    }
+    if (!__syncthreads_or(any)) return;
+    uint32_t n = cnt[b];
+    if (n > cap) n = cap;
+    device const uint32_t *rec = bucket + (size_t)b * cap;
+    ulong ovf = 0;
+    /* Warp-uniform trip count: every lane takes part in every ballot. */
+    for (uint32_t base = (threadIdx.x >> 5) * 32u; base < n; base += nwarp * 32u) {
+        const uint32_t i = base + lane;
+        const uint32_t r = i < n ? rec[i] : 0u;
+        const uint32_t off = r & offmask;
+        const bool hit = i < n && ((sbits[off >> 5] >> (off & 31u)) & 1u);
+        uint32_t m = __ballot_sync(0xffffffffu, hit);
+        while (m) {
+            const int src = __ffs((int)m) - 1;
+            m &= m - 1u;
+            const uint32_t rr = __shfl_sync(0xffffffffu, r, src);
+            const uint32_t x = (b << log_region) | (rr & offmask);
+            const uint32_t f = rr >> FINE_SHIFT;
+            const uint32_t idx = td_rank(bits, gbase, x);
+            const int64_t a = A[idx], bb = B[idx];
+            for (uint32_t k = fine_start[f] + lane, ke = fine_start[f + 1];
+                 k < ke; k += 32u) {
+                if (plat[k].inc_warp == PL_INVALID) continue;
+                const uint32_t p = primes[k], re = roots[k];
+                const uint64_t am = rb_mod(a, p), bm = rb_mod(bb, p);
+                const uint64_t t = re < p
+                    ? (am + p - ((uint64_t)re * bm) % p) % p
+                    : (((uint64_t)(re - p) * am) % p + p - bm) % p;
+                if (t) continue;
+                const uint32_t slot = atomicAdd(&pcnt[idx], 1u);
+                if (slot < K) plist[(size_t)idx * K + slot] = p;
+                else ovf++;
+            }
+        }
+    }
+    if (ovf) atomicAdd64(noverflow, ovf);
+}
 

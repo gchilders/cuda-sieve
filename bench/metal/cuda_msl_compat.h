@@ -99,6 +99,49 @@ static inline int cu_syncthreads_or(threadgroup uint *flag, bool pred, uint lid)
 /* CUDA's __ffs is 1-based and returns 0 for 0; ctz(0) is undefined. */
 static inline int __ffs(uint x) { return x ? (int)ctz(x) + 1 : 0; }
 
+/* CUDA's __trap(): end the kernel, now, with an error. MSL has no trap
+ * instruction and no abort, so this takes the one fault macOS reports BY
+ * NAME -- a store through a null device pointer fails the command buffer with
+ * MTLCommandBufferErrorPageFault, which metal_rt prints as `page fault`
+ * (plan 9z-i). Loud and fatal, which is what the call sites want; the
+ * alternative of making it a no-op would turn a detected impossibility into
+ * silently wrong residues. `volatile` so the store cannot be folded away. */
+static inline void __trap()
+{
+    volatile device uint *p = (volatile device uint *)0;
+    *p = 0xdeadbeefu;
+}
+
+/* sm_70's __match_any_sync: the mask of participating lanes holding the same
+ * value as this one. Metal has no such instruction at any family, so this is
+ * the standard ballot/shuffle emulation -- O(distinct values), not O(32).
+ *
+ * THE MASK ARGUMENT IS IGNORED, as it is for __ballot_sync above, and for the
+ * same reason: Metal's SIMD operations act on the ACTIVE lanes. That is also
+ * what makes this correct at the one call site -- k_fill_rows calls it inside
+ * `if (hit)`, having passed exactly the ballot of hit lanes, so CUDA's
+ * participating set and Metal's active set are the same lanes.
+ *
+ * `todo` is uniform across those lanes, so the loop trip count is uniform and
+ * every participant reaches every simd_ballot and every simd_shuffle. The
+ * leader is drawn from `todo`, so it is always a participating lane -- a
+ * shuffle from an inactive lane would be undefined. */
+static inline uint __match_any_sync(uint mask, uint value)
+{
+    (void)mask;
+    uint todo = (uint)((simd_vote::vote_t)simd_ballot(true));
+    uint result = 0;
+    while (todo) {
+        const ushort leader = (ushort)ctz(todo);
+        const uint v = simd_shuffle(value, leader);
+        const bool eq = (v == value);
+        const uint peers = (uint)((simd_vote::vote_t)simd_ballot(eq));
+        if (eq) result = peers;
+        todo &= ~peers;
+    }
+    return result;
+}
+
 /* ---- fp32 math under CUDA's names -------------------------------------- *
  *
  * Phase 0 measured Metal's fp32 divide and fma as bit-exact against the host

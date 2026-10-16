@@ -97,7 +97,13 @@ std::vector<Alloc>   g_allocs;           /* sorted by base                   */
 std::map<std::string, id<MTLComputePipelineState>> g_psos;
 std::map<std::string, void *>                      g_symbols;
 std::mutex           g_lock;
-mtlError_t           g_last_error = mtlSuccess;
+/* PER THREAD, as CUDA's is. --cof-async runs cofq_flush on a second host
+ * thread, and a shared sticky error would let one thread's
+ * mtlGetLastError() consume the other's failure -- so a real command-buffer
+ * error could be reported against an unrelated operation, or swallowed by a
+ * check that was passing anyway. The errors each thread raises are the ones
+ * it should see. */
+thread_local mtlError_t g_last_error = mtlSuccess;
 int                  g_core_count = 0;
 bool                 g_width_checked = false;
 

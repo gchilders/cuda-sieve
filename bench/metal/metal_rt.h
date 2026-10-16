@@ -328,6 +328,36 @@ inline mtlError_t mtlMemcpyAsync(void *dst, const void *src, size_t n, int kind)
 { return mtlMemcpyAsync(dst, src, n, kind, 0); }
 
 /* cudaEventRecord(e) defaults to the legacy default stream. */
+/* ---- CUDA's creation flags and stream priorities ------------------------
+ *
+ * Accepted and ignored, which is what they MEAN here rather than a shortcut.
+ * Every mtlStream_t is its own MTLCommandQueue and is already non-blocking
+ * with respect to every other one, so cudaStreamNonBlocking describes the
+ * only behaviour available. Every mtlEvent_t is a timestamped command-buffer
+ * bracket, so there is no timing to disable -- and nothing reads the
+ * timestamp of an event created with DisableTiming anyway. Metal publishes no
+ * command-queue priority at all, so the range is the single value 0: a caller
+ * asking for the lowest priority gets the only one, which is honest, where
+ * inventing two distinct numbers would promise an ordering that does not
+ * exist.
+ *
+ * These are inline here rather than renamed away in portlib because the
+ * shared orchestration passes the flags through variables in places, and a
+ * textual rename cannot follow a variable. */
+enum { mtlStreamDefault = 0x0u, mtlStreamNonBlocking = 0x1u };
+enum { mtlEventDefault = 0x0u, mtlEventBlockingSync = 0x1u,
+       mtlEventDisableTiming = 0x2u };
+
+inline mtlError_t mtlStreamCreateWithFlags(mtlStream_t *s, unsigned flags)
+{ (void)flags; return mtlStreamCreate(s); }
+inline mtlError_t mtlStreamCreateWithPriority(mtlStream_t *s, unsigned flags,
+                                              int priority)
+{ (void)flags; (void)priority; return mtlStreamCreate(s); }
+inline mtlError_t mtlEventCreateWithFlags(mtlEvent_t *e, unsigned flags)
+{ (void)flags; return mtlEventCreate(e); }
+inline mtlError_t mtlDeviceGetStreamPriorityRange(int *least, int *greatest)
+{ if (least) *least = 0; if (greatest) *greatest = 0; return mtlSuccess; }
+
 inline mtlError_t mtlEventRecord(mtlEvent_t e) { return mtlEventRecordOn(e, 0); }
 inline mtlError_t mtlEventRecord(mtlEvent_t e, mtlStream_t s) { return mtlEventRecordOn(e, s); }
 

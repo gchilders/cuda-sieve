@@ -35,8 +35,42 @@ for _i in range(k3, len(lines)):
     if _seen and _d == 0: e3 = _i; break
 b3 = k3
 while not lines[b3].startswith('typedef struct'): b3 -= 1   # carry td_mod_case_t
+
+# Same gate for ss_first's two magic forms (upstream 2a3dfb0). Worth the same
+# as the reciprocal gate and for the same reason: the two-step path exists
+# because the one-step numerator can overflow, and only the device runs it.
+k4 = next(i for i, l in enumerate(lines)
+          if l.startswith('__global__ void k_verify_ss_first_cases'))
+_d, _seen, e4 = 0, False, k4
+for _i in range(k4, len(lines)):
+    _d += lines[_i].count('{') - lines[_i].count('}')
+    if '{' in lines[_i]: _seen = True
+    if _seen and _d == 0: e4 = _i; break
+b4 = k4
+while not lines[b4].startswith('typedef struct'): b4 -= 1   # carry ss_first_case_t
+assert 'ss_first_case_t' in '\n'.join(lines[b4:e4 + 1]), 'ss_first_case_t not carried'
 body = ('\n'.join(lines[b1:e1 + 1]) + '\n\n' + '\n'.join(lines[b2:e2 + 1])
-        + '\n\n' + '\n'.join(lines[b3:e3 + 1]))
+        + '\n\n' + '\n'.join(lines[b3:e3 + 1])
+        + '\n\n' + '\n'.join(lines[b4:e4 + 1]))
+
+# Every __global__ inside the extracted region must have an entry in K below,
+# or it is silently dropped from the metallib and surfaces -- if at all -- as a
+# missing-kernel error at run time on whatever path launches it. The 2026-09-16
+# rebase lost k_cofac this way in the sibling generator and the only signal was
+# a count in a progress line; upstream 2a3dfb0 then added three kernels here at
+# once. Checked before any rewriting, against the source's own spelling.
+def _kernel_names(text):
+    # A comment block and a `void` on its own line can sit between __global__
+    # and the name (k_apply and k_fill_l1 both do), so take the identifier that
+    # immediately precedes the parameter list instead of pattern-matching the
+    # whole head.
+    out = []
+    for m in re.finditer(r'__global__', text):
+        a = text.index('(', m.end())
+        out.append(re.findall(r'(\w+)\s*$', text[m.end():a])[-1])
+    return sorted(set(out))
+_declared = _kernel_names(
+    re.sub(r'__launch_bounds__\([^)]*\)\s*', '', body))
 
 body = body.replace('__device__ __forceinline__ ', 'static inline ')
 body = body.replace('__device__ ', 'static inline ')
@@ -79,17 +113,35 @@ IDS_ARGS = ['_tid', '_ntid', '_bid', '_lid', '_bdim', '_gdim']
 # name -> (template params or None, instantiations, wants dynamic threadgroup mem)
 K = {
  'k_transform':        (['bool SLABBED'], [('false',), ('true',)], False),
- 'k_fill_atomic':      (['int RECBYTES', 'bool SLABBED'],
-                        [('2','false'),('4','false'),('8','false'),('4','true')], False),
- # Production uses <16,1,NORM_HORNER,SLABBED>; the rest are run_bench's own
- # A/B pricing arms, which cost nothing to instantiate and would otherwise
- # fail at run time with a missing-kernel error.
+ # SLICE_T: upstream 2a3dfb0 widened the bucket record's slice field to 32 bits
+ # for the fine-slice ids the bucket resieve needs. The DEFAULTED instances
+ # (two template arguments, uint16_t) and the explicit uint32_t ones are
+ # different kernels and both are launched, so both are named here -- the
+ # suffix is the template arguments as WRITTEN at the call site, which is what
+ # portlib's mangler produces.
+ 'k_fill_atomic':      (['int RECBYTES', 'bool SLABBED', 'typename SLICE_T = uint16_t'],
+                        [('2','false'),('4','false'),('8','false'),('4','true'),
+                         ('4','false','uint32_t'),('4','true','uint32_t')], False),
+ 'k_fill_rows':        (['bool SLABBED', 'typename SLICE_T = uint16_t'],
+                        [('false',),('true',),
+                         ('false','uint32_t'),('true','uint32_t')], False),
+ 'k_rows_walk_next':   (None, None, False),
+ 'k_gate_fold':        (None, None, False),
+ # Production uses <16,1,NORM_HORNER,SLABBED,SSTAIL>; the rest are run_bench's
+ # own A/B pricing arms, which cost nothing to instantiate and would otherwise
+ # fail at run time with a missing-kernel error. SSTAIL is chosen at run time
+ # by ss_needs_tail on both paths, so both values of it are needed for the
+ # production configuration and the tail instance alone for the others --
+ # exactly what LAUNCH_APPLY's own ST argument says.
  'k_fill_l1':          (None, None, False),
  'k_fill_l2':          (['int RECBYTES'], [('2',), ('4',)], False),
- 'k_apply':            (['int CELLBITS','int ATOMIC','int NORMMODE','bool SLABBED'],
-                        [(c, a, n, 'false') for c in ('16', '8')
+ 'k_apply':            (['int CELLBITS','int ATOMIC','int NORMMODE','bool SLABBED',
+                         'bool SSTAIL = true'],
+                        [(c, a, n, 'false', 'true') for c in ('16', '8')
                          for a in ('0', '1') for n in ('0', '1')]
-                        + [('16','1','1','true')], True),
+                        + [('16','1','1','false','false'),
+                           ('16','1','1','true','true'),
+                           ('16','1','1','true','false')], True),
  'k_build_summary_g':  (None, None, False),
  'k_build_summary':    (None, None, False),
  'k_resieve_rewalk':   (None, None, False),
@@ -99,7 +151,17 @@ K = {
  'k_purge_prime':      (None, None, False),
  'k_intersect_compact':(['int AGG','bool SLABBED'], [('1','false'),('1','true')], False),
  'k_verify_td_mod_cases': (None, None, False),
+ 'k_verify_ss_first_cases': (None, None, False),
 }
+
+_missing = [k for k in _declared if k not in K]
+assert not _missing, (
+    '__global__ kernels in the extracted device region with no K entry: %s.\n'
+    'Add each one (template parameters and the instantiations the host\n'
+    'launches), or it is dropped from the metallib silently.' % ', '.join(_missing))
+_extra = [k for k in K if k not in _declared]
+assert not _extra, ('K names a kernel the device region does not declare: %s'
+                    % ', '.join(_extra))
 
 def split_top(s):
     out, cur, d = [], '', 0
@@ -124,13 +186,28 @@ def split_top(s):
 # 9z-c. An index missing here that is passed nullptr somewhere shows up as a
 # validation abort naming the kernel and the index, which is how these were
 # found in the first place.
+#
+# BY PARAMETER NAME, not by index. They were indices until upstream 2a3dfb0
+# inserted `nsplit` in the middle of k_apply's list and shifted the last two by
+# one: the names 24 and 25 then meant `probe_x` (a scalar) and `probe_out`.
+# That particular shift happened to stop compiling, because a scalar cannot be
+# declared `device T *`. Had the inserted parameter landed one place further
+# along, the mask would simply have described the wrong two buffers, and the
+# only symptom would have been a validation abort on a path that passes null.
 OPTIONAL_BUFFERS = {
-    'k_apply':             [11, 13, 24, 25],
-    'k_fill_atomic':       [10, 11],
-    'k_transform':         [12],
-    'k_resieve_scatter':   [2, 14],
-    'k_intersect_compact': [9, 10, 11, 16],
+    'k_apply':             ['dump', 'dbg_cells', 'probe_out', 'survbits'],
+    'k_fill_atomic':       ['walk_cur', 'walk_next', 'gate'],
+    'k_fill_rows':         ['gate'],
+    'k_transform':         ['walk_cur', 'rt_out'],
+    'k_resieve_scatter':   ['ispow', 'walk_cur'],
+    'k_resieve_rows':      ['ispow'],
+    'k_intersect_compact': ['out_x', 'out_a', 'out_b', 'nqb'],
 }
+
+# Buffer indices resolved from OPTIONAL_BUFFERS' parameter names by the
+# emission loop; the function-constant declarations at the end of this
+# file are emitted for exactly these.
+OPT_INDICES = set()
 
 MASK_DECL = """/* Optional buffer arguments: see metal/gen_bench_kernels.py.
  * metal_rt supplies bit i = "kernel argument i is bound". */
@@ -175,7 +252,12 @@ for name, (tparams, insts, dynsmem) in K.items():
             d -= 1
             if d == 0: break
         i += 1
-    params = split_top(body[a + 1:i])
+    # MSL has no default kernel argument -- every parameter is a binding the
+    # dispatch must set -- so the default is dropped here and moved to the
+    # call site instead (portlib.pad_launch_defaults). Dropping it silently
+    # would emit `device uint32_t *rt_out = nullptr` in the body template and
+    # `constant uint32_t &n_rt = &0` in the wrapper, neither of which is legal.
+    params = [p.split('=', 1)[0].rstrip() for p in split_top(body[a + 1:i])]
     brace = body.index('{', i)
     # find end of the kernel
     d = 0; j = brace
@@ -225,6 +307,9 @@ for name, (tparams, insts, dynsmem) in K.items():
             tg_args.append(nm)
 
     if tparams is None:
+        assert name not in OPTIONAL_BUFFERS, (
+            '%s is not templated, so it has no wrapper to forward an optional'
+            ' buffer through; give it one or drop the entry' % name)
         head = 'kernel void %s(\n    %s)\n{\n    CUDA_KERNEL_IDS\n' % (
             name, ',\n    '.join([bufparam(p, k) for k, p in enumerate(params)]
                                  + smem_param + IDS))
@@ -235,7 +320,12 @@ for name, (tparams, insts, dynsmem) in K.items():
                    ',\n    '.join([plainparam(p) for p in params] + smem_plain
                                     + tg_params + IDS_PLAIN)))
         wrappers = []
-        opt = set(OPTIONAL_BUFFERS.get(name, ()))
+        _names = [argname(p) for p in params]
+        _want = OPTIONAL_BUFFERS.get(name, ())
+        for _w in _want:
+            assert _w in _names, ('%s has no parameter named %s' % (name, _w))
+        opt = set(_names.index(w) for w in _want)
+        OPT_INDICES |= opt
         args = [argname(p) for p in params] + smem_args + tg_args + IDS_ARGS
         kps = [bufparam(p, k, opt) for k, p in enumerate(params)] + smem_param + IDS
         decls = ('\n'.join(tg_decl_lines) + '\n') if tg_decl_lines else ''
@@ -249,9 +339,28 @@ for name, (tparams, insts, dynsmem) in K.items():
             optdecl += ('    device %s = nullptr;\n' % re.sub(r'(\w+)\s*$', an + '_opt', pk))
             optdecl += ('    if (%s) %s_opt = %s;\n' % (bound_name(k), an, an))
             args[k] = an + '_opt'
+        # A wrapper is a concrete kernel, so a parameter declared with a
+        # template TYPE (upstream's `const SLICE_T *slice`) has to be spelled
+        # with that instance's type. Defaulted template parameters an instance
+        # does not name take their default, which is what the call site means.
+        tnames, tdefaults = [], []
+        for tp in tparams:
+            _d = tp.split('=', 1)
+            tnames.append(_d[0].split()[-1].strip())
+            tdefaults.append(_d[1].strip() if len(_d) > 1 else None)
         for inst in insts:
+            vals = list(inst) + tdefaults[len(inst):]
+            assert all(v is not None for v in vals), (
+                '%s<%s>: a template parameter with no default was not given'
+                % (name, ', '.join(inst)))
+            def subst(t, vals=vals):
+                for nm, v in zip(tnames, vals):
+                    t = re.sub(r'\b' + nm + r'\b', v, t)
+                return t
             wrappers.append('kernel void %s_%s(\n    %s)\n{\n%s%s    %s_body<%s>(%s);\n}\n'
-                            % (name, suffix_of(inst), ',\n    '.join(kps), decls, optdecl,
+                            % (name, suffix_of(inst),
+                               ',\n    '.join(subst(k) for k in kps),
+                               subst(decls), subst(optdecl),
                                name, ', '.join(inst), ', '.join(args)))
         newtext = head + inner + '}\n\n' + '\n'.join(wrappers)
     body = body[:m.start()] + newtext + body[end:]
@@ -324,6 +433,9 @@ HELPER_SPACES = {
     'sieve_small':             {'S': 'threadgroup', 'sp': 'device', 'srt': 'device',
                                 'sg': 'device', 'slp': 'device', 'smag': 'device'},
     'apply_cell_side_effects': {'probe_out': 'device', 'dump': 'device'},
+    # upstream 2a3dfb0's --fill-gate: the side-1 survivor bitmap, folded, as a
+    # device buffer the fill kernels read per candidate record.
+    'fill_gate_drops':         {'gate': 'device'},
 }
 _unspecified = []
 
@@ -459,7 +571,25 @@ print('fp64 fallback rewritten onto softfp64')
 # One uint from the host, booleans derived here, so a kernel never needs the
 # host to know which constant indices it declares -- which matters because
 # Metal REJECTS a constant value for an index a function does not declare.
-_idx = sorted({i for v in OPTIONAL_BUFFERS.values() for i in v})
+# ---- bench.h constants the device half reads -----------------------------
+# LIFTED by name from bench.h, never retyped here: this file has said since
+# Phase 4 that a hand-copied constant is how a port computes something else
+# while compiling cleanly. Each must be USED by the body, so an entry that
+# stops being needed fails here rather than lingering.
+DEVICE_DEFINES = ['ROWRT_NONE']
+_bh = open('bench/bench.h').read()
+_lift = ''
+for _nm in DEVICE_DEFINES:
+    _m = re.search(r'^#define\s+' + _nm + r'\s+(.+?)\s*(?:/\*.*)?$', _bh, re.M)
+    assert _m, 'bench.h does not define ' + _nm
+    assert re.search(r'\b' + _nm + r'\b', body), (
+        '%s is lifted from bench.h but the device half does not use it' % _nm)
+    _lift += '#ifndef %s\n#define %s %s\n#endif\n' % (_nm, _nm, _m.group(1))
+body = _lift + '\n' + body
+print('  lifted %d bench.h #define(s) the device half reads' % len(DEVICE_DEFINES))
+
+assert OPT_INDICES, 'no optional buffer was resolved -- the loop above did not run'
+_idx = sorted(OPT_INDICES)
 _decl = MASK_DECL + ''.join(
     'constant bool %s = (mtl_bound_mask & (1u << %d)) != 0;\n' % (bound_name(i), i)
     for i in _idx) + '\n'

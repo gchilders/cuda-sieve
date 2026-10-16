@@ -7,7 +7,8 @@
 # versions.
 import re, sys
 sys.path.insert(0, 'bench/metal')
-from portlib import rewrite_launches, apply_renames
+from portlib import (rewrite_launches, apply_renames,
+                     kernel_param_defaults, pad_launch_defaults)
 
 SRC = 'bench/bench_kernels.cu'
 OUT = 'bench/metal/bench_host.cpp'
@@ -70,6 +71,10 @@ src, nl = rewrite_launches(src)
 # The apply threadgroup width.
 ATHR_NOTE = "/* 192, not CUDA's 512. MEASURED on this box, bracketed interior minimum,\n * three runs per point at logI 14 / J 8192 / region 13 on oracle/c183:\n *\n *   threads   64      128     192     256     512\n *   apply    83.9    56.2    54.6    57.8    77.4  ms\n *\n * Run-to-run spread is under 1%% at each point, so the 29.5%% gap between 192\n * and CUDA's 512 is far outside the noise. 192 is 6 SIMD groups and keeps\n * (athr & 31) == 0, which k_apply's warp-ballot path requires.\n *\n * THE BOX: a 10-core M3 in a fanless MacBook Air that also drives the\n * display. The shape of the curve should carry to other Apple GPUs; the\n * exact optimum may not, and an M3 Max has four times the cores. Re-measure\n * there rather than trusting this number. */\n"
 n_athr = src.count('cfg->apply_threads ? cfg->apply_threads : 512;')
+# ASSERTED: missing this is silent. The build would simply keep CUDA's 512
+# threads for k_apply, which measured 29.5% slower than 192 on this box -- a
+# performance regression with no compile error and no changed output.
+assert n_athr >= 1, 'the apply-threads default is no longer spelled `: 512;`'
 src = src.replace('cfg->apply_threads ? cfg->apply_threads : 512;',
                   'cfg->apply_threads ? cfg->apply_threads : 192;')
 if n_athr:
@@ -149,24 +154,78 @@ static int mtl_check_impl""", 1)
 # formed here -- the same shape fbgen_gpu's LAUNCH_FIXED needed. The norm mode
 # is passed as NORM_CONST/NORM_HORNER, which stringify to their own names, so
 # the call sites pass 0/1 instead.
-i0 = src.find('CK(cudaFuncSetAttribute(k_apply<CBV, AT, NM, false>')
-if i0 >= 0:
-    i1 = src.index('(int)smem));', i0) + len('(int)smem));')
-    src = (src[:i0]
-           + 'CK(mtlFuncSetMaxThreadgroupMemory('
-           + '"k_apply_" #CBV "_" #AT "_" #NM "_0", smem));'
-           + src[i1:])
-src = re.sub(r'MTL_LAUNCH\(k_apply_CBV_AT_NM_0,',
-             'MTL_LAUNCH_NAMED("k_apply_" #CBV "_" #AT "_" #NM "_0",', src)
-for a, b in (('LAUNCH_APPLY(16, 1, NORM_CONST)', 'LAUNCH_APPLY(16, 1, 0)'),
-             ('LAUNCH_APPLY(16, 1, NORM_HORNER)', 'LAUNCH_APPLY(16, 1, 1)'),
-             ('LAUNCH_APPLY(16, 0, NORM_CONST)', 'LAUNCH_APPLY(16, 0, 0)'),
-             ('LAUNCH_APPLY(16, 0, NORM_HORNER)', 'LAUNCH_APPLY(16, 0, 1)'),
-             ('LAUNCH_APPLY(8, 1, NORM_CONST)', 'LAUNCH_APPLY(8, 1, 0)'),
-             ('LAUNCH_APPLY(8, 1, NORM_HORNER)', 'LAUNCH_APPLY(8, 1, 1)'),
-             ('LAUNCH_APPLY(8, 0, NORM_CONST)', 'LAUNCH_APPLY(8, 0, 0)'),
-             ('LAUNCH_APPLY(8, 0, NORM_HORNER)', 'LAUNCH_APPLY(8, 0, 1)')):
-    src = src.replace(a, b)
+_fsa = 'CK(cudaFuncSetAttribute(k_apply<CBV, AT, NM, false, ST>'
+assert src.count(_fsa) == 1, 'LAUNCH_APPLY cudaFuncSetAttribute shape changed'
+i0 = src.index(_fsa)
+i1 = src.index('(int)smem));', i0) + len('(int)smem));')
+src = (src[:i0]
+       + 'CK(mtlFuncSetMaxThreadgroupMemory('
+       + '"k_apply_" #CBV "_" #AT "_" #NM "_0_" #ST, smem));'
+       + src[i1:])
+src, _n = re.subn(r'MTL_LAUNCH\(k_apply_CBV_AT_NM_0_ST,',
+                  'MTL_LAUNCH_NAMED("k_apply_" #CBV "_" #AT "_" #NM "_0_" #ST,', src)
+assert _n == 1, 'LAUNCH_APPLY launch shape changed'
+
+# The macro arguments are PASTED into the kernel name, so every one of them
+# has to arrive as the digit the suffix uses. NORM_CONST/NORM_HORNER and
+# true/false stringify to their own spelling, so the call sites are rewritten
+# to 0/1 -- and the count is asserted, because a call site this missed would
+# ask for a kernel named "k_apply_16_1_NORM_HORNER_0_true" and fail only when
+# that pricing arm is run.
+_sites = re.findall(r'LAUNCH_APPLY\((\d+), (\d+), (NORM_\w+), (true|false)\)', src)
+assert len(_sites) == 9, ('expected 9 LAUNCH_APPLY call sites, found %d'
+                           % len(_sites))
+src = re.sub(r'LAUNCH_APPLY\((\d+), (\d+), NORM_CONST, (true|false)\)',
+             lambda m: 'LAUNCH_APPLY(%s, %s, 0, %s)'
+                       % (m.group(1), m.group(2), '1' if m.group(3) == 'true' else '0'), src)
+src = re.sub(r'LAUNCH_APPLY\((\d+), (\d+), NORM_HORNER, (true|false)\)',
+             lambda m: 'LAUNCH_APPLY(%s, %s, 1, %s)'
+                       % (m.group(1), m.group(2), '1' if m.group(3) == 'true' else '0'), src)
+assert 'LAUNCH_APPLY(16, 1, NORM' not in src and 'LAUNCH_APPLY(8, 0, NORM' not in src, \
+    'a LAUNCH_APPLY call site still names the norm mode by macro'
+print('  LAUNCH_APPLY: %d call sites mangled by the preprocessor' % len(_sites))
+
+# ---- run_device_cases: a kernel passed as a FUNCTION POINTER -------------
+# upstream 2a3dfb0 factored the two --verify device gates onto a template that
+# takes the kernel as `void (*kern)(const Case *, uint32_t, uint32_t *)`.
+# Metal reaches a kernel by NAME, not by address -- there is no device
+# function pointer to take -- so the parameter becomes the name and the two
+# callers pass a string. The kernels themselves go to the metallib
+# (gen_bench_kernels.py carries both case structs and both kernels).
+_rdc_old = """static int run_device_cases(void (*kern)(const Case *, uint32_t, uint32_t *),
+                            const Case *h, uint32_t n, uint32_t blocks,
+                            uint32_t *first_bad)"""
+_rdc_new = """static int run_device_cases(const char *kern,
+                            const Case *h, uint32_t n, uint32_t blocks,
+                            uint32_t *first_bad)"""
+assert src.count(_rdc_old) == 1, 'run_device_cases signature shape changed'
+src = src.replace(_rdc_old, _rdc_new, 1)
+_rdl_old = "    kern<<<blocks, 256>>>(d, n, d_bad);"
+assert src.count(_rdl_old) == 1, 'run_device_cases launch shape changed'
+src = src.replace(_rdl_old,
+                  "    MTL_LAUNCH_NAMED(kern, blocks, 256, 0, 0, d, n, d_bad);", 1)
+for _k in ('k_verify_td_mod_cases', 'k_verify_ss_first_cases'):
+    _c = 'run_device_cases(%s,' % _k
+    assert src.count(_c) == 1, 'run_device_cases call site for %s' % _k
+    src = src.replace(_c, 'run_device_cases("%s",' % _k, 1)
+print('  run_device_cases takes a kernel NAME (2 call sites)')
+
+# ...and the kernel DEFINITION that upstream wrote between the two host
+# verifiers goes with them. k_verify_td_mod_cases was already outside the host
+# half; k_verify_ss_first_cases is new and sits among host code, the ss_tiers
+# shape again, so it is dropped by name with the count asserted.
+_ssk = '__global__ void k_verify_ss_first_cases('
+assert src.count(_ssk) == 1, 'k_verify_ss_first_cases is not unique'
+_i = src.index(_ssk); _j = src.index('{', _i); _d = 0
+while _j < len(src):
+    if src[_j] == '{': _d += 1
+    elif src[_j] == '}':
+        _d -= 1
+        if _d == 0: break
+    _j += 1
+src = (src[:_i] + '/* device code: see metal/bench_kernels.metal */\n'
+       + src[_j + 1:])
+assert '__global__' not in src, 'device code survives in bench_host.cpp'
 
 src = src.replace('cuda_optin_smem_limit', 'mtl_optin_smem_limit')
 
@@ -184,6 +243,20 @@ _eh_new = '"Metal %s: %s at %s:%d\\n"'
 assert _eh_old in src, 'harness error message shape changed'
 src = src.replace(_eh_old, _eh_new, 1)
 print('  harness error message names Metal')
+
+
+# ---- defaulted kernel arguments become explicit ones ----------------------
+# See portlib.pad_launch_defaults: Metal has no default argument: every
+# parameter a kernel declares must be bound at dispatch, so each omitted
+# trailing argument is filled in here from the KERNEL'S own default rather
+# than retyped per call site. The assert inside also checks that no launch
+# passes more arguments than the kernel declares -- which is how a kernel
+# gaining a parameter in the middle would be caught.
+_sigs = kernel_param_defaults(['bench/bench_kernels.cu', 'bench/td.cuh',
+                               'bench/pipeline.cuh'])
+src, _npad, _bad = pad_launch_defaults(src, _sigs, allow_unresolved=('kern',))
+assert not _bad, 'launch through a name this cannot resolve: %s' % ', '.join(sorted(_bad))
+print('  %d launch(es) had defaulted arguments filled in' % _npad)
 
 open(OUT, 'w').write(src)
 print('wrote %s (%d lines, %d launches rewritten)' % (OUT, src.count('\n'), nl))

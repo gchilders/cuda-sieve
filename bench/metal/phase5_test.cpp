@@ -85,7 +85,7 @@ int main(int argc, char **argv)
     const size_t smem = mtl_apply_smem(ncell, 16);
     printf("geometry: logI %d, J %u, xmax %u, %u regions of %u cells;"
            " %zu B threadgroup memory\n", logI, J, xmax, nregion, ncell, smem);
-    CK(mtlFuncSetMaxThreadgroupMemory("k_apply_16_1_1_0", smem));
+    CK(mtlFuncSetMaxThreadgroupMemory("k_apply_16_1_1_0_0", smem));
 
     /* ---- CPU reference for the fill, first: it also sizes the buckets ---- */
     std::vector<uint32_t> ref(nregion);
@@ -240,7 +240,7 @@ int main(int argc, char **argv)
     printf("\napply: T(i=0,j=J/2) = %u, CINIT %u, threshold %u, debug region %u\n",
            tconst, CINIT, THRESH, dbgreg);
 
-    CK(MTL_LAUNCH(k_apply_16_1_1_0, nregion, 256, smem, 0,
+    CK(MTL_LAUNCH(k_apply_16_1_1_0_0, nregion, 256, smem, 0,
                   (const uint32_t *)d_out, (const uint32_t *)d_cursor, cap,
                   logI, log_region, (const uint16_t *)d_slice_logp, nslice_pow2,
                   N, CINIT, THRESH, tconst,
@@ -248,8 +248,8 @@ int main(int argc, char **argv)
                   (const uint32_t *)d_dummy, (const uint32_t *)d_dummy,
                   (const uint32_t *)d_dummy, (const uint16_t *)d_dummy16,
                   (const uint32_t *)d_dummy,
-                  0u, 0u, 0u, 0xFFFFFFFFu, d_probe,
-                  (uint32_t *)nullptr, 0, 0u));
+                  0u, 0u, 0u, 0u, 0xFFFFFFFFu, d_probe,
+                  (uint32_t *)nullptr, 0, 0u, 0u, 16));
     CK(mtlDeviceSynchronize());
     printf("survivors: %u of %u positions\n", *d_nsurv, xmax);
 
@@ -268,7 +268,7 @@ int main(int argc, char **argv)
              * pointed at this one. */
             CK(mtlMemset(d_dbg, 0, (size_t)ncell * 2));
             CK(mtlMemset(d_nsurv, 0, 4));
-            CK(MTL_LAUNCH(k_apply_16_1_1_0, nregion, 256, smem, 0,
+            CK(MTL_LAUNCH(k_apply_16_1_1_0_0, nregion, 256, smem, 0,
                           (const uint32_t *)d_out, (const uint32_t *)d_cursor, cap,
                           logI, log_region, (const uint16_t *)d_slice_logp, nslice_pow2,
                           N, CINIT, THRESH, tconst,
@@ -276,8 +276,8 @@ int main(int argc, char **argv)
                           (const uint32_t *)d_dummy, (const uint32_t *)d_dummy,
                           (const uint32_t *)d_dummy, (const uint16_t *)d_dummy16,
                           (const uint32_t *)d_dummy,
-                          0u, 0u, 0u, 0xFFFFFFFFu, d_probe,
-                          (uint32_t *)nullptr, 0, 0u));
+                          0u, 0u, 0u, 0u, 0xFFFFFFFFu, d_probe,
+                          (uint32_t *)nullptr, 0, 0u, 0u, 16));
             CK(mtlDeviceSynchronize());
             /* verify_apply_region's OWN return value counts cells >= Cinit,
              * i.e. survivors at BOUND = 0, so it is not comparable with a run

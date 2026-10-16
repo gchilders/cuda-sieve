@@ -19,6 +19,11 @@
 #define CUDA_SIEVE_PIPELINE_CUH
 
 #include "td.cuh"      /* ss_magic_build, SS_KSHIFT */
+#include <thread>
+#include <functional>
+#include <mutex>
+#include <atomic>
+#include <utility>
 #include "ckpt.h"
 #include "runlog.h"
 #include "watchdog.h"
@@ -38,6 +43,93 @@
  * older, resume point. _exit is used because it is async-signal-safe and
  * flushing stdio from a handler is not. */
 static volatile sig_atomic_t g_pipe_stop = 0;
+
+/* run_pipeline_impl -> run_pipeline only: the bucket array did not fit or
+ * could not be allocated, before anything was opened or consumed. Negative,
+ * so every `rc < 0` test treats it as the failure it is; run_pipeline retries
+ * an up-sized slab plan once at the default and maps it to PIPE_RC_FAIL. */
+#define PIPE_RC_NOVRAM (-2)
+
+/* ---- --instances: what a pipeline thread knows about its siblings ------ *
+ *
+ * NULL on an ordinary run, so every hook below is a no-op there. Under
+ * --instances each pipeline thread points it at its own context: its index,
+ * and the state the instances share -- one lock that lets a single instance at
+ * a time run its setup or its end-of-band report (which also serialises their
+ * device allocations), and the per-instance progress the BOINC fraction is
+ * averaged from. */
+struct pipe_inst_shared_t {
+    std::mutex print;
+    std::mutex boinc;
+    int n;
+    double frac[PIPE_INSTANCES_MAX];
+    /* Under `print`: instances whose setup has not finished, and the modelled
+     * footprint each will need. The optional second bucket array and
+     * --q-pipeline's transform set reserve that much for them, so the first
+     * instance cannot take what a sibling needs to start at all. */
+    int setups_left;
+    size_t m_inst;
+};
+struct pipe_inst_ctx_t {
+    int k, n;
+    uint64_t qmin, qmax;
+    pipe_inst_shared_t *sh;
+};
+static thread_local pipe_inst_ctx_t *g_pinst = NULL;
+
+/* What an optional allocation must leave free for the siblings still to set
+ * up: 0 without --instances. Read during setup, under `print`. */
+static size_t pipe_inst_reserve()
+{
+    return g_pinst
+        ? (size_t)(g_pinst->sh->setups_left - 1) * g_pinst->sh->m_inst : 0;
+}
+
+/* Held across run_pipeline_impl's setup and its end-of-band report, released
+ * for the band itself. A no-op without --instances. */
+struct pipe_print_guard_t {
+    bool held = false;
+    void lock()
+    {
+        if (g_pinst && !held) { g_pinst->sh->print.lock(); held = true; }
+    }
+    void unlock()
+    {
+        if (held) { g_pinst->sh->print.unlock(); held = false; }
+    }
+    ~pipe_print_guard_t() { unlock(); }
+};
+
+#ifdef HAVE_BOINC
+/* One fraction for the work unit: under --instances the mean of the
+ * instances' own, each of which is the existing estimator over its share. */
+static void pipe_report_fraction(double f)
+{
+    if (!g_pinst) { bench_boinc_fraction_done(f); return; }
+    pipe_inst_shared_t *sh = g_pinst->sh;
+    std::lock_guard<std::mutex> g(sh->boinc);
+    double sum = 0.0;
+    sh->frac[g_pinst->k] = f;
+    for (int i = 0; i < sh->n; i++) sum += sh->frac[i];
+    bench_boinc_fraction_done(sum / sh->n);
+}
+#endif
+
+/* The per-q sync of the q loop. Device-wide by default; under --cof-async the
+ * loop's own work is all on the legacy stream, and a device-wide sync would
+ * wait for the in-flight cofactor flush (on g_cof_stream) and undo the
+ * overlap. See cofa_start. */
+static mtlError_t pipe_qsync(void)
+{
+    /* Stream 0 is this thread's own default stream (the build uses
+     * --default-stream per-thread), and never the device-wide form: under
+     * --q-pipeline the next q is sieving on another stream (finding 108),
+     * under --instances so are the other pipelines, and under --cof-async a
+     * flush is running on its own. Every launch this sync stands for is on
+     * stream 0; --fill-concurrent's side streams are joined by event first. */
+    return mtlStreamSynchronize(0);
+}
+
 
 /* Called from signal context on POSIX and from the console-control thread on
  * Windows, so it touches nothing but the flag. The ++ is not atomic against
@@ -60,7 +152,7 @@ static void pipe_request_stop(void)
  * pipe_side_prepare_q, whose return value is already a three-way code; the
  * alternative was an out-parameter threaded through the per-q path for a value
  * only the cap ever reads. Reset at the top of every band. */
-static int g_pipe_need_limbs = 0;
+static thread_local int g_pipe_need_limbs = 0;
 
 /* Record a resume point.
  *
@@ -78,7 +170,7 @@ static int pipe_checkpoint(const poly_t *P, const bench_cfg_t *cfg, ckpt_t *ck,
                            FILE *fr, FILE *fc, const qsel_t *next,
                            unsigned long long nrel, unsigned long long nqdone)
 {
-    static int warned_no_id = 0;
+    static thread_local int warned_no_id = 0;
     int64_t ro, co = 0;
     bench_file_id_t cid;
     if (!fr || !cfg->relations) return 0;
@@ -159,14 +251,39 @@ typedef struct {
     uint32_t *primes, *roots;
     plat_t   *plat;
     /* Present only in the slabbed specialization. fill advances walk_cur into
-     * walk_next; resieve replays walk_cur, then the host swaps the pointers. */
+     * walk_next; resieve replays walk_cur. Then, single-queued, the host swaps
+     * the two pointers after the slab; under --q-pipeline the three buffers
+     * (with walk_spare) turn at the issue point instead (pside_rotate_walk). */
     uint64_t *walk_cur, *walk_next;
+    /* --fill-rows: the first nrow bucketed entries (q < fill_rows * I) are
+     * filled by k_fill_rows from their transformed roots, written here by
+     * k_transform; k_fill_atomic walks the rest. nrow == 0 is the old fill. */
+    uint32_t *rowrt;
+    uint32_t  nrow;
+    /* --q-pipeline: the next q's transform output, written while this q's
+     * trial division still reads plat/rowrt. pside_swap_alt trades the two
+     * sets at the point the next q is issued. NULL when single-queued.
+     *
+     * walk_spare is the third walk-cursor buffer a slabbed plan needs once
+     * the next slab is sieved under this slab's trial division: this slab's
+     * TD reads the cursor it started from (walk_cur), the next slab's fill
+     * reads this slab's output (walk_next) and writes its own, so three are
+     * live. pside_rotate_walk turns them at every issue point. NULL unless
+     * the pipeline was granted on a slabbed plan. */
+    plat_t   *plat_alt;
+    uint32_t *rowrt_alt;
+    uint64_t *walk_spare;
     uint32_t *survbits;
+    /* Fine slices (pipe_build_fine): per-entry 18-bit id, and the first entry
+     * of each id. NULL when log_region > 14 keeps the original slices. */
+    uint32_t *fine, *fine_start;
+    uint32_t  nfine, fineF;
+    int       lut_shift;   /* apply's LUT index: rec >> lut_shift */
     uint16_t *slice, *slice_logp;
     uint32_t *sp, *srt, *sg;
     uint32_t *smag;             /* ss_first reciprocals; see ss_magic_build */
     uint16_t *slp;
-    uint32_t  nslice_pow2, nsmall, nblk, nwrp, nfb;
+    uint32_t  nslice_pow2, nsmall, nblk, nwrp, nsplit, nfb;
     size_t    apply_smem;
     norm_t    N;
     uint32_t  CINIT, BOUND, tconst, nsurv;
@@ -175,17 +292,27 @@ typedef struct {
     uint32_t *hsmag;
     uint32_t *d_nsurv, *d_nproj;
     unsigned long long *d_nlost;
+    /* PINNED readback slot, filled by async copies queued right behind each
+     * slab's k_apply. The join reads it after ev[5] instead of making two
+     * synchronous mtlMemcpy round trips per side, which cost 35-70 us each
+     * under WSL2 and sat on the critical path between q (finding 113). */
+    struct { uint32_t nsurv, overflow; } *h_rb;
     /* ev[0..3] are the transform/fill/apply boundaries. ev[4] is the
      * transform END, kept separate because pipe_side_sieve_issue re-records
-     * ev[1] once per slab and would clobber it. */
-    mtlEvent_t ev[5];
+     * ev[1] once per slab and would clobber it. ev[5] follows the h_rb
+     * copies, after ev[3], so the apply timing does not include them; it is
+     * only waited on, never timed, so it is created without timing. */
+    mtlEvent_t ev[6];
 } pside_t;
 
 static void pside_free(pside_t *S)
 {
     mtlFree(S->primes); mtlFree(S->roots); mtlFree(S->plat);
     mtlFree(S->walk_cur); mtlFree(S->walk_next);
+    mtlFree(S->rowrt);
+    mtlFree(S->plat_alt); mtlFree(S->rowrt_alt); mtlFree(S->walk_spare);
     mtlFree(S->survbits); mtlFree(S->slice); mtlFree(S->slice_logp);
+    mtlFree(S->fine); mtlFree(S->fine_start);
     mtlFree(S->sp); mtlFree(S->srt); mtlFree(S->sg); mtlFree(S->slp);
     mtlFree(S->smag);
     mtlFree(S->d_nsurv);
@@ -195,8 +322,31 @@ static void pside_free(pside_t *S)
     if (S->hsg)  mtlFreeHost(S->hsg);
     if (S->hslp) mtlFreeHost(S->hslp);
     if (S->hsmag) mtlFreeHost(S->hsmag);
-    for (int k = 0; k < 5; k++) if (S->ev[k]) mtlEventDestroy(S->ev[k]);
+    if (S->h_rb) mtlFreeHost(S->h_rb);
+    for (int k = 0; k < 6; k++) if (S->ev[k]) mtlEventDestroy(S->ev[k]);
     memset(S, 0, sizeof(*S));
+}
+
+/* --q-pipeline: point the side at its other transform-output set. The caller
+ * keeps a copy of the pside_t from before the swap for the trial division of
+ * the q it has not finished; everything else in the struct is shared. */
+static void pside_swap_alt(pside_t *S)
+{
+    std::swap(S->plat, S->plat_alt);
+    std::swap(S->rowrt, S->rowrt_alt);
+}
+
+/* --q-pipeline on a slabbed plan, at an issue point: the next slab (or the
+ * next q's first) starts from this slab's output cursor and writes into the
+ * spare, while the cursor this slab started from stays with its trial
+ * division. The caller takes TD's view of the side BEFORE turning them. The
+ * single-queued advance is the two-buffer swap in run_pipeline_impl. */
+static void pside_rotate_walk(pside_t *S)
+{
+    uint64_t *const started = S->walk_cur;
+    S->walk_cur = S->walk_next;
+    S->walk_next = S->walk_spare;
+    S->walk_spare = started;
 }
 
 /* The walk and line-sieve preconditions, checked where the factor bases are
@@ -278,6 +428,103 @@ static double pipe_progress_fraction(const bench_cfg_t *cfg, int streaming,
 /* Everything that does NOT depend on the special-q: the factor base upload,
  * the slice tables, and the pinned staging. Hoisted out of the per-q path so a
  * band of q measures sieving rather than allocation churn. */
+/* ---- fine slices: the bucket record names its factor-base entry -------- *
+ *
+ * A bucket record is (offset in region | slice << 16), and the slice only told
+ * apply which log p to add: up to 262,144 entries shared one. The bucket
+ * resieve (k_resieve_bucket) has to get from a record back to its prime, so
+ * the pipeline gives each record an 18-bit FINE slice id at bit 14 instead --
+ * a run of at most F consecutive entries, F chosen so the ids fit -- and apply
+ * reads log p from a 256-entry COARSE table indexed by id >> 10. A coarse
+ * group never spans a change of log p (the id skips to the next group when
+ * log p changes), so every record still adds exactly its entry's log p; only
+ * the index arithmetic moved. Needs log_region <= 14; above that the pipeline
+ * keeps the original slices and the walking resieve. */
+#define FINE_SHIFT     14u
+#define FINE_BITS      18u
+#define FINE_PER_GROUP 1024u    /* fine ids per coarse log-p group */
+
+static int pipe_build_fine(const fb_t *fb, uint32_t **fine_out,
+                           uint32_t **start_out, uint16_t **coarse_out,
+                           uint32_t *nfine_out, uint32_t *F_out)
+{
+    const uint32_t maxid = 1u << FINE_BITS;
+    const uint32_t ngroup = maxid / FINE_PER_GROUP;
+    for (uint32_t F = 32; F <= (1u << 26); F <<= 1) {
+        uint32_t id = 0, fill = 0;
+        int cur = -1, ok = 1;
+        for (uint32_t k = 0; k < fb->n && ok; k++) {
+            const int lp = fb->logp[k];
+            if (cur < 0) cur = lp;
+            else if (lp != cur) {
+                id = (id / FINE_PER_GROUP + 1) * FINE_PER_GROUP; fill = 0; cur = lp;
+            } else if (fill == F) { id++; fill = 0; }
+            if (id >= maxid) ok = 0;
+            fill++;
+        }
+        if (!ok) continue;
+        const uint32_t nfine = id + 1;
+        uint32_t *fine = (uint32_t *)malloc((size_t)fb->n * 4);
+        uint32_t *start = (uint32_t *)malloc((size_t)(nfine + 1) * 4);
+        uint16_t *coarse = (uint16_t *)calloc(ngroup, 2);
+        if (!fine || !start || !coarse) {
+            free(fine); free(start); free(coarse);
+            fprintf(stderr, "pipe_build_fine: out of memory\n");
+            return -1;
+        }
+        id = 0; fill = 0; cur = -1;
+        for (uint32_t k = 0; k < fb->n; k++) {
+            const int lp = fb->logp[k];
+            if (cur < 0) cur = lp;
+            else if (lp != cur) {
+                id = (id / FINE_PER_GROUP + 1) * FINE_PER_GROUP; fill = 0; cur = lp;
+            } else if (fill == F) { id++; fill = 0; }
+            fill++;
+            fine[k] = id;
+            coarse[id / FINE_PER_GROUP] = (uint16_t)lp;
+        }
+        for (uint32_t f = 0; f <= nfine; f++) start[f] = fb->n;
+        for (uint32_t k = fb->n; k-- > 0; ) start[fine[k]] = k;
+        for (uint32_t f = nfine; f-- > 0; )
+            if (start[f] > start[f + 1]) start[f] = start[f + 1];
+        *fine_out = fine; *start_out = start; *coarse_out = coarse;
+        *nfine_out = nfine; *F_out = F;
+        return 0;
+    }
+    fprintf(stderr, "pipe_build_fine: %u entries do not fit %u fine ids\n",
+            fb->n, maxid);
+    return -1;
+}
+
+/* Recover each bucketed prime hitting a two-sided survivor from the side's
+ * bucket records rather than by re-walking its lattice (k_resieve_scatter),
+ * after glas. One block per region. A record at a survivor names its fine
+ * slice; every entry in that slice is tested at the survivor's (a, b) --
+ * p | a - r*b for an affine root, p | r'*a - b for a projective one (the
+ * convention pl_transform_gen uses) -- skipping the lattice-degenerate entries
+ * the walk also skips. Two hitting entries in one slice are each appended once
+ * per record, i.e. twice: harmless, k_td divides a listed prime out
+ * completely, and the factor list it records is the same. */
+/* rb_mod: device code, see metal/td.metal */
+
+
+/* One block per region. The region's slice of the two-sided survivor bitmap
+ * (2 KB at --region 14) is staged in shared memory once, so the test every
+ * record faces is a shared-memory read rather than a global load that waits
+ * on the record just loaded.
+ *
+ * A HIT IS HANDLED BY THE WHOLE WARP. Most of this kernel's time was never
+ * the record scan: it was the hits, each one walking its fine slice -- ~120
+ * factor-base entries on 2,1147+ -- in ONE lane, three dependent random loads
+ * per entry, while the rest of the warp waited. The warp now finds its hits
+ * with a ballot and takes them one at a time, lane l testing entries
+ * start+l, start+l+32, ...: the slice is contiguous, so the loads coalesce,
+ * and 120 serial steps become 4. Several primes of one slice can land in the
+ * same survivor's list in any order; the emitters sort, so the relations do
+ * not change. */
+/* k_resieve_bucket: device code, see metal/td.metal */
+
+
 template <bool SLABBED>
 static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
                           const bench_cfg_t *cfg, uint32_t bound,
@@ -286,6 +533,7 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
 {
     const uint32_t nbitword = xmax_alloc >> 5;
     uint16_t *hslice = NULL, *hlogp = NULL;
+    uint32_t *hfine = NULL, *hstart = NULL;
     int rc = -1;
 
 #define SIDE_INIT_CK(x) do { if (CUDA_CHECKED(x)) goto done; } while (0)
@@ -312,12 +560,38 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
         SIDE_INIT_CK(mtlMalloc(&S->walk_next, (size_t)fb->n * sizeof(uint64_t)));
     }
     SIDE_INIT_CK(mtlMalloc(&S->survbits, (size_t)nbitword * 4));
+    if (cfg->fill_rows) {
+        /* The row tier is a PREFIX of the bucketed entries, which is what lets
+         * k_fill_atomic take the rest by pointer offset. Ascending order is
+         * fb_validate's (fb_load.c), and the check above refuses a base that
+         * has not passed it. */
+        const uint64_t rb = (uint64_t)cfg->fill_rows << cfg->logI;
+        while (S->nrow < fb->n && fb->primes[S->nrow] < rb) S->nrow++;
+        if (S->nrow) SIDE_INIT_CK(mtlMalloc(&S->rowrt, (size_t)S->nrow * 4));
+    }
     SIDE_INIT_CK(mtlMemcpy(S->primes, fb->primes, (size_t)fb->n * 4,
                             mtlMemcpyHostToDevice));
     SIDE_INIT_CK(mtlMemcpy(S->roots, fb->roots, (size_t)fb->n * 4,
                             mtlMemcpyHostToDevice));
 
-    if (fb_build_slices(fb, &hslice, &hlogp, &S->nslice_pow2) < 0) {
+    S->lut_shift = 16;
+    /* Fine slices when they fit; otherwise -- log_region > 14, or a base with
+     * more log-p changes than 256 coarse groups hold -- the original slices
+     * and the walking resieve, exactly as before. Never a reason to fail. */
+    if (cfg->log_region <= (int)FINE_SHIFT &&
+        !pipe_build_fine(fb, &hfine, &hstart, &hlogp, &S->nfine, &S->fineF)) {
+        S->nslice_pow2 = (1u << FINE_BITS) / FINE_PER_GROUP;
+        S->lut_shift = (int)(FINE_SHIFT + 10u);   /* log2(FINE_PER_GROUP) */
+        SIDE_INIT_CK(mtlMalloc(&S->fine, (size_t)fb->n * 4));
+        SIDE_INIT_CK(mtlMalloc(&S->fine_start, (size_t)(S->nfine + 1) * 4));
+        SIDE_INIT_CK(mtlMemcpy(S->fine, hfine, (size_t)fb->n * 4,
+                                mtlMemcpyHostToDevice));
+        SIDE_INIT_CK(mtlMemcpy(S->fine_start, hstart,
+                                (size_t)(S->nfine + 1) * 4,
+                                mtlMemcpyHostToDevice));
+        free(hfine); hfine = NULL;
+        free(hstart); hstart = NULL;
+    } else if (fb_build_slices(fb, &hslice, &hlogp, &S->nslice_pow2) < 0) {
         report_slice_build_error();
         goto done;
     }
@@ -335,10 +609,12 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
          * k_apply once, after both sides are initialized, to the larger value. */
         S->apply_smem = smem;
     }
-    SIDE_INIT_CK(mtlMalloc(&S->slice, (size_t)fb->n * 2));
+    if (!S->fine) {
+        SIDE_INIT_CK(mtlMalloc(&S->slice, (size_t)fb->n * 2));
+        SIDE_INIT_CK(mtlMemcpy(S->slice, hslice, (size_t)fb->n * 2,
+                                mtlMemcpyHostToDevice));
+    }
     SIDE_INIT_CK(mtlMalloc(&S->slice_logp, (size_t)S->nslice_pow2 * 2));
-    SIDE_INIT_CK(mtlMemcpy(S->slice, hslice, (size_t)fb->n * 2,
-                            mtlMemcpyHostToDevice));
     SIDE_INIT_CK(mtlMemcpy(S->slice_logp, hlogp,
                             (size_t)S->nslice_pow2 * 2,
                             mtlMemcpyHostToDevice));
@@ -369,11 +645,16 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
     SIDE_INIT_CK(mtlMalloc(&S->d_nproj, 4));
     SIDE_INIT_CK(mtlMalloc(&S->d_nlost, 8));
     for (int k = 0; k < 5; k++) SIDE_INIT_CK(mtlEventCreate(&S->ev[k]));
+    SIDE_INIT_CK(mtlEventCreateWithFlags(&S->ev[5], mtlEventDisableTiming));
+    SIDE_INIT_CK(mtlHostAlloc((void **)&S->h_rb, sizeof(*S->h_rb),
+                               mtlHostAllocDefault));
     rc = 0;
 
 done:
     free(hslice);
     free(hlogp);
+    free(hfine);
+    free(hstart);
 #undef SIDE_INIT_CK
     return rc;
 }
@@ -388,8 +669,8 @@ enum { PIPE_Q_SKIP = 1 };
  * bucket-overflow site for why these are not static locals. Like the other
  * file statics here they are never reset, so a second band in one process
  * inherits the first band's spend and sees only the end-of-band totals. */
-static int g_warned_bucket_ovf = 0;
-static int g_warned_td_trunc   = 0;
+static thread_local int g_warned_bucket_ovf = 0;
+static thread_local int g_warned_td_trunc   = 0;
 
 /* Skips that end the run. Past this the build is simply too narrow for the job
  * and the band would emit systematically deficient output; ./normscan says so
@@ -463,7 +744,8 @@ template <bool SLABBED>
 static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
                                const qlat_t *L, const poly_t *POLY,
                                const bench_cfg_t *cfg, int side, double scale,
-                               int blocks, pside_t *S, double *t_host)
+                               int blocks, pside_t *S, double *t_host,
+                               mtlStream_t st = 0, int quiet_skip = 0)
 {
     uint32_t *idx = NULL, *tp = NULL, *trt = NULL, *tg = NULL;
     uint16_t *tlp = NULL;
@@ -525,11 +807,14 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
         }
         /* Reciprocals AFTER the sort, same as the standalone path: the sort
          * key is the modulus, so building them earlier would only mean
-         * permuting them too. */
+         * permuting them too. And after the tiers: the thread tier's
+         * two-step range starts at nsplit, and each magic is proved for the
+         * form its index gets (ss_bound_ok in td.cuh). */
+        ss_tiers(hsp, k, &S->nblk, &S->nwrp);
+        S->nsplit = ss_two_step_from(hsp, k, S->nwrp, cfg->J, cfg->logI);
         for (uint32_t i = 0; i < k; i++)
             ss_magic_build(hsp[i], hsg[i] > 1 ? cfg->J / hsg[i] : cfg->J,
-                           cfg->logI, &S->hsmag[i]);
-        ss_tiers(hsp, k, &S->nblk, &S->nwrp);
+                           cfg->logI, i >= S->nsplit, &S->hsmag[i]);
         /* ASYNC on purpose. A synchronous mtlMemcpy on the legacy default
          * stream cannot begin until prior stream work drains, so once the
          * transform sync was removed from the end of this function these
@@ -538,12 +823,27 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
          * `host per-q` (measured: 1.179 -> 3.220 ms/q). Async keeps the host
          * running ahead and issuing the next launch.
          *
-         * Safe because hsp/hsrt/hsg/hslp/hsmag are PINNED (mtlHostAlloc, see
-         * pipe_side_init) and are only rewritten by the NEXT q's call, by
-         * which point the stream has drained. THREE paths provide that drain
-         * and ALL THREE are load-bearing:
+         * `st` is the legacy stream unless --q-pipeline was granted, when it
+         * is the sieve stream; either way these copies precede this q's
+         * transform, fill and apply on it.
          *
-         *   normal            the slab loop's mtlEventSynchronize(ev[3]);
+         * Safe because hsp/hsrt/hsg/hslp/hsmag are PINNED (mtlHostAlloc, see
+         * pipe_side_init) and are only rewritten by the NEXT q's call, which
+         * must not start before these copies have run. FOUR paths provide
+         * that drain and ALL FOUR are load-bearing:
+         *
+         *   normal            single-queued, the slab loop's join, which waits
+         *                     on ev[5] -- later in stream order. Under
+         *                     --q-pipeline the next call is made DURING this
+         *                     q's last slab, before its join (finding 114),
+         *                     and prepare_next_q first reads this q's
+         *                     transform time, which waits on ev[4] -- recorded
+         *                     after these copies;
+         *   prepared, not issued
+         *                     a next q prepared that way and then not issued
+         *                     (stop, a soft skip of this q, its own skip) is
+         *                     prepared again at the loop top: the end-of-q
+         *                     drain after the slab loop waits on its ev[4];
          *   PIPE_Q_SKIP       never reaches the slab loop, so it carries its
          *                     own mtlStreamSynchronize for exactly this
          *                     reason (see the skip site below);
@@ -557,15 +857,15 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
          * A new early return added between here and that ev[4] synchronise
          * needs the same treatment, or these must go back to synchronous. */
         PERQ_CK(mtlMemcpyAsync(S->sp, hsp, (size_t)k * sizeof(*hsp),
-                                mtlMemcpyHostToDevice, 0));
+                                mtlMemcpyHostToDevice, st));
         PERQ_CK(mtlMemcpyAsync(S->srt, hsrt, (size_t)k * sizeof(*hsrt),
-                                mtlMemcpyHostToDevice, 0));
+                                mtlMemcpyHostToDevice, st));
         PERQ_CK(mtlMemcpyAsync(S->sg, hsg, (size_t)k * sizeof(*hsg),
-                                mtlMemcpyHostToDevice, 0));
+                                mtlMemcpyHostToDevice, st));
         PERQ_CK(mtlMemcpyAsync(S->slp, hslp, (size_t)k * sizeof(*hslp),
-                                mtlMemcpyHostToDevice, 0));
+                                mtlMemcpyHostToDevice, st));
         PERQ_CK(mtlMemcpyAsync(S->smag, S->hsmag, (size_t)k * sizeof(*S->hsmag),
-                                mtlMemcpyHostToDevice, 0));
+                                mtlMemcpyHostToDevice, st));
     }
 
     /* Side 0's norms are G(x) = Y1*x + Y0, a degree-1 form. run_bench gets
@@ -610,6 +910,15 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
                  * build for the job, and quietly emitting a whole band of
                  * deficient output would be worse than stopping. */
                 const int need = bn_limbs_for_bits(bits);
+                /* --q-pipeline's speculative call stays silent and leaves the
+                 * band's limb advice alone: that q may never be counted (a
+                 * stop or the target can come first), so the loop top
+                 * prepares it again, loudly, if and when it is consumed. */
+                if (quiet_skip) {
+                    PERQ_CK(mtlStreamSynchronize(st));
+                    rc = PIPE_Q_SKIP;
+                    goto done;
+                }
                 /* NAMES rho, NOT JUST q. A q carries up to deg roots and it is
                  * the (q,rho) LATTICE that overflows, not the q: on the 2,1139+
                  * octic, (600002827, 369315816) needs 260.75 bits while
@@ -646,7 +955,7 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
                  * execution errors would otherwise be reported against the
                  * next q's first CUDA call. Skips are rare and capped at
                  * PIPE_SKIP_MAX, so the cost here is irrelevant. */
-                PERQ_CK(mtlStreamSynchronize(0));
+                PERQ_CK(mtlStreamSynchronize(st));
                 rc = PIPE_Q_SKIP;
                 goto done;
             }
@@ -664,12 +973,14 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
 
     *t_host = host_ms() - h0;
     /* k_transform writes these unconditionally; NULL is an illegal access */
-    PERQ_CK(mtlMemset(S->d_nproj, 0, 4));
-    PERQ_CK(mtlMemset(S->d_nlost, 0, 8));
+    /* st is 0 (the legacy default stream) unless --q-pipeline was granted,
+     * so the single-queued path issues exactly what it always did. */
+    PERQ_CK(mtlMemsetAsync(S->d_nproj, 0, 4, st));
+    PERQ_CK(mtlMemsetAsync(S->d_nlost, 0, 8, st));
 
-    PERQ_CK(mtlEventRecord(S->ev[0]));
-    MTL_LAUNCH_NAMED((SLABBED ? "k_transform_1" : "k_transform_0"), blocks, cfg->threads, 0, 0, S->primes, S->roots, S->plat, fb->n, cfg->logI, cfg->J, L->a0, L->a1, L->b0, L->b1, S->d_nproj, S->d_nlost, S->walk_cur);
-    PERQ_CK(mtlEventRecord(S->ev[4]));
+    PERQ_CK(mtlEventRecord(S->ev[0], st));
+    MTL_LAUNCH_NAMED((SLABBED ? "k_transform_1" : "k_transform_0"), blocks, cfg->threads, 0, st, S->primes, S->roots, S->plat, fb->n, cfg->logI, cfg->J, L->a0, L->a1, L->b0, L->b1, S->d_nproj, S->d_nlost, S->walk_cur, S->rowrt, S->nrow);
+    PERQ_CK(mtlEventRecord(S->ev[4], st));
     /* NO SYNCHRONIZE HERE. This function used to block on the transform purely
      * to read t_transform, and nothing after that read touches device data --
      * it is mtlGetLastError, an elapsed-time read and five host free()s. The
@@ -677,8 +988,9 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
      * k_transform -> k_fill_atomic boundary plus 0.487 at
      * k_transform -> k_transform (RESULTS finding 88's gap ranking), because
      * the card drained while the host prepared the other side and the TD
-     * tables. The elapsed time is now read after the slab loop, where the
-     * ev[3] sync has already guaranteed ev[4] completed.
+     * tables. The elapsed time is now read later -- after the slab loop, or
+     * under --q-pipeline when the next q is prepared -- by
+     * pipe_read_transform, which waits on ev[4] itself.
      *
      * mtlGetLastError still catches launch-configuration failures, which is
      * what it was for. An error raised DURING execution now surfaces at the
@@ -727,11 +1039,23 @@ typedef struct {
  * emitting correct relations, so no output gate would catch it. That is also
  * why the memsets below became mtlMemsetAsync ON THE SIDE'S STREAM: the
  * synchronous form runs on the default stream and would do exactly that. */
+/* Row bands per slab for the row tier (k_fill_rows, k_resieve_rows):
+ * --fill-row-bands, else one band per FILL_ROW_RUN rows; never more bands
+ * than rows, so no band is empty. */
+static uint32_t pipe_row_bands(const bench_cfg_t *cfg, uint32_t rows)
+{
+    uint32_t nb = cfg->fill_row_bands ? (uint32_t)cfg->fill_row_bands
+                                      : (rows + FILL_ROW_RUN - 1) / FILL_ROW_RUN;
+    if (nb > rows) nb = rows;
+    return nb ? nb : 1;
+}
+
 template <bool SLABBED>
 static int pipe_side_sieve_issue(const fb_t *fb, const bench_cfg_t *cfg,
                                  int side, uint32_t xmax, uint32_t j_base,
                                  const pbkt_t *bk, int fblocks, int fthreads,
-                                 pside_t *S)
+                                 pside_t *S, const uint32_t *gate_bits = NULL,
+                                 uint32_t *gate_fold = NULL)
 {
     const int log_region = cfg->log_region;
     const uint32_t nregion = xmax >> log_region;
@@ -759,20 +1083,58 @@ static int pipe_side_sieve_issue(const fb_t *fb, const bench_cfg_t *cfg,
      * cursors/overflow counter, just as pipe_side_perq did. */
     wd_phase(side ? "slab.fill.side1" : "slab.fill.side0");
     /* k_fill_atomic reads S->plat and S->walk_cur, which k_transform wrote on
-     * the LEGACY DEFAULT STREAM in pipe_side_prepare_q. On a blocking stream
-     * that ordering is implicit and free -- and it is also ambient: compiling
-     * with `--default-stream per-thread`, or ever creating these with
-     * cudaStreamNonBlocking, removes it silently and lets fill race the
-     * transform for uninitialised plattices. The failure would be wrong log
-     * sums in the CONCURRENT arm only, which the serial-vs-concurrent identity
-     * gate is the one test that could catch and the serial gates could not.
-     * Wait on the transform's own end event instead, so the dependency is
-     * stated rather than inherited. Costs nothing on stream 0. */
+     * the stream pipe_side_prepare_q was given: the LEGACY DEFAULT STREAM,
+     * except under --q-pipeline, where it is this same sieve stream. With the
+     * concurrent arm's blocking side streams that ordering is implicit and
+     * free -- and it is also ambient: compiling with `--default-stream
+     * per-thread`, or ever creating those with mtlStreamNonBlocking, removes
+     * it silently and lets fill race the transform for uninitialised
+     * plattices. The failure would be wrong log sums in the CONCURRENT arm
+     * only, which the serial-vs-concurrent identity gate is the one test that
+     * could catch and the serial gates could not. Wait on the transform's own
+     * end event instead, so the dependency is stated rather than inherited.
+     * Costs nothing on stream 0, or on the stream the transform ran on. */
     if (st) SLAB_CK(mtlStreamWaitEvent(st, S->ev[4], 0));
     SLAB_CK(mtlEventRecord(S->ev[1], st));
     SLAB_CK(mtlMemsetAsync(bk->cursor, 0, (size_t)nregion * 4, st));
     SLAB_CK(mtlMemsetAsync(bk->overflow, 0, 4, st));
-    MTL_LAUNCH_NAMED((SLABBED ? "k_fill_atomic_4_1" : "k_fill_atomic_4_0"), fblocks, fthreads, 0, st, S->plat, S->slice, fb->n, xmax, cfg->logI, log_region, bk->cursor, bk->bucket, bk->cap, bk->overflow, S->walk_cur, S->walk_next, cfg->sieve_skip, j_base);
+    {
+        /* --fill-gate: gate_bits is the OTHER side's survivor bitmap for this
+         * slab, already complete (the serial arm joins it first). The fold
+         * runs inside the fill window so the gate's cost is billed to fill. */
+        const uint32_t *gate = gate_bits;
+        const int gshift = gate_bits ? cfg->fill_gate_shift : 0;
+        if (gate_bits && gshift) {
+            /* rounded up: a bitmap tail shorter than 2^gshift words still
+             * gets a gate word, which k_gate_fold fills from what exists */
+            const uint32_t nbw = xmax >> 5;
+            const uint32_t ngword = (nbw + (1u << gshift) - 1) >> gshift;
+            MTL_LAUNCH(k_gate_fold, (ngword + 255) / 256, 256, 0, st, gate_bits, gate_fold, gshift, ngword, nbw);
+            gate = gate_fold;
+        }
+        const uint32_t nrow = S->nrow;
+        if (nrow) {
+            const uint32_t rows = xmax >> cfg->logI;
+            const uint32_t nband = pipe_row_bands(cfg, rows);
+            const uint64_t nthr = (uint64_t)((nrow + 31u) >> 5) * nband * 32u;
+            /* Fine-slice ids when the side has them (the bucket resieve
+             * reads them back), the original slices otherwise. */
+            if (S->fine)
+                MTL_LAUNCH_NAMED((SLABBED ? "k_fill_rows_1_uint32_t" : "k_fill_rows_0_uint32_t"), (unsigned)((nthr + 255) / 256), 256, 0, st, S->primes, S->rowrt, S->fine, nrow, nband, rows, cfg->logI, log_region, bk->cursor, bk->bucket, bk->cap, bk->overflow, cfg->sieve_skip, j_base, gate, gshift, (int)FINE_SHIFT);
+            else
+                MTL_LAUNCH_NAMED((SLABBED ? "k_fill_rows_1" : "k_fill_rows_0"), (unsigned)((nthr + 255) / 256), 256, 0, st, S->primes, S->rowrt, S->slice, nrow, nband, rows, cfg->logI, log_region, bk->cursor, bk->bucket, bk->cap, bk->overflow, cfg->sieve_skip, j_base, gate, gshift, 16);
+            /* Only k_resieve_scatter reads the row tier's walk state, and only
+             * when --resieve-rows is off; nothing else needs it. */
+            if (SLABBED && !cfg->resieve_rows)
+                MTL_LAUNCH(k_rows_walk_next, (nrow + 255) / 256, 256, 0, st, S->primes, S->rowrt, nrow, j_base + rows, cfg->logI, S->walk_cur, S->walk_next);
+        }
+        /* The rest by pointer offset: k_fill_atomic indexes every per-entry
+         * array by the same k. */
+        if (fb->n > nrow && S->fine)
+            MTL_LAUNCH_NAMED((SLABBED ? "k_fill_atomic_4_1_uint32_t" : "k_fill_atomic_4_0_uint32_t"), fblocks, fthreads, 0, st, S->plat + nrow, S->fine + nrow, fb->n - nrow, xmax, cfg->logI, log_region, bk->cursor, bk->bucket, bk->cap, bk->overflow, SLABBED ? S->walk_cur + nrow : nullptr, SLABBED ? S->walk_next + nrow : nullptr, cfg->sieve_skip, j_base, gate, gshift, (int)FINE_SHIFT);
+        else if (fb->n > nrow)
+            MTL_LAUNCH_NAMED((SLABBED ? "k_fill_atomic_4_1" : "k_fill_atomic_4_0"), fblocks, fthreads, 0, st, S->plat + nrow, S->slice + nrow, fb->n - nrow, xmax, cfg->logI, log_region, bk->cursor, bk->bucket, bk->cap, bk->overflow, SLABBED ? S->walk_cur + nrow : nullptr, SLABBED ? S->walk_next + nrow : nullptr, cfg->sieve_skip, j_base, gate, gshift, 16);
+    }
     SLAB_CK(mtlEventRecord(S->ev[2], st));
     SLAB_CK(mtlMemsetAsync(S->d_nsurv, 0, 4, st));
     /* Provably redundant on every production geometry: k_apply's warp-ballot
@@ -789,8 +1151,26 @@ static int pipe_side_sieve_issue(const fb_t *fb, const bench_cfg_t *cfg,
      * ever shows up in a profile. */
     SLAB_CK(mtlMemsetAsync(S->survbits, 0, (size_t)nbitword * 4, st));
     wd_phase(side ? "slab.apply.side1" : "slab.apply.side0");
-    MTL_LAUNCH_NAMED((SLABBED ? "k_apply_16_1_1_1" : "k_apply_16_1_1_0"), nregion, athr, S->apply_smem, st, (const uint32_t *)bk->bucket, bk->cursor, bk->cap, cfg->logI, log_region, S->slice_logp, S->nslice_pow2, S->N, S->CINIT, S->CINIT - S->BOUND, S->tconst, nullptr, S->d_nsurv, nullptr, 0xFFFFFFFFu, S->sp, S->srt, S->sg, S->slp, S->smag, S->nsmall, S->nblk, S->nwrp, 0xFFFFFFFFu, nullptr, S->survbits, cfg->not_both_even, cfg->sieve_skip, j_base);
+    {   /* The instance with the two-step tail only when this q has one: at
+         * logI <= 15 it never does, and that instance's thread tier is the
+         * one-step loop alone (sieve_small, SSTAIL; finding 111). The choice
+         * is ss_needs_tail, never a geometry test: the one-step instance on a
+         * table with a tail would give silently wrong residues, and traps.
+         * Its own scope, so the SLAB_CK gotos above do not jump past it. */
+        const char *const apply_kern = ss_needs_tail(S->nsplit, S->nsmall)
+            ? (SLABBED ? "k_apply_16_1_1_1_1" : "k_apply_16_1_1_0_1")
+            : (SLABBED ? "k_apply_16_1_1_1_0" : "k_apply_16_1_1_0_0");
+        MTL_LAUNCH_NAMED(apply_kern, nregion, athr, S->apply_smem, st,
+            (const uint32_t *)bk->bucket, bk->cursor, bk->cap, cfg->logI, log_region, S->slice_logp, S->nslice_pow2, S->N, S->CINIT, S->CINIT - S->BOUND, S->tconst, nullptr, S->d_nsurv, nullptr, 0xFFFFFFFFu, S->sp, S->srt, S->sg, S->slp, S->smag, S->nsmall, S->nblk, S->nwrp, S->nsplit, 0xFFFFFFFFu, nullptr, S->survbits, cfg->not_both_even, cfg->sieve_skip, j_base, S->lut_shift);
+    }
     SLAB_CK(mtlEventRecord(S->ev[3], st));
+    /* The join's two counts, queued behind apply on the same stream: the
+     * join then waits once (ev[5]) and reads host memory. */
+    SLAB_CK(mtlMemcpyAsync(&S->h_rb->nsurv, S->d_nsurv, 4,
+                            mtlMemcpyDeviceToHost, st));
+    SLAB_CK(mtlMemcpyAsync(&S->h_rb->overflow, bk->overflow, 4,
+                            mtlMemcpyDeviceToHost, st));
+    SLAB_CK(mtlEventRecord(S->ev[5], st));
     rc = 0;
 done:
 #undef SLAB_CK
@@ -800,19 +1180,16 @@ done:
 /* Await a slab issued above and classify it. Returns 0 = usable, 1 = SOFT
  * (skip this slab, the band lives), -1 = a real device/API failure.
  *
- * The D2H reads are ordinary synchronous copies. On THIS side's stream ev[3]
- * has already been awaited, so an async copy would buy nothing but a second
- * sync. Note what that means in the concurrent order, because it is not what
- * the sync-per-side reading suggests: join(1) runs while side 0 is still
- * executing, and a synchronous mtlMemcpy on the legacy default stream
- * implicitly synchronises with every blocking stream -- so join(1) does not
- * return until side 0 has finished either. Harmless today (both sides were
- * issued before either join, so the overlap has already happened by then) but
- * it is a whole-device barrier sitting inside a function documented as
- * per-side. Anyone reordering the joins, adding a third concurrency unit, or
- * making these streams non-blocking must re-derive it rather than trust the
- * name. */
-static int pipe_side_sieve_join(int side, const pbkt_t *bk, pside_t *S,
+ * The two counts arrive in S->h_rb by async copies queued behind apply on
+ * this side's stream, so one wait on ev[5] (after ev[3], so ev[1..3] are
+ * complete for the timings) delivers them. They used to be two synchronous
+ * mtlMemcpy calls after the ev[3] wait: four round trips per q at 35-70 us
+ * each under WSL2, on the critical path (finding 113). That also removes a
+ * whole-device barrier: a synchronous copy on the legacy stream waited for
+ * every blocking stream, so join(1) used to wait for side 0 as well. Now each
+ * join waits for its own side only; the callers join both sides before using
+ * either, which is all they relied on. */
+static int pipe_side_sieve_join(int side, pside_t *S,
                                 float *t_fill, float *t_apply,
                                 int concurrent_join)
 {
@@ -825,14 +1202,13 @@ static int pipe_side_sieve_join(int side, const pbkt_t *bk, pside_t *S,
      * side 0's k_apply. Name what is actually being awaited. */
     wd_phase(concurrent_join ? "slab.sync.both"
                              : (side ? "slab.sync.side1" : "slab.sync.side0"));
-    SLAB_CK(mtlEventSynchronize(S->ev[3]));
+    SLAB_CK(mtlEventSynchronize(S->ev[5]));
     SLAB_CK(mtlGetLastError());
     *t_fill  = time_kernel(S->ev[1], S->ev[2]);
     *t_apply = time_kernel(S->ev[2], S->ev[3]);
-    SLAB_CK(mtlMemcpy(&S->nsurv, S->d_nsurv, 4, mtlMemcpyDeviceToHost));
+    S->nsurv = S->h_rb->nsurv;
     {
-        uint32_t hov = 0;
-        SLAB_CK(mtlMemcpy(&hov, bk->overflow, 4, mtlMemcpyDeviceToHost));
+        const uint32_t hov = S->h_rb->overflow;
         if (hov) {
             /* SOFT failure: rc = 1, not -1. Dropped bucket records can only
              * LOWER a position's log sum, so an overflow costs survivors it
@@ -920,8 +1296,24 @@ done:
 #define PIPE_K 16
 #endif
 
+/* Bucket capacity as a percentage of the estimate's: test builds only (see
+ * its use in run_pipeline_impl). */
+#ifndef PIPE_CAP_PCT
+#define PIPE_CAP_PCT 100
+#endif
+
+/* TD's three per-slab counters, as ONE device allocation (pipe_td_t.d_ctr)
+ * so the host reads them with one copy. Order is the copy's layout; the
+ * 64-bit word is 8-byte aligned in both the device block and the pinned
+ * mirror (pipe_td_t.h_rb). */
+typedef struct {
+    uint32_t flags, nacc;
+    unsigned long long ovf;
+} td_ctr_t;
+
 typedef struct {
     double rank, emit, summary, resieve, td, classify, compact, record;
+    double resieve0;    /* side 0's share of resieve, reported beside it */
     double readback, join, hostq, cofac;
 } pipe_tm_t;
 
@@ -932,6 +1324,20 @@ typedef struct {
     uint32_t *d_cnt, *d_gbase, *d_bsum, *d_sum;
     uint32_t *d_x;  int64_t *d_a, *d_b;
     uint32_t *d_flags;  unsigned long long *d_ovf;
+    /* d_flags, d_nacc and d_ovf are views into ONE device block, d_ctr, so
+     * the host reads all three with one copy. */
+    td_ctr_t *d_ctr;
+    /* PINNED readback slot for the per-slab counts the host needs: the
+     * survivor total's two parts (phase 1), the counter block (after
+     * k_scatter_sel) and the intersection's count. Filled by async copies
+     * behind the kernels and read after one wait each, instead of
+     * synchronous mtlMemcpy round trips (35-70 us each under WSL2,
+     * finding 113). */
+    struct {
+        uint32_t base, cnt;     /* last group's scan base and count */
+        td_ctr_t ctr;           /* flags, accepted count, overflow word */
+        uint32_t isect;         /* the intersection's survivor count */
+    } *h_rb;
     /* joint acceptance */
     uint32_t *d_aflag, *d_aoff, *d_absum, *d_sel, *d_nacc;
     /* per side */
@@ -955,12 +1361,13 @@ static void pipe_td_free(pipe_td_t *C)
 {
     mtlFree(C->d_cnt); mtlFree(C->d_gbase); mtlFree(C->d_bsum);
     mtlFree(C->d_sum); mtlFree(C->d_x); mtlFree(C->d_a); mtlFree(C->d_b);
-    mtlFree(C->d_flags); mtlFree(C->d_ovf);
+    mtlFree(C->d_ctr);     /* d_flags, d_nacc, d_ovf point into it */
     mtlFree(C->d_aflag); mtlFree(C->d_aoff); mtlFree(C->d_absum);
-    mtlFree(C->d_sel); mtlFree(C->d_nacc);
+    mtlFree(C->d_sel);
     mtlFree(C->d_ca); mtlFree(C->d_cb);
     if (C->h_ca) mtlFreeHost(C->h_ca);
     if (C->h_cb) mtlFreeHost(C->h_cb);
+    if (C->h_rb) mtlFreeHost(C->h_rb);
     mtlFree(C->d_stats);
     for (int s = 0; s < 2; s++) {
         mtlFree(C->d_plist[s]); mtlFree(C->d_pcnt[s]);
@@ -1071,13 +1478,15 @@ static int pipe_td_init(pipe_td_t *C, const fb_t *fbs1, const fb_t *fbs0,
     C->nb = (C->ngroup + TD_SCAN_BLK - 1) / TD_SCAN_BLK;
     C->nsumword = ((nbitword / 2) + 31) / 32;
     for (int k = 0; k < 16; k++) CK(mtlEventCreate(&C->ev[k]));
+    CK(mtlHostAlloc((void **)&C->h_rb, sizeof(*C->h_rb), mtlHostAllocDefault));
     CK(mtlMalloc(&C->d_cnt, (size_t)C->ngroup * 4));
     CK(mtlMalloc(&C->d_gbase, (size_t)C->ngroup * 4));
     CK(mtlMalloc(&C->d_bsum, (size_t)C->nb * 4));
     CK(mtlMalloc(&C->d_sum, (size_t)C->nsumword * 4));
-    CK(mtlMalloc(&C->d_flags, 4));
-    CK(mtlMalloc(&C->d_ovf, 8));
-    CK(mtlMalloc(&C->d_nacc, 4));
+    CK(mtlMalloc(&C->d_ctr, sizeof(td_ctr_t)));
+    C->d_flags = &C->d_ctr->flags;
+    C->d_nacc  = &C->d_ctr->nacc;
+    C->d_ovf   = &C->d_ctr->ovf;
     CK(mtlMalloc(&C->d_stats, 12));
     CK(mtlMemset(C->d_stats, 0, 12));      /* accumulates over the whole band */
     for (int s = 0; s < 2; s++) {
@@ -1244,16 +1653,45 @@ out:
 
 /* ---- one special-q of trial division, both sides ----------------------- */
 
+/* What trial division reads of a side, and nothing else. Under --q-pipeline
+ * the next q's sieve is already rewriting the rest of pside_t -- its norm, its
+ * small-sieve tables and staging, its events -- while this q is trial-divided,
+ * and only plat and rowrt are doubled to allow it (finding 108). A TD change
+ * that needs another per-q field has to add it here, and with it decide
+ * whether the pipeline must double that field too. primes and nfb are fixed
+ * for the band; walk_cur, read only under slabbing, is the cursor this slab
+ * started from, which pside_rotate_walk keeps out of the next slab's way. */
+typedef struct {
+    const plat_t   *plat;
+    const uint32_t *primes, *rowrt;
+    const uint64_t *walk_cur;
+    uint32_t        nfb, nrow;
+    /* The bucket resieve's tables: fixed for the band, like primes. fine is
+     * NULL when the side keeps the original slices (no bucket resieve). */
+    const uint32_t *fine, *fine_start, *roots;
+} ptd_side_t;
+
+static inline ptd_side_t pipe_td_side(const pside_t *S)
+{
+    ptd_side_t v;
+    v.plat = S->plat; v.primes = S->primes; v.rowrt = S->rowrt;
+    v.walk_cur = S->walk_cur; v.nfb = S->nfb; v.nrow = S->nrow;
+    v.fine = S->fine; v.fine_start = S->fine_start; v.roots = S->roots;
+    return v;
+}
+
 template <bool SLABBED>
 static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
-                        const pside_t *S1, const pside_t *S0,
+                        const ptd_side_t *S1, const ptd_side_t *S0,
                         const uint32_t *d_two, uint32_t xmax,
                         uint32_t j_base, int blocks, int threads, int verify,
                         uint32_t *n_out, uint32_t *nacc_out, pipe_tm_t *tm,
                         double *t_verify, int want_host, int accumulate_stats,
-                        uint32_t gate_found[2])
+                        uint32_t gate_found[2],
+                        const pbkt_t *const bkr[2] = NULL,
+                        const std::function<int()> *after_resieve = NULL)
 {
-    const pside_t *S[2];
+    const ptd_side_t *S[2];
     const uint32_t lpb[2] = {cfg->lpb0, cfg->lpb};
     const uint32_t mfb[2] = {cfg->mfb0, cfg->mfb};
     const uint32_t lim[2] = {cfg->lim0, cfg->lim};
@@ -1281,13 +1719,16 @@ static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
     MTL_LAUNCH(k_scan_pass2, 1, 1024, 0, 0, C->d_bsum, nb);
     MTL_LAUNCH(k_scan_pass3, nb, TD_SCAN_BLK, 0, 0, C->d_gbase, ngroup, C->d_bsum);
     CK(mtlEventRecord(E[1]));
-    CK(mtlEventSynchronize(E[1])); CK(mtlGetLastError());
-    {
-        uint32_t base = 0, cnt = 0;
-        CK(mtlMemcpy(&base, C->d_gbase + ngroup - 1, 4, mtlMemcpyDeviceToHost));
-        CK(mtlMemcpy(&cnt, C->d_cnt + ngroup - 1, 4, mtlMemcpyDeviceToHost));
-        n = base + cnt;
-    }
+    /* The survivor total, base + count of the last group (two arrays, so two
+     * copies), queued after E[1] so the rank-scan timing excludes them, and
+     * one wait on the legacy stream, which is where they and every TD
+     * kernel run -- not two synchronous round trips. */
+    CK(mtlMemcpyAsync(&C->h_rb->base, C->d_gbase + ngroup - 1, 4,
+                       mtlMemcpyDeviceToHost, 0));
+    CK(mtlMemcpyAsync(&C->h_rb->cnt, C->d_cnt + ngroup - 1, 4,
+                       mtlMemcpyDeviceToHost, 0));
+    CK(mtlStreamSynchronize(0)); CK(mtlGetLastError());
+    n = C->h_rb->base + C->h_rb->cnt;
     *n_out = n; *nacc_out = 0;
     /* A slab can legitimately contain no survivors, especially a short tail.
      * Preserve the original q-level invariant after all slabs have run rather
@@ -1306,16 +1747,47 @@ static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
     MTL_LAUNCH(k_build_summary_g, blocks, threads, 0, 0, d_two, nbitword, 2u, C->d_sum);
     CK(mtlEventRecord(E[4]));
 
+    /* Both sides' resieves first, then the rest of trial division. The
+     * resieve is the last reader of this slab's bucket records, so the hook
+     * between the two -- --q-pipeline's issue of the next slab or special-q,
+     * whose fill rewrites those arrays -- runs only once they are queued, and
+     * makes its stream wait on E[14]. Same kernels, same inputs, in a
+     * different order: the relations cannot change.
+     *
+     * Events: resieve side 1 E[4]->E[5], side 0 E[5]->E[14]; trial division
+     * side 1 E[15]->E[6], side 0 E[7]->E[9]; classify E[6]->E[7] and
+     * E[9]->E[10]. */
     for (int si = 0; si < 2; si++) {
         const int side = si ? 0 : 1;          /* side 1 first, as before */
-        const int e = si ? 7 : 4;
         CK(mtlMemsetAsync(C->d_pcnt[side], 0, (size_t)n * 4));
-        MTL_LAUNCH_NAMED((SLABBED ? "k_resieve_scatter_4_1" : "k_resieve_scatter_4_0"), blocks, threads, 0, 0, S[side]->plat, S[side]->primes, nullptr, S[side]->nfb, xmax, cfg->logI, C->d_sum, d_two, C->d_gbase, C->d_plist[side], C->d_pcnt[side], PIPE_K, C->d_ovf, 6, S[side]->walk_cur);
-        CK(mtlEventRecord(E[e + 1]));
+        if (bkr && bkr[side] && S[side]->fine) {
+            /* This side's records for this slab are still in its bucket
+             * array -- the --fill-rows tier's included, which writes the same
+             * fine-slice ids: read the primes back from them. */
+            MTL_LAUNCH(k_resieve_bucket, xmax >> cfg->log_region, 256, 0, 0, (const uint32_t *)bkr[side]->bucket, bkr[side]->cursor, bkr[side]->cap, cfg->log_region, d_two, C->d_gbase, C->d_a, C->d_b, S[side]->fine_start, S[side]->primes, S[side]->roots, S[side]->plat, C->d_plist[side], C->d_pcnt[side], PIPE_K, C->d_ovf);
+        } else {
+            /* --resieve-rows: the --fill-rows tier, banded by row; the FK
+             * walk takes the rest by pointer offset, as in the fill. */
+            const uint32_t nr = cfg->resieve_rows ? S[side]->nrow : 0;
+            if (nr) {
+                const uint32_t rows = xmax >> cfg->logI;
+                const uint32_t nband = pipe_row_bands(cfg, rows);
+                const uint64_t nthr = (uint64_t)nr * nband;
+                MTL_LAUNCH_NAMED((SLABBED ? "k_resieve_rows_4_1" : "k_resieve_rows_4_0"), (unsigned)((nthr + 255) / 256), 256, 0, 0, S[side]->primes, S[side]->rowrt, nullptr, nr, nband, rows, cfg->logI, C->d_sum, d_two, C->d_gbase, C->d_plist[side], C->d_pcnt[side], PIPE_K, C->d_ovf, 6, j_base);
+            }
+            if (S[side]->nfb > nr)
+                MTL_LAUNCH_NAMED((SLABBED ? "k_resieve_scatter_4_1" : "k_resieve_scatter_4_0"), blocks, threads, 0, 0, S[side]->plat + nr, S[side]->primes + nr, nullptr, S[side]->nfb - nr, xmax, cfg->logI, C->d_sum, d_two, C->d_gbase, C->d_plist[side], C->d_pcnt[side], PIPE_K, C->d_ovf, 6, SLABBED ? S[side]->walk_cur + nr : nullptr);
+        }
+        CK(mtlEventRecord(E[si ? 14 : 5]));
+    }
+    if (after_resieve && *after_resieve && (*after_resieve)()) return -1;
+    CK(mtlEventRecord(E[15]));
+    for (int si = 0; si < 2; si++) {
+        const int side = si ? 0 : 1;
         MTL_LAUNCH_NAMED((SLABBED ? "k_td_1_0_0_1" : "k_td_1_0_0_0"), blocks, threads, 0, 0, C->d_a, C->d_b, C->d_x, nullptr, n, cfg->logI, C->d_poly[side], side == cfg->sq_side ? (uint32_t)L->q : 0u, C->d_plist[side], C->d_pcnt[side], PIPE_K, C->d_sm[side], C->nsm[side], C->d_cof[side], C->d_cofbits[side], C->d_flags, nullptr, nullptr, nullptr, 0, j_base);
-        CK(mtlEventRecord(E[e + 2]));
+        CK(mtlEventRecord(E[si ? 9 : 6]));
         MTL_LAUNCH(k_classify, blocks, threads, 0, 0, C->d_cof[side], C->d_cofbits[side], C->d_b, n, lpb[side], mfb[side], (double)lim[side], C->d_status[side]);
-        CK(mtlEventRecord(E[e + 3]));
+        CK(mtlEventRecord(E[si ? 10 : 7]));
     }
 
     /* ---- joint acceptance, compacted on device ---- */
@@ -1326,17 +1798,25 @@ static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
     MTL_LAUNCH(k_scan_pass3, nab, TD_SCAN_BLK, 0, 0, C->d_aoff, n, C->d_absum);
     MTL_LAUNCH(k_scatter_sel, blocks, threads, 0, 0, C->d_aflag, C->d_aoff, n, C->d_sel, C->ccap, C->d_nacc);
     CK(mtlEventRecord(E[11]));
-    CK(mtlEventSynchronize(E[11])); CK(mtlGetLastError());
+    /* flags, the accepted count and the overflow word: the one counter
+     * block, one async copy queued after E[11] (so the compact timing
+     * excludes it) and one wait on the legacy stream -- not three
+     * synchronous round trips. The count is read before the flags are
+     * judged; harmless, and a slab the flags reject never uses it. */
+    CK(mtlMemcpyAsync(&C->h_rb->ctr, C->d_ctr, sizeof(td_ctr_t),
+                       mtlMemcpyDeviceToHost, 0));
+    CK(mtlStreamSynchronize(0)); CK(mtlGetLastError());
     tm->emit     += time_kernel(E[2], E[3]);
     tm->summary  += time_kernel(E[3], E[4]);
-    tm->resieve  += time_kernel(E[4], E[5]) + time_kernel(E[7], E[8]);
-    tm->td       += time_kernel(E[5], E[6]) + time_kernel(E[8], E[9]);
+    tm->resieve  += time_kernel(E[4], E[14]);
+    tm->resieve0 += time_kernel(E[5], E[14]);
+    tm->td       += time_kernel(E[15], E[6]) + time_kernel(E[7], E[9]);
     tm->classify += time_kernel(E[6], E[7]) + time_kernel(E[9], E[10]);
     tm->compact  += time_kernel(E[10], E[11]);
     tm->rank     += time_kernel(E[0], E[1]);
 
-    CK(mtlMemcpy(&hflags, C->d_flags, 4, mtlMemcpyDeviceToHost));
-    CK(mtlMemcpy(&hovf, C->d_ovf, 8, mtlMemcpyDeviceToHost));
+    hflags = C->h_rb->ctr.flags;
+    hovf = C->h_rb->ctr.ovf;
     /* The TRUNCATED LIST is SOFT (return 1): it says this slab's trial
      * division is untrustworthy, not that the device or the run is broken.
      * Norm overflow, immediately below, is NOT -- see its own note. It is
@@ -1399,11 +1879,11 @@ static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
                         " cap -- slab skipped", hovf, PIPE_K);
         return 1;
     }
-    CK(mtlMemcpy(&nacc, C->d_nacc, 4, mtlMemcpyDeviceToHost));
+    nacc = C->h_rb->ctr.nacc;
     if (nacc > C->ccap) {           /* the scatter clamped; redo it once, larger */
         if (pipe_td_grow_cand(C, nacc)) return -1;
         MTL_LAUNCH(k_scatter_sel, blocks, threads, 0, 0, C->d_aflag, C->d_aoff, n, C->d_sel, C->ccap, C->d_nacc);
-        CK(mtlDeviceSynchronize()); CK(mtlGetLastError());
+        CK(pipe_qsync()); CK(mtlGetLastError());
     }
     *nacc_out = nacc;
 
@@ -1496,6 +1976,132 @@ static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
 /* Memory reports are telemetry, not part of the scientific result. A failed
  * query must never discard a completed band or bypass the final cofactor queue
  * flush. Admission-control queries remain fatal at their call site. */
+/* ---- --cof-async: the cofactor queue flushed off the q loop -------------- *
+ *
+ * glas overlaps its device ECM with the next special-q's sieve; cuda-sieve's
+ * queue flush used to stall the q loop for the whole of it (57 ms/q of 315 on
+ * the 2,1147+ job, RTX 4090). Under --cof-async the queue is double-buffered:
+ * when the filling set is full it is handed, whole, to a host thread that runs
+ * the unchanged cofq_flush on g_cof_stream, and the q loop carries on into the
+ * spare set. Flushes stay strictly serialised -- the next one waits for this
+ * one -- so relation order, and so the output file, is exactly what the
+ * synchronous path writes.
+ *
+ * Only the per-batch DEVICE BUFFERS move between the two sets. The schedule
+ * tables, the status histogram d_nst and every host statistic and chunk
+ * steering field belong to the canonical queue Q: the flush works on a copy
+ * (F) and cofa_wait copies them back, which is safe because nothing else
+ * writes them while a flush is in flight. */
+static void cofq_swap_buffers(cofq_t *a, cofq_t *b)
+{
+#define CQ_SW(f) std::swap(a->f, b->f)
+    CQ_SW(n);
+    CQ_SW(d_c0); CQ_SW(d_c1); CQ_SW(d_st0); CQ_SW(d_st1);
+    CQ_SW(d_sm0); CQ_SW(d_sm1); CQ_SW(d_a); CQ_SW(d_b);
+    CQ_SW(d_f0); CQ_SW(d_f1); CQ_SW(d_fn0); CQ_SW(d_fn1);
+    CQ_SW(d_sp0); CQ_SW(d_sp1); CQ_SW(d_nsp0); CQ_SW(d_nsp1);
+    CQ_SW(d_flag); CQ_SW(d_off); CQ_SW(d_bsum); CQ_SW(d_idx); CQ_SW(d_nrel);
+    CQ_SW(d_sel); CQ_SW(d_nsel); CQ_SW(d_ovf);
+#undef CQ_SW
+}
+
+typedef struct {
+    cofq_t      spare;      /* the second buffer set; only its buffers are used */
+    cofq_out_t  spare_out;  /* allocated by cofq_init alongside it, unused      */
+    cofq_t      F;          /* the queue as handed to the in-flight flush       */
+    std::thread *th;
+    std::atomic<int> *fin;  /* set by the flush thread as its last act         */
+    int         busy, rc;
+    double      ms_wait;    /* host time the q loop spent waiting on a flush    */
+    /* Each async flush's own wall time, and the spacing of their starts: a
+     * flush that takes longer than the interval is what ms_wait pays for. */
+    double      t_start, t_last, ms_flush, ms_interval;
+    int         nflush;
+    /* The checkpoint the flush writes when it is done (ck_pending), from the
+     * flush thread itself: its relations are then in the file, and the q loop
+     * never waits on the fsync. Measured on a network filesystem (CephFS) at
+     * ~0.6 s a flush -- 16-19 ms/q, a quarter of c187's wall -- against
+     * nothing on local disk; a volunteer's slow disk pays it the same way.
+     * Every other checkpoint is written by the q loop only after cofa_wait,
+     * so ck and its flags are never touched by both threads at once. */
+    const poly_t *ck_P;
+    ckpt_t      *ck;
+    FILE        *ck_fc;
+    unsigned long long ck_base_rel;
+    int         *ck_written, *ck_warned;
+    /* The resume point as it stood when the in-flight flush started: the file
+     * holds exactly that flush's relations once it is joined, so that is the
+     * checkpoint to write then -- not the q the loop has since reached. */
+    int         ck_pending;
+    qsel_t      ck_next;
+    unsigned long long ck_nq;
+} cofasync_t;
+
+static int cofa_wait(cofasync_t *A, cofq_t *Q)
+{
+    if (!A->busy) return 0;
+    const double t0 = host_ms();
+    A->th->join();
+    delete A->th;
+    A->th = NULL;
+    A->busy = 0;
+    A->ms_wait += host_ms() - t0;
+    Q->ms_rat = A->F.ms_rat; Q->ms_alg = A->F.ms_alg; Q->ms_host = A->F.ms_host;
+    Q->nseen = A->F.nseen; Q->nrel = A->F.nrel;
+    memcpy(Q->nst, A->F.nst, sizeof Q->nst);
+    Q->chunk_cur = A->F.chunk_cur; Q->chunk_ceiling = A->F.chunk_ceiling;
+    Q->eff_prev_valve = A->F.eff_prev_valve;
+    Q->ms_prev_valve = A->F.ms_prev_valve;
+    Q->valve_parked = A->F.valve_parked;
+    A->spare.n = 0;
+    return A->rc;
+}
+
+static void cofa_start(cofasync_t *A, cofq_t *Q, cofq_out_t *O,
+                       const bench_cfg_t *cfg, int blocks, FILE *fr)
+{
+    {   /* Metal only: see metal/gen_pipeline_host.py. The q loop's stream
+         * and g_cof_stream are separate command queues with no ordering
+         * between them, and the enqueue below has just written the buffers
+         * this flush is about to read. */
+        const mtlError_t _e = mtlDeviceSynchronize();
+        if (_e != mtlSuccess)
+            fprintf(stderr, "  pipeline: the cofactor handover barrier failed:"
+                    " %s; the flush will report it\n", mtlGetErrorString(_e));
+    }
+    A->F = *Q;                        /* full buffers, stats, steering   */
+    cofq_swap_buffers(Q, &A->spare);  /* Q now fills the spare set, n=0  */
+    A->busy = 1;
+    A->rc = 0;
+    A->fin->store(0, std::memory_order_relaxed);
+    A->t_start = host_ms();
+    if (A->nflush) A->ms_interval += A->t_start - A->t_last;
+    A->t_last = A->t_start;
+    A->nflush++;
+    /* Full width. Launching the flush narrower so the sieve kept SMs to
+     * itself was measured twice: blocks/2, /4 at 278.2, 277.0 ms/q against
+     * 276.5 (2,1147+, RTX 4090), and 256/128/64 blocks against 768 at
+     * 196.8/195.6/203.5 vs 192.5 (and c187 68.6/70.5/69.8 vs 66.9). No
+     * effect, so there is no knob. */
+    const mtlStream_t cs = g_cof_stream;   /* thread_local: hand it over */
+    const int ecm_rounds = (int)Q->ecm_rounds;
+    A->th = new std::thread([A, O, cfg, blocks, fr, cs, ecm_rounds]() {
+        g_cof_stream = cs;
+        wd_bind(-1);    /* the sieve thread's slot stays the sieve thread's */
+        A->rc = cofq_flush(&A->F, O, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
+                           ecm_rounds, cfg->cof_budget, cfg->cof_chunk,
+                           blocks, cfg->threads, fr);
+        if (A->rc == 0 && A->ck_pending) {
+            pipe_try_checkpoint(A->ck_P, cfg, A->ck, fr, A->ck_fc, &A->ck_next,
+                                A->ck_base_rel + A->F.nrel, A->ck_nq,
+                                A->ck_written, A->ck_warned);
+            A->ck_pending = 0;
+        }
+        A->ms_flush += host_ms() - A->t_start;
+        A->fin->store(1, std::memory_order_release);
+    });
+}
+
 static int pipe_mem_info_optional(const char *where,
                                   size_t *free_bytes, size_t *total_bytes)
 {
@@ -1582,6 +2188,21 @@ static inline double pipe_ovl_credit(double acc_ovl)
     return acc_ovl > 0 ? acc_ovl : 0;
 }
 
+/* Both sides' transform time for the q whose events these are. The explicit
+ * ev[4] synchronises are load-bearing (see the read after the slab loop):
+ * time_kernel discards mtlEventElapsedTime's status, so a not-ready event
+ * would read 0 ms and latch mtlErrorNotReady for the next unrelated check. */
+static int pipe_read_transform(const pside_t *S1, const pside_t *S0,
+                               float *t1, float *t0)
+{
+    if (CUDA_CHECKED(mtlEventSynchronize(S1->ev[4])) ||
+        CUDA_CHECKED(mtlEventSynchronize(S0->ev[4])))
+        return -1;
+    *t1 = time_kernel(S1->ev[0], S1->ev[4]);
+    *t0 = time_kernel(S0->ev[0], S0->ev[4]);
+    return 0;
+}
+
 template <bool SLABBED>
 static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                              const fb_t *fb0, const fb_t *fbs0,
@@ -1589,6 +2210,15 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                              const poly_t *POLY, const bench_cfg_t *cfg,
                              const slab_plan_t *slab_plan)
 {
+    /* First, ahead of every goto: see pipe_print_guard_t, and cofasync_t's
+     * `fin`, which the memset of A below cannot hold by value. */
+    pipe_print_guard_t pg;
+    std::atomic<int> cofa_fin(0);
+    pg.lock();
+    if (g_pinst)
+        printf("\n=== instance %d of %d: q [%llu, %llu] ===\n", g_pinst->k,
+               g_pinst->n, (unsigned long long)g_pinst->qmin,
+               (unsigned long long)g_pinst->qmax);
     const uint32_t I = 1u << cfg->logI;
     const uint32_t xmax_alloc = I * slab_plan->jmax;
     const uint32_t nregion_alloc = xmax_alloc >> cfg->log_region;
@@ -1602,10 +2232,23 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     pipe_td_t C;
     pipe_tm_t tm;
     cofq_t Q; cofq_out_t QO;
+    cofasync_t A;
     uint8_t *d_bucket = NULL;
     double vram_prev = 0;
     size_t need = 0;
     uint32_t *d_cursor = NULL, *d_overflow = NULL, *d_two = NULL;
+    /* --fill-gate with --fill-gate-shift > 0: side 1's folded bitmap */
+    uint32_t *d_gate = NULL;
+    /* --q-pipeline as GRANTED, not as requested: the stream the next q is
+     * sieved on. Both sides share the bucket array's overflow counter, as in
+     * the serial arm: side 1's count is copied to the host in stream order,
+     * behind its apply, before side 0's issue clears the counter (finding
+     * 114 retired the separate side-0 counter this needed when the join
+     * read the counter after both sides had run). */
+    mtlStream_t st_sv = 0;
+    int qpipe = 0;
+    /* Slabs and q actually issued ahead, for the band summary. */
+    unsigned long long n_ahead_slab = 0, n_ahead_q = 0;
     /* Second bucket workspace, allocated only under --fill-concurrent. The
      * two sides share one today because they run back to back; overlapping
      * them is exactly what that sharing forbids. */
@@ -1613,6 +2256,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     uint32_t *d_cursor_c = NULL, *d_overflow_c = NULL;
     mtlStream_t st_side[2] = { 0, 0 };
     int concurrent = 0;         /* the option as GRANTED, not as requested */
+    int dual = 0;               /* serial arm with a second bucket array      */
     pbkt_t bk1, bk0;
     uint32_t *d_n = NULL;
     unsigned long long *d_pre = NULL;
@@ -1731,6 +2375,8 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     memset(&S1, 0, sizeof S1); memset(&S0, 0, sizeof S0);
     memset(&C, 0, sizeof C); memset(&tm, 0, sizeof tm);
     memset(&Q, 0, sizeof Q); memset(&QO, 0, sizeof QO);
+    memset(&A, 0, sizeof A);
+    A.fin = &cofa_fin;
 #define PIPE_CK(x) do { if (CUDA_CHECKED(x)) { rc = -1; goto done; } } while (0)
 /* Headroom left for the per-q buffers that grow on demand after all
  * one-time setup -- measured at 0.12 GB at 15e (finding 94). ONE constant:
@@ -1761,6 +2407,21 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     est0 = pipe_est_records(fb0, xmax_alloc);
     est = est1 > est0 ? est1 : est0;
     cap = (uint32_t)(est / nregion_alloc) + 256;
+    /* TEST-ONLY (PIPE_CAP_PCT, 100 everywhere else): cut the bucket capacity
+     * so that some slabs overflow. No real job reaches the bucket-overflow
+     * soft skip (degradecheck.sh), and finding 114's review needed it driven
+     * with the next q already prepared. Set through DEFS, so a build that
+     * changes it is marked a pricing build. Region loads are tight, so the
+     * band where SOME slabs overflow is narrow: such a build also reads a
+     * finer setting, in parts per thousand, from BENCH_TEST_CAP_PERMILLE. */
+    if (PIPE_CAP_PCT != 100) {
+        unsigned long pm = (unsigned long)PIPE_CAP_PCT * 10;
+        const char *e = getenv("BENCH_TEST_CAP_PERMILLE");
+        if (e && *e) pm = strtoul(e, NULL, 10);
+        cap = (uint32_t)((uint64_t)cap * pm / 1000);
+        printf("  TEST BUILD: bucket capacity cut to %lu per mille of the"
+               " estimate's (%u records per region)\n", pm, cap);
+    }
     {
         size_t freeB = 0, totalB = 0;
         need = (size_t)nregion_alloc * cap * 4;
@@ -1768,12 +2429,26 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         printf("  bucket array %u x %u x 4 B = %.2f GB, shared by both sides"
                " (%.2f GB free)\n", nregion_alloc, cap, need / 1073741824.0,
                freeB / 1073741824.0);
+        /* PIPE_RC_NOVRAM, not -1: when run_pipeline sized the slab up from
+         * free VRAM, another process may have taken that memory since (two
+         * tasks starting on one GPU), and the band can still run at the
+         * default slab. Nothing is opened or consumed before this point. */
         if (need + PIPE_VRAM_MARGIN > freeB) {
             fprintf(stderr, "  pipeline: bucket array does not fit\n");
-            rc = -1;
+            rc = PIPE_RC_NOVRAM;
             goto done;
         }
-        PIPE_CK(mtlMalloc(&d_bucket, need));
+        {
+            const mtlError_t me = mtlMalloc(&d_bucket, need);
+            if (me == mtlErrorMemoryAllocation) {
+                (void)mtlGetLastError();        /* not sticky; clear it */
+                fprintf(stderr, "  pipeline: bucket array allocation of"
+                        " %.2f GB failed\n", need / 1073741824.0);
+                rc = PIPE_RC_NOVRAM;
+                goto done;
+            }
+            PIPE_CK(me);
+        }
     }
     /* The OTHER capacity a job can undersize, reported beside the bucket array
      * because the two are the pair the per-slab soft skips fire on and the pair
@@ -1826,13 +2501,19 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     {
         const size_t apply_smem =
             S1.apply_smem > S0.apply_smem ? S1.apply_smem : S0.apply_smem;
-        /* MaxDynamicSharedMemorySize belongs to this k_apply specialization.
+        /* MaxDynamicSharedMemorySize belongs to each k_apply specialization.
          * Setting it independently while initializing the two sides is wrong:
-         * the second side can lower the limit required by the first. */
-        PIPE_CK(mtlFuncSetMaxThreadgroupMemory(SLABBED ? "k_apply_16_1_1_1" : "k_apply_16_1_1_0", apply_smem));
+         * the second side can lower the limit required by the first. Both
+         * SSTAIL instances, because the launch picks one per q. */
+        PIPE_CK(mtlFuncSetMaxThreadgroupMemory(SLABBED ? "k_apply_16_1_1_1_1" : "k_apply_16_1_1_0_1", apply_smem));
+        PIPE_CK(mtlFuncSetMaxThreadgroupMemory(SLABBED ? "k_apply_16_1_1_1_1" : "k_apply_16_1_1_0_1", apply_smem));
     }
     VRAM_MARK("factor bases + bitmaps");
     PIPE_CK(mtlMalloc(&d_two, (size_t)nbitword_alloc * 4));
+    if (cfg->fill_gate && cfg->fill_gate_shift)
+        PIPE_CK(mtlMalloc(&d_gate, (size_t)((nbitword_alloc +
+                           (1u << cfg->fill_gate_shift) - 1) >>
+                           cfg->fill_gate_shift) * 4));
     PIPE_CK(mtlMalloc(&d_n, 4));
     PIPE_CK(mtlMalloc(&d_pre, 8));
     /* Untimed warm-up, n = 0 so it touches nothing. Everything above this line
@@ -1848,7 +2529,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
      * and apply still pay their own first-launch cost inside q0. They are the
      * reps-stable stages and the cost is one-time either way, but a band short
      * enough to care should be treated as a warm-up run, not a measurement. */
-    MTL_LAUNCH_NAMED((SLABBED ? "k_transform_1" : "k_transform_0"), blocks, cfg->threads, 0, 0, S1.primes, S1.roots, S1.plat, 0u, cfg->logI, cfg->J, (int64_t)1, (int64_t)0, (int64_t)0, (int64_t)1, S1.d_nproj, S1.d_nlost, S1.walk_cur);
+    MTL_LAUNCH_NAMED((SLABBED ? "k_transform_1" : "k_transform_0"), blocks, cfg->threads, 0, 0, S1.primes, S1.roots, S1.plat, 0u, cfg->logI, cfg->J, (int64_t)1, (int64_t)0, (int64_t)0, (int64_t)1, S1.d_nproj, S1.d_nlost, S1.walk_cur, nullptr, 0);
     PIPE_CK(mtlDeviceSynchronize());
     PIPE_CK(mtlGetLastError());
     if (pipe_td_init(&C, fbs1, fbs0, POLY, nbitword_alloc)) { rc = -1; goto done; }
@@ -1866,6 +2547,26 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                                    (uint32_t)cfg->cof_rounds))
         { rc = -1; goto done; }
     if (cfg->cofactor) VRAM_MARK("cofactor queue");
+    if (cfg->cofactor && cfg->cof_async) {
+        int plo = 0, phi = 0, irc;
+        g_cofq_quiet = 1;
+        irc = cofq_init(&A.spare, &A.spare_out, CQ_FLUSH,
+                        cfg->cof_meth0, cfg->cof_meth1,
+                        cfg->ecm_b1, cfg->ecm_b2, cfg->ecm_curves,
+                        cfg->cof_limbs0, cfg->cof_limbs,
+                        cfg->ecm_curves_set, (uint32_t)cfg->cof_rounds);
+        g_cofq_quiet = 0;
+        if (irc) { rc = -1; goto done; }
+        /* Lowest priority, so the q loop's own kernels win any SM a flush
+         * frees -- what glas does with its ECM stream. The legacy stream the
+         * loop runs on is itself at the default (lowest) priority today, so
+         * on current parts this ties rather than yields. */
+        PIPE_CK(mtlDeviceGetStreamPriorityRange(&plo, &phi));
+        PIPE_CK(mtlStreamCreateWithPriority(&g_cof_stream,
+                                             mtlStreamNonBlocking, plo));
+        VRAM_MARK("cofactor queue, second buffer set");
+        printf("  cofactor queue: async, double-buffered (--no-cof-async: inline)\n");
+    }
     /* --fill-concurrent's admission check, deliberately LAST.
      *
      * It ran beside the first bucket array at first, and that was wrong: the
@@ -1917,7 +2618,148 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                " subtracts the overlap\n");
         VRAM_MARK("second bucket array");
     }
+    /* The SERIAL arm's second bucket array, when VRAM allows (default on,
+     * --no-dual-bucket). Side 0 then fills its own array instead of
+     * overwriting side 1's, so side 1's records are still resident at trial
+     * division and k_resieve_bucket covers both sides instead of side 1
+     * re-walking every lattice (measured under --fill-concurrent: resieve
+     * 28.8 -> 21.9 ms/q, RTX 4090). Same launches, same stream, same caps --
+     * the relations cannot change. Optional, so never fatal: a card without
+     * the room (margin max(1 GiB, 10%), since a volunteer's card may also be
+     * driving a display) keeps the one shared array exactly as before. */
+    if (!concurrent && cfg->bucket_resieve && cfg->dual_bucket &&
+        cfg->log_region <= (int)FINE_SHIFT) {
+        const size_t need2 = need + (size_t)nregion_alloc * 4 + 4;
+        size_t f2 = 0, t2 = 0;
+        PIPE_CK(mtlMemGetInfo(&f2, &t2));
+        const size_t gib = (size_t)1 << 30;
+        const size_t margin = t2 / 10 > gib ? t2 / 10 : gib;
+        if (need2 + margin + pipe_inst_reserve() <= f2) {
+            PIPE_CK(mtlMalloc(&d_bucket_c, need));
+            PIPE_CK(mtlMalloc(&d_cursor_c, (size_t)nregion_alloc * 4));
+            PIPE_CK(mtlMalloc(&d_overflow_c, 4));
+            dual = 1;
+            printf("  second bucket array (%.2f GB): side 1's records kept for"
+                   " the bucket resieve\n", need / 1073741824.0);
+            VRAM_MARK("second bucket array (serial)");
+        } else {
+            printf("  one bucket array: %.2f GB free is short of a second"
+                   " (%.2f GB + margin); side 1 resieves by walking\n",
+                   f2 / 1073741824.0, need2 / 1073741824.0);
+        }
+    }
+    /* --q-pipeline's admission check, after every other allocation for the
+     * same reason as --fill-concurrent's above: free memory is only real once
+     * the factor bases, TD context and cofactor queue are resident.
+     *
+     * It needs a second copy of what the next q's k_transform writes while
+     * this q's resieve still reads it: plat for every bucketed entry and
+     * rowrt for the row tier. On a slabbed plan, where the next SLAB is also
+     * sieved under this slab's TD, a third walk-cursor buffer per entry
+     * (walk_spare; see pside_rotate_walk). NOT another bucket array: the
+     * next q's fills reuse this q's one or two, and pipe_td_perq issues them
+     * only after both sides' bucket resieve has recorded C.ev[14] (st_sv
+     * waits on it), so a fill never overwrites records still being read.
+     *
+     * Under --instances the siblings still to set up are held back
+     * (pipe_inst_reserve), as for the second bucket array above; their
+     * modelled footprint already prices this transform set.
+     *
+     * SINGLE-QUEUED, NOT REFUSED, when it does not fit: the flag asks for a
+     * speed-up, and a job that runs today must keep running. The banner and
+     * the run log say which happened. */
+    if (cfg->q_pipeline) {
+        char why[160] = "";
+        size_t extra = 0;
+        for (int side = 0; side < 2; side++) {
+            const pside_t *S = side ? &S1 : &S0;
+            extra += (size_t)S->nfb * sizeof(plat_t) + (size_t)S->nrow * 4;
+            if (SLABBED) extra += (size_t)S->nfb * sizeof(uint64_t);
+        }
+        /* bench_main refuses these combinations on the command line; a caller
+         * reaching this public entry point another way gets the same answer
+         * as every other exclusion here, one q at a time. */
+        if (concurrent || cfg->qspan) {
+            snprintf(why, sizeof why, "%s excludes it",
+                     concurrent ? "--fill-concurrent" : "--qspan");
+        } else {
+            size_t f3 = 0, t3 = 0;
+            PIPE_CK(mtlMemGetInfo(&f3, &t3));
+            const size_t reserve = pipe_inst_reserve();
+            if (extra + PIPE_VRAM_MARGIN + reserve > f3)
+                snprintf(why, sizeof why, "it needs %.2f GB more and %.2f GB"
+                         " is free%s", extra / 1073741824.0, f3 / 1073741824.0,
+                         reserve ? " after the other instances' share" : "");
+        }
+        if (!why[0]) {
+            /* An allocation that fails AFTER the check passed -- another
+             * process took the memory, or (WSL2) the driver's free figure was
+             * optimistic -- is not a reason to fail a band that runs
+             * single-queued. Undo the partial set, clear the error (an
+             * out-of-memory status is not sticky) and fall back. */
+            mtlError_t e = mtlSuccess;
+            for (int side = 0; side < 2 && e == mtlSuccess; side++) {
+                pside_t *S = side ? &S1 : &S0;
+                e = mtlMalloc(&S->plat_alt, (size_t)S->nfb * sizeof(plat_t));
+                if (e == mtlSuccess && S->nrow)
+                    e = mtlMalloc(&S->rowrt_alt, (size_t)S->nrow * 4);
+                if (e == mtlSuccess && SLABBED)
+                    e = mtlMalloc(&S->walk_spare,
+                                   (size_t)S->nfb * sizeof(uint64_t));
+            }
+            if (e == mtlSuccess)
+                e = mtlStreamCreateWithFlags(&st_sv, mtlStreamNonBlocking);
+            if (e != mtlSuccess) {
+                mtlGetLastError();
+                for (int side = 0; side < 2; side++) {
+                    pside_t *S = side ? &S1 : &S0;
+                    mtlFree(S->plat_alt);   S->plat_alt = NULL;
+                    mtlFree(S->rowrt_alt);  S->rowrt_alt = NULL;
+                    mtlFree(S->walk_spare); S->walk_spare = NULL;
+                }
+                if (st_sv) { mtlStreamDestroy(st_sv); st_sv = 0; }
+                snprintf(why, sizeof why, "allocating it failed (%s)",
+                         mtlGetErrorString(e));
+            }
+        }
+        if (why[0]) {
+            printf("  --q-pipeline: staying single-queued, because %s\n", why);
+            runlog_note("q-pipeline", "single-queued: %s", why);
+        } else {
+            qpipe = 1;
+            if (SLABBED)
+                printf("  --q-pipeline: each slab's sieve under the previous"
+                       " slab's trial division, across q too; a second"
+                       " transform set and a third walk-cursor set (%.2f GB)\n",
+                       extra / 1073741824.0);
+            else
+                printf("  --q-pipeline: two special-q in flight, a second"
+                       " transform set (%.2f GB)\n", extra / 1073741824.0);
+            printf("  NOTE: stage times now include sharing the card with the"
+                   " other q; only wall clock per q is additive, and"
+                   " `unaccounted` and GPU-accounted / wall are not reported\n");
+            runlog_note("q-pipeline", "%s, +%.2f GB",
+                        SLABBED ? "slabs and q overlapped" : "two q in flight",
+                        extra / 1073741824.0);
+            VRAM_MARK("q-pipeline transform set");
+        }
+    } else {
+        runlog_note("q-pipeline", "off");
+    }
 #undef VRAM_MARK
+    /* Name the fill knobs in the banner: a knob the log does not show is one
+     * a reader cannot prove was live. */
+    if (cfg->fill_rows)
+        printf("  --fill-rows %d: q < %d*I filled by row (side 1: %u entries,"
+               " side 0: %u), %s\n", cfg->fill_rows, cfg->fill_rows,
+               S1.nrow, S0.nrow,
+               cfg->fill_row_bands ? "fixed row bands" : "auto row bands");
+    if (cfg->resieve_rows)
+        printf("  --resieve-rows: the same tier is resieved by row\n");
+    if (cfg->fill_gate)
+        printf("  --fill-gate: side 0 stores fill records only under side 1's"
+               " survivors, 1 gate bit per %u positions\n",
+               1u << cfg->fill_gate_shift);
 
     /* Serial mode points BOTH sides at the one workspace on the legacy default
      * stream, which is what the two sides have always shared -- so the slab
@@ -1931,6 +2773,13 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         bk0.bucket = d_bucket_c; bk0.cursor = d_cursor_c;
         bk0.overflow = d_overflow_c; bk0.cap = cap;
         bk0.stream = st_side[0];
+    } else if (dual) {
+        /* Serial, on the legacy stream like the one-array arm; only the
+         * workspace differs. */
+        bk0 = bk1;
+        bk0.bucket = d_bucket_c; bk0.cursor = d_cursor_c;
+        bk0.overflow = d_overflow_c;
+        bk0.stream = 0;
     } else {
         bk0 = bk1;
         /* Redundant today -- bk1.stream is provably 0 on this branch -- and
@@ -1939,6 +2788,17 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
          * stream, so a later edit to the ternary above cannot hand the serial
          * path a side stream by accident. */
         bk0.stream = 0;
+    }
+    /* --q-pipeline: both sides on the one non-blocking sieve stream, so the
+     * gate's side-1-before-side-0 order is stream order and a bucket array is
+     * never filled by two q at once; TD and cofactorisation stay on the
+     * legacy stream, which a non-blocking stream does not wait for. Each
+     * side keeps its own array when the serial arm has two (dual): only the
+     * stream moves. The next unit's fill waits for this one's resieves on
+     * C.ev[14] (see issue_next), the last readers of either array. */
+    if (qpipe) {
+        bk1.stream = st_sv;
+        bk0.stream = st_sv;
     }
 
     if (cfg->relations && cfg->candidates &&
@@ -2024,8 +2884,12 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
          * handler, because signal(SIGTERM) is never delivered there. A task
          * stopped with TerminateProcess still runs nothing at all, so
          * --stop-file remains the only reliable managed stop on Windows. */
-        stop_hooked = bench_stop_hook_install(pipe_request_stop) == 0;
-        g_pipe_stop = 0;
+        /* --instances: run_pipeline_instances owns the hook and the flag for
+         * all of them; one instance finishing must not unhook the others. */
+        if (!g_pinst) {
+            stop_hooked = bench_stop_hook_install(pipe_request_stop) == 0;
+            g_pipe_stop = 0;
+        }
     }
 
     /* ---- the band ---- */
@@ -2044,7 +2908,10 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
      * have silently moved from 30 s to 300 s because log_every_s defaults to
      * 300 whether or not a log exists. The run log (--log) is a separate,
      * richer stream on its own clock. */
-    const int reporting_to_tty = bench_stdout_is_tty();
+    /* --instances: whole lines, tagged, since several pipelines report. */
+    const int reporting_to_tty = bench_stdout_is_tty() && !g_pinst;
+    char ipfx[16] = "";
+    if (g_pinst) snprintf(ipfx, sizeof ipfx, "[%d] ", g_pinst->k);
     const double report_ms = reporting_to_tty ? 30000.0 : 300000.0;
 #ifdef HAVE_BOINC
     double t_boinc_report = t_band - 1000.0; /* report after the first q */
@@ -2058,6 +2925,78 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
      * resume scan sit under one coarse label and can legitimately run for
      * minutes. */
     wd_arm_kill();
+    if (g_pinst) g_pinst->sh->setups_left--;
+    pg.unlock();            /* --instances: the band runs alongside the others */
+    /* --q-pipeline: the special-q selected ahead of the loop top that will
+     * process it, during the previous q's last slab (prepared before that
+     * slab's join, issued after its intersection, finding 114). spec_qr
+     * replays the source step's outcome there, and spec_issued says its
+     * sieve is already running on st_sv. A q that was prepared but not
+     * issued -- the norm-width skip, the stop flag, or a soft skip of the
+     * previous q -- is prepared again by the loop top, which only then warns
+     * and counts a skip. */
+    int spec_have = 0, spec_issued = 0, spec_qr = 0;
+    qsel_t spec_raw = {};
+    double spec_th1 = 0, spec_th0 = 0;
+    /* One step of the special-q source: 1 = a q, 0 = none left, -1 = failure.
+     * qlist first, then the streaming generator. The loop top and the
+     * --q-pipeline issue point both pull through this, and both ask
+     * count_limit_before first. */
+    auto pull_q = [&](uint32_t idx, qsel_t *out) -> int {
+        if (idx < nq) { *out = qlist[idx]; return 1; }
+        if (qgen) {
+            const int r = sqgen_next(qgen, out);
+            return r < 0 ? -1 : (r > 0 ? 1 : 0);
+        }
+        return 0;
+    };
+    /* The generator's budget, checked before pulling position idx with `done`
+     * q completed. Enforced here as well as in the generator, because a
+     * resumed run hands sqgen no limit at all -- see the sqgen_create comment
+     * in bench_main.cu. Without this the budget would not exist. A qlist is
+     * bounded by its own length. */
+    auto count_limit_before = [&](uint32_t idx, uint32_t done) -> int {
+        return idx >= nq && qgen && cfg->nq_max && done >= cfg->nq_max;
+    };
+    /* Both sides' preparation, short-circuiting on failure or skip like the
+     * `||` chain it replaced: 0, PIPE_Q_SKIP, or negative. One side being
+     * unfittable is enough to pass over the q, and running side 0 after side
+     * 1 failed would launch work against a sticky error and blame side 0. */
+    auto prepare_sides = [&](const qlat_t *L, double *h1, double *h0,
+                             int quiet_skip) -> int {
+        const int p1 = pipe_side_prepare_q<SLABBED>(fb1, fbs1, L, POLY, cfg, 1,
+                                                    cfg->scale, blocks, &S1, h1,
+                                                    st_sv, quiet_skip);
+        if (p1 != 0) return p1;
+        return pipe_side_prepare_q<SLABBED>(fb0, fbs0, L, POLY, cfg, 0,
+                                            cfg->scale0, blocks, &S0, h0,
+                                            st_sv, quiet_skip);
+    };
+    /* One side's sieve issue for one slab. Side 0 is gated on side 1's bitmap
+     * when the gate is on, which it never is under --fill-concurrent. */
+    auto issue_side = [&](int side, uint32_t xmax, uint32_t j_base) -> int {
+        return side
+            ? pipe_side_sieve_issue<SLABBED>(fb1, cfg, 1, xmax, j_base, &bk1,
+                                             fblocks, fthreads, &S1)
+            : pipe_side_sieve_issue<SLABBED>(fb0, cfg, 0, xmax, j_base, &bk0,
+                                             fblocks, fthreads, &S0,
+                                             cfg->fill_gate ? S1.survbits : NULL,
+                                             d_gate);
+    };
+    /* --q-pipeline: both sides of slab `sl` (of the q currently prepared)
+     * issued back to back on st_sv, with no host wait; the joins come at the
+     * loop top that consumes it. A failed issue leaves launches in flight, so
+     * the stream is drained before the caller unwinds. Counted (n_ahead_*),
+     * so a band shows how often each kind of overlap actually happened. */
+    auto issue_ahead = [&](uint32_t sl) -> int {
+        const uint32_t xm = I * slab_rows_at(slab_plan, cfg->J, sl);
+        const uint32_t jb = slab_jbase_at(slab_plan, sl);
+        if (issue_side(1, xm, jb) || issue_side(0, xm, jb)) {
+            mtlStreamSynchronize(st_sv);
+            return -1;
+        }
+        return 0;
+    };
     for (uint32_t qi = 0;; qi++) {
         qsel_t generated, checked;
         const qsel_t *cur;
@@ -2121,38 +3060,35 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         const int want_host = !cfg->cofactor || fc;
 
         wd_phase("q.select");
-        if (qi < nq) {
-            cur = &qlist[qi];
-        } else if (qgen) {
-            int qr;
-            /* Enforced here as well as in the generator, because a resumed run
-             * hands sqgen no limit at all -- see the sqgen_create comment in
-             * bench_main.cu. Without this the budget would not exist. */
-            if (cfg->nq_max && nqdone >= cfg->nq_max) {
-                count_limit_reached = 1;
-                break;
-            }
-            qr = sqgen_next(qgen, &generated);
-            if (qr < 0) {
-                fprintf(stderr, "  special-q generator failed after %u q\n",
-                        nqdone);
-                rc = -1; break;
-            }
-            if (qr == 0) {
-                if (cfg->nq_max && nqdone >= cfg->nq_max)
-                    count_limit_reached = 1;
-                else
-                    source_exhausted = 1;
-                break;
-            }
-            cur = &generated;
+        int pre_issued = 0, ts_read = 0, qr;
+        if (spec_have) {
+            /* Pulled during the previous q's last slab. Its outcome is replayed
+             * below, so a failed or exhausted source is reported at the same
+             * loop top, with the same nqdone, as it would have been. */
+            spec_have = 0;
+            qr = spec_qr;
+            generated = spec_raw;
+            pre_issued = spec_issued;
+            if (pre_issued) { th1 = spec_th1; th0 = spec_th0; }
+        } else if (count_limit_before(qi, nqdone)) {
+            count_limit_reached = 1;
+            break;
         } else {
+            qr = pull_q(qi, &generated);
+        }
+        if (qr < 0) {
+            fprintf(stderr, "  special-q generator failed after %u q\n",
+                    nqdone);
+            rc = -1; break;
+        }
+        if (qr == 0) {
             if (cfg->nq_max && nqdone >= cfg->nq_max)
                 count_limit_reached = 1;
             else
                 source_exhausted = 1;
             break;
         }
+        cur = &generated;
         /* Validate again at the consumer boundary. bench_main validates every
          * input before scale derivation, but run_pipeline is a public entry
          * point and the streaming generator supplies later q directly here. */
@@ -2234,6 +3170,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                           : "Mostly bucket overflow: check this job's bucket"
                             " array size first (the counts above separate the"
                             " two).");
+            if (cofa_wait(&A, &Q)) { rc = -1; break; }
             if (cfg->cofactor && Q.n &&
                 cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
                            (int)Q.ecm_rounds, cfg->cof_budget, cfg->cof_chunk, blocks,
@@ -2275,6 +3212,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             printf("\n  stopping cleanly at q=%llu; draining the cofactor"
                    " queue\n", (unsigned long long)cur->q);
             wd_phase("stop.cofq_flush");
+            if (cofa_wait(&A, &Q)) { rc = -1; break; }
             if (cfg->cofactor && Q.n &&
                 cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
                            (int)Q.ecm_rounds, cfg->cof_budget, cfg->cof_chunk, blocks,
@@ -2317,14 +3255,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 hreg = host_ms();
             }
             wd_phase("q.prepare");
-            const int p1 = pipe_side_prepare_q<SLABBED>(fb1, fbs1, &Lq, POLY, cfg, 1,
-                                                        cfg->scale, blocks, &S1,
-                                                        &th1);
-            const int p0 = (p1 != 0) ? p1
-                         : pipe_side_prepare_q<SLABBED>(fb0, fbs0, &Lq, POLY, cfg, 0,
-                                                        cfg->scale0, blocks, &S0,
-                                                        &th0);
-            if (p1 == PIPE_Q_SKIP || p0 == PIPE_Q_SKIP) {
+            /* A q issued ahead was prepared at the issue point. */
+            const int pq = pre_issued ? 0 : prepare_sides(&Lq, &th1, &th0, 0);
+            if (pq == PIPE_Q_SKIP) {
                 if (++nqskip >= (unsigned long long)PIPE_SKIP_MAX) {
                     /* A POLICY STOP, NOT A CRASH. Falling out with rc = -1
                      * skipped the post-loop cofactor flush (guarded on rc == 0)
@@ -2350,6 +3283,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                                     " no supported BN_LIMBS is wide enough for"
                                     " every skipped (q,rho). Run ./normscan"
                                     " over the band.", nqskip);
+                    if (cofa_wait(&A, &Q)) { rc = -1; break; }
                     if (cfg->cofactor && Q.n &&
                         cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim,
                                    cfg->lpb, (int)Q.ecm_rounds, cfg->cof_budget, cfg->cof_chunk,
@@ -2379,7 +3313,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             }
             if (cfg->qspan) { prep_q   = host_ms() - hreg; hreg = host_ms(); }
             wd_phase("q.td_prepare");
-            if (p1 < 0 || p0 < 0 || pipe_td_prepare_q(&C, fbs1, fbs0, &Lq, cfg, &tm)) {
+            if (pq < 0 || pipe_td_prepare_q(&C, fbs1, fbs0, &Lq, cfg, &tm)) {
                 rc = -1; break;
             }
             /* AFTER the skip check, not before: last_q names the band's final
@@ -2393,18 +3327,38 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
          * removes every continuation-state operation from device code. */
         if (cfg->qspan) { tdprep_q = host_ms() - hreg; hreg = host_ms(); }
         uint32_t nslab_skipped_q = 0;   /* soft-skipped slabs, THIS q */
+        /* --q-pipeline: the slab about to be processed was already issued,
+         * at the previous slab's issue point (or, for slab 0, the previous
+         * q's). Only its joins remain, and its walk cursors were turned
+         * there. */
+        int ahead = pre_issued;
+        /* --q-pipeline: the next q was prepared during this q's last slab
+         * (next_prepared), and may be issued (next_ready); its (q, rho) for
+         * the watchdog at the issue. q-level because the end-of-q drain
+         * below needs them after the slab loop. */
+        int next_prepared = 0, next_ready = 0;
+        unsigned long long next_wq = 0, next_wrho = 0;
+        /* The next slab's cursors were already turned at THIS slab's issue
+         * point, so the end-of-slab advance must not swap them again. Set
+         * only at that issue point, cleared at the top of every slab: one
+         * meaning, one slab. */
+        int rotated = 0;
         /* The per-q continuation advance, factored out because THREE paths
          * must run it and one of them is a skip: the ordinary end of the slab
          * loop, and the trial-division skip that keeps going. Returns -1 on a
          * device failure. Skipping it leaves the next slab reading the
-         * previous slab's walk positions against its own j_base. */
+         * previous slab's walk positions against its own j_base. When the
+         * next slab was issued ahead, its cursors were already rotated at the
+         * issue point; only trial division's small-prime origin moves here. */
         auto advance_slab = [&](uint32_t sl, uint32_t rows) -> int {
             if constexpr (SLABBED) {
                 if (sl + 1 < slab_plan->nslab) {
                     if (pipe_td_advance_small(&C, rows, blocks, cfg->threads))
                         return -1;
-                    std::swap(S1.walk_cur, S1.walk_next);
-                    std::swap(S0.walk_cur, S0.walk_next);
+                    if (!rotated) {
+                        std::swap(S1.walk_cur, S1.walk_next);
+                        std::swap(S0.walk_cur, S0.walk_next);
+                    }
                 }
             } else {
                 (void)sl; (void)rows;
@@ -2427,7 +3381,111 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
              * side 1 is unusable there is no point sieving side 0, and the
              * skip below means neither side's survbits are ever read. */
             int sv1, sv0 = 0;
-            if (concurrent) {
+            rotated = 0;
+            /* --q-pipeline: preparing the next q. This q's transform time
+             * first (preparing the next q records the same two events again,
+             * and that wait also guarantees this q's table uploads have left
+             * the pinned staging buffers the preparation overwrites); then
+             * the plat/rowrt sets swap and, slabbed, the walk cursors turn,
+             * because the next q's k_transform writes them while this q's TD
+             * still reads its own (tdS1/tdS0, taken before). Pulls the next
+             * q once -- the source is a generator -- and leaves spec_* for
+             * the loop top. next_ready says it is prepared and may be issued.
+             * Shared by both call sites so the two cannot drift. */
+            ptd_side_t tdS1 = {}, tdS0 = {};
+            auto prepare_next_q = [&]() -> int {
+                if (pipe_read_transform(&S1, &S0, &ts1[0], &ts0[0])) return -1;
+                ts_read = 1;
+                pside_swap_alt(&S1);
+                pside_swap_alt(&S0);
+                /* Slabbed: the next q's k_transform writes walk_cur, which
+                 * this last slab's TD still reads; turn the cursors as for a
+                 * next slab. The new walk_cur is this slab's output, which
+                 * nothing needs once the q is over. */
+                if (SLABBED) {
+                    pside_rotate_walk(&S1);
+                    pside_rotate_walk(&S0);
+                }
+                spec_have = 1; spec_issued = 0;
+                spec_th1 = spec_th0 = 0;
+                wd_phase("q.select_next");
+                spec_qr = pull_q(qi + 1, &spec_raw);
+                if (spec_qr == 1) {
+                    qsel_t vq = spec_raw;
+                    if (qsel_validate(&vq, POLY, cfg->sq_side) == QSEL_VALID) {
+                        qlat_t Ln;
+                        qlat_build(&Ln, vq.q, vq.rho, POLY->skew);
+                        next_wq = vq.q; next_wrho = vq.rho;
+                        /* The watchdog names the q being worked on: the next
+                         * one while it is prepared, this one again after. */
+                        wd_q((unsigned long long)vq.q, (unsigned long long)vq.rho,
+                             (unsigned long long)nqdone);
+                        wd_phase("q.prepare_next");
+                        /* Silent here, and the setup print is left as the
+                         * single-queued run leaves it: a q prepared ahead is
+                         * not yet a q the band has reached. */
+                        const int nv = norm_verbose;
+                        norm_verbose = 0;
+                        const int pn = prepare_sides(&Ln, &spec_th1, &spec_th0, 1);
+                        norm_verbose = nv;
+                        wd_q((unsigned long long)cur->q, (unsigned long long)cur->rho,
+                             (unsigned long long)nqdone);
+                        if (pn < 0) return -1;
+                        /* A skip is not issued: the loop top prepares the q
+                         * again, warns and counts it if it gets that far. */
+                        next_ready = pn == 0;
+                    }
+                    /* An invalid q is not issued; the loop top validates it
+                     * again and fails there, exactly as it would have. */
+                }
+                return 0;
+            };
+            /* ONE POINT, every arm: once this slab is fully issued and before
+             * its last join. TD's views are taken here (nothing between here
+             * and TD changes them, except the swap and rotation below, which
+             * is why they come first). On --q-pipeline's last slab, the next
+             * q is prepared here too, on the host, while this slab's sieve
+             * runs -- not after this q's intersect, where the card waited for
+             * it (0.39 ms/q at C143, finding 113). Its uploads and k_transform
+             * queue on st_sv behind this slab's apply. Same stop and budget
+             * conditions as the issue point used, which now only issues.
+             *
+             * A FAILURE HERE MAY NOT BE THE PREPARATION'S. This slab's sieve
+             * is still in flight, so a fault in its fill or apply surfaces
+             * at the first CUDA call made here, not at its join. Drain, and
+             * say so, rather than let the error name the next q's upload. */
+            auto views_and_prep = [&]() -> int {
+                tdS1 = pipe_td_side(&S1);
+                tdS0 = pipe_td_side(&S0);
+                if (!(qpipe && slab + 1 == slab_plan->nslab && !g_pipe_stop &&
+                      !count_limit_before(qi + 1, nqdone + 1)))
+                    return 0;
+                next_prepared = 1;
+                if (prepare_next_q()) {
+                    const mtlError_t e = mtlStreamSynchronize(st_sv);
+                    fprintf(stderr, "  q=%llu: the error above surfaced while"
+                            " preparing the next q, with this q's last slab"
+                            " still sieving (%s); either may be its source\n",
+                            (unsigned long long)cur->q, mtlGetErrorString(e));
+                    return -1;
+                }
+                return 0;
+            };
+            if (ahead) {
+                ahead = 0;
+                if (views_and_prep()) { rc = -1; break; }
+                /* --q-pipeline: both sides were issued back to back on st_sv
+                 * at the previous slab's or q's issue point, so only the joins
+                 * remain.
+                 * On a soft skip this behaves like the concurrent arm: side 0
+                 * ran anyway, and the q is abandoned below either way. */
+                sv1 = pipe_side_sieve_join(1, &S1, &sf1, &sa1, 1);
+                /* Side 1 failing hard is not a reason to call into a sticky
+                 * error again and have it blamed on side 0. Drain the stream
+                 * so `done:` frees nothing a kernel is still writing. */
+                if (sv1 < 0) mtlStreamSynchronize(st_sv);
+                else sv0 = pipe_side_sieve_join(0, &S0, &sf0, &sa0, 1);
+            } else if (concurrent) {
                 /* Both sides go to the device before either is awaited, and
                  * NOTHING between the two issues may touch the legacy default
                  * stream -- see pipe_side_sieve_issue. The short-circuit below
@@ -2443,19 +3501,16 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                  * this to turn that break into a continue: it would be correct
                  * HERE and wrong in the serial arm, which is exactly the kind
                  * of divergence output identity cannot catch. */
-                int i1 = pipe_side_sieve_issue<SLABBED>(fb1, cfg, 1, xmax,
-                                               j_base, &bk1, fblocks, fthreads,
-                                               &S1);
-                int i0 = i1 ? -1
-                       : pipe_side_sieve_issue<SLABBED>(fb0, cfg, 0, xmax,
-                                               j_base, &bk0, fblocks, fthreads,
-                                               &S0);
+                int i1 = issue_side(1, xmax, j_base);
+                int i0 = i1 ? -1 : issue_side(0, xmax, j_base);
                 /* A failed ISSUE leaves launches in flight with nobody to
                  * await them, and `done:` below frees the bucket array they
                  * are writing into. Drain before unwinding. */
                 if (i1 || i0) { mtlDeviceSynchronize(); rc = -1; break; }
-                sv1 = pipe_side_sieve_join(1, &bk1, &S1, &sf1, &sa1, concurrent);
-                sv0 = pipe_side_sieve_join(0, &bk0, &S0, &sf0, &sa0, concurrent);
+                /* qpipe is never granted with --fill-concurrent: views only. */
+                if (views_and_prep()) { rc = -1; break; }
+                sv1 = pipe_side_sieve_join(1, &S1, &sf1, &sa1, concurrent);
+                sv0 = pipe_side_sieve_join(0, &S0, &sf0, &sa0, concurrent);
                 /* NOTHING collapses sv0 into sv1 here, and an earlier
                  * `if (sv1 > 0 && sv0 > 0) sv0 = 0;` was dead code: below,
                  * sv0 is read only by `sv1 < 0 || sv0 < 0` and
@@ -2473,16 +3528,20 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                  * is a real divergence that the relations-identity gate cannot
                  * see, so it is recorded rather than papered over. */
             } else {
-                sv1 = pipe_side_sieve_issue<SLABBED>(fb1, cfg, 1, xmax, j_base,
-                                               &bk1, fblocks, fthreads, &S1);
+                sv1 = issue_side(1, xmax, j_base);
                 if (!sv1)
-                    sv1 = pipe_side_sieve_join(1, &bk1, &S1, &sf1, &sa1, concurrent);
+                    sv1 = pipe_side_sieve_join(1, &S1, &sf1, &sa1, concurrent);
                 if (!sv1) {
-                    sv0 = pipe_side_sieve_issue<SLABBED>(fb0, cfg, 0, xmax,
-                                               j_base, &bk0, fblocks, fthreads,
-                                               &S0);
+                    /* --fill-gate: side 1 has been joined, so its bitmap for
+                     * this slab is complete. Refused with --fill-concurrent,
+                     * whose side 0 is issued before side 1 finishes. */
+                    sv0 = issue_side(0, xmax, j_base);
+                    if (!sv0 && views_and_prep()) {
+                        mtlDeviceSynchronize();
+                        rc = -1; break;
+                    }
                     if (!sv0)
-                        sv0 = pipe_side_sieve_join(0, &bk0, &S0, &sf0, &sa0, concurrent);
+                        sv0 = pipe_side_sieve_join(0, &S0, &sf0, &sa0, concurrent);
                 }
                 /* The SAME hazard as the concurrent arm's, and it is NOT
                  * ruled out by joining side 1 before side 0 is issued: an
@@ -2543,7 +3602,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                  * extra driver read is d1, which is genuinely new information;
                  * side 1's own end is sf1+sa1, already in hand from join. */
                 /* Both ev[1] are complete here only because join() synced
-                 * each side's ev[3], which is later in stream order -- a
+                 * each side's ev[5], which is later in stream order -- a
                  * guarantee established in ANOTHER function, which is exactly
                  * what the ev[4] reads after the slab loop refuse to rely on.
                  * time_kernel discards mtlEventElapsedTime's status, so a
@@ -2572,11 +3631,77 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             PIPE_CK(mtlEventRecord(ea));
             MTL_LAUNCH_NAMED((SLABBED ? "k_intersect_compact_1_1" : "k_intersect_compact_1_0"), blocks, cfg->threads, 0, 0, S1.survbits, S0.survbits, nbitword, cfg->logI, Lq.a0, Lq.a1, Lq.b0, Lq.b1, (int64_t)Lq.q, nullptr, nullptr, nullptr, 0u, d_n, d_pre, d_two, nullptr, j_base);
             PIPE_CK(mtlEventRecord(eb));
-            PIPE_CK(mtlEventSynchronize(eb));
+            /* The count by an async copy queued after eb (so the intersect
+             * timing excludes it) and one wait on the legacy stream, where
+             * the kernel and the copy run -- not a synchronous round trip
+             * after the wait (finding 113). */
+            PIPE_CK(mtlMemcpyAsync(&C.h_rb->isect, d_n, 4,
+                                    mtlMemcpyDeviceToHost, 0));
+            PIPE_CK(mtlStreamSynchronize(0));
             PIPE_CK(mtlGetLastError());
             tis += time_kernel(ea, eb);
-            PIPE_CK(mtlMemcpy(&hn_s, d_n, 4, mtlMemcpyDeviceToHost));
+            hn_s = C.h_rb->isect;
 
+            /* ---- --q-pipeline issue point ----
+             *
+             * This slab's sieve and intersection are complete and nothing
+             * reads its survbits again, so the next unit of work -- the next
+             * slab of this q, or after the last slab the next q -- can be
+             * sieved on st_sv while this slab is trial-divided on the legacy
+             * stream. TD's view of each side (tdS1/tdS0) was taken before this
+             * slab's last join (views_and_prep), before anything moved. A next
+             * slab turns the walk cursors here (pside_rotate_walk); a next q
+             * was already prepared there, which swapped plat/rowrt (its
+             * k_transform would otherwise overwrite them under this q's
+             * resieve), so here it is only issued.
+             *
+             * Everything the loop top checks for the next q -- stop, ceiling,
+             * checkpoints -- still runs there, before any of its output is
+             * consumed; a q issued here and then not processed is simply
+             * drained at the loop exit and resumed from, never counted. */
+            /* Called by pipe_td_perq once both sides' resieves are queued
+             * (they are the last readers of this slab's bucket records), or
+             * below if it returned before reaching them -- a slab with no
+             * survivors, or a skip. The next unit's fill rewrites the bucket
+             * arrays, so st_sv waits on the resieves' end (C.ev[14]) first. */
+            int issue_done = 0;
+            const std::function<int()> issue_next = [&]() -> int {
+                if (issue_done) return 0;
+                issue_done = 1;
+                if (qpipe && (slab + 1 < slab_plan->nslab || next_prepared) &&
+                    mtlStreamWaitEvent(st_sv, C.ev[14], 0) != mtlSuccess)
+                    return -1;
+                if (qpipe && slab + 1 < slab_plan->nslab) {
+                    /* The next slab of this q. Its fill starts from this slab's
+                     * output cursor; the cursor this slab started from stays with
+                     * its TD (tdS1/tdS0 above), so the three turn. plat and rowrt
+                     * belong to the whole q and are not touched. No stop or
+                     * budget check: a q is never left half-sieved, single-queued
+                     * or not. */
+                    pside_rotate_walk(&S1);
+                    pside_rotate_walk(&S0);
+                    rotated = 1;
+                    wd_phase("slab.issue_next");
+                    if (issue_ahead(slab + 1)) return -1;
+                    ahead = 1;
+                    n_ahead_slab++;
+                } else if (qpipe && next_prepared) {
+                    /* The next q, after this q's last slab, prepared before its
+                     * join (views_and_prep). Issued only if the stop flag is still
+                     * clear: a q prepared and not issued is consumed at the loop
+                     * top like any other, after the end-of-q drain below. */
+                    if (next_ready && !g_pipe_stop) {
+                        wd_q(next_wq, next_wrho, (unsigned long long)nqdone);
+                        wd_phase("q.issue_next");
+                        if (issue_ahead(0)) return -1;
+                        wd_q((unsigned long long)cur->q, (unsigned long long)cur->rho,
+                             (unsigned long long)nqdone);
+                        spec_issued = 1;
+                        n_ahead_q++;
+                    }
+                }
+                return 0;
+            };
             td_start = host_ms();
             tv_before = tv;
             {
@@ -2590,12 +3715,23 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 const int do_verify = nqdone == 0 && cfg->td_verify && hn_s != 0 &&
                     (!td_verified || cfg->cofgate);
                 wd_phase("slab.trialdiv");
-                const int tdrc = pipe_td_perq<SLABBED>(&C, &Lq, cfg, &S1, &S0,
+                /* Whose bucket records survive to here: side 0's always in
+                 * the serial arm (it filled last into the shared array), both
+                 * when each side has its own (--fill-concurrent, or the
+                 * serial arm's second array). */
+                const pbkt_t *bkr[2] = {
+                    cfg->bucket_resieve ? &bk0 : NULL,
+                    cfg->bucket_resieve && (concurrent || dual) ? &bk1 : NULL };
+                const int tdrc = pipe_td_perq<SLABBED>(&C, &Lq, cfg, &tdS1, &tdS0,
                                           d_two, xmax,
                                           j_base, blocks, cfg->threads, do_verify,
                                           &n, &nacc_s, &tm, &tv, want_host,
-                                          !want_host, cofgate_found);
+                                          !want_host, cofgate_found, bkr,
+                                          &issue_next);
                 if (tdrc < 0) { rc = -1; break; }
+                /* TD returned before its resieves (no survivors) or skipped
+                 * them: issue the next unit now. */
+                if (issue_next()) { rc = -1; break; }
                 if (tdrc > 0) {
                     /* Untrustworthy TD: drop THIS slab only and carry on.
                      *
@@ -2640,7 +3776,22 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
              * truncates to the previous whole-q checkpoint, so a crash still
              * replays the q atomically. */
             if (cfg->cofactor && nacc_s) {
-                if (Q.n + nacc_s > Q.cap) {
+                if (Q.n + nacc_s > Q.cap && cfg->cof_async) {
+                    wd_phase("slab.cofq_flush_async");
+                    if (cofa_wait(&A, &Q)) { rc = -1; break; }
+                    A.ck_pending = fr && slab == 0;
+                    if (A.ck_pending) {
+                        A.ck_next = *cur;
+                        A.ck_nq = base_nq + nqdone;
+                    }
+                    /* fc's offset is safe to take from this thread: under
+                     * --cofactor (the only mode with a cofactor queue) the
+                     * join loop writes no candidates, so it does not move. */
+                    A.ck_P = POLY; A.ck = &ck; A.ck_fc = fc;
+                    A.ck_base_rel = base_rel;
+                    A.ck_written = &ckpt_written; A.ck_warned = &ckpt_warned;
+                    cofa_start(&A, &Q, &QO, cfg, blocks, fr);
+                } else if (Q.n + nacc_s > Q.cap) {
                     wd_phase("slab.cofq_flush");
                     if (cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0,
                                    cfg->lim, cfg->lpb, (int)Q.ecm_rounds,
@@ -2669,9 +3820,15 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                                 nacc_s, Q.n, cfg->lpb0, cfg->lpb, &Q)) {
                     rc = -1; break;
                 }
-                if (CUDA_CHECKED(mtlDeviceSynchronize()) ||
+                if (CUDA_CHECKED(pipe_qsync()) ||
                     CUDA_CHECKED(mtlGetLastError())) { rc = -1; break; }
                 Q.n += nacc_s;
+                /* --cof-async: a flush that has finished (and checkpointed
+                 * itself) is joined HERE rather than at the next queue-full,
+                 * so --target-rels sees its relations a whole flush interval
+                 * sooner. The join cannot wait: the thread has returned. */
+                if (A.busy && A.fin->load(std::memory_order_acquire))
+                    if (cofa_wait(&A, &Q)) { rc = -1; break; }
             }
             tm.cofac += host_ms() - cf_start;
 
@@ -2736,6 +3893,22 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
 
             if (advance_slab(slab, J_here)) { rc = -1; break; }
         }
+        /* A next q prepared during this q's last slab and NOT issued -- the
+         * stop flag rose, this q was abandoned on a soft skip, or the next
+         * q skips -- still has its table uploads in flight from the pinned
+         * staging buffers, and the loop top is about to prepare it again
+         * into the same buffers. ev[4] is recorded after those uploads:
+         * wait for it. This is the fourth drain pipe_side_prepare_q's
+         * comment lists. (Finding 114's review: the soft-skip case is not
+         * reachable by any gate, as degradecheck.sh explains.) */
+        if (next_prepared && !spec_issued) {
+            const mtlError_t e1 = mtlEventSynchronize(S1.ev[4]);
+            const mtlError_t e0 = mtlEventSynchronize(S0.ev[4]);
+            if (!rc && (e1 != mtlSuccess || e0 != mtlSuccess)) {
+                CUDA_CHECKED(e1 != mtlSuccess ? e1 : e0);
+                rc = -1;
+            }
+        }
         if (cfg->qspan) { slab_q   = host_ms() - hreg; hreg = host_ms(); }
         if (rc) {
             /* Same rule as the nq_lost rollback below, on the other exit. This
@@ -2776,7 +3949,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
          * ev[4] synchronises below are what make this safe now -- they are
          * load-bearing, not the belt-and-braces the next comment calls them.
          * Do not reinstate the ev[3] reasoning. */
-        /* On the ordinary path the slab loop's ev[3] has already covered
+        /* On the ordinary path the slab loop's ev[5] has already covered
          * these, so they cost microseconds; on the all-slabs-skipped path
          * above they are the ONLY thing that drains side 0. Either way they
          * make the read structurally safe rather than dependent on a
@@ -2786,10 +3959,10 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
          * not-ready event would silently report 0 ms AND latch
          * mtlErrorNotReady for the next unrelated mtlGetLastError to
          * report as fatal. Do not remove these to save the microseconds. */
-        PIPE_CK(mtlEventSynchronize(S1.ev[4]));
-        PIPE_CK(mtlEventSynchronize(S0.ev[4]));
-        ts1[0] = time_kernel(S1.ev[0], S1.ev[4]);
-        ts0[0] = time_kernel(S0.ev[0], S0.ev[4]);
+        /* --q-pipeline read them when it prepared the next q */
+        if (!ts_read && pipe_read_transform(&S1, &S0, &ts1[0], &ts0[0])) {
+            rc = -1; goto done;
+        }
         /* This is the original pre-slabbing invariant: an entire special-q
          * with no two-sided survivors is suspicious and remains fatal. Empty
          * individual slabs are allowed; only their sum is tested here. */
@@ -2838,10 +4011,13 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                    ts1[0], ts1[1], ts1[2], ts1[0] + ts1[1] + ts1[2],
                    (unsigned long long)side_surv1, S1.BOUND,
                    SLABBED ? " [slabbed]" : "");
+            /* Gated, side 0's own count is not its survivor population: its
+             * fill skips every position side 1 rejected. */
             printf("  side 0: transform %.3f + fill %.3f + apply %.3f = %7.3f ms,"
-                   " %8llu survivors (bound %u)%s\n",
+                   " %8llu survivors (bound %u)%s%s\n",
                    ts0[0], ts0[1], ts0[2], ts0[0] + ts0[1] + ts0[2],
                    (unsigned long long)side_surv0, S0.BOUND,
+                   cfg->fill_gate ? " [gated by side 1]" : "",
                    SLABBED ? " [slabbed]" : "");
         }
 
@@ -2891,7 +4067,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                  * successful workunit reports exactly 1.0 only after main has
                  * completed successfully. */
                 if (fraction > 0.99) fraction = 0.99;
-                bench_boinc_fraction_done(fraction);
+                pipe_report_fraction(fraction);
                 t_boinc_report = now;
             }
         }
@@ -2899,9 +4075,10 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         /* --target-rels: stop once enough relations exist. Under inline
          * cofactorisation the only running total the host has without a per-q
          * readback is Q.nrel, which advances at FLUSH boundaries -- so this
-         * overshoots by at most one flush (~256 q here, well under 1% of any
-         * useful target). Sieving upward until satisfied is what you actually
-         * want when the question is "enough for the matrix", since the yield
+         * overshoots by at most one flush (~256 q here; two under
+         * --cof-async, where Q.nrel also lags by the flush still in flight),
+         * well under 1% of any useful target. Sieving upward until satisfied
+         * is what you actually want when the question is "enough for the matrix", since the yield
          * per q falls as q grows and guessing the range wastes either time or
          * relations. */
         if (cfg->target_rels) {
@@ -3022,19 +4199,19 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                     const double eta_hours = floor(eta / 3600.0);
                     const int eta_minutes =
                         (int)fmod(floor(eta / 60.0), 60.0);
-                    printf("    q=%llu  %u q  %llu rel%s  %.0f rel/s  %.1f%%"
+                    printf("    %sq=%llu  %u q  %llu rel%s  %.0f rel/s  %.1f%%"
                            "  ETA %.0fh %02dm%s",
-                           (unsigned long long)cur->q, nqdone, rels, queued,
+                           ipfx, (unsigned long long)cur->q, nqdone, rels, queued,
                            rps, 100.0 * frac, eta_hours, eta_minutes, end);
                 } else if (rps > 0.0) {
-                    printf("    q=%llu  %u q  %llu rel%s  %.0f rel/s  %.1f%%"
+                    printf("    %sq=%llu  %u q  %llu rel%s  %.0f rel/s  %.1f%%"
                            "  ETA inf%s",
-                           (unsigned long long)cur->q, nqdone, rels, queued,
+                           ipfx, (unsigned long long)cur->q, nqdone, rels, queued,
                            rps, 100.0 * frac, end);
                 } else {
-                    printf("    q=%llu  %u q  %llu rel%s  -- rel/s  %.1f%%"
+                    printf("    %sq=%llu  %u q  %llu rel%s  -- rel/s  %.1f%%"
                            "  ETA --h --m%s",
-                           (unsigned long long)cur->q, nqdone, rels, queued,
+                           ipfx, (unsigned long long)cur->q, nqdone, rels, queued,
                            100.0 * frac, end);
                 }
             }
@@ -3063,6 +4240,13 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                     ? (acc_tr + acc_fi + acc_ap - pipe_ovl_credit(acc_ovl)
                        + acc_isect + devsum) / denom
                     : 0.0;
+                /* Two q in flight: the next q's sieve time overlaps this q's
+                 * host-clocked TD, so the stage sum is no measure of how busy
+                 * the card was and can pass 1.0. No credit is computable from
+                 * these timers, so say so rather than print a number. */
+                char accwall_s[32];
+                if (qpipe) snprintf(accwall_s, sizeof accwall_s, "acc/wall=n/a");
+                else snprintf(accwall_s, sizeof accwall_s, "acc/wall=%.3f", accwall);
                 char gpu[48] = "gpu=n/a", pwr[32] = "board=n/a";
                 char eta_s[32] = "eta=--";
                 double load[3] = {0.0, 0.0, 0.0};
@@ -3083,17 +4267,21 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                     snprintf(eta_s, sizeof eta_s, "eta=%.2fh", eta / 3600.0);
                 runlog_record(
                     "q=%llu nq=%llu rel=%llu cand=%u rel/s=%.1f pct=%.2f %s"
-                    " ms/q=%.2f acc/wall=%.3f %s %s load=%.2f",
+                    " ms/q=%.2f %s %s %s load=%.2f",
                     (unsigned long long)cur->q,
                     base_nq + (unsigned long long)nqdone, rels,
                     cfg->cofactor ? Q.n : 0u, rps, 100.0 * frac, eta_s,
-                    nqdone ? acc_wall / nqdone : 0.0, accwall, gpu, pwr,
+                    nqdone ? acc_wall / nqdone : 0.0, accwall_s, gpu, pwr,
                     load[0]);
             }
         }
         fflush(stdout);
     }
 
+    pg.lock();
+    if (g_pinst)
+        printf("\n=== instance %d of %d: end of band ===\n", g_pinst->k,
+               g_pinst->n);
     /* A streamed source discovers its end only when the NEXT pull returns 0,
      * so the in-loop 30-second reporter cannot know that the preceding q was
      * terminal. Give it an explicit terminal line instead of leaving the last
@@ -3132,11 +4320,18 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         double fraction = pipe_progress_fraction(
             cfg, qgen != NULL, nq, nqdone, last_q.q, rels, base_nq);
         if (fraction > 0.99) fraction = 0.99;
-        bench_boinc_fraction_done(fraction);
+        pipe_report_fraction(fraction);
     }
 #endif
 
     }   /* t_band scope */
+
+    /* --q-pipeline: a q issued ahead and never consumed (the band stopped,
+     * ran out, or reached its target) is drained here, before anything below
+     * reads results. Its relations are never used, but a device fault in it
+     * is still a fault, and must not vanish at `done:`. */
+    if (st_sv && CUDA_CHECKED(mtlStreamSynchronize(st_sv)) && rc == 0)
+        rc = -1;
 
     /* Fold in the device-side candidate counters. Under inline cofactorisation
      * the host loop never ran, so acc_cand and acc_rel are still zero and these
@@ -3164,13 +4359,19 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
      * in acc_wall. On a band shorter than one flush that is the ENTIRE
      * cofactorisation, which is why it is carried separately and added back
      * rather than folded into the per-q average. */
+    {
+        /* Joined whatever rc is: the thread writes fr, which done: closes. */
+        const double cfw = host_ms();
+        if (cofa_wait(&A, &Q) && rc == 0) rc = -1;
+        cofac_tail += host_ms() - cfw;
+    }
     if (rc == 0 && cfg->cofactor && Q.n) {
         const double cf0 = host_ms();
         wd_phase("band.final_cofq_flush");
         if (cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
                        (int)Q.ecm_rounds, cfg->cof_budget, cfg->cof_chunk, blocks, cfg->threads, fr))
             rc = -1;
-        cofac_tail = host_ms() - cf0;
+        cofac_tail += host_ms() - cf0;
     }
     if (rc == 0 && !stopped && cfg->target_rels && !target_reached) {
         const unsigned long long have = base_rel + (cfg->cofactor
@@ -3229,7 +4430,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
      * remaining-time estimate both jump backwards. The 0.99 means "the band is
      * finished and only the flush, rename and cleanup remain"; a stop has the
      * whole band left. */
-    if (rc == 0 && !stopped) bench_boinc_fraction_done(0.99);
+    if (rc == 0 && !stopped) pipe_report_fraction(0.99);
 #endif
     if (rc == 0) {
         /* Query only after the scientific output is committed. Per-q buffers
@@ -3429,6 +4630,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         printf("      %-30s %8.3f ms\n", "survivor filter (shared)", tm.summary / N);
         printf("      %-30s %8.3f ms\n", "resieve + scatter, both sides",
                tm.resieve / N);
+        printf("      %-30s %8.3f ms\n", "  of which side 0", tm.resieve0 / N);
         printf("      %-30s %8.3f ms\n", "norms + trial division, both sides",
                tm.td / N);
         printf("      %-30s %8.3f ms\n", "classify, both sides", tm.classify / N);
@@ -3445,9 +4647,14 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         if (cfg->cofactor)
             printf("  %-34s %8.2f ms\n", "  cofactorisation, in-loop flushes",
                    tm.cofac / N);
-        printf("  %-34s %8.2f ms\n", "  unaccounted",
-               (acc_wall - acc_sieve - acc_isect - acc_host - acc_td - tm.join
-                - tm.cofac) / N);
+        /* Under --q-pipeline the stages above overlap the other q, so the
+         * residual is not a time anything spent (it goes negative). */
+        if (qpipe)
+            printf("  %-34s %8s\n", "  unaccounted", "n/a");
+        else
+            printf("  %-34s %8.2f ms\n", "  unaccounted",
+                   (acc_wall - acc_sieve - acc_isect - acc_host - acc_td - tm.join
+                    - tm.cofac) / N);
         /* The one number that makes host starvation visible. Every stage above
          * is either a cudaEvent (blind to what the CPU is doing) or a host
          * clock, so a contended box prints PERFECT kernel times next to a bad
@@ -3488,8 +4695,18 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
          * flush (see the comment on cofac_tail above). On a band shorter than
          * one flush that tail IS the whole cofactorisation, so a short smoke
          * run and a production band are not comparable to each other. */
-        printf("  %-34s %8.3f\n", "GPU-accounted / wall (excl cofac)",
-               (acc_sieve + acc_isect + dev * N) / (acc_wall - tm.cofac));
+        const double gpu_acc = (acc_sieve + acc_isect + dev * N) /
+                               (acc_wall - tm.cofac);
+        char gpu_acc_s[32];
+        if (qpipe) snprintf(gpu_acc_s, sizeof gpu_acc_s, "n/a");
+        else snprintf(gpu_acc_s, sizeof gpu_acc_s, "%.3f", gpu_acc);
+        printf("  %-34s %8s\n", "GPU-accounted / wall (excl cofac)", gpu_acc_s);
+        /* What --q-pipeline actually overlapped, as against what it was
+         * granted: fillcheck.sh reads this line to tell a band that issued
+         * slabs ahead from one that only ever issued whole q. */
+        if (qpipe)
+            printf("  %-34s %llu slab(s), %llu q\n", "issued ahead (--q-pipeline)",
+                   n_ahead_slab, n_ahead_q);
         printf("  %-34s %8.1f\n", "two-sided primitive survivors/q",
                (double)acc_surv / N);
         printf("  %-34s %8.2f\n", "cofactorisation candidates/q",
@@ -3513,7 +4730,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
          * says which reading applies to which line. */
         runlog_record("band end  nq=%llu  rel=%llu  nq_session=%u"
                       "  rel_session=%llu  cand_session=%llu  wall=%.2fms/q"
-                      "  sieve=%.2fms/q  td=%.2fms/q  acc/wall=%.3f"
+                      "  sieve=%.2fms/q  td=%.2fms/q  acc/wall=%s"
                       "  rel/q=%.3f%s",
                       base_nq + nqdone,
                       base_rel + (cfg->cofactor ? Q.nrel
@@ -3521,8 +4738,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                       nqdone,
                       cfg->cofactor ? Q.nrel : (unsigned long long)acc_rel,
                       (unsigned long long)acc_cand,
-                      acc_wall / N, acc_sieve / N, acc_td / N,
-                      (acc_sieve + acc_isect + dev * N) / (acc_wall - tm.cofac),
+                      acc_wall / N, acc_sieve / N, acc_td / N, gpu_acc_s,
                       /* rel_session per q, not the summary's COMPLETE
                        * RELATIONS/q, which counts only what trial division
                        * finished -- next to rel_session on the same line the
@@ -3547,6 +4763,14 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             printf("  %-34s %8.2f ms\n", "  = device time per q",
                    (Q.ms_rat + Q.ms_alg + Q.ms_host) / N);
             printf("  %-34s %8.2f ms\n", "wall: in-loop flushes", tm.cofac / N);
+            if (cfg->cof_async && A.nflush) {
+                printf("  %-34s %8.2f ms\n", "  of which waiting on a flush",
+                       A.ms_wait / N);
+                printf("  %-34s %8.0f ms each, one every %.0f ms (%d)\n",
+                       "async flushes", A.ms_flush / A.nflush,
+                       A.nflush > 1 ? A.ms_interval / (A.nflush - 1) : 0.0,
+                       A.nflush);
+            }
             printf("  %-34s %8.2f ms\n", "wall: final flush after the band",
                    cofac_tail / N);
             /* Everything joint-accepted is enqueued, INCLUDING the records
@@ -3679,18 +4903,26 @@ done:
      * finalized exactly once above; an early jump closes and discards here --
      * but still honours a written checkpoint, since a .part that a sidecar
      * describes is resumable work whatever killed this session. */
+    /* An error path can leave a flush in flight; it writes fr, so join it
+     * before the outputs are closed below. */
+    if (cofa_wait(&A, &Q)) rc = -1;
     if (!outputs_finalized) {
         if (pipe_finalize_outputs(&fr, &fc, cfg, rtmp, ctmp, 0, ckpt_written))
             rc = -1;
     }
     pipe_td_free(&C);
     cofq_free(&Q, &QO);
+    /* A special-q issued ahead and never consumed may still be sieving. */
+    if (st_sv) mtlStreamSynchronize(st_sv);
+    if (A.spare.cap) cofq_free(&A.spare, &A.spare_out);
+    if (g_cof_stream) { mtlStreamDestroy(g_cof_stream); g_cof_stream = 0; }
     pside_free(&S1); pside_free(&S0);
     mtlFree(d_bucket); mtlFree(d_cursor); mtlFree(d_overflow);
+    if (st_sv) mtlStreamDestroy(st_sv);
     mtlFree(d_bucket_c); mtlFree(d_cursor_c); mtlFree(d_overflow_c);
     if (st_side[0]) mtlStreamDestroy(st_side[0]);
     if (st_side[1]) mtlStreamDestroy(st_side[1]);
-    mtlFree(d_two); mtlFree(d_n); mtlFree(d_pre);
+    mtlFree(d_two); mtlFree(d_n); mtlFree(d_pre); mtlFree(d_gate);
     if (ea) mtlEventDestroy(ea);
     if (eb) mtlEventDestroy(eb);
     if (qspan0) mtlEventDestroy(qspan0);
@@ -3755,6 +4987,301 @@ done:
     return rc;
 }
 
+/* ---- the slab target from free VRAM ------------------------------------ *
+ *
+ * SLAB_PERF_REGIONS (2^29 positions at --region 14) was tuned on factor bases
+ * of a few million entries. Every slab re-walks every bucketed entry's lattice
+ * state, so with a large factor base that per-slab cost dominates: on the
+ * 2,1147+ SNFS job (31M entries a side, I16, RTX 4090) going from four 2^29
+ * slabs to one 2^31 slab cut fill 120.8 -> 79.9 ms/q and resieve 47.5 ->
+ * 33.3 ms/q, byte-identical relations, for 5.5 -> 9.4 GB of device memory.
+ *
+ * Small cards cannot pay that, so the target is chosen at run time: the
+ * largest of 4x, 2x the default whose modelled footprint fits the free memory
+ * with headroom, else the default exactly as before. The model mirrors the
+ * allocations pipe_side_init and run_pipeline_impl make, and errs high; the
+ * per-allocation admission checks there still stand behind it. */
+static double pipe_inv_sum(const fb_t *fb)
+{
+    double acc = 0;
+    for (uint32_t i = 0; i < fb->n; i++) acc += 1.0 / fb->primes[i];
+    return acc;
+}
+
+static size_t pipe_vram_model(const fb_t *fb1, const fb_t *fb0,
+                              const bench_cfg_t *cfg, uint32_t jmax,
+                              double inv1, double inv0)
+{
+    const uint64_t X = ((uint64_t)1 << cfg->logI) * jmax;
+    const uint64_t nregion = X >> cfg->log_region;
+    const double inv = inv1 > inv0 ? inv1 : inv0;
+    const uint64_t est = (uint64_t)((double)X * inv * 1.15) + 4096; /* pipe_est_records */
+    const uint64_t cap = est / nregion + 256;
+    const size_t narr = cfg->fill_concurrent ? 2 : 1;
+    size_t b = 0;
+    b += narr * (size_t)nregion * cap * 4;              /* bucket array(s)   */
+    b += narr * (size_t)nregion * 4;                    /* cursors           */
+    b += 3 * (size_t)(X / 8);                           /* S1, S0, d_two     */
+    b += 2 * (size_t)(X / 64);                          /* --fill-gate folds */
+    b += (size_t)(fb1->n + fb0->n) *
+         (4 + 4 + sizeof(plat_t) + 8 + 8 + 4);          /* per-entry state   */
+    if (cfg->q_pipeline)        /* plat_alt, rowrt_alt (nrow <= n), walk_spare */
+        b += (size_t)(fb1->n + fb0->n) * (sizeof(plat_t) + 4 + 8);
+    b += (size_t)768 << 20;   /* TD buffers, cofactor queue(s), small tables */
+    return b;
+}
+
+/* One run_pipeline_impl, at whichever instantiation the plan needs: a plan
+ * whose one slab covers the whole area runs unslabbed. */
+static int pipe_impl_any(const slab_plan_t *P, const fb_t *fb1,
+                         const fb_t *fbs1, const fb_t *fb0, const fb_t *fbs0,
+                         const qsel_t *qlist, uint32_t nq, sqgen_t *qgen,
+                         const poly_t *POLY, const bench_cfg_t *cfg)
+{
+    return P->enabled
+        ? run_pipeline_impl<true>(fb1, fbs1, fb0, fbs0, qlist, nq, qgen, POLY,
+                                  cfg, P)
+        : run_pipeline_impl<false>(fb1, fbs1, fb0, fbs0, qlist, nq, qgen, POLY,
+                                   cfg, P);
+}
+
+/* ---- --instances N: N whole pipelines on one GPU ----------------------- *
+ *
+ * Several special-q in flight without restructuring the q loop: the bounded
+ * band is cut into N equal q ranges and each runs its own run_pipeline_impl on
+ * its own host thread. The build uses --default-stream per-thread, so each
+ * thread's launches go to its own stream and the pipelines' kernels overlap
+ * on the device (2,1147+, RTX 4090: two instances 73.5 s of band against
+ * 80.5 s for one, byte-identical relations).
+ *
+ * Each instance is an ordinary band over its share, with its own relation
+ * file NAME.inst<k>: its own .part, checkpoint, BOINC recovery counter,
+ * resume and commit, all the existing code. What the instances share is set
+ * up here -- the stop hook, the watchdog and run-log slots, the BOINC
+ * fraction -- and what they produce is merged here, in q order, into NAME:
+ * the file one pipeline would have written. NAME.instances (written by
+ * run_pipeline when the band starts) pins N and the band for a relaunch. */
+static int pipe_inst_merge(const pipe_inst_plan_t *IP, const char *relations)
+{
+    static char buf[1 << 20];
+    char tmp[CKPT_PATH_MAX];
+    FILE *out;
+    if (ckpt_path_fmt(relations, tmp, sizeof tmp, ".instances.merge")) {
+        fprintf(stderr, "--instances: output path too long\n");
+        return -1;
+    }
+    if (!(out = fopen(tmp, "wb"))) { perror(tmp); return -1; }
+    for (int k = 0; k < IP->n; k++) {
+        FILE *in = fopen(IP->in[k].relations, "rb");
+        size_t m;
+        int bad = 0;
+        if (!in) { perror(IP->in[k].relations); bad = 1; }
+        while (!bad && (m = fread(buf, 1, sizeof buf, in)) > 0)
+            if (fwrite(buf, 1, m, out) != m) { perror(tmp); bad = 1; }
+        if (in) {
+            if (!bad && ferror(in)) { perror(IP->in[k].relations); bad = 1; }
+            fclose(in);
+        }
+        if (bad) { fclose(out); remove(tmp); return -1; }
+    }
+    if (fflush(out) || bench_sync_stream(out) || fclose(out)) {
+        perror(tmp); remove(tmp); return -1;
+    }
+    if (bench_atomic_replace(tmp, relations)) {
+        perror(relations); remove(tmp); return -1;
+    }
+    if (bench_sync_parent(relations)) perror(relations);
+    /* The instance files first and the manifest last. Interrupted in
+     * between, a relaunch still finds the manifest, sieves again whichever
+     * instance's file is gone, and merges again: wasted work, never a lost
+     * or doubled special-q. */
+    for (int k = 0; k < IP->n; k++)
+        if (remove(IP->in[k].relations) && errno != ENOENT)
+            perror(IP->in[k].relations);
+    if (IP->manifest[0] && remove(IP->manifest) && errno != ENOENT)
+        perror(IP->manifest);
+    return 0;
+}
+
+/* One instance, on its own thread: its configuration is the band's with its
+ * own share, relation file and resume state, and its own special-q stream. */
+static int pipe_inst_run_one(const fb_t *fb1, const fb_t *fbs1,
+                             const fb_t *fb0, const fb_t *fbs0,
+                             const poly_t *POLY, const bench_cfg_t *base,
+                             const pipe_inst_one_t *I, int k,
+                             const slab_plan_t *plan,
+                             const slab_plan_t *base_plan, int upsized)
+{
+    bench_cfg_t c = *base;
+    qsel_t first;
+    int r, have, rc;
+    c.inst = NULL;
+    c.relations = I->relations[0] ? I->relations : NULL;
+    c.qmin = I->resume ? I->resume_q : I->qmin;
+    c.qmax = I->qmax;
+    c.nq_max = 0;
+    c.restart = 0;
+    c.resume = I->resume;
+    c.resume_q = I->resume_q;
+    c.resume_rho = I->resume_rho;
+    c.resume_qmin = I->resume_qmin;
+    c.resume_rel_bytes = I->resume_rel_bytes;
+    c.resume_cand_bytes = 0;
+    c.resume_nrel = I->resume_nrel;
+    c.resume_nq = I->resume_nq;
+
+    sqgen_t *G = sqgen_create(POLY, c.sq_side, c.qmin, c.qmax, 0);
+    if (!G) return PIPE_RC_FAIL;
+    r = sqgen_next(G, &first);
+    /* As bench_main does for one pipeline: the checkpoint names the exact
+     * root, so wind forward to it rather than re-sieve the q's other roots.
+     * An instance whose checkpoint is already past its last q still runs,
+     * with nothing to sieve, so that it commits. */
+    if (r > 0 && c.resume) {
+        int guard = 0;
+        while ((first.q != c.resume_q || first.rho != c.resume_rho) &&
+               ++guard <= BENCH_NCOEFF)
+            if ((r = sqgen_next(G, &first)) <= 0) break;
+        if (r > 0 && (first.q != c.resume_q || first.rho != c.resume_rho)) {
+            fprintf(stderr, "  instance %d: the generator does not produce"
+                    " q=%llu rho=%llu at its checkpoint\n", k,
+                    (unsigned long long)c.resume_q,
+                    (unsigned long long)c.resume_rho);
+            sqgen_free(G);
+            return PIPE_RC_FAIL;
+        }
+    }
+    if (r < 0) { sqgen_free(G); return PIPE_RC_FAIL; }
+    have = r > 0;
+    rc = pipe_impl_any(plan, fb1, fbs1, fb0, fbs0, have ? &first : NULL,
+                       have ? 1u : 0u, G, POLY, &c);
+    /* Nothing is opened or consumed before the bucket admission, so this
+     * instance can retry at the default slab exactly as one pipeline does --
+     * whatever its siblings are doing. */
+    if (rc == PIPE_RC_NOVRAM && upsized) {
+        printf("  [%d] slab size from VRAM: the up-sized plan no longer fits;"
+               " retrying at the default %u rows/slab, one bucket array\n",
+               k, base_plan->jmax);
+        c.dual_bucket = 0;
+        rc = pipe_impl_any(base_plan, fb1, fbs1, fb0, fbs0,
+                           have ? &first : NULL, have ? 1u : 0u, G, POLY, &c);
+    }
+    sqgen_free(G);
+    return rc == PIPE_RC_NOVRAM ? PIPE_RC_FAIL : rc;
+}
+
+/* Worst first: a failure outranks the two policy stops, which outrank a clean
+ * stop, which outranks a finished band. */
+static int pipe_rc_rank(int rc)
+{
+    switch (rc) {
+    case PIPE_RC_OK:          return 0;
+    case PIPE_RC_STOPPED:     return 1;
+    case PIPE_RC_DEGRADED:    return 2;
+    case PIPE_RC_UNSUPPORTED: return 3;
+    default:                  return 4;
+    }
+}
+
+static int run_pipeline_instances(const fb_t *fb1, const fb_t *fbs1,
+                                  const fb_t *fb0, const fb_t *fbs0,
+                                  const poly_t *POLY, const bench_cfg_t *cfg,
+                                  const pipe_inst_plan_t *IP,
+                                  const slab_plan_t *plan,
+                                  const slab_plan_t *base_plan, int upsized,
+                                  size_t m_inst)
+{
+    const int n = IP->n;
+    pipe_inst_shared_t sh;
+    pipe_inst_ctx_t ctx[PIPE_INSTANCES_MAX];
+    int rc[PIPE_INSTANCES_MAX] = { 0 };
+    std::thread th[PIPE_INSTANCES_MAX];
+    int hooked = 0, worst = PIPE_RC_OK;
+    const double t0 = host_ms();
+
+    sh.n = n;
+    sh.m_inst = m_inst;
+    sh.setups_left = 0;
+    for (int k = 0; k < n; k++) sh.setups_left += !IP->in[k].done;
+    printf("\n=== --instances %d: q [%llu, %llu] ===\n", n,
+           (unsigned long long)cfg->qmin, (unsigned long long)cfg->qmax);
+    for (int k = 0; k < n; k++) {
+        const pipe_inst_one_t *I = &IP->in[k];
+        sh.frac[k] = I->done ? 1.0 : 0.0;
+        printf("  instance %d: q [%llu, %llu]%s", k,
+               (unsigned long long)I->qmin, (unsigned long long)I->qmax,
+               I->relations[0] ? ", " : "");
+        if (I->relations[0]) printf("%s", I->relations);
+        if (I->done)        printf(" (complete)");
+        else if (I->resume) printf(" (resuming at q=%llu)",
+                                   (unsigned long long)I->resume_q);
+        printf("\n");
+        runlog_note("instance", "%d of %d: q [%llu, %llu] %s%s", k, n,
+                    (unsigned long long)I->qmin, (unsigned long long)I->qmax,
+                    I->relations[0] ? I->relations : "(no relations)",
+                    I->done ? " complete" : I->resume ? " resumed" : "");
+    }
+    /* One stop hook for all of them, owned here: an instance that finishes
+     * first must not unhook the others (see the g_pinst test where
+     * run_pipeline_impl would install it). */
+    if (cfg->relations) {
+        hooked = bench_stop_hook_install(pipe_request_stop) == 0;
+        g_pipe_stop = 0;
+    }
+    for (int k = 0; k < n; k++) {
+        if (IP->in[k].done) continue;
+        ctx[k].k = k;
+        ctx[k].n = n;
+        ctx[k].qmin = IP->in[k].qmin;
+        ctx[k].qmax = IP->in[k].qmax;
+        ctx[k].sh = &sh;
+        th[k] = std::thread([&, k]() {
+            char tag[16];
+            g_pinst = &ctx[k];
+            wd_bind(k + 1);
+            snprintf(tag, sizeof tag, "inst%d", k);
+            runlog_thread_tag(tag);
+            rc[k] = pipe_inst_run_one(fb1, fbs1, fb0, fbs0, POLY, cfg,
+                                      &IP->in[k], k, plan, base_plan,
+                                      upsized);
+            /* A failure or a policy stop ends the band, so let the others
+             * drain and checkpoint at their next special-q rather than sieve
+             * on into a work unit that will not be credited. */
+            if (rc[k] != PIPE_RC_OK && rc[k] != PIPE_RC_STOPPED &&
+                !g_pipe_stop) {
+                fprintf(stderr, "  instance %d ended with status %d;"
+                        " stopping the others at their next special-q\n",
+                        k, rc[k]);
+                g_pipe_stop = 1;
+            }
+            wd_active(0);
+            g_pinst = NULL;
+        });
+    }
+    /* The main thread only waits; a parked join is not a stall. */
+    wd_active(0);
+    for (int k = 0; k < n; k++)
+        if (th[k].joinable()) th[k].join();
+    wd_active(1);
+    wd_phase("instances.merge");
+    if (hooked) bench_stop_hook_remove();
+
+    for (int k = 0; k < n; k++)
+        if (pipe_rc_rank(rc[k]) > pipe_rc_rank(worst)) worst = rc[k];
+    if (worst == PIPE_RC_OK && cfg->relations) {
+        if (pipe_inst_merge(IP, cfg->relations)) worst = PIPE_RC_FAIL;
+        else printf("\n  --instances %d: the instances' relations merged into"
+                    " %s, in q order\n", n, cfg->relations);
+    } else if (worst != PIPE_RC_OK) {
+        printf("\n  --instances %d: band not finished (status %d); each"
+               " instance's own .part and checkpoint are kept, and the same"
+               " command resumes all of them\n", n, worst);
+    }
+    printf("  --instances %d: %.1f s for the instances' bands\n", n,
+           (host_ms() - t0) / 1000.0);
+    return worst;
+}
+
 #include "slab_calib.inc"
 
 extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
@@ -3766,6 +5293,12 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     uint32_t pmax1 = fb_max_td_prime(fbs1);
     uint32_t pmax0 = fb_max_td_prime(fbs0);
     uint32_t pmax = pmax1 > pmax0 ? pmax1 : pmax0;
+
+    if (cfg->fill_rows < 0) {   /* FILL_ROWS_UNSET / _BY_DEVICE: a caller bug */
+        fprintf(stderr, "  pipeline: --fill-rows was not resolved (%d)\n",
+                cfg->fill_rows);
+        return -1;
+    }
     /* Auto-calibration returns 0 when it did not run or was inconclusive, in
      * which case the caller's own --slab-j (itself usually 0, meaning the
      * static default) is what the planner sees -- exactly as before. */
@@ -3779,9 +5312,95 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         fprintf(stderr,
                 "  pipeline: cannot make a safe slab plan for logI=%d J=%u"
                 " (largest direct-test prime %u, requested --slab-j %u)\n",
-                cfg->logI, cfg->J, pmax, cfg->slab_j);
+                cfg->logI, cfg->J, pmax, forced_j);
         return -1;
     }
+    const slab_plan_t base_plan = plan;
+    uint32_t perf_regions = SLAB_PERF_REGIONS;
+    /* --instances: a band under way has its N; a fresh one takes the number
+     * asked for, or for auto (0) the choice below. Without a plan, one. */
+    pipe_inst_plan_t *IP = cfg->inst;
+    int ninst = IP ? (IP->n ? IP->n : cfg->instances) : 1;
+    /* The slab target: the largest of 4x, 2x the default whose modelled
+     * footprint fits free VRAM with headroom, else the default. N instances
+     * need N footprints and share ONE headroom -- the margin is for the
+     * display and the model's error, which do not multiply. The serial arm's
+     * second bucket array is decided later, in run_pipeline_impl, against the
+     * memory actually left once everything else it needs is allocated. */
+    struct choice_t {
+        slab_plan_t P;
+        uint32_t regions;
+        int idx;                /* 0 = 4x, 1 = 2x, 2 = the default */
+        size_t m;
+        int fits;               /* n footprints + headroom fit free VRAM */
+    };
+    choice_t ch = { plan, SLAB_PERF_REGIONS, 2, 0, 1 };
+    if (!calibrated_j && !cfg->slab_j && !cfg->slab_fixed) {
+        size_t freeB = 0, totalB = 0;
+        if (mtlMemGetInfo(&freeB, &totalB) == mtlSuccess) {
+            const size_t gib = (size_t)1 << 30;
+            const size_t headroom = totalB / 10 > gib ? totalB / 10 : gib;
+            const double inv1 = pipe_inv_sum(fb1), inv0 = pipe_inv_sum(fb0);
+            const size_t m0 = pipe_vram_model(fb1, fb0, cfg, plan.jmax,
+                                              inv1, inv0);
+            auto choose = [&](int n, choice_t *out) {
+                /* The default is the fallback whether or not it fits: one
+                 * pipeline ran it before any of this existed. `fits` says
+                 * whether it does, for auto's N and the warning below. */
+                *out = { plan, SLAB_PERF_REGIONS, 2, m0,
+                         m0 * (size_t)n + headroom <= freeB };
+                for (int k = 2; k >= 1; k--) {
+                    slab_plan_t P2;
+                    const uint32_t r = (uint32_t)SLAB_PERF_REGIONS << k;
+                    if (slab_make_plan_r(cfg->logI, cfg->log_region, cfg->J,
+                                         pmax, 0u, r, &P2))
+                        continue;
+                    if (P2.jmax <= plan.jmax) continue;   /* a safety cap binds */
+                    const size_t m = pipe_vram_model(fb1, fb0, cfg, P2.jmax,
+                                                     inv1, inv0);
+                    if (m * (size_t)n + headroom > freeB) continue;
+                    *out = { P2, r, 2 - k, m, 1 };
+                    return;
+                }
+            };
+            if (ninst == 0) {
+                /* auto: two instances only when each still gets the slab
+                 * one would, and two footprints fit. A smaller slab does not
+                 * pay for the second instance: on 2,1147+ (RTX 4090) two at
+                 * 2^30 took 110.0 s against 108.2 s for one at 2^31, while on
+                 * c187 two at the same default slab took 30.1 s against 33.8.
+                 * Three measured slower than two, so auto stops at two. */
+                choice_t c1, c2;
+                choose(1, &c1);
+                choose(2, &c2);
+                ninst = c2.fits && c2.idx == c1.idx ? 2 : 1;
+                printf("  --instances auto: %d (%.2f GB free)\n", ninst,
+                       freeB / 1073741824.0);
+            }
+            choose(ninst, &ch);
+            if (ninst > 1 && !ch.fits)
+                fprintf(stderr, "  warning: --instances %d: %d x %.2f GB modelled"
+                        " plus %.2f GB headroom exceeds the %.2f GB free; an"
+                        " instance may fail to allocate\n", ninst, ninst,
+                        ch.m / 1073741824.0, headroom / 1073741824.0,
+                        freeB / 1073741824.0);
+            if (ch.idx < 2)
+                printf("  slab size from VRAM: %.2f GB free, modelled"
+                       " %.2f GB at %u rows/slab%s (%.2f GB at the default"
+                       " %u); using %u bucket regions/slab\n",
+                       freeB / 1073741824.0, ch.m / 1073741824.0, ch.P.jmax,
+                       ninst > 1 ? " per instance" : "",
+                       m0 / 1073741824.0, plan.jmax, ch.regions);
+            else
+                printf("  slab size from VRAM: %.2f GB free, modelled %.2f GB"
+                       " at the default %u rows/slab%s; keeping it\n",
+                       freeB / 1073741824.0, m0 / 1073741824.0, plan.jmax,
+                       ninst > 1 ? " per instance" : "");
+            plan = ch.P;
+            perf_regions = ch.regions;
+        }
+    }
+    if (ninst == 0) ninst = 1;     /* auto without a VRAM reading */
 #ifdef HAVE_BOINC
     if (cfg->slab_j ||
         slab_perf_jmax(cfg->logI, cfg->log_region, cfg->J) != 0xffffffffu)
@@ -3799,29 +5418,81 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
         printf("  recording pass: SCALAR (one thread per candidate,"
                " --td-record-scalar) -- the pre-finding-77 path, for A/B only\n");
 
-    if (plan.enabled) {
-        const uint32_t perf_jmax = slab_perf_jmax(cfg->logI, cfg->log_region,
-                                                  cfg->J);
-        if (calibrated_j)
+    /* run_pipeline_impl reads the decision from the flag it already tests;
+     * its own free-memory check stays behind it as a second line. */
+    bench_cfg_t cfg_run = *cfg;
+    cfg_run.inst = NULL;
+
+    auto slab_line = [&](const slab_plan_t &P, uint32_t regions) {
+        if (!P.enabled) return;
+        const uint32_t perf_jmax = slab_perf_jmax_r(cfg->logI, cfg->log_region,
+                                                    cfg->J, regions);
+        if (calibrated_j) {
             printf("  j-slabbing: %u slab%s, up to %u rows/slab"
                    " (auto-calibrated against this run's first special-q,"
                    " not the static target)\n",
-                   plan.nslab, plan.nslab == 1 ? "" : "s", plan.jmax);
-        else if (!cfg->slab_j && perf_jmax != 0xffffffffu)
+                   P.nslab, P.nslab == 1 ? "" : "s", P.jmax);
+        } else if (!cfg->slab_j && perf_jmax != 0xffffffffu)
             printf("  j-slabbing: %u slab%s, up to %u rows/slab"
                    " (auto target %u bucket regions at --region %d;"
                    " safety bounds may reduce it further)\n",
-                   plan.nslab, plan.nslab == 1 ? "" : "s", plan.jmax,
-                   (unsigned)SLAB_PERF_REGIONS, cfg->log_region);
+                   P.nslab, P.nslab == 1 ? "" : "s", P.jmax,
+                   (unsigned)regions, cfg->log_region);
         else
             printf("  j-slabbing: %u slab%s, up to %u rows/slab"
                    " (<=2^31 local-position safety bound)\n",
-                   plan.nslab, plan.nslab == 1 ? "" : "s", plan.jmax);
-        return run_pipeline_impl<true>(fb1, fbs1, fb0, fbs0, qlist, nq, qgen,
-                                       POLY, cfg, &plan);
+                   P.nslab, P.nslab == 1 ? "" : "s", P.jmax);
+    };
+    slab_line(plan, perf_regions);
+
+    if (IP && ninst >= 2) {
+        if (!IP->n) {
+            /* A fresh band: split it, and pin the split before any instance
+             * creates a file -- a relaunch reads N from here. */
+            IP->n = ninst;
+            for (int k = 0; k < ninst; k++) {
+                pipe_inst_one_t *I = &IP->in[k];
+                inst_split(cfg->qmin, cfg->qmax, ninst, k, &I->qmin, &I->qmax);
+                I->relations[0] = 0;
+                if (cfg->relations &&
+                    (inst_rel_path(cfg->relations, k, I->relations,
+                                   sizeof I->relations) ||
+                     ckpt_path_usable(I->relations,
+                                      "--relations (instance file)")))
+                    return PIPE_RC_FAIL;
+            }
+            if (IP->manifest[0]) {
+                inst_manifest_t m;
+                memset(&m, 0, sizeof m);
+                m.n = ninst;
+                m.qmin = cfg->qmin;
+                m.qmax = cfg->qmax;
+                ckpt_fingerprint(POLY, cfg, m.fp);
+                if (inst_manifest_write(IP->manifest, &m)) return PIPE_RC_FAIL;
+            }
+        }
+        return run_pipeline_instances(fb1, fbs1, fb0, fbs0, POLY, &cfg_run, IP,
+                                      &plan, &base_plan,
+                                      perf_regions != SLAB_PERF_REGIONS,
+                                      ch.m);
     }
-    return run_pipeline_impl<false>(fb1, fbs1, fb0, fbs0, qlist, nq, qgen,
-                                    POLY, cfg, &plan);
+
+    int rc = pipe_impl_any(&plan, fb1, fbs1, fb0, fbs0, qlist, nq, qgen, POLY,
+                           &cfg_run);
+    /* An up-sized plan whose bucket array did not fit or could not be
+     * allocated -- typically another task took the memory after the free-VRAM
+     * reading above -- runs once more at the default, which is what this
+     * build ran before the slab target became VRAM-driven. */
+    if (rc == PIPE_RC_NOVRAM && perf_regions != SLAB_PERF_REGIONS) {
+        printf("  slab size from VRAM: the up-sized plan no longer fits;"
+               " retrying at the default %u rows/slab, one bucket array\n",
+               base_plan.jmax);
+        cfg_run.dual_bucket = 0;
+        slab_line(base_plan, SLAB_PERF_REGIONS);
+        rc = pipe_impl_any(&base_plan, fb1, fbs1, fb0, fbs0, qlist, nq, qgen,
+                           POLY, &cfg_run);
+    }
+    return rc == PIPE_RC_NOVRAM ? PIPE_RC_FAIL : rc;
 }
 
 #endif  /* CUDA_SIEVE_PIPELINE_CUH */

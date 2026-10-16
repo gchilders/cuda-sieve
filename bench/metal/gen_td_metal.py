@@ -17,6 +17,48 @@ b = next(i for i, l in enumerate(lines) if l.startswith('#if defined(__CUDACC__)
 e = next(i for i in range(len(lines) - 1, 0, -1)
          if lines[i].startswith('#endif  /* __CUDACC__ */'))
 body = '\n'.join(lines[b + 1:e])
+
+# ---- pipeline.cuh's one kernel --------------------------------------------
+# upstream 2a3dfb0 put k_resieve_bucket in pipeline.cuh, which until then was
+# host orchestration with no device code in it at all -- gen_pipeline_host.py
+# says so in its own header. It is pulled in HERE, rather than into a third
+# generator, because it calls td_rank and reads plat_t, so td.metal is the
+# translation unit that already has everything it needs in scope; and because
+# a third copy of the kernel-head machinery below would be a third thing to
+# drift. gen_pipeline_host.py drops the same span from the host file, with
+# asserts on both sides naming the other.
+_pl = open('bench/pipeline.cuh').read().split('\n')
+_pb = next(i for i, l in enumerate(_pl) if l.startswith('#define FINE_SHIFT'))
+_pe = next(i for i, l in enumerate(_pl) if '__global__ void k_resieve_bucket' in l)
+_d, _seen = 0, False
+for _i in range(_pe, len(_pl)):
+    _d += _pl[_i].count('{') - _pl[_i].count('}')
+    if '{' in _pl[_i]: _seen = True
+    if _seen and _d == 0: _pe = _i; break
+_pspan = '\n'.join(_pl[_pb:_pe + 1])
+# The span opens with the three FINE_* defines and must carry rb_mod, the
+# kernel's only helper. pipe_build_fine is HOST code written between them --
+# the ss_tiers shape from the 2026-09-24 rebase -- so it is dropped by name.
+for _need in ('#define FINE_SHIFT', '#define FINE_BITS', '#define FINE_PER_GROUP',
+              'uint32_t rb_mod(', '__global__ void k_resieve_bucket'):
+    assert _need in _pspan, 'pipeline.cuh device span lost ' + _need
+_hb = _pspan.index('static int pipe_build_fine(')
+_he = _pspan.index('{', _hb); _d = 0
+while _he < len(_pspan):
+    if _pspan[_he] == '{': _d += 1
+    elif _pspan[_he] == '}':
+        _d -= 1
+        if _d == 0: break
+    _he += 1
+_pspan = (_pspan[:_hb] + '/* pipe_build_fine: host-side, see pipeline.cuh */\n'
+          + _pspan[_he + 1:])
+assert 'pipe_build_fine(' not in _pspan.replace('see pipeline.cuh', ''), \
+    'a CALL to pipe_build_fine survives into the metallib'
+# A lifted #define must not override a -D of the same name; see td_host.h.
+_pspan = re.sub(r'^#define (FINE_\w+)(\s+)(\S+)', r'#ifndef \1\n#define \1\2\3\n#endif',
+                _pspan, flags=re.M)
+body = body + '\n\n' + _pspan
+print('  pulled k_resieve_bucket + rb_mod in from pipeline.cuh')
 # tdpoly_t and tdsmall_t are declared above td.cuh's __CUDACC__ guard, so
 # they come from td_msl.h -- generated from that same section -- rather than
 # being prepended here. bench_kernels.metal needs them too, and one
@@ -50,11 +92,34 @@ K = {
  'k_td_record_warp':  (['bool SLABBED'], [('false',), ('true',)]),
  'k_resieve_scatter': (['int UNROLL', 'bool SLABBED'],
                        [('1','false'),('2','false'),('4','false'),('8','false'),('4','true')]),
+ # upstream 2a3dfb0's --resieve-rows: the row tier of k_resieve_scatter.
+ # pipeline.cuh launches <4, SLABBED> only, as it does for the scatter.
+ 'k_resieve_rows':    (['int UNROLL', 'bool SLABBED'],
+                       [('4','false'),('4','true')]),
+ 'k_resieve_bucket':  (None, None),   # from pipeline.cuh, see above
  'k_td':              (['int DIVIDE', 'int RECORD', 'int SELECT', 'bool SLABBED'],
                        [('0','0','0','false'),('1','0','0','false'),('1','0','0','true'),
                         ('1','1','0','false'),('1','1','0','true'),
                         ('1','1','1','false'),('1','1','1','true')]),
 }
+
+# Every __global__ in td.cuh's device half must be named in K, or it is
+# dropped from the metallib silently and surfaces -- if at all -- as a
+# missing-kernel error on whatever path launches it. upstream 2a3dfb0 added
+# k_resieve_rows here and nothing complained until this check existed.
+def _kernel_names(text):
+    out = []
+    for m in re.finditer(r'__global__', text):
+        a = text.index('(', m.end())
+        out.append(re.findall(r'(\w+)\s*$', text[m.end():a])[-1])
+    return sorted(set(out))
+_declared = _kernel_names(body)
+_missing = [k for k in _declared if k not in K]
+assert not _missing, ('__global__ kernels in td.cuh with no K entry: %s'
+                      % ', '.join(_missing))
+_extra = [k for k in K if k not in _declared]
+assert not _extra, ('K names a kernel td.cuh does not declare: %s'
+                    % ', '.join(_extra))
 
 def split_top(s):
     out, cur, d = [], '', 0
@@ -101,7 +166,12 @@ for name, (tparams, insts) in K.items():
             d -= 1
             if d == 0: break
         i += 1
-    params = split_top(body[a + 1:i])
+    # MSL has no default kernel argument -- every parameter is a binding the
+    # dispatch must set -- so the default is dropped here and moved to the
+    # call site instead (portlib.pad_launch_defaults). Dropping it silently
+    # would emit `device uint32_t *rt_out = nullptr` in the body template and
+    # `constant uint32_t &n_rt = &0` in the wrapper, neither of which is legal.
+    params = [p.split('=', 1)[0].rstrip() for p in split_top(body[a + 1:i])]
     brace = body.index('{', i); d = 0; j = brace
     while j < len(body):
         if body[j] == '{': d += 1
@@ -110,6 +180,14 @@ for name, (tparams, insts) in K.items():
             if d == 0: break
         j += 1
     inner = re.sub(r'\b__shared__\s+', 'threadgroup ', body[brace + 1:j])
+
+    # A kernel that votes with __syncthreads_or needs the scratch word the
+    # compat macro names -- k_resieve_bucket, pulled in from pipeline.cuh,
+    # is the first kernel in this half to use it. Declared as a one-element
+    # array so a plain kernel and a templated one spell the call site
+    # identically. Same shape as gen_bench_kernels.py's.
+    if '__syncthreads_or' in inner:
+        inner = '    threadgroup uint _sync_or_flag[1];\n' + inner
 
     # MSL forbids a threadgroup declaration inside a non-kernel function, so a
     # templated kernel's static shared arrays have to become parameters. The
@@ -217,7 +295,29 @@ if n_lim: print('k_classify: lim carried as a binary64 bit pattern (softfp64)')
 # (Both sites are the same idiom in k_td and k_td_record_warp.)
 n_local = body.count('uint32_t *myfac =')
 body = body.replace('uint32_t *myfac =', 'device uint32_t *myfac =')
+# k_resieve_bucket's alias into its bucket argument, the same idiom.
+_rec = 'const uint32_t *rec = bucket +'
+assert body.count(_rec) == 1, 'k_resieve_bucket record alias shape changed'
+body = body.replace(_rec, 'device const uint32_t *rec = bucket +', 1)
+n_local += 1
 if n_local: print('qualified %d local device-pointer alias(es)' % n_local)
+
+# ---- bench.h constants this half reads ------------------------------------
+# Lifted by name, never retyped; see gen_bench_kernels.py's copy. td.metal is
+# its own translation unit, so it needs its own statement of ROWRT_NONE --
+# the #ifndef guard is what keeps the two from fighting or from overriding a
+# -D of the same name.
+DEVICE_DEFINES = ['ROWRT_NONE']
+_bh = open('bench/bench.h').read()
+_lift = ''
+for _nm in DEVICE_DEFINES:
+    _m = re.search(r'^#define\s+' + _nm + r'\s+(.+?)\s*(?:/\*.*)?$', _bh, re.M)
+    assert _m, 'bench.h does not define ' + _nm
+    assert re.search(r'\b' + _nm + r'\b', body), (
+        '%s is lifted from bench.h but td.cuh does not use it' % _nm)
+    _lift += '#ifndef %s\n#define %s %s\n#endif\n' % (_nm, _nm, _m.group(1))
+body = _lift + '\n' + body
+print('  lifted %d bench.h #define(s)' % len(DEVICE_DEFINES))
 
 # ---- k_td's congruence test: one struct load, not six field loads ---------
 # Profiled against a GTX 1080 at the same q with identical work (17,625,929

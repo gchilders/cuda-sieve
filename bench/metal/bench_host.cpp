@@ -837,6 +837,35 @@ done:
     return rc;
 }
 
+/* The scaffold both device arithmetic gates share: upload n host-built cases,
+ * run the check kernel, and read back the first failing index (UINT32_MAX if
+ * none). Returns -1 on a CUDA error, leaving *first_bad untouched. One copy,
+ * so an error-path fix reaches both gates. */
+template <typename Case>
+static int run_device_cases(const char *kern,
+                            const Case *h, uint32_t n, uint32_t blocks,
+                            uint32_t *first_bad)
+{
+    Case *d = NULL;
+    uint32_t *d_bad = NULL, bad = UINT32_MAX;
+    int rc = -1;
+#define DEVCASE_CK(x) do { if (CUDA_CHECKED(x)) goto out; } while (0)
+    DEVCASE_CK(mtlMalloc(&d, sizeof(*h) * n));
+    DEVCASE_CK(mtlMalloc(&d_bad, sizeof(*d_bad)));
+    DEVCASE_CK(mtlMemcpy(d, h, sizeof(*h) * n, mtlMemcpyHostToDevice));
+    DEVCASE_CK(mtlMemcpy(d_bad, &bad, sizeof(bad), mtlMemcpyHostToDevice));
+    MTL_LAUNCH_NAMED(kern, blocks, 256, 0, 0, d, n, d_bad);
+    DEVCASE_CK(mtlGetLastError());
+    DEVCASE_CK(mtlDeviceSynchronize());
+    DEVCASE_CK(mtlMemcpy(&bad, d_bad, sizeof(bad), mtlMemcpyDeviceToHost));
+    *first_bad = bad;
+    rc = 0;
+out:
+    mtlFree(d); mtlFree(d_bad);
+#undef DEVCASE_CK
+    return rc;
+}
+
 typedef struct {
     uint32_t w, m, magic, sh, ref;
 } td_mod_case_t;
@@ -850,9 +879,8 @@ typedef struct {
 static int verify_td_mod_device(void)
 {
     enum { NCASE = 4096 };
-    td_mod_case_t *h = NULL, *d = NULL;
-    uint32_t *d_bad = NULL, bad = UINT32_MAX, seed = 0x7f4a7c15u;
-    int rc = -1;
+    td_mod_case_t *h = NULL;
+    uint32_t bad = UINT32_MAX, seed = 0x7f4a7c15u;
 
     h = (td_mod_case_t *)malloc(sizeof(*h) * NCASE);
     if (!h) return -1;
@@ -874,28 +902,137 @@ static int verify_td_mod_device(void)
         h[k].w = w; h[k].m = m; h[k].magic = magic; h[k].sh = sh;
         h[k].ref = w % m;
     }
-#define MODDEV_CK(x) do { if (CUDA_CHECKED(x)) goto out; } while (0)
-    MODDEV_CK(mtlMalloc(&d, sizeof(*h) * NCASE));
-    MODDEV_CK(mtlMalloc(&d_bad, sizeof(*d_bad)));
-    MODDEV_CK(mtlMemcpy(d, h, sizeof(*h) * NCASE, mtlMemcpyHostToDevice));
-    MODDEV_CK(mtlMemcpy(d_bad, &bad, sizeof(bad), mtlMemcpyHostToDevice));
-    MTL_LAUNCH(k_verify_td_mod_cases, 16, 256, 0, 0, d, NCASE, d_bad);
-    MODDEV_CK(mtlDeviceSynchronize());
-    MODDEV_CK(mtlGetLastError());
-    MODDEV_CK(mtlMemcpy(&bad, d_bad, sizeof(bad), mtlMemcpyDeviceToHost));
+    if (run_device_cases("k_verify_td_mod_cases", h, NCASE, 16, &bad)) {
+        free(h);
+        return -1;
+    }
     if (bad != UINT32_MAX) {
         const td_mod_case_t c = h[bad];
         fprintf(stderr,
                 "[verify] device td_mod mismatch case %u: w=%u m=%u"
                 " magic=%u sh=%u ref=%u\n",
                 bad, c.w, c.m, c.magic, c.sh, c.ref);
-        goto out;
+        free(h);
+        return -1;
     }
-    rc = 0;
-out:
-    mtlFree(d); mtlFree(d_bad); free(h);
-#undef MODDEV_CK
-    return rc;
+    free(h);
+    return 0;
+}
+
+typedef struct {
+    uint32_t p, rt, j, magic, kshift, two, ref;
+    int32_t  ilo;
+} ss_first_case_t;
+
+/* device code: see metal/bench_kernels.metal */
+
+
+/* Device gate for ss_first's two magic forms, against the 64-bit fallback's
+ * own formula computed on the host. Each modulus is routed the way the
+ * device routes it -- two-step exactly when it fails the one-step bound at J
+ * (ss_one_step_fits, the predicate ss_two_step_from splits on), powers of two
+ * included -- and gets the magic ss_magic_build builds for that form. Every
+ * geometry gets the corners: both sides of the split, both sides of the
+ * two-step form's own refusal boundary (the largest modulus it accepts),
+ * m = I-1, I-2, a power of two; then random moduli. Each case's inputs come
+ * at the proof's corners (rt = m-1, j = jmax, ilo = -ihalf) or at random.
+ * Relations would catch a wrong residue too, but only as a smaller relation
+ * count; this names the case. Runs only under --verify; slabtest runs the
+ * same routing and corners on the CPU, inside `make check`. */
+static int verify_ss_first_device(void)
+{
+    enum { NCASE = 8192, NCORNER = 12 };
+    static const uint32_t geo[][2] = {     /* {logI, J} */
+        {15, 16384}, {16, 16384}, {16, 32768}, {16, 65536}, {17, 32768},
+        {17, 65536}, {18, 65536}
+    };
+    const uint32_t NG = (uint32_t)(sizeof geo / sizeof geo[0]);
+    ss_first_case_t *h = NULL;
+    uint32_t bad = UINT32_MAX, seed = 0x2545f491u, n = 0;
+    uint32_t ntwo = 0, ncorner2 = 0;
+    uint32_t splits[sizeof geo / sizeof geo[0]], tmax[sizeof geo / sizeof geo[0]];
+
+    /* Per geometry: the first modulus the one-step bound refuses (where the
+     * device's two-step range starts), and the largest non-power-of-two
+     * modulus the two-step proof still accepts (0 if none). */
+    for (uint32_t g = 0; g < NG; g++) {
+        const uint32_t logI = geo[g][0], J = geo[g][1], I = 1u << logI;
+        uint32_t s = 2, t = I - 1;
+        while (s < I && ss_one_step_fits(s, J, logI)) s++;
+        while (t >= s && ((t & (t - 1)) == 0 || !ss_bound_ok(t, J, logI, 1))) t--;
+        splits[g] = s;
+        tmax[g] = t >= s ? t : 0;
+    }
+    h = (ss_first_case_t *)malloc(sizeof(*h) * NCASE);
+    if (!h) return -1;
+    for (uint32_t tries = 0; n < NCASE && tries < 64u * NCASE; tries++) {
+        const uint32_t g = tries % NG, logI = geo[g][0], J = geo[g][1];
+        const uint32_t I = 1u << logI, ihalf = I >> 1, k = tries / NG;
+        const uint32_t split = splits[g];
+        uint32_t m, magic, two;
+        seed = seed * 1664525u + 1013904223u;
+        switch (k < NCORNER ? k : NCORNER) {    /* the corners first */
+        case 0:  m = split - 2; break;
+        case 1:  m = split - 1; break;
+        case 2:  m = split;     break;
+        case 3:  m = split + 1; break;
+        case 4:  m = split + 2; break;
+        case 5:  m = tmax[g] ? tmax[g] - 1 : 0; break;
+        case 6:  m = tmax[g];   break;
+        case 7:  m = tmax[g] ? tmax[g] + 1 : 0; break;   /* refused: skipped */
+        case 8:  m = I - 1;     break;
+        case 9:  m = I - 2;     break;
+        case 10: m = I >> 1;    break;                   /* a power of two */
+        case 11: m = split | 1u; break;
+        default: m = 2u + seed % (I - 2u); break;
+        }
+        if (m < 2 || m >= I) continue;
+        two = !ss_one_step_fits(m, J, logI);
+        ss_magic_build(m, J, logI, (int)two, &magic);
+        if (!magic) continue;               /* the fallback; not this gate's */
+        ss_first_case_t c;
+        seed = seed * 1664525u + 1013904223u;
+        c.rt = (k & 3u) == 0 ? m - 1u : seed % m;
+        seed = seed * 1664525u + 1013904223u;
+        c.j = (k % 3u) == 0 ? J : seed % (J + 1u);
+        seed = seed * 1664525u + 1013904223u;
+        c.ilo = (k % 5u) == 0 ? -(int32_t)ihalf
+              : (k % 5u) == 1 ? (int32_t)ihalf - 1
+              : (int32_t)(seed % I) - (int32_t)ihalf;
+        if (k < NCORNER) {                  /* corner moduli: worst inputs */
+            c.rt = m - 1u; c.j = J; c.ilo = -(int32_t)ihalf;
+            ncorner2 += two;
+        }
+        c.p = m; c.magic = magic; c.kshift = SS_KSHIFT(logI); c.two = two;
+        c.ref = (uint32_t)(((uint64_t)c.rt * c.j + ((uint64_t)m << 20)
+                            - (uint64_t)(int64_t)c.ilo) % m);
+        h[n++] = c;
+        ntwo += two;
+    }
+    if (n < NCASE || ntwo < NCASE / 8 || ncorner2 < 3) {
+        fprintf(stderr, "[verify] ss_first gate built %u cases (%u two-step,"
+                " %u two-step corners); the geometry table no longer reaches"
+                " the two-step range\n", n, ntwo, ncorner2);
+        free(h);
+        return -1;
+    }
+    if (run_device_cases("k_verify_ss_first_cases", h, NCASE, 32, &bad)) {
+        free(h);
+        return -1;
+    }
+    if (bad != UINT32_MAX) {
+        const ss_first_case_t c = h[bad];
+        fprintf(stderr,
+                "[verify] device ss_first mismatch case %u: p=%u rt=%u j=%u"
+                " ilo=%d kshift=%u two=%u ref=%u\n",
+                bad, c.p, c.rt, c.j, c.ilo, c.kshift, c.two, c.ref);
+        free(h);
+        return -1;
+    }
+    printf("[verify] OK: %u device ss_first cases, %u of them two-step"
+           " (%u at the corners)\n", n, ntwo, ncorner2);
+    free(h);
+    return 0;
 }
 
 extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
@@ -959,6 +1096,8 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
         printf("[verify] direct-TD reciprocal on device (__umulhi path)...\n");
         if (verify_td_mod_device()) return -1;
         printf("[verify] OK: 4096 device reciprocal cases through w=0x7fffffff\n");
+        printf("[verify] small-sieve first offset, one- and two-step forms...\n");
+        if (verify_ss_first_device()) return -1;
     }
 
     int td_failed = 0;      /* a failed gate must reach the exit status */
@@ -993,7 +1132,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     /* ---- small primes: transform on the host (a few thousand entries) and
      * split into the three load-balance tiers. Entries arrive sorted by p, so
      * the tier boundaries are just two indices. ---- */
-    uint32_t nsmall = 0, nblk = 0, nwrp = 0;
+    uint32_t nsmall = 0, nblk = 0, nwrp = 0, nsplit = 0;
     uint32_t *hsp = NULL, *hsrt = NULL, *hsg = NULL; uint16_t *hslp = NULL;
     uint32_t *hsmag = NULL;
     /* per-q HOST work, billed separately: it is invisible to cudaEvent timing
@@ -1064,13 +1203,17 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
         h_ms_sort = host_ms() - h_ms_sort;
 
         /* Reciprocals AFTER the sort: the key is the modulus itself, so
-         * building them earlier would mean permuting them too, for no gain. */
+         * building them earlier would mean permuting them too, for no gain.
+         * And after the tiers, because the thread tier's two-step range
+         * starts at nsplit and each magic is proved for the form its index
+         * gets (ss_bound_ok). */
+        ss_tiers(hsp, nsmall, &nblk, &nwrp);
+        nsplit = ss_two_step_from(hsp, nsmall, nwrp, cfg->J, cfg->logI);
         for (i = 0; i < nsmall; i++)
             ss_magic_build(hsp[i],
                            hsg[i] > 1 ? cfg->J / hsg[i] : cfg->J,
-                           cfg->logI, &hsmag[i]);
+                           cfg->logI, i >= nsplit, &hsmag[i]);
 
-        ss_tiers(hsp, nsmall, &nblk, &nwrp);
         CK(mtlMalloc(&D.smag, (size_t)nsmall * 4));
         CK(mtlMalloc(&D.sp,  (size_t)nsmall * 4));
         CK(mtlMalloc(&D.srt, (size_t)nsmall * 4));
@@ -1138,13 +1281,13 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
      * different people compared that number across GPUs before anyone noticed
      * it was measuring startup. The memsets follow the warm-up because nproj
      * and nlost are accumulators divided by reps. */
-    MTL_LAUNCH(k_transform_0, blocks, cfg->threads, 0, 0, D.primes, D.roots, D.plat, fb->n, cfg->logI, cfg->J, L->a0, L->a1, L->b0, L->b1, D.nproj, D.nlost, nullptr);
+    MTL_LAUNCH(k_transform_0, blocks, cfg->threads, 0, 0, D.primes, D.roots, D.plat, fb->n, cfg->logI, cfg->J, L->a0, L->a1, L->b0, L->b1, D.nproj, D.nlost, nullptr, nullptr, 0);
     CK(mtlDeviceSynchronize());
     CK(mtlMemset(D.nproj, 0, 4));
     CK(mtlMemset(D.nlost, 0, 8));
     mtlEventRecord(e0);
     for (int rep = 0; rep < cfg->reps; rep++)
-        MTL_LAUNCH(k_transform_0, blocks, cfg->threads, 0, 0, D.primes, D.roots, D.plat, fb->n, cfg->logI, cfg->J, L->a0, L->a1, L->b0, L->b1, D.nproj, D.nlost, nullptr);
+        MTL_LAUNCH(k_transform_0, blocks, cfg->threads, 0, 0, D.primes, D.roots, D.plat, fb->n, cfg->logI, cfg->J, L->a0, L->a1, L->b0, L->b1, D.nproj, D.nlost, nullptr, nullptr, 0);
     mtlEventRecord(e1);
     CK(mtlEventSynchronize(e1));
     CK(mtlGetLastError());
@@ -1184,11 +1327,11 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
 #define FILL_ONE(GRID, STREAM, PLAT, CUR, OUT, OVF)                          \
     do {                                                                     \
         if (cfg->record_bytes == 2)                                          \
-            MTL_LAUNCH(k_fill_atomic_2_0, (GRID), fthreads, 0, (STREAM), (PLAT), D.slice, fb->n, xmax, cfg->logI, log_region, (CUR), (OUT), cap, (OVF), nullptr, nullptr, 0, 0u);                       \
+            MTL_LAUNCH(k_fill_atomic_2_0, (GRID), fthreads, 0, (STREAM), (PLAT), D.slice, fb->n, xmax, cfg->logI, log_region, (CUR), (OUT), cap, (OVF), nullptr, nullptr, 0, 0u, nullptr, 0, 16);                       \
         else if (cfg->record_bytes == 4)                                     \
-            MTL_LAUNCH(k_fill_atomic_4_0, (GRID), fthreads, 0, (STREAM), (PLAT), D.slice, fb->n, xmax, cfg->logI, log_region, (CUR), (OUT), cap, (OVF), nullptr, nullptr, 0, 0u);                       \
+            MTL_LAUNCH(k_fill_atomic_4_0, (GRID), fthreads, 0, (STREAM), (PLAT), D.slice, fb->n, xmax, cfg->logI, log_region, (CUR), (OUT), cap, (OVF), nullptr, nullptr, 0, 0u, nullptr, 0, 16);                       \
         else                                                                 \
-            MTL_LAUNCH(k_fill_atomic_8_0, (GRID), fthreads, 0, (STREAM), (PLAT), D.slice, fb->n, xmax, cfg->logI, log_region, (CUR), (OUT), cap, (OVF), nullptr, nullptr, 0, 0u);                       \
+            MTL_LAUNCH(k_fill_atomic_8_0, (GRID), fthreads, 0, (STREAM), (PLAT), D.slice, fb->n, xmax, cfg->logI, log_region, (CUR), (OUT), cap, (OVF), nullptr, nullptr, 0, 0u, nullptr, 0, 16);                       \
     } while (0)
 
         mtlEventRecord(e2);
@@ -1548,15 +1691,20 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                 goto after_apply;
             }
 
-#define LAUNCH_APPLY(CBV, AT, NM)                                              \
+            /* ST: the SSTAIL instance. The production configuration (16-bit
+             * cells, atomic, Horner) picks it with ss_needs_tail exactly as
+             * the pipeline does, so --verify checks the instances the
+             * pipeline runs, tail and no tail; the other configurations keep
+             * the tail instance, which is right with or without one. */
+#define LAUNCH_APPLY(CBV, AT, NM, ST)                                          \
             do {                                                               \
-                CK(mtlFuncSetMaxThreadgroupMemory("k_apply_" #CBV "_" #AT "_" #NM "_0", smem));  \
+                CK(mtlFuncSetMaxThreadgroupMemory("k_apply_" #CBV "_" #AT "_" #NM "_0_" #ST, smem));  \
                 mtlEventRecord(e3);                                           \
                 for (int rep = 0; rep < cfg->reps; rep++) {                    \
                     CK(mtlMemset(D.nsurv, 0, 4));                             \
                     if (D.survbits)                                            \
                         CK(mtlMemset(D.survbits, 0, (size_t)nbitword * 4));   \
-                    MTL_LAUNCH_NAMED("k_apply_" #CBV "_" #AT "_" #NM "_0", nregion, athr, smem, 0, (const uint32_t *)D.out, D.cursor, cap, cfg->logI, log_region, D.slice_logp, nslice_pow2, N, CINIT, CINIT - BOUND, tconst, D.dumpbuf, D.nsurv, D.dbg, dbgreg, D.sp, D.srt, D.sg, D.slp, D.smag, nsmall, nblk, nwrp, probe_x, D.probe, D.survbits, cfg->not_both_even, 0, 0u);                   \
+                    MTL_LAUNCH_NAMED("k_apply_" #CBV "_" #AT "_" #NM "_0_" #ST, nregion, athr, smem, 0, (const uint32_t *)D.out, D.cursor, cap, cfg->logI, log_region, D.slice_logp, nslice_pow2, N, CINIT, CINIT - BOUND, tconst, D.dumpbuf, D.nsurv, D.dbg, dbgreg, D.sp, D.srt, D.sg, D.slp, D.smag, nsmall, nblk, nwrp, nsplit, probe_x, D.probe, D.survbits, cfg->not_both_even, 0, 0u, 16);                   \
                 }                                                              \
                 mtlEventRecord(e4);                                           \
                 CK(mtlEventSynchronize(e4));                                  \
@@ -1566,19 +1714,21 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
 
             if (CB == 16) {
                 if (cfg->apply_atomic) {
-                    if (cfg->norm_mode == NORM_CONST) LAUNCH_APPLY(16, 1, 0);
-                    else                              LAUNCH_APPLY(16, 1, 1);
+                    if (cfg->norm_mode == NORM_CONST) LAUNCH_APPLY(16, 1, 0, 1);
+                    else if (ss_needs_tail(nsplit, nsmall))
+                                                      LAUNCH_APPLY(16, 1, 1, 1);
+                    else                              LAUNCH_APPLY(16, 1, 1, 0);
                 } else {
-                    if (cfg->norm_mode == NORM_CONST) LAUNCH_APPLY(16, 0, 0);
-                    else                              LAUNCH_APPLY(16, 0, 1);
+                    if (cfg->norm_mode == NORM_CONST) LAUNCH_APPLY(16, 0, 0, 1);
+                    else                              LAUNCH_APPLY(16, 0, 1, 1);
                 }
             } else {
                 if (cfg->apply_atomic) {
-                    if (cfg->norm_mode == NORM_CONST) LAUNCH_APPLY(8, 1, 0);
-                    else                              LAUNCH_APPLY(8, 1, 1);
+                    if (cfg->norm_mode == NORM_CONST) LAUNCH_APPLY(8, 1, 0, 1);
+                    else                              LAUNCH_APPLY(8, 1, 1, 1);
                 } else {
-                    if (cfg->norm_mode == NORM_CONST) LAUNCH_APPLY(8, 0, 0);
-                    else                              LAUNCH_APPLY(8, 0, 1);
+                    if (cfg->norm_mode == NORM_CONST) LAUNCH_APPLY(8, 0, 0, 1);
+                    else                              LAUNCH_APPLY(8, 0, 1, 1);
                 }
             }
 #undef LAUNCH_APPLY

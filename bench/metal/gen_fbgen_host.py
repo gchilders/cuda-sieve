@@ -105,6 +105,17 @@ def rewrite_launches(text):
             else: cur += ch
         parts.append(cur)
         grid, block = parts[0], parts[1]
+        # This rewriter hard-codes the threadgroup length and the stream as
+        # `0, 0`, which is only correct while fbgen_gpu.cu launches everything
+        # with neither. The sibling generator for cofac.cuh made the same
+        # assumption and kept it after upstream put every cofactor launch on
+        # g_cof_stream: the kernels then ran on stream 0 while the host waited
+        # on g_cof_stream, and a 288-q band lost five thousand relations
+        # without an error. Asserted here so the next such change stops the
+        # generator instead.
+        assert len(parts) <= 2, (
+            'fbgen launch of %s carries a threadgroup length or a stream '
+            '(%s); this rewriter drops both' % (base, ', '.join(parts[2:])))
         # argument list after >>>
         a = text.index('(', m)
         d = 0; b = a

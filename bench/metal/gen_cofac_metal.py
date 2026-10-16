@@ -140,9 +140,27 @@ IDS = ['uint _tid [[thread_position_in_grid]]', 'uint _ntid [[threads_per_grid]]
 IDS_PLAIN = [x.split(' [[')[0] for x in IDS]
 IDS_ARGS = ['_tid', '_ntid', '_bid', '_lid', '_bdim', '_gdim']
 
+# The limb widths this metallib carries. CF_LMIN is LIFTED from bench.h --
+# upstream 2a3dfb0 lowered it from 3 to 2 for a side whose mfb fits 64 bits,
+# and the only symptom here was `k_cof_enqueue_2_3 was not found in the
+# library` at the first flush of a band that had already sieved. CF_LMAX is
+# the build's, and the generator's output is committed, so the Makefile's
+# default is asserted rather than read per build.
+_bh = open('bench/bench.h').read()
+_m = re.search(r'^#define CF_LMIN (\d+)', _bh, re.M)
+assert _m, 'bench.h does not define CF_LMIN'
+CF_LMIN = int(_m.group(1))
+_mk = re.search(r'^CF_LMAX\s*\?=\s*(\d+)', open('bench/Makefile.metal').read(), re.M)
+assert _mk and _mk.group(1) == '4', (
+    'Makefile.metal no longer defaults CF_LMAX to 4; this file instantiates'
+    ' %s..4 and the committed output would not match the build' % CF_LMIN)
+CF_LIMBS = [str(L) for L in range(CF_LMIN, 5)]
+print('  cofactor limb widths: %s (CF_LMIN lifted from bench.h)'
+      % ', '.join(CF_LIMBS))
+
 K = {
  'k_cofac': (['int L', 'int METHOD', 'int STAGE2'],
-             [(str(L), m, s) for L in (3, 4) for (m, s) in (('1','1'), ('1','0'), ('0','0'))]),
+             [(L, m, s) for L in CF_LIMBS for (m, s) in (('1','1'), ('1','0'), ('0','0'))]),
  'k_cof_selflags':   (None, None),
  'k_cof_selscatter': (None, None),
  'k_cof_gate':       (None, None),
@@ -151,7 +169,7 @@ K = {
  'k_rel_gather':     (None, None),
  'k_rel_pack':       (None, None),
  'k_cof_enqueue':    (['int L0', 'int L1'],
-                      [('3','3'), ('3','4'), ('4','3'), ('4','4')]),
+                      [(a, b) for a in CF_LIMBS for b in CF_LIMBS]),
 }
 
 def split_top(s):

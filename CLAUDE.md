@@ -2161,6 +2161,348 @@ failed quietly would have shipped.
 `sievecheck`, `cofaccheck`, `validationcheck`, `cbtimecheck`, `boinccheck`,
 `metallibcheck`, `progresscheck` -- plus `cofcheck.sh` **54 PASS / 0 FAIL**.
 
+## Rebase, 2026-10-15: the biggest one yet, and FOUR silent bugs in it
+
+Twenty-two upstream commits onto `80f5869` -- ~2,900 lines of CUDA across
+`pipeline.cuh`, `bench_kernels.cu`, `bench_main.cu`, `td.cuh`, `cofac.cuh` and
+`plattice.cuh`. `--instances`, `--q-pipeline`, `--fill-rows`, `--fill-gate`,
+`--resieve-rows`, the bucket resieve, the async cofactor flush, VRAM-sized
+slabs, `CF_LMIN` back to 2, and six new kernels. The rebase itself was clean
+and every drift-ledger row survived.
+
+**TWO GENERATORS FAILED LOUDLY AND COST MINUTES; FOUR THINGS FAILED SILENTLY
+AND COST A DAY AND THE USER'S DESKTOP SESSION.** That ratio is the whole
+lesson of this file, demonstrated again at scale.
+
+### What failed loudly (the system working)
+
+A right-shift in a grid expression -- `k_resieve_bucket<<<xmax >> log_region,
+...>>>` -- drove portlib's bracket scanner negative, so it ran off the end of
+the file. At depth 0 a `>` closes nothing and is an operator; fixed in both
+the terminator scan and the configuration splitter. And `HELPER_SPACES`
+refused to guess an address space for `fill_gate_drops`, exactly as it was
+built to.
+
+### What failed silently
+
+**1. A SECOND COPY OF THE LAUNCH REWRITER.** `gen_cofac_host.py` carried its
+own fork, hardcoding the threadgroup length and the stream as `0, 0`. That was
+invisible while `cofac.cuh` launched everything on the default stream;
+upstream a025c32 put every cofactor launch on `g_cof_stream` for the async
+flush, and the fork dropped it -- so the kernels ran on one queue while
+`cof_sync()` and `cof_d2h()` waited on another, and the host read relation
+counts and buffers the kernels had not written. A 288-q band lost 5,000
+relations and exited 0. CLAUDE.md has named this hazard since Phase 3: "two
+copies of that transformation would drift, and a drifting transformation
+produces a file that compiles and computes something else." **This was the
+second copy.** It now goes through portlib, and asserts that no cofactor
+launch lands on stream 0 except `k_cof_enqueue`, which upstream leaves there
+deliberately. `gen_fbgen_host.py` has the same fork shape and currently gets
+away with it, so it now ASSERTS that no fbgen launch carries a stream or a
+threadgroup length.
+
+**2. `mtlStreamFlush(0)` WHERE THE LAUNCHES WERE ON `g_cof_stream`.** 9z-k's
+per-launch submission boundary was committing a queue with nothing in it while
+the cofactor queue batched exactly as before. `cbtimecheck` caught it at
+**2,561.69 ms in ONE command buffer of 23 dispatches** against the 400 ms
+bound. **This is what killed WindowServer** (userspace watchdog timeout, 40 s
+without a checkin, `AGXHardwareWorkLoop` and `bench` in the stackshot) -- the
+same failure mode as the `--ecm-b1 400000` incidents, from a one-word
+argument. 9z-k undone silently.
+
+**3. `cf_kname` KNEW ONLY `L == 3`.** It read `if (L == 3) ... else
+<4-limb name>`, which was exhaustive only while `CF_LMIN` was 3. upstream
+2a3dfb0 lowered it to 2, and **every 2-limb launch then ran the FOUR-limb
+kernel over two-limb data**: each record's modulus was read from twice the
+limbs that were packed, so rho ran its whole budget without finding a factor
+and a 1,792-record launch took 2,255 ms instead of tens. Built from `L` now,
+with the range asserted -- the failure of the enumerated form was that it had
+no case for a width it was handed.
+
+**4. AN UNASSERTED `src.replace`, BROKEN BY FIX 1.** The anchor that turns
+`k_rel_pack`'s by-value `*Q` into the argument buffer spelled out the whole
+launch configuration, *including* the stream as `0, 0`. Fixing the stream made
+it stop matching, and it silently did nothing -- so 400 bytes of **HOST
+POINTERS** went to the GPU as device addresses. Every relation came out
+`0,0::` while the COUNT stayed correct, because the count comes from a
+different kernel. Both by-value launches are asserted now, and a final check
+refuses any `MTL_LAUNCH` still passing `*Q`.
+
+**That is this file's own oldest rule, broken in the file it was written
+about.** Worse, it was broken BY a fix for another silent failure -- so the
+first fix's reward was a second, quieter bug. An assert would have stopped the
+generator; without one the only symptom was eight hours of band results that
+looked plausible and measured nothing.
+
+### Three mechanisms added, each closing a class
+
+- **Default kernel arguments.** Upstream added them to `k_transform`,
+  `k_fill_atomic`, `k_fill_rows` and `k_apply`. Metal has no such thing: every
+  parameter a kernel declares is a binding the dispatch must set. The default
+  is stripped MSL-side and filled in at each call site from the KERNEL'S OWN
+  declaration (`portlib.pad_launch_defaults`), so there is one definition of
+  each default and a launch passing the wrong NUMBER of arguments fails here.
+- **`OPTIONAL_BUFFERS` by parameter NAME, not index.** Upstream inserted
+  `nsplit` mid-list in `k_apply` and shifted the last two entries by one. It
+  happened to stop compiling because index 24 landed on a scalar; one place
+  further along and the nil-mask would have described the wrong two buffers,
+  with a validation abort only on a path that passes null.
+- **Kernel-coverage asserts.** No generator checked that every `__global__` in
+  its source had an entry in its `K` table. `k_resieve_rows` was missing and
+  nothing said so. Both kernel generators now assert coverage in both
+  directions, comment-aware.
+
+### The chunker opens at the floor now, and climbs
+
+Auto opened at one core-derived grid -- 15,360 records here -- and let the
+measurement walk it down. Safe while that opening launch measured ~240 ms;
+after the rebase it measured **975-1211 ms**, so the first flush of every band
+submitted a command buffer two and a half to three times the bound, and the
+controller only reacted AFTER it had run, riding down over flushes seventy
+special-q apart. **A controller whose probe is itself the hazard is the wrong
+shape** -- fbgen had this and 9z-o replaced it with "start safe and measure".
+Auto now opens at the FLOOR (one wave, device-scaled, the shortest useful
+launch this device can run) and grows. Growth was gated at a quarter of the
+bound, which cannot climb from the floor (the opening launch measures ~125 ms
+against a 100 ms threshold), so the gate is 0.6x now -- and every growth step
+is computed to land at 0.8x the bound, so no step can be PREDICTED over it.
+
+### Verified
+
+`cofcheck.sh` **62 PASS / 0 FAIL** (54 before the rebase, 55/4 mid-fix).
+`cbtimecheck` PASS: worst command buffer **170.00 ms** against 400, with its
+control still failing at 796. The golden parity special-q gives **exactly
+las's 37 (a,b) pairs**, `diff`-clean against
+`oracle/c183.q120000053.relations_ab.txt`, zero empty records. `argbufcheck`
+PASS with its negative control, `cofaccheck` 37 in all four configurations.
+Zero generator drift.
+
+**THE 288-q BAND IS BYTE-IDENTICAL: 13,485 relations, 564,696 enqueued,
+sha256 `8e79762c90cc08fb5c1e4146ec04e22ba58e67f9d2fa16136360114edafbc002`** --
+the same hash as the pre-rebase port and as the real CUDA build in Phase 7.
+Worst command buffer over the whole band **322.48 ms**, none over the 400 ms
+bound. Run with every new upstream feature ACTIVE: `--q-pipeline`,
+`--fill-rows 4`, `--fill-gate`, the bucket resieve with its second bucket
+array, the async double-buffered cofactor flush, and `CF_LMIN` 2 (side 0 at
+two limbs). All of that changed the WORK and none of it changed the output.
+
+Side 0 comes back at Phase 7's own numbers exactly -- **477,071 split / 87,625
+dead / 0 stuck, with no overflow line at all** -- so `CF_LMIN = 2` costs this
+job nothing, and the relation shortfall reported while hunting these bugs was
+an artifact of the broken emitter, not a property of the narrower width. Side
+1's split count is also exactly Phase 7's 14,291; its dead/stuck split moves
+(434,410/115,995 against 550,145/260) while dead+stuck is unchanged at
+550,405, which is a reclassification by upstream's class-aware gate and moves
+no relation -- the file is byte-identical.
+
+**Staged, after the crash.** `--nq 72` first (worst buffer 136.9 ms, 0 over
+bound, 3,385 relations, 0 empty), then the full band. The chunker's new
+opening is visible in both: 1792 -> 6014 -> 9423, climbing from the floor with
+no over-bound launch anywhere.
+
+### Tuning the rebase's new features (10-core M3, c183, logI 15, 24 q)
+
+**THE FIRST SWEEP WAS INVALID AND ITS "FINDINGS" WERE THE SLAB PLAN.** Run
+with the slab auto-calibration left to decide per arm, it chose 2^26 for four
+arms and 2^27 for the other four -- and the four "wins" were exactly the 2^27
+arms. The feature was never the variable. This file's own rule, written after
+the same mistake: **pin `--slab-j` on BOTH sides before comparing anything.**
+
+Redone with `--slab-j 2048` pinned and the baseline run FIRST AND LAST, so the
+pair brackets the sweep: 555.43 and 558.89 ms/q, i.e. **0.62% drift** across
+the whole thing, which is the noise floor every number below is read against.
+Every arm is `cmp`-identical to the baseline, so all of this is cost only.
+
+| arm | wall/q | fill |
+|---|---|---|
+| `--fill-rows 0` | **-3.7%** | **-15.3%** |
+| `--no-bucket-resieve` | **-4.5%** | -1.1% |
+| `--no-fill-gate` | **+2.8%** | **+10.6%** |
+| `--no-dual-bucket` | -1.5% | -0.4% |
+| `--no-q-pipeline` | -0.4% | +1.5% |
+| `--no-cof-async` | +0.1% | -0.2% |
+
+**TWO UPSTREAM DEFAULTS LOSE HERE, AND ONE EARNS ITS KEEP.**
+
+- **`--fill-rows` costs 3.7% of wall and 15.3% of fill.** This is upstream's
+  own mechanism playing out at the small end: the row tier removes a fixed
+  single-thread tail, which matters more the MORE cores finish the rest early.
+  2a3dfb0 measured it neutral-to-negative on a 48-SM RTX 5070 and positive on
+  a 128-SM 4090; ten Apple cores is far below their smaller card.
+- **The bucket resieve costs 4.5% of wall**, and the mechanism is explicit:
+  `resieve + scatter` is **72.9 ms with it against 55.8 without**, with
+  norms+TD unchanged (69.8 vs 69.5). Recovering a prime from the bucket record
+  is dearer here than re-walking its lattice.
+- **`--fill-gate` is a real win** and stays on: disabling it costs 2.8% of
+  wall and 10.6% of fill.
+
+**Together the two losers are worth 7.0%**, interleaved and repeated:
+558.29/541.00 upstream against 518.47/504.02 with both off, relations
+`cmp`-identical in all four runs. Roughly additive with the -3.7% and -4.5%
+measured separately.
+
+**`--cof-async` IS NEUTRAL ON METAL, measured where it can actually act.**
+At 24 q the cross-q queue never flushes mid-band, so that arm measured
+nothing; at 72 q, where it does, async is 715.09 ms/q against inline 713.16 --
+0.27%, inside the noise. A STRUCTURAL REASON IS AVAILABLE AND IS NOT YET
+MEASURED: `sync()` holds `g_lock` across `[cb waitUntilCompleted]`, so the
+flush thread blocks every launch the sieve thread wants to make for the whole
+GPU wait, and there is no overlap to be had. Releasing the lock across the
+wait is a real optimisation and a lifetime-sensitive change to the file 9z-b
+was written about; it should be measured, not assumed.
+
+**THESE ARE THE METAL DEFAULTS NOW** (changed on request, 2026-10-16, after
+first shipping them as job settings). `cfg.bucket_resieve` is 0 and
+`cfg.fill_rows` resolves to 0 at EVERY geometry in this build, against
+upstream's 1 and 4-below-logI-16. Changed in `gen_bench_main.py`, so
+`bench_main.cu` is untouched and no drift-ledger row is needed.
+
+**Both are reversible, and one needed a new flag to be.** `--fill-rows N`
+already turned the tier back on; `--bucket-resieve` did not exist, because
+upstream defaults it on and only ever needed the negative form. A default of
+OFF with no way back ON is a worse bug than the regression it fixes, so the
+positive flag is added Metal-side. `--dual-bucket` is deliberately left at 1:
+`pipeline.cuh` only allocates the second bucket array when `bucket_resieve` is
+on, so it is inert here rather than wrong.
+
+**MEASURED AT 288 q, WHICH IS THE REPRESENTATIVE LENGTH: the new defaults are
+2.0% FASTER than the pre-rebase build, and seven times steadier.**
+
+| 288 q, alternated, each build at its own defaults | mean ms/q | spread |
+|---|---|---|
+| pre-rebase (72f808b) | 579.42 | 3.0% |
+| this build's defaults | **567.59** | **0.4%** |
+
+All four bands: 13,485 relations, `8e79762c…`. And the steer counts say what
+the spread is made of -- **both pre arms report ONE chunk line and zero
+over-bound reports**, i.e. the old build ran all 288 q at 15,360
+records/launch without ever checking, which is the slice another run of that
+same build measured at 2,115 ms. Both new arms report four, ramping to ~19,000
+and settling, with no over-bound launch at any point.
+
+At 144 q the same comparison reads +3.8% the other way, because the band ends
+mid-ramp. The 288-q number is the one to quote.
+
+**THE RAMP IS WHY THE BAND LENGTH MATTERS.** The new chunker climbs
+1792 -> ~6000 -> ~14000 -> ~19000, one step per flush, and a flush is about
+71 q. So a 144-q band ENDS while still ramping and never reaches the settled
+chunk -- it measures the ramp, not the steady state, and charges the new build
+a per-process cost a real workunit pays once over thousands of q. At 288 q it
+settles at flush 4 (~q 213) and runs there for the rest. **Do not price this
+controller on a band shorter than ~300 q.**
+
+**THE CAVEAT THAT MATTERS: this is ONE box, and the mechanism predicts the
+sign can flip on a bigger one.** A 10-core M3 is the small end of the Apple
+range; an M3/M4 Max has 40, which is the direction that made `--fill-rows` win
+on the 4090. Nothing here should be read as "measured on Apple silicon" -- it
+is measured on a 10-core M3 in a fanless MacBook Air, at logI 15 on c183.
+
+### Dropping g_lock across the GPU wait: WRONG TWICE OVER, and REVERTED
+
+`sync()` holds `g_lock` across `[cb waitUntilCompleted]`, so the --cof-async
+flush thread blocks every launch the sieve thread wants to make for the whole
+GPU wait. That is an obvious reason for the async flush to measure neutral,
+and it is wrong in both directions.
+
+**It bought nothing.** `sync()` was given the caller's `std::unique_lock` and
+dropped it across the wait (teardown paths passing `nullptr`). Measured at
+72 q, where the queue actually flushes mid-band:
+
+| | async | inline |
+|---|---|---|
+| before | 715.09 | 713.16 |
+| after  | 716.05 | 717.31 |
+
+Both differences inside the 0.62% noise floor. The likelier reason the async
+flush cannot pay here is that there is nothing to overlap INTO: ten Apple
+cores running a cofactor flush have no spare capacity for the next q's sieve,
+and 8h established that this stage is latency-bound on one ECM chain rather
+than occupancy-bound. An M4 Max could differ; unmeasured.
+
+**AND IT CHANGED THE ANSWER.** The 288-q band came back with the right counts
+-- 13,485 relations, 564,696 enqueued, worst command buffer 313.76 ms -- and
+a DIFFERENT relation set: `e332ab91…` against `8e79762c…`, with **3,054 of
+13,485 relations differing**, which is not an ordering difference. Reverted.
+
+**WHAT THE GATES DID NOT CATCH, AND WHY.** `cofcheck.sh` 62/0, `cbtimecheck`,
+`validationcheck`, `rtcheck`, `cofaccheck` all PASS with the change in, the
+parity q still gives las's exact 37, and `NSZombieEnabled` is clean. Every one
+of those is a SINGLE-THREADED test or a single-q one: the cross-q queue never
+flushes mid-band, so the second host thread barely runs. **Only the full band
+exercises two threads against the shim at once, and only the full band caught
+it.** A gate suite that is green is not the same as a change that is safe.
+
+**The leading explanation, NOT proven:** `g_lock` was providing mutual
+exclusion between the two threads' operation SEQUENCES on a shared stream, not
+merely protecting the shim's own structures. Dropping it mid-sequence lets the
+flush thread's stream work interleave with the q loop's, so a readback can
+observe state partway through someone else's sequence. If this is ever retried
+-- and on a wider Apple GPU it might be worth retrying -- the unit of mutual
+exclusion has to be thought about first, and the acceptance test is the 288-q
+hash, not the gate suite.
+
+### Against the PRE-REBASE build: a wash on speed, and far steadier
+
+Measured against `metal-port-pre-20261015` (72f808b) built from a worktree and
+run ALTERNATELY, 144 q (two full cofactor flushes), both reading the identical
+`oracle/c183.fb1`, three arms twice through:
+
+| arm | mean ms/q | spread | vs pre |
+|---|---|---|---|
+| pre-rebase | 595.70 | **8.7%** | -- |
+| post-rebase, upstream defaults | 636.22 | 0.2% | +6.8% |
+| post-rebase + the job settings | 596.46 | 0.4% | **+0.1%** |
+
+**All six runs emit 6,724 relations and the identical `fb9fdf6d…`.** The
+rebase moves no relation at 144 q any more than it does at 288.
+
+**THE SPEED NUMBER IS A WASH; THE SPREAD IS THE RESULT.** With
+`--fill-rows 0 --no-bucket-resieve` the rebased build is within 0.1% of where
+it started -- and the 6.2% between the two post arms is the same 7% those two
+features cost at 24 q with the slab pinned, measured a second way.
+
+**AND THE PRE-REBASE BUILD'S 8.7% SPREAD IS NOT NOISE, IT IS THE OLD
+CHUNKER.** The two pre runs did completely different things:
+
+```
+pre1   opens 15360, measures 2115 ms (5x the 400 ms bound), descends to 2324
+pre2   opens 15360 and NEVER STEERS -- one chunk line, no over-bound report
+```
+
+pre2 is the FASTER of the two (569.71 against 621.69) because it ran the whole
+band at a slice its sibling measured at **2.1 seconds** -- squarely in the
+range macOS kills command buffers in, and the configuration that took
+WindowServer down during this rebase. The old build's speed advantage, where
+it appears at all, is the advantage of not having noticed.
+
+Both post arms open at 1792 and climb identically -- 6023/6223 -> 14002/14729
+-> ~20000 -- with **zero** over-bound reports and a 0.2% spread between runs.
+It settles HIGHER than the old opening chunk and still inside the bound.
+
+So the honest summary for a volunteer: same relations, same speed, and a
+cofactor stage that is now reproducible and bounded instead of occasionally
+submitting two-second command buffers.
+
+### Open, found while validating the lock change: the pools claim has rotted
+
+9z-c recorded `OBJC_DEBUG_MISSING_POOLS=YES` giving **0** "autoreleased with
+no pool". It now gives **645** on a single special-q, 596 of them
+`AGXG15GDevice` -- and the SAME 645 on the pre-change binary, so this is the
+rebase's, not the lock change's. `NSZombieEnabled=YES` is still clean (0
+messages to a deallocated object) on both, so nothing is over-released; these
+are objects autoreleased outside any pool and therefore leaked outright.
+Small objects, and memory was flat over a band before, so this is hygiene
+rather than a failure -- but it is a standing claim in this file that is no
+longer true, and the band-length RSS measurement behind it should be redone
+before it is quoted again.
+
+### A measuring-rig note, because it cost real time
+
+The sandbox's `sleep` does not advance wall time reliably here, so polling a
+long run burns turns without the run progressing. Wait on a CONDITION
+(`until [ -s file ]`, `while pgrep`) through a backgrounded command or the
+Monitor tool, never on a duration.
+
 ## Drift ledger — CUDA-side changes made for this port
 
 **The ledger lives in `bench/METAL_PORT_PLAN.md` section 9, and only there.**

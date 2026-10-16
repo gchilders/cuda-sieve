@@ -291,6 +291,44 @@ static void usage(void)
 "  --fill-concurrent  --pipeline only; sieve the two sides of a slab on two\n"
 "                   streams instead of back to back. Costs a second bucket\n"
 "                   array and is refused if it does not fit [off]\n"
+"  --no-cof-async   --pipeline --cofactor; flush the cofactor queue inline,\n"
+"                   stalling the q loop, instead of on its own stream from a\n"
+"                   host thread (double-buffered, overlapping the next q's\n"
+"                   sieve). Relations are identical either way [async]\n"
+"  --slab-fixed     pipeline: keep the fixed 2^29-position slab target instead\n"
+"                   of the largest (up to 4x) that free VRAM admits [auto]\n"
+"  --bucket-resieve / --no-bucket-resieve  pipeline: read the primes at\n"
+"                   survivors back from the bucket records instead of\n"
+"                   re-walking every bucketed lattice. Same relations.\n"
+"                   OFF in this build: -4.5%% of wall on a 10-core M3,\n"
+"                   where upstream measures it a win on a wide card  [off]\n"
+"  --no-dual-bucket pipeline, serial sides: share one bucket array between the\n"
+"                   sides even when VRAM has room for a second, which lets side\n"
+"                   1 resieve from its records too. Same relations [dual]\n"
+"  --instances N|auto  pipeline, bounded --qrange: split the band N ways (1-4)\n"
+"                   and sieve the shares concurrently on the one GPU, each with\n"
+"                   its own NAME.inst<k> .part and checkpoint, merged into NAME\n"
+"                   in q order at the end -- the same file. auto: two when two\n"
+"                   fit in VRAM at the slab one would get alone, else one. A\n"
+"                   band under way keeps its N (NAME.instances)          [1]\n"
+"  --fill-rows N    --pipeline only; fill bucketed q < N*I row by row in\n"
+"                   bands rather than one thread per q. 0 = off\n"
+"                   [0 in this build at EVERY geometry -- the row tier\n"
+"                   costs 3.7%% of wall and 15.3%% of fill on a 10-core M3;\n"
+"                   upstream defaults to 4 at logI <= 15, and at logI 16\n"
+"                   on a card with\n"
+"                   >= " BENCH_STR(FILL_ROWS_I16_MIN_SMS) " SMs; else 0]\n"
+"  --fill-row-bands N  row bands per slab for --fill-rows; 0 = auto  [0]\n"
+"  --resieve-rows / --no-resieve-rows  resieve the --fill-rows tier row by\n"
+"                   row too         [on at logI <= " BENCH_STR(RESIEVE_ROWS_LOGI_MAX) ", else off]\n"
+"  --fill-gate / --no-fill-gate  --pipeline only; side 0's fill stores\n"
+"                   records only under side 1's survivors\n"
+"                   [on, off under --fill-concurrent, which refuses it]\n"
+"  --fill-gate-shift N  positions per gate bit = 2^N, 0..5        [3]\n"
+"  --q-pipeline / --no-q-pipeline  --pipeline only; sieve the next slab or\n"
+"                   special-q while this one is trial-divided. Falls back to\n"
+"                   one at a time when its extra VRAM does not fit\n"
+"                   [on, off under --fill-concurrent/--qspan]\n"
 "  --fill-threads N fill only; 0 = auto (32), else a multiple of 32 in\n"
 "                   [32,1024]. Independent of --threads: fill wants many\n"
 "                   narrow blocks, the other kernels do not.            [0]\n"
@@ -667,6 +705,15 @@ static int verify_walk_cases(void)
         printf("[verify] OK: %d forced/native slab walk cases, including"
                " partial tails and I17+\n", nslab);
     }
+    {
+        const int nrow = verify_rows_to_hit();
+        if (nrow < 0) {
+            printf("[verify] ROW-TIER HANDOFF FAILED\n");
+            return 1;
+        }
+        printf("[verify] OK: %d row-tier handoff cases (pl_rows_to_hit"
+               " against stepping)\n", nrow);
+    }
     return 0;
 }
 
@@ -938,6 +985,524 @@ static int boinc_discard_bad_resume(const resume_recovery_t *r,
  * the argument checks. main() supplies the default -- OK on a zero status,
  * FAILED otherwise -- so only the pipeline branch, the one caller that can
  * tell a checkpointed stop from a finished band, writes to it. */
+/* ---- resume, for one relation file -------------------------------------- *
+ *
+ * Everything bench_main used to do inline between taking the lock and reading
+ * the band: --restart, the empty-.part heal, the checkpoint and its
+ * fingerprint, the candidate file, the sampled reconstruction, BOINC's
+ * automatic recovery -- unchanged, but on `c`, so --instances can run it once
+ * per instance file with that instance's own band. Returns 0 to proceed (c is
+ * set up to resume, or to start fresh), 1 when the caller must exit 1, and 2
+ * when there is nothing left to do (--nq already satisfied). *scale_restored
+ * says the checkpoint's scale and allowance were loaded into c. */
+static int resume_prepare(bench_cfg_t *c, const poly_t *POLY, int qrange_set,
+                          int *scale_restored)
+{
+    char part[CKPT_PATH_MAX], cpath[CKPT_PATH_MAX];
+    char fp[17];
+    bench_stat_t st;
+    ckpt_t ck;
+    if (ckpt_part_path(c->relations, part, sizeof part) ||
+        ckpt_ckpt_path(c->relations, cpath, sizeof cpath))
+        return 1;
+    ckpt_fingerprint(POLY, c, fp);
+    resume_recovery_t recovery;
+    int part_exists;
+
+    if (resume_recovery_init(&recovery, c, part, cpath)) return 1;
+    if (bench_stat_path(part, &st) == 0)
+        part_exists = 1;
+    else if (errno == ENOENT)
+        part_exists = 0;
+    else {
+        perror(part);
+        return 1;
+    }
+
+#define BOINC_RECOVER_OR_RETURN(why) do {                              \
+        const int br_ = boinc_discard_bad_resume(&recovery, why); \
+        if (br_ < 0) return 1;                                 \
+        if (br_ > 0) return 0;              \
+    } while (0)
+
+    /* A hard kill can land after fopen(NAME.part, "wb") creates the
+     * staging file but before the first cofactor flush writes a
+     * checkpoint. There is no resume ambiguity when that file is
+     * empty: it contains no relation and restarting from the band's
+     * beginning cannot duplicate or lose work. Heal that state here
+     * so an unattended BOINC relaunch does not fail forever.
+     *
+     * A nonempty candidates .part is different: it may contain useful
+     * uncheckpointed output even while the relations file is empty.
+     * Preserve the old refusal in that case rather than silently
+     * overwriting it. An absent or empty candidates file is safe to
+     * restart alongside the empty relations file. */
+    if (!c->restart && part_exists && st.st_size == 0) {
+        bench_stat_t sidecar_st;
+        int sidecar_missing = 0;
+        int candidates_empty = 1, candidates_present = 0;
+        char candidates_part[CKPT_PATH_MAX] = "";
+
+        if (bench_stat_path(cpath, &sidecar_st)) {
+            if (errno == ENOENT)
+                sidecar_missing = 1;
+            else {
+                perror(cpath);
+                return 1;
+            }
+        }
+        if (sidecar_missing && c->candidates) {
+            bench_stat_t candidates_st;
+            if (ckpt_part_path(c->candidates, candidates_part,
+                               sizeof candidates_part))
+                return 1;
+            if (bench_stat_path(candidates_part, &candidates_st) == 0) {
+                candidates_present = 1;
+                candidates_empty = candidates_st.st_size == 0;
+            } else if (errno != ENOENT) {
+                perror(candidates_part);
+                return 1;
+            }
+        }
+        if (sidecar_missing && candidates_empty) {
+            printf("resume: discarding empty uncheckpointed %s; "
+                   "starting the band from the beginning\n", part);
+            if (remove(part)) {
+                perror(part);
+                return 1;
+            }
+            if (candidates_present && remove(candidates_part)) {
+                perror(candidates_part);
+                return 1;
+            }
+            part_exists = 0;
+        }
+    }
+    if (c->restart) {
+        const char *restart_paths[6] = {
+            part, cpath, recovery.ckpt_tmp,
+            recovery.candidates_part, recovery.retry,
+            recovery.retry_tmp
+        };
+        if (part_exists)
+            printf("resume: --restart, discarding %s (%lld bytes)\n",
+                   part, (long long)st.st_size);
+        for (unsigned ri = 0; ri < 6; ri++) {
+            if (!restart_paths[ri][0]) continue;
+            if (remove(restart_paths[ri]) && errno != ENOENT) {
+                perror(restart_paths[ri]);
+                return 1;
+            }
+        }
+        part_exists = 0;
+    } else if (part_exists) {
+        const int r = ckpt_read(c->relations, &ck);
+        /* Every branch here refuses rather than guesses. An existing
+         * .part is either resumable work or somebody else's data; the
+         * one thing this must never do is silently truncate it. */
+        if (r == -1) {
+            BOINC_RECOVER_OR_RETURN("the .part has no checkpoint");
+            fprintf(stderr,
+                "bench: %s exists but %s does not.\n"
+                "  That file cannot be resumed automatically -- the"
+                " special-q that produced a relation\n"
+                "  cannot be recovered from the relation itself under"
+                " the full factor base (a line\n"
+                "  carries ~1.8 in-band primes and none of them is"
+                " marked). Move it aside, or pass\n"
+                "  --restart to discard it.\n", part, cpath);
+            return 1;
+        }
+        if (r == -2) {              /* ckpt_read explained why */
+            BOINC_RECOVER_OR_RETURN("the checkpoint is malformed");
+            return 1;
+        }
+        if (r == -3) return 1;       /* unreadable: ckpt_read explained */
+        if (!c->candidates && ck.cand_bytes &&
+            bench_boinc_is_managed()) {
+            const int cr =
+                resume_recovery_add_checkpoint_candidate(&recovery,
+                                                         &ck);
+            if (cr < 0) return 1;
+            recovery.checkpoint_candidate_required = 1;
+            recovery.checkpoint_candidate_known = cr > 0;
+        }
+        if (strcmp(ck.fp, fp)) {
+            BOINC_RECOVER_OR_RETURN(
+                "the checkpoint belongs to a different job");
+            fprintf(stderr,
+                "bench: %s belongs to a different job.\n"
+                "  checkpoint fingerprint %s, this run %s.\n"
+                "  Appending would produce a file whose lines all"
+                " verify and whose yield means\n"
+                "  nothing. Check the polynomial, lim/lpb/mfb, logI/J"
+                " and --sq-side, or --restart.\n",
+                cpath, ck.fp, fp);
+            return 1;
+        }
+        if (ck.rel_bytes > (unsigned long long)st.st_size) {
+            BOINC_RECOVER_OR_RETURN(
+                "the relation file is shorter than its checkpoint");
+            fprintf(stderr,
+                "bench: %s is %lld bytes but %s claims %llu.\n"
+                "  The relation file has been truncated or replaced"
+                " since the checkpoint.\n",
+                part, (long long)st.st_size, cpath, ck.rel_bytes);
+            return 1;
+        }
+        /* The candidates .part is truncated to a recorded offset just
+         * like the relations one, so it needs the same guard. Two ways
+         * it goes wrong unguarded: a short file is EXTENDED by
+         * ftruncate and the gap is a run of NULs no parser survives;
+         * and because --candidates is not part of the fingerprint, a
+         * resume that omitted it records cand_bytes = 0, so the next
+         * resume that supplies it again truncates the whole file away. */
+        {
+            bench_stat_t cst;
+            int cpart_exists = 0;
+            const char *cpart = recovery.candidates_part;
+            if (c->candidates) {
+                if (bench_stat_path(cpart, &cst) == 0)
+                    cpart_exists = 1;
+                else if (errno != ENOENT) {
+                    perror(cpart);
+                    return 1;
+                }
+            }
+            if (c->candidates && !ck.cand_bytes &&
+                cpart_exists && cst.st_size > 0) {
+                BOINC_RECOVER_OR_RETURN(
+                    "candidate output is not represented by the checkpoint");
+                fprintf(stderr,
+                    "bench: %s holds %lld bytes but the checkpoint"
+                    " records none.\n"
+                    "  It was written by a session run without"
+                    " --candidates. Resuming would\n"
+                    "  discard it; drop --candidates, or move the file"
+                    " aside.\n", cpart, (long long)cst.st_size);
+                return 1;
+            }
+            if (c->candidates && ck.cand_bytes &&
+                (!cpart_exists || (unsigned long long)cst.st_size
+                                  < ck.cand_bytes)) {
+                BOINC_RECOVER_OR_RETURN(
+                    "candidate output is shorter than its checkpoint");
+                fprintf(stderr,
+                    "bench: %s is missing or shorter than the %llu"
+                    " bytes the checkpoint records.\n", cpart,
+                    ck.cand_bytes);
+                return 1;
+            }
+            if (!c->candidates && ck.cand_bytes) {
+                BOINC_RECOVER_OR_RETURN(
+                    "the checkpoint requires candidate output not supplied by this launch");
+                fprintf(stderr,
+                    "bench: the checkpoint records %llu bytes of"
+                    " candidates but --candidates was not given.\n"
+                    "  Resuming would strand them. Pass the same"
+                    " --candidates path, or --restart.\n",
+                    ck.cand_bytes);
+                return 1;
+            }
+        }
+        /* Cheap, host-only, and it catches the case the fingerprint
+         * cannot: a .part that was hand-edited, or concatenated from another
+         * job, under a checkpoint that still matches. Proves the polynomial
+         * only.
+         *
+         * NOT when the checkpointed prefix is empty. The resume truncates the
+         * .part to nothing, so there is nothing to prove -- and
+         * check_relations_sample reads a limit of 0 as "the whole file",
+         * where a kill -9 has left the first flush's relations and a torn
+         * last line. That is a kill between the first cofactor flush and the
+         * next checkpoint (under --cof-async the checkpoint for a flush is
+         * written at the following one), and it used to refuse the resume:
+         * a stuck standalone band, a discarded and recomputed BOINC task. */
+        if (ck.rel_bytes) {
+            uint32_t nchecked = 0;
+            const int bad = check_relations_sample(part, POLY,
+                                                   c->lpb0, c->lpb,
+                                                   8, ck.rel_bytes,
+                                                   &nchecked);
+            if (bad < 0) return 1;
+            if (bad > 0) {
+                BOINC_RECOVER_OR_RETURN(
+                    "sampled relations do not reconstruct");
+                fprintf(stderr,
+                    "bench: %d of %u sampled relations in %s do not"
+                    " reconstruct.\n"
+                    "  Refusing to append to it.\n", bad, nchecked,
+                    part);
+                return 1;
+            }
+        }
+        /* The single-q fallback builds ql[0] from --q/--rho and never
+         * consults the checkpoint, so resuming into it would truncate
+         * the .part, sieve one unrelated q, decide the band finished
+         * normally, rename over the final name and delete the sidecar
+         * -- presenting a multi-day partial band as complete. The band
+         * source is not in the fingerprint, so only this check stops
+         * it. */
+        if (!c->qlist && !qrange_set) {
+            fprintf(stderr,
+                "bench: %s is a resumable band, but neither --qlist nor"
+                " --qrange was given.\n"
+                "  The single-q path cannot continue it. Supply the"
+                " original band, or --restart.\n", part);
+            return 1;
+        }
+        c->resume = 1;
+        c->resume_q = ck.next_q;
+        c->resume_rho = ck.next_rho;
+        c->resume_rel_bytes = ck.rel_bytes;
+        c->resume_cand_bytes = ck.cand_bytes;
+        c->resume_nrel = ck.nrel;
+        c->resume_nq = ck.nqdone;
+        /* The gate must not move mid-run. scale/allowance are derived
+         * once from the band's FIRST q and held band-wide; re-deriving
+         * them here from the resume q would sieve the rest of the job
+         * against a different survivor bound than the part already on
+         * disk. Carried in the checkpoint, restored here, and marked
+         * as explicit so the derivation below leaves them alone. */
+        c->scale = ck.scale;
+        c->scale0 = ck.scale0;
+        c->allowance = ck.allowance;
+        c->allowance0 = ck.allowance0;
+        *scale_restored = 1;
+        if (qrange_set && c->qmin > ck.next_q) {
+            fprintf(stderr,
+                "bench: --qrange starts at %llu but the checkpoint"
+                " resumes at %llu.\n"
+                "  The gap would never be sieved.\n",
+                (unsigned long long)c->qmin,
+                (unsigned long long)ck.next_q);
+            return 1;
+        }
+        if (qrange_set) {
+            /* Before the overwrite, not after: this is the only
+             * record of where the band began, and the progress
+             * estimator needs it or a resumed run's bar restarts at 0
+             * and climbs through the REMAINING span. */
+            c->resume_qmin = c->qmin;
+            c->qmin = ck.next_q;
+        }
+        /* --nq counts this session's q, so a resumed run must not be
+         * handed the whole original budget again. */
+        if (c->nq_max) {
+            c->nq_max = ck.nqdone >= c->nq_max
+                ? 0 : (uint32_t)(c->nq_max - ck.nqdone);
+            if (!c->nq_max) {
+                printf("resume: --nq already satisfied by %llu"
+                       " completed q; nothing to do\n", ck.nqdone);
+                return 2;
+            }
+        }
+        printf("resume: %s at q=%llu rho=%llu -- %llu relations,"
+               " %llu q done, %llu bytes kept\n",
+               part, (unsigned long long)ck.next_q,
+               (unsigned long long)ck.next_rho,
+               ck.nrel, ck.nqdone, ck.rel_bytes);
+        printf("        scale %.4f/%.4f allowance %.2f/%.2f restored"
+               " from the checkpoint\n",
+               c->scale, c->scale0, c->allowance, c->allowance0);
+    } else {
+        bench_stat_t checkpoint_st;
+        if (bench_stat_path(cpath, &checkpoint_st) == 0) {
+            BOINC_RECOVER_OR_RETURN(
+                "a checkpoint exists without its relation file");
+            fprintf(stderr,
+                "bench: %s exists but %s does not. Remove the checkpoint"
+                " to start fresh.\n", cpath, part);
+            return 1;
+        }
+        if (errno != ENOENT) {
+            perror(cpath);
+            return 1;
+        }
+    }
+    return 0;
+#undef BOINC_RECOVER_OR_RETURN
+}
+
+/* ---- --instances: settle the band split before anything reads qmin ----- */
+
+static const char *const inst_suffixes[] = {
+    "", ".part", ".part.ckpt", ".part.ckpt.tmp", ".part.recover",
+    ".part.recover.tmp"
+};
+
+/* One instance's files: its committed relation file and everything
+ * resume_prepare would look for. ENOENT is not an error. */
+static int inst_remove_artifacts(const char *rel)
+{
+    char p[CKPT_PATH_MAX];
+    for (unsigned i = 0; i < sizeof inst_suffixes / sizeof *inst_suffixes; i++) {
+        if (ckpt_path_fmt(rel, p, sizeof p, inst_suffixes[i])) return -1;
+        if (remove(p) && errno != ENOENT) { perror(p); return -1; }
+    }
+    return 0;
+}
+
+static int inst_any_artifact(const char *rel, char *which, size_t n)
+{
+    for (unsigned i = 0; i < sizeof inst_suffixes / sizeof *inst_suffixes; i++)
+        if (ckpt_path_fmt(rel, which, n, inst_suffixes[i]) == 0 &&
+            bench_path_exists(which))
+            return 1;
+    return 0;
+}
+
+/* Decides between one pipeline and --instances, and for a band of instances
+ * already under way restores each instance's resume state from its own
+ * checkpoint (resume_prepare, once per NAME.inst<k>). Returns 0 for one
+ * pipeline -- the caller resumes cfg->relations exactly as before -- 3 when
+ * cfg->inst is set, 1 to exit 1, 2 when there is nothing left to do.
+ *
+ * A band under way decides, never the request: a manifest means N instances
+ * whatever --instances says, and a NAME.part means one pipeline. A fresh band
+ * leaves plan->n at 0 for run_pipeline, which picks N against the VRAM model
+ * (--instances auto) or takes the number given, and writes the manifest. */
+static int inst_prepare(bench_cfg_t *cfg, const poly_t *POLY, int qrange_set,
+                        pipe_inst_plan_t *plan, int *scale_restored)
+{
+    static_assert(PIPE_INST_PATH == BENCH_PATH_MAX,
+                  "pipe_inst_one_t paths are CKPT_PATH_MAX buffers");
+    const int bounded = qrange_set && cfg->qmax && !cfg->target_rels &&
+                        !cfg->nq_max && !cfg->qlist && !cfg->candidates;
+    char mpath[CKPT_PATH_MAX] = "", which[CKPT_PATH_MAX];
+    inst_manifest_t m;
+    int mr = -1;
+
+    memset(plan, 0, sizeof *plan);
+    if (cfg->relations) {
+        if (inst_manifest_path(cfg->relations, mpath, sizeof mpath)) return 1;
+        mr = inst_manifest_read(mpath, &m);
+        if (mr == -3) return 1;
+        if (mr == -2 && !cfg->restart) {
+            fprintf(stderr, "bench: %s cannot be read as an instance manifest;"
+                    " --restart discards it with its instance files\n", mpath);
+            return 1;
+        }
+    }
+    if (cfg->restart && cfg->relations) {
+        /* Every instance N could have been, not just the manifest's: a
+         * manifest may be the very thing that is damaged. */
+        int had = mr != -1;
+        for (int k = 0; k < PIPE_INSTANCES_MAX; k++) {
+            char rel[CKPT_PATH_MAX];
+            if (inst_rel_path(cfg->relations, k, rel, sizeof rel)) return 1;
+            had |= inst_any_artifact(rel, which, sizeof which);
+            if (inst_remove_artifacts(rel)) return 1;
+        }
+        if (remove(mpath) && errno != ENOENT) { perror(mpath); return 1; }
+        if (had)
+            printf("resume: --restart, discarding the --instances band"
+                   " files of %s\n", cfg->relations);
+        mr = -1;
+    }
+    if (mr != 0 && cfg->instances == 1) return 0;
+    if (mr == 0) {
+        char fp[17];
+        ckpt_fingerprint(POLY, cfg, fp);
+        if (!bounded || m.qmin != cfg->qmin || m.qmax != cfg->qmax ||
+            strcmp(m.fp, fp)) {
+            fprintf(stderr,
+                "bench: %s is a %d-instance band over q [%llu, %llu]"
+                " (fingerprint %s);\n"
+                "  this run is a different band or job (fingerprint %s)."
+                " Supply the original --qrange\n"
+                "  and parameters, or --restart to discard it.\n",
+                mpath, m.n, (unsigned long long)m.qmin,
+                (unsigned long long)m.qmax, m.fp, fp);
+            return 1;
+        }
+        if (cfg->instances != m.n)
+            printf("instances: resuming the %d-instance band in %s\n",
+                   m.n, mpath);
+        plan->n = m.n;
+    } else {
+        if (!bounded) {
+            if (cfg->instances != 1)
+                printf("instances: --instances needs a bounded --qrange"
+                       " without --target-rels, --nq, --qlist or"
+                       " --candidates; running one pipeline\n");
+            return 0;
+        }
+        if (cfg->relations) {
+            char part[CKPT_PATH_MAX];
+            if (ckpt_part_path(cfg->relations, part, sizeof part)) return 1;
+            if (!cfg->restart && bench_path_exists(part)) {
+                printf("instances: %s is a one-pipeline band under way;"
+                       " resuming it with one pipeline\n", part);
+                return 0;
+            }
+            /* Instance files with no manifest. The manifest goes last when a
+             * band commits, so these are not a finished band's leftovers --
+             * they are another band's, and resuming over them would mix
+             * the two. BOINC recomputes rather than strand the task. */
+            for (int k = 0; k < PIPE_INSTANCES_MAX; k++) {
+                char rel[CKPT_PATH_MAX];
+                if (inst_rel_path(cfg->relations, k, rel, sizeof rel)) return 1;
+                if (!inst_any_artifact(rel, which, sizeof which)) continue;
+                if (bench_boinc_is_managed()) {
+                    printf("BOINC: discarding %s, an instance file with no"
+                           " manifest\n", which);
+                    if (inst_remove_artifacts(rel)) return 1;
+                    continue;
+                }
+                fprintf(stderr, "bench: %s exists but %s does not; it belongs"
+                        " to no band this run can resume.\n"
+                        "  Move it aside, or --restart.\n", which, mpath);
+                return 1;
+            }
+        }
+        plan->n = 0;          /* run_pipeline picks N */
+    }
+    snprintf(plan->manifest, sizeof plan->manifest, "%s", mpath);
+    for (int k = 0; k < plan->n; k++) {
+        pipe_inst_one_t *I = &plan->in[k];
+        bench_cfg_t c = *cfg;
+        int restored = 0;
+        inst_split(cfg->qmin, cfg->qmax, plan->n, k, &I->qmin, &I->qmax);
+        if (inst_rel_path(cfg->relations, k, I->relations,
+                          sizeof I->relations) ||
+            ckpt_path_usable(I->relations, "--relations (instance file)"))
+            return 1;
+        if (bench_path_exists(I->relations)) {   /* committed already */
+            I->done = 1;
+            printf("resume: %s is complete\n", I->relations);
+            continue;
+        }
+        c.relations = I->relations;
+        c.qmin = I->qmin; c.qmax = I->qmax;
+        c.nq_max = 0; c.restart = 0; c.resume = 0; c.resume_qmin = 0;
+        if (resume_prepare(&c, POLY, 1, &restored)) return 1;
+        I->resume = c.resume;
+        I->resume_q = c.resume_q; I->resume_rho = c.resume_rho;
+        I->resume_qmin = c.resume_qmin;
+        I->resume_rel_bytes = c.resume_rel_bytes;
+        I->resume_nrel = c.resume_nrel; I->resume_nq = c.resume_nq;
+        if (restored) {
+            /* One band, one gate: every instance was started from the same
+             * derivation, so their checkpoints must agree. */
+            if (*scale_restored &&
+                (cfg->scale != c.scale || cfg->scale0 != c.scale0 ||
+                 cfg->allowance != c.allowance ||
+                 cfg->allowance0 != c.allowance0)) {
+                fprintf(stderr, "bench: the instance checkpoints of %s"
+                        " disagree on scale/allowance; --restart\n",
+                        cfg->relations);
+                return 1;
+            }
+            cfg->scale = c.scale; cfg->scale0 = c.scale0;
+            cfg->allowance = c.allowance; cfg->allowance0 = c.allowance0;
+            *scale_restored = 1;
+        }
+    }
+    cfg->inst = plan;
+    return 3;
+}
+
 /* Seconds to ask BOINC to wait before retrying a task that found no GPU.
  * The cause is usually a login session, which can change at any time, so
  * this is a compromise: 10 minutes is six retries an hour rather than a
@@ -1015,6 +1580,18 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
      * prevent. Non-deterministic across builds, so it passes locally and fires
      * on a rented card. */
     cfg.fill_concurrent = 0;
+    cfg.cof_async = 1;
+    cfg.slab_fixed = 0;
+    /* 0, not upstream's 1: the bucket resieve costs 4.5% of wall on a
+     * 10-core M3 (resieve + scatter 72.9 ms against 55.8). `--bucket-resieve`
+     * turns it back on. See metal/gen_bench_main.py. */
+    cfg.bucket_resieve = 0;
+    cfg.dual_bucket = 1;
+    cfg.instances = 1;
+    /* -1 = resolved below once logI and --fill-concurrent are known */
+    cfg.fill_rows = FILL_ROWS_UNSET; cfg.fill_row_bands = 0; cfg.resieve_rows = -1;
+    cfg.fill_gate = -1; cfg.fill_gate_shift = 3;
+    cfg.q_pipeline = -1;   /* resolved with the fill defaults below */
     cfg.qspan = 0;
     cfg.threads = 256; cfg.blocks = 0; cfg.fill_blocks = 0; cfg.fill_threads = 0;
 
@@ -1072,6 +1649,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     cfg.resume_nrel = 0; cfg.resume_nq = 0;
     int maxbits = 0, maxbits_set = 0;
     int sieve_skip_set = 0;
+    int fill_row_bands_set = 0, fill_gate_shift_set = 0;
     int allowance_set = 0, allowance0_set = 0, scale0_set = 0;
     const char *cofac_in = NULL;
     const char *check_rel = NULL;
@@ -1159,6 +1737,40 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         }
         else if (!strcmp(argv[i], "--qspan")) { cfg.qspan = 1; }
         else if (!strcmp(argv[i], "--fill-concurrent")) { cfg.fill_concurrent = 1; }
+        else if (!strcmp(argv[i], "--cof-async")) { cfg.cof_async = 1; }
+        else if (!strcmp(argv[i], "--no-cof-async")) { cfg.cof_async = 0; }
+        else if (!strcmp(argv[i], "--slab-fixed")) { cfg.slab_fixed = 1; }
+        else if (!strcmp(argv[i], "--no-bucket-resieve")) { cfg.bucket_resieve = 0; }
+        else if (!strcmp(argv[i], "--bucket-resieve")) { cfg.bucket_resieve = 1; }
+        else if (!strcmp(argv[i], "--no-dual-bucket")) { cfg.dual_bucket = 0; }
+        else if (!strcmp(argv[i], "--instances") && i + 1 < argc) {
+            uint32_t ni = 1;
+            if (!strcmp(argv[++i], "auto")) cfg.instances = 0;
+            else if (parse_u32_range_arg("--instances", argv[i], 1u,
+                                         (uint32_t)PIPE_INSTANCES_MAX, &ni))
+                return 1;
+            else cfg.instances = (int)ni;
+        }
+        else if (!strcmp(argv[i], "--fill-rows") && i + 1 < argc) {
+            if (parse_int_range_arg("--fill-rows", argv[++i], 0, 256,
+                                    &cfg.fill_rows)) return 1;
+        }
+        else if (!strcmp(argv[i], "--fill-row-bands") && i + 1 < argc) {
+            if (parse_int_range_arg("--fill-row-bands", argv[++i], 0, 65536,
+                                    &cfg.fill_row_bands)) return 1;
+            fill_row_bands_set = 1;
+        }
+        else if (!strcmp(argv[i], "--fill-gate")) { cfg.fill_gate = 1; }
+        else if (!strcmp(argv[i], "--no-fill-gate")) { cfg.fill_gate = 0; }
+        else if (!strcmp(argv[i], "--resieve-rows")) { cfg.resieve_rows = 1; }
+        else if (!strcmp(argv[i], "--no-resieve-rows")) { cfg.resieve_rows = 0; }
+        else if (!strcmp(argv[i], "--q-pipeline")) { cfg.q_pipeline = 1; }
+        else if (!strcmp(argv[i], "--no-q-pipeline")) { cfg.q_pipeline = 0; }
+        else if (!strcmp(argv[i], "--fill-gate-shift") && i + 1 < argc) {
+            if (parse_int_range_arg("--fill-gate-shift", argv[++i], 0, 5,
+                                    &cfg.fill_gate_shift)) return 1;
+            fill_gate_shift_set = 1;
+        }
         else if (!strcmp(argv[i], "--fill-streams") && i + 1 < argc) {
             if (parse_int_range_arg("--fill-streams", argv[++i], 0,
                                     FILL_STREAMS_MAX, &cfg.fill_streams)) return 1;
@@ -1514,6 +2126,66 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         fprintf(stderr, "--sieve-skip applies to --pipeline only\n");
         return 1;
     }
+    /* Defaults of record (RESULTS finding 107), resolved only under --pipeline
+     * because nothing else reads them. All three are output-identical, so
+     * they are policy, not part of the resume fingerprint:
+     *   - the row tier wherever k_fill_atomic's longest walk (xmax/I hits) is
+     *     many times its average thread's: ~29x at logI 13, ~17x at 14, ~8x
+     *     at 15, ~4x at 16, where the row kernel no longer pays (c194 +1-3%
+     *     fill);
+     *   - its resieve only where that tail is long enough to pay;
+     *   - the gate whenever the sides run back to back. --fill-concurrent
+     *     overlaps them, so there the default is off and an explicit
+     *     --fill-gate is refused below. */
+    /* logI 16 is the device's call (FILL_ROWS_I16_MIN_SMS): BY_DEVICE here,
+     * settled once the card is known, below. It reads as on until then, so
+     * the two checks that need the tier are repeated there. */
+    if (cfg.fill_rows == FILL_ROWS_UNSET)
+        /* 0 at every geometry, not upstream's 4 below logI 16: the row
+         * tier costs 3.7% of wall and 15.3% of fill here. `--fill-rows N`
+         * turns it back on. See metal/gen_bench_main.py. */
+        cfg.fill_rows = 0;
+    if (cfg.resieve_rows < 0)
+        cfg.resieve_rows = (cfg.fill_rows &&
+                            cfg.logI <= RESIEVE_ROWS_LOGI_MAX) ? 1 : 0;
+    if (cfg.fill_gate < 0)
+        cfg.fill_gate = (cfg.pipeline && !cfg.fill_concurrent) ? 1 : 0;
+    /* --q-pipeline (findings 108-109): on wherever it can run. Its VRAM check
+     * happens in run_pipeline_impl and falls back to one q at a time;
+     * --fill-concurrent and --qspan exclude it, so there the default is off
+     * and an explicit --q-pipeline is refused below. */
+    if (cfg.q_pipeline < 0)
+        cfg.q_pipeline = (cfg.pipeline && !cfg.fill_concurrent && !cfg.qspan)
+                         ? 1 : 0;
+    /* Refused rather than ignored: a sub-option without its option, or a gate
+     * whose side 0 would be issued before side 1's bitmap exists, is a run
+     * quoted as something it was not. Under --pipeline only: without it these
+     * all resolve off, and the pipeline_only check below names the real cause. */
+    if (cfg.pipeline && fill_row_bands_set && !cfg.fill_rows) {
+        fprintf(stderr, "--fill-row-bands needs the row tier; it is off"
+                " (--fill-rows 0, or logI > 15)\n");
+        return 1;
+    }
+    if (cfg.pipeline && cfg.resieve_rows && !cfg.fill_rows) {
+        fprintf(stderr, "--resieve-rows uses the --fill-rows tier; give both\n");
+        return 1;
+    }
+    if (cfg.pipeline && fill_gate_shift_set && !cfg.fill_gate) {
+        fprintf(stderr, "--fill-gate-shift needs the gate; it is off"
+                " (--no-fill-gate, or --fill-concurrent)\n");
+        return 1;
+    }
+    if (cfg.pipeline && cfg.q_pipeline && (cfg.fill_concurrent || cfg.qspan)) {
+        fprintf(stderr, "--q-pipeline overlaps slabs and special-q on its own"
+                " stream; it is not combined with %s\n",
+                cfg.fill_concurrent ? "--fill-concurrent" : "--qspan");
+        return 1;
+    }
+    if (cfg.pipeline && cfg.fill_gate && cfg.fill_concurrent) {
+        fprintf(stderr, "--fill-gate needs side 1's survivors before side 0's"
+                " fill; --fill-concurrent overlaps them. Pick one.\n");
+        return 1;
+    }
     if (!bkthresh) bkthresh = 1u << cfg.logI;
     /* The bucket walk is Franke-Kleinjung, whose basis (plattice.cuh) exists
      * only for p >= I: then a row holds at most one hit and each walk step
@@ -1712,6 +2384,16 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     if (poly_load(polypath, &POLY) != 0) return 1;
     printf("polynomial %s: algebraic degree %d, skew %.4g\n",
            polypath, POLY.deg, POLY.skew);
+    /* poly_load has already refused a file whose n is not a common root of
+     * the two polynomials (poly_check_n). Say which of the two cases this is:
+     * a file without n cannot be checked at all. */
+    if (POLY.has_n)
+        printf("  the two polynomials share a root mod n (%zu digits)\n",
+               strlen(POLY.ns));
+    else
+        fprintf(stderr, "warning: %s has no n: line, so whether its two"
+                " polynomials belong to the same number cannot be checked\n",
+                polypath);
 
     /* ---- sieve parameters: explicit flag > job file > derived > refuse ----
      *
@@ -1976,6 +2658,29 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         fprintf(stderr, "BOINC: running on Metal device %d of %d: %s\n",
                 dev, ndev, prop.name);
 #endif
+        /* --fill-rows at logI 16: the tail the row tier removes is one
+         * thread's walk of xmax/I dependent steps -- the same time on any card
+         * -- while the bulk of the fill finishes sooner the more SMs there
+         * are. So the tier pays at logI 16 on a wide card and not a narrow
+         * one: measured neutral to +1-3% fill on a 48-SM RTX 5070 (c194,
+         * finding 107) and -15% fill, -8.7% band on a 128-SM RTX 4090
+         * (2,1147+). Between the two is unmeasured; see the define. */
+        if (cfg.fill_rows == FILL_ROWS_BY_DEVICE) {
+            cfg.fill_rows = prop.multiProcessorCount >= FILL_ROWS_I16_MIN_SMS
+                          ? 4 : 0;
+            printf("--fill-rows %d at logI 16 (%d GPU cores; the %d-SM"
+                   " threshold is an NVIDIA measurement and no Apple part"
+                   " reaches it -- unmeasured here)\n",
+                   cfg.fill_rows, prop.multiProcessorCount,
+                   FILL_ROWS_I16_MIN_SMS);
+            if (!cfg.fill_rows && (fill_row_bands_set || cfg.resieve_rows)) {
+                fprintf(stderr, "%s needs the row tier, which is off on this"
+                        " card at logI 16; give --fill-rows N as well\n",
+                        fill_row_bands_set ? "--fill-row-bands"
+                                           : "--resieve-rows");
+                return 1;
+            }
+        }
         {
             const uint64_t ab_cores = (uint64_t)prop.multiProcessorCount * 6u;
             /* One record per thread for a full CQ_FLUSH batch. */
@@ -2085,7 +2790,13 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
              * still freeze forever. --watchdog itself is NOT here; its
              * reporting works in any mode. */
             "--watchdog-kill",
-            "--slab-j", "--qspan", "--fill-concurrent", NULL
+            "--slab-j", "--qspan", "--fill-concurrent", "--cof-async",
+            "--no-cof-async", "--slab-fixed", "--no-bucket-resieve",
+            "--no-dual-bucket", "--instances",
+            "--fill-rows", "--fill-row-bands", "--fill-gate", "--resieve-rows",
+            "--no-fill-gate", "--no-resieve-rows", "--q-pipeline",
+            "--no-q-pipeline",
+            "--fill-gate-shift", NULL
         };
         int nbad = 0;
         for (int i = 1; i < argc; i++)
@@ -2247,321 +2958,27 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
             }
             atexit(ckpt_unlock_held);
         }
-        if (cfg.relations) {
-            char part[CKPT_PATH_MAX], cpath[CKPT_PATH_MAX];
-            char fp[17];
-            bench_stat_t st;
-            ckpt_t ck;
-            if (ckpt_part_path(cfg.relations, part, sizeof part) ||
-                ckpt_ckpt_path(cfg.relations, cpath, sizeof cpath))
-                return 1;
-            ckpt_fingerprint(&POLY, &cfg, fp);
-            resume_recovery_t recovery;
-            int part_exists;
-
-            if (resume_recovery_init(&recovery, &cfg, part, cpath)) return 1;
-            if (bench_stat_path(part, &st) == 0)
-                part_exists = 1;
-            else if (errno == ENOENT)
-                part_exists = 0;
-            else {
-                perror(part);
-                return 1;
+        {
+            /* static: the plan carries a path buffer per instance, and
+             * cfg.inst points at it for the rest of the run. */
+            static pipe_inst_plan_t inst_plan;
+            int restored = 0;
+            int rr = inst_prepare(&cfg, &POLY, qrange_set, &inst_plan,
+                                  &restored);
+            if (rr == 1) return 1;
+            if (rr == 2) return 0;
+            /* One pipeline resumes NAME itself; so does --restart under
+             * --instances, to discard a one-pipeline band's files too. */
+            if (cfg.relations && (rr == 0 || cfg.restart)) {
+                int r0 = 0;
+                rr = resume_prepare(&cfg, &POLY, qrange_set, &r0);
+                if (rr == 1) return 1;
+                if (rr == 2) return 0;
+                restored |= r0;
             }
-
-#define BOINC_RECOVER_OR_RETURN(why) do {                              \
-                const int br_ = boinc_discard_bad_resume(&recovery, why); \
-                if (br_ < 0) return 1;                                 \
-                if (br_ > 0) goto resume_artifacts_ready;              \
-            } while (0)
-
-            /* A hard kill can land after fopen(NAME.part, "wb") creates the
-             * staging file but before the first cofactor flush writes a
-             * checkpoint. There is no resume ambiguity when that file is
-             * empty: it contains no relation and restarting from the band's
-             * beginning cannot duplicate or lose work. Heal that state here
-             * so an unattended BOINC relaunch does not fail forever.
-             *
-             * A nonempty candidates .part is different: it may contain useful
-             * uncheckpointed output even while the relations file is empty.
-             * Preserve the old refusal in that case rather than silently
-             * overwriting it. An absent or empty candidates file is safe to
-             * restart alongside the empty relations file. */
-            if (!cfg.restart && part_exists && st.st_size == 0) {
-                bench_stat_t sidecar_st;
-                int sidecar_missing = 0;
-                int candidates_empty = 1, candidates_present = 0;
-                char candidates_part[CKPT_PATH_MAX] = "";
-
-                if (bench_stat_path(cpath, &sidecar_st)) {
-                    if (errno == ENOENT)
-                        sidecar_missing = 1;
-                    else {
-                        perror(cpath);
-                        return 1;
-                    }
-                }
-                if (sidecar_missing && cfg.candidates) {
-                    bench_stat_t candidates_st;
-                    if (ckpt_part_path(cfg.candidates, candidates_part,
-                                       sizeof candidates_part))
-                        return 1;
-                    if (bench_stat_path(candidates_part, &candidates_st) == 0) {
-                        candidates_present = 1;
-                        candidates_empty = candidates_st.st_size == 0;
-                    } else if (errno != ENOENT) {
-                        perror(candidates_part);
-                        return 1;
-                    }
-                }
-                if (sidecar_missing && candidates_empty) {
-                    printf("resume: discarding empty uncheckpointed %s; "
-                           "starting the band from the beginning\n", part);
-                    if (remove(part)) {
-                        perror(part);
-                        return 1;
-                    }
-                    if (candidates_present && remove(candidates_part)) {
-                        perror(candidates_part);
-                        return 1;
-                    }
-                    part_exists = 0;
-                }
-            }
-            if (cfg.restart) {
-                const char *restart_paths[6] = {
-                    part, cpath, recovery.ckpt_tmp,
-                    recovery.candidates_part, recovery.retry,
-                    recovery.retry_tmp
-                };
-                if (part_exists)
-                    printf("resume: --restart, discarding %s (%lld bytes)\n",
-                           part, (long long)st.st_size);
-                for (unsigned ri = 0; ri < 6; ri++) {
-                    if (!restart_paths[ri][0]) continue;
-                    if (remove(restart_paths[ri]) && errno != ENOENT) {
-                        perror(restart_paths[ri]);
-                        return 1;
-                    }
-                }
-                part_exists = 0;
-            } else if (part_exists) {
-                const int r = ckpt_read(cfg.relations, &ck);
-                /* Every branch here refuses rather than guesses. An existing
-                 * .part is either resumable work or somebody else's data; the
-                 * one thing this must never do is silently truncate it. */
-                if (r == -1) {
-                    BOINC_RECOVER_OR_RETURN("the .part has no checkpoint");
-                    fprintf(stderr,
-                        "bench: %s exists but %s does not.\n"
-                        "  That file cannot be resumed automatically -- the"
-                        " special-q that produced a relation\n"
-                        "  cannot be recovered from the relation itself under"
-                        " the full factor base (a line\n"
-                        "  carries ~1.8 in-band primes and none of them is"
-                        " marked). Move it aside, or pass\n"
-                        "  --restart to discard it.\n", part, cpath);
-                    return 1;
-                }
-                if (r == -2) {              /* ckpt_read explained why */
-                    BOINC_RECOVER_OR_RETURN("the checkpoint is malformed");
-                    return 1;
-                }
-                if (r == -3) return 1;       /* unreadable: ckpt_read explained */
-                if (!cfg.candidates && ck.cand_bytes &&
-                    bench_boinc_is_managed()) {
-                    const int cr =
-                        resume_recovery_add_checkpoint_candidate(&recovery,
-                                                                 &ck);
-                    if (cr < 0) return 1;
-                    recovery.checkpoint_candidate_required = 1;
-                    recovery.checkpoint_candidate_known = cr > 0;
-                }
-                if (strcmp(ck.fp, fp)) {
-                    BOINC_RECOVER_OR_RETURN(
-                        "the checkpoint belongs to a different job");
-                    fprintf(stderr,
-                        "bench: %s belongs to a different job.\n"
-                        "  checkpoint fingerprint %s, this run %s.\n"
-                        "  Appending would produce a file whose lines all"
-                        " verify and whose yield means\n"
-                        "  nothing. Check the polynomial, lim/lpb/mfb, logI/J"
-                        " and --sq-side, or --restart.\n",
-                        cpath, ck.fp, fp);
-                    return 1;
-                }
-                if (ck.rel_bytes > (unsigned long long)st.st_size) {
-                    BOINC_RECOVER_OR_RETURN(
-                        "the relation file is shorter than its checkpoint");
-                    fprintf(stderr,
-                        "bench: %s is %lld bytes but %s claims %llu.\n"
-                        "  The relation file has been truncated or replaced"
-                        " since the checkpoint.\n",
-                        part, (long long)st.st_size, cpath, ck.rel_bytes);
-                    return 1;
-                }
-                /* The candidates .part is truncated to a recorded offset just
-                 * like the relations one, so it needs the same guard. Two ways
-                 * it goes wrong unguarded: a short file is EXTENDED by
-                 * ftruncate and the gap is a run of NULs no parser survives;
-                 * and because --candidates is not part of the fingerprint, a
-                 * resume that omitted it records cand_bytes = 0, so the next
-                 * resume that supplies it again truncates the whole file away. */
-                {
-                    bench_stat_t cst;
-                    int cpart_exists = 0;
-                    const char *cpart = recovery.candidates_part;
-                    if (cfg.candidates) {
-                        if (bench_stat_path(cpart, &cst) == 0)
-                            cpart_exists = 1;
-                        else if (errno != ENOENT) {
-                            perror(cpart);
-                            return 1;
-                        }
-                    }
-                    if (cfg.candidates && !ck.cand_bytes &&
-                        cpart_exists && cst.st_size > 0) {
-                        BOINC_RECOVER_OR_RETURN(
-                            "candidate output is not represented by the checkpoint");
-                        fprintf(stderr,
-                            "bench: %s holds %lld bytes but the checkpoint"
-                            " records none.\n"
-                            "  It was written by a session run without"
-                            " --candidates. Resuming would\n"
-                            "  discard it; drop --candidates, or move the file"
-                            " aside.\n", cpart, (long long)cst.st_size);
-                        return 1;
-                    }
-                    if (cfg.candidates && ck.cand_bytes &&
-                        (!cpart_exists || (unsigned long long)cst.st_size
-                                          < ck.cand_bytes)) {
-                        BOINC_RECOVER_OR_RETURN(
-                            "candidate output is shorter than its checkpoint");
-                        fprintf(stderr,
-                            "bench: %s is missing or shorter than the %llu"
-                            " bytes the checkpoint records.\n", cpart,
-                            ck.cand_bytes);
-                        return 1;
-                    }
-                    if (!cfg.candidates && ck.cand_bytes) {
-                        BOINC_RECOVER_OR_RETURN(
-                            "the checkpoint requires candidate output not supplied by this launch");
-                        fprintf(stderr,
-                            "bench: the checkpoint records %llu bytes of"
-                            " candidates but --candidates was not given.\n"
-                            "  Resuming would strand them. Pass the same"
-                            " --candidates path, or --restart.\n",
-                            ck.cand_bytes);
-                        return 1;
-                    }
-                }
-                {   /* Cheap, host-only, and it catches the case the
-                     * fingerprint cannot: a .part that was hand-edited, or
-                     * concatenated from another job, under a checkpoint that
-                     * still matches. Proves the polynomial only. */
-                    uint32_t nchecked = 0;
-                    const int bad = check_relations_sample(part, &POLY,
-                                                           cfg.lpb0, cfg.lpb,
-                                                           8, ck.rel_bytes,
-                                                           &nchecked);
-                    if (bad < 0) return 1;
-                    if (bad > 0) {
-                        BOINC_RECOVER_OR_RETURN(
-                            "sampled relations do not reconstruct");
-                        fprintf(stderr,
-                            "bench: %d of %u sampled relations in %s do not"
-                            " reconstruct.\n"
-                            "  Refusing to append to it.\n", bad, nchecked,
-                            part);
-                        return 1;
-                    }
-                }
-                /* The single-q fallback builds ql[0] from --q/--rho and never
-                 * consults the checkpoint, so resuming into it would truncate
-                 * the .part, sieve one unrelated q, decide the band finished
-                 * normally, rename over the final name and delete the sidecar
-                 * -- presenting a multi-day partial band as complete. The band
-                 * source is not in the fingerprint, so only this check stops
-                 * it. */
-                if (!cfg.qlist && !qrange_set) {
-                    fprintf(stderr,
-                        "bench: %s is a resumable band, but neither --qlist nor"
-                        " --qrange was given.\n"
-                        "  The single-q path cannot continue it. Supply the"
-                        " original band, or --restart.\n", part);
-                    return 1;
-                }
-                cfg.resume = 1;
-                cfg.resume_q = ck.next_q;
-                cfg.resume_rho = ck.next_rho;
-                cfg.resume_rel_bytes = ck.rel_bytes;
-                cfg.resume_cand_bytes = ck.cand_bytes;
-                cfg.resume_nrel = ck.nrel;
-                cfg.resume_nq = ck.nqdone;
-                /* The gate must not move mid-run. scale/allowance are derived
-                 * once from the band's FIRST q and held band-wide; re-deriving
-                 * them here from the resume q would sieve the rest of the job
-                 * against a different survivor bound than the part already on
-                 * disk. Carried in the checkpoint, restored here, and marked
-                 * as explicit so the derivation below leaves them alone. */
-                cfg.scale = ck.scale;   scale_set = 1;
-                cfg.scale0 = ck.scale0; scale0_set = 1;
-                cfg.allowance = ck.allowance;   allowance_set = 1;
-                cfg.allowance0 = ck.allowance0; allowance0_set = 1;
-                if (qrange_set && cfg.qmin > ck.next_q) {
-                    fprintf(stderr,
-                        "bench: --qrange starts at %llu but the checkpoint"
-                        " resumes at %llu.\n"
-                        "  The gap would never be sieved.\n",
-                        (unsigned long long)cfg.qmin,
-                        (unsigned long long)ck.next_q);
-                    return 1;
-                }
-                if (qrange_set) {
-                    /* Before the overwrite, not after: this is the only
-                     * record of where the band began, and the progress
-                     * estimator needs it or a resumed run's bar restarts at 0
-                     * and climbs through the REMAINING span. */
-                    cfg.resume_qmin = cfg.qmin;
-                    cfg.qmin = ck.next_q;
-                }
-                /* --nq counts this session's q, so a resumed run must not be
-                 * handed the whole original budget again. */
-                if (cfg.nq_max) {
-                    cfg.nq_max = ck.nqdone >= cfg.nq_max
-                        ? 0 : (uint32_t)(cfg.nq_max - ck.nqdone);
-                    if (!cfg.nq_max) {
-                        printf("resume: --nq already satisfied by %llu"
-                               " completed q; nothing to do\n", ck.nqdone);
-                        return 0;
-                    }
-                }
-                printf("resume: %s at q=%llu rho=%llu -- %llu relations,"
-                       " %llu q done, %llu bytes kept\n",
-                       part, (unsigned long long)ck.next_q,
-                       (unsigned long long)ck.next_rho,
-                       ck.nrel, ck.nqdone, ck.rel_bytes);
-                printf("        scale %.4f/%.4f allowance %.2f/%.2f restored"
-                       " from the checkpoint\n",
-                       cfg.scale, cfg.scale0, cfg.allowance, cfg.allowance0);
-            } else {
-                bench_stat_t checkpoint_st;
-                if (bench_stat_path(cpath, &checkpoint_st) == 0) {
-                    BOINC_RECOVER_OR_RETURN(
-                        "a checkpoint exists without its relation file");
-                    fprintf(stderr,
-                        "bench: %s exists but %s does not. Remove the checkpoint"
-                        " to start fresh.\n", cpath, part);
-                    return 1;
-                }
-                if (errno != ENOENT) {
-                    perror(cpath);
-                    return 1;
-                }
-            }
+            if (restored)
+                scale_set = scale0_set = allowance_set = allowance0_set = 1;
         }
-resume_artifacts_ready:
-#undef BOINC_RECOVER_OR_RETURN
 
         /* --qlist is read HERE, before the factor base, for two reasons. It
          * needs nothing from the base, so a missing or malformed list should
@@ -3071,6 +3488,15 @@ resume_artifacts_ready:
                         " %.2f/%.2f  lpb %u/%u  mfb %u/%u", cfg.sq_side,
                         cfg.scale, cfg.scale0, cfg.allowance, cfg.allowance0,
                         cfg.lpb, cfg.lpb0, cfg.mfb, cfg.mfb0);
+            /* Always: these are defaults now, and a log must show which ones
+             * a run actually had. */
+            /* The q-pipeline's state is NOT here: what a run gets depends on
+             * free VRAM after setup, so run_pipeline_impl writes its own
+             * `q-pipeline` line with what was granted. */
+            runlog_note("fill", "rows<%d*I bands=%d resieve-rows=%d"
+                        " gate=%d shift=%d", cfg.fill_rows,
+                        cfg.fill_row_bands, cfg.resieve_rows, cfg.fill_gate,
+                        cfg.fill_gate ? cfg.fill_gate_shift : 0);
             if (cfg.resume)
                 runlog_note("resume", "at q=%llu rho=%llu after %llu q,"
                             " %llu relations",

@@ -124,6 +124,113 @@ if '#include "metal/metal_rt.h"' not in src:
 # max(), not replacement: the core-count rule stays as a floor and takes over
 # on a hypothetical very large Apple GPU. Uses the live cfg.threads, since
 # --threads moves and a literal 256 would silently mis-size the grid with it.
+# ---- --fill-rows at logI 16: the threshold is an NVIDIA SM count ----------
+# upstream 2a3dfb0 turns the row tier on at logI 16 when the card has at least
+# FILL_ROWS_I16_MIN_SMS (64) SMs, measured off-side at 48 (RTX 5070) and
+# on-side at 128 (RTX 4090). `prop.multiProcessorCount` here is Apple's GPU
+# CORE count -- 10 on this M3, 40 on an M3 Max -- which is not the same unit
+# at all, so no Apple GPU will ever reach 64 and the tier is effectively off
+# at logI 16 on every Apple part.
+#
+# LEFT THAT WAY ON PURPOSE, for now: off is upstream's own answer for the
+# smaller of the two cards it measured, this port's own geometry is logI 13-15
+# where the tier is on by the logI rule regardless, and inventing an
+# Apple-shaped threshold without measuring one would be the 9z-j mistake --
+# picking a device-independent-looking unit that is not. What is fixed here is
+# the MESSAGE, which said "SMs" out of a Metal binary about a number that is
+# not an SM count.
+_fr_old = chr(10).join([
+    '            printf("--fill-rows %d at logI 16 (%d SMs; on from %d)\\n",',
+    "                   cfg.fill_rows, prop.multiProcessorCount,",
+    "                   FILL_ROWS_I16_MIN_SMS);"])
+_fr_new = chr(10).join([
+    '            printf("--fill-rows %d at logI 16 (%d GPU cores; the %d-SM"',
+    '                   " threshold is an NVIDIA measurement and no Apple part"',
+    '                   " reaches it -- unmeasured here)\\n",',
+    "                   cfg.fill_rows, prop.multiProcessorCount,",
+    "                   FILL_ROWS_I16_MIN_SMS);"])
+assert _fr_old in src, 'the --fill-rows logI 16 message shape changed'
+src = src.replace(_fr_old, _fr_new, 1)
+print('  --fill-rows logI 16 message says GPU cores, and that the threshold is NVIDIA\'s')
+
+# ---- two upstream defaults that COST on Apple silicon ---------------------
+# Measured on this 10-core M3 against the pre-rebase build, 144 q, alternated
+# and repeated, every arm emitting the identical relation file: upstream's
+# defaults are +6.8% of wall, and turning these two off puts the rebased build
+# within 0.1% of where it started (595.70 -> 636.22 -> 596.46 ms/q).
+#
+#   --fill-rows     -3.7% wall, -15.3% fill
+#   --bucket-resieve -4.5% wall (resieve + scatter 72.9 -> 55.8 ms)
+#
+# Both are upstream WINS on a wide card and both lose here, for the reason
+# 2a3dfb0 gives itself: the row tier removes a fixed single-thread tail, which
+# pays off the MORE cores finish the rest early. Upstream measured it
+# neutral-to-negative on a 48-SM RTX 5070 and positive on a 128-SM 4090; ten
+# Apple cores is far below their smaller card.
+#
+# CHANGED ONLY IN THE METAL BUILD, and reversible: `--fill-rows N` already
+# turns the tier back on, and `--bucket-resieve` is added below as the
+# positive form, which upstream has no need for and therefore does not have.
+# --dual-bucket is left alone: pipeline.cuh only allocates the second bucket
+# array when bucket_resieve is on, so it is inert here rather than wrong.
+#
+# THE CAVEAT, and it is the reason these stay options rather than becoming a
+# compiled-in truth: this is ONE Apple GPU at the small end of the range. An
+# M3/M4 Max has forty cores, which is the direction that made the row tier win
+# on the 4090, so the sign could flip there. Re-measure before assuming.
+_br_old = "    cfg.bucket_resieve = 1;"
+_br_new = chr(10).join([
+    "    /* 0, not upstream's 1: the bucket resieve costs 4.5% of wall on a",
+    "     * 10-core M3 (resieve + scatter 72.9 ms against 55.8). `--bucket-resieve`",
+    "     * turns it back on. See metal/gen_bench_main.py. */",
+    "    cfg.bucket_resieve = 0;"])
+assert src.count(_br_old) == 1, 'bucket_resieve default shape changed'
+src = src.replace(_br_old, _br_new, 1)
+
+_fr_old = chr(10).join([
+    "        cfg.fill_rows = !cfg.pipeline ? 0 : cfg.logI <= 15 ? 4",
+    "                      : cfg.logI == 16 ? FILL_ROWS_BY_DEVICE : 0;"])
+_fr_new = chr(10).join([
+    "        /* 0 at every geometry, not upstream's 4 below logI 16: the row",
+    "         * tier costs 3.7% of wall and 15.3% of fill here. `--fill-rows N`",
+    "         * turns it back on. See metal/gen_bench_main.py. */",
+    "        cfg.fill_rows = 0;"])
+assert src.count(_fr_old) == 1, 'fill_rows default resolution shape changed'
+src = src.replace(_fr_old, _fr_new, 1)
+
+# The positive form, so a Metal default of OFF stays overridable.
+_opt_old = '        else if (!strcmp(argv[i], "--no-bucket-resieve")) { cfg.bucket_resieve = 0; }'
+_opt_new = chr(10).join([
+    _opt_old,
+    '        else if (!strcmp(argv[i], "--bucket-resieve")) { cfg.bucket_resieve = 1; }'])
+assert src.count(_opt_old) == 1, 'bucket-resieve option shape changed'
+src = src.replace(_opt_old, _opt_new, 1)
+
+# ...and the help has to state what this build actually does. Replaced as ONE
+# block: upstream's entry is three lines describing only the negative flag.
+_h1_old = chr(10).join([
+    '"  --no-bucket-resieve  pipeline: re-walk every bucketed lattice to find the\\n"',
+    '"                   primes at survivors, instead of reading them back from the\\n"',
+    '"                   bucket records that are still resident. Same relations\\n"'])
+_h1_new = chr(10).join([
+    '"  --bucket-resieve / --no-bucket-resieve  pipeline: read the primes at\\n"',
+    '"                   survivors back from the bucket records instead of\\n"',
+    '"                   re-walking every bucketed lattice. Same relations.\\n"',
+    '"                   OFF in this build: -4.5%% of wall on a 10-core M3,\\n"',
+    '"                   where upstream measures it a win on a wide card  [off]\\n"'])
+assert src.count(_h1_old) == 1, 'bucket-resieve help block shape changed'
+src = src.replace(_h1_old, _h1_new, 1)
+
+_h2_old = '"                   [4 at logI <= 15, and at logI 16 on a card with\\n"'
+_h2_new = chr(10).join([
+    '"                   [0 in this build at EVERY geometry -- the row tier\\n"',
+    '"                   costs 3.7%% of wall and 15.3%% of fill on a 10-core M3;\\n"',
+    '"                   upstream defaults to 4 at logI <= 15, and at logI 16\\n"',
+    '"                   on a card with\\n"'])
+assert src.count(_h2_old) == 1, 'fill-rows help shape changed'
+src = src.replace(_h2_old, _h2_new, 1)
+print('  --fill-rows and --bucket-resieve default OFF (measured: +0.1% vs pre-rebase)')
+
 _ab_old = "            const uint64_t ab = (uint64_t)prop.multiProcessorCount * 6u;"
 _ab_new = (
     "            const uint64_t ab_cores = (uint64_t)prop.multiProcessorCount * 6u;" + chr(10) +

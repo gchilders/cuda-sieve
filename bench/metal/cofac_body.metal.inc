@@ -826,6 +826,99 @@ static inline void k_cofac_body(
     }
 }
 
+kernel void k_cofac_2_1_1(
+    device const mz<2> * n [[buffer(0)]],
+    constant mz<2> &lim2 [[buffer(1)]],
+    constant uint32_t &lpb [[buffer(2)]],
+    constant uint32_t &c0 [[buffer(3)]],
+    constant uint32_t &budget [[buffer(4)]],
+    device const uint32_t * sel [[buffer(5)]],
+    device const uint32_t * njp [[buffer(6)]],
+    device uint8_t * status [[buffer(7)]],
+    device uint64_t * fac [[buffer(8)]],
+    device uint8_t * nfac [[buffer(9)]],
+    device ulong * iters [[buffer(10), function_constant(mtl_bound_10)]],
+    device const uint32_t * s [[buffer(11)]],
+    constant uint32_t &ns [[buffer(12)]],
+    device const uint8_t * s2mask [[buffer(13)]],
+    constant uint32_t &s2vmin [[buffer(14)]],
+    constant uint32_t &s2nv [[buffer(15)]],
+    constant uint32_t &ibeg [[buffer(16)]],
+    constant uint32_t &iend [[buffer(17)]],
+    uint _tid [[thread_position_in_grid]],
+    uint _ntid [[threads_per_grid]],
+    uint _bid [[threadgroup_position_in_grid]],
+    uint _lid [[thread_position_in_threadgroup]],
+    uint _bdim [[threads_per_threadgroup]],
+    uint _gdim [[threadgroups_per_grid]])
+{
+    device ulong * iters_opt = nullptr;
+    if (mtl_bound_10) iters_opt = iters;
+    k_cofac_body<2, 1, 1>(n, lim2, lpb, c0, budget, sel, njp, status, fac, nfac, iters_opt, s, ns, s2mask, s2vmin, s2nv, ibeg, iend, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+}
+
+kernel void k_cofac_2_1_0(
+    device const mz<2> * n [[buffer(0)]],
+    constant mz<2> &lim2 [[buffer(1)]],
+    constant uint32_t &lpb [[buffer(2)]],
+    constant uint32_t &c0 [[buffer(3)]],
+    constant uint32_t &budget [[buffer(4)]],
+    device const uint32_t * sel [[buffer(5)]],
+    device const uint32_t * njp [[buffer(6)]],
+    device uint8_t * status [[buffer(7)]],
+    device uint64_t * fac [[buffer(8)]],
+    device uint8_t * nfac [[buffer(9)]],
+    device ulong * iters [[buffer(10), function_constant(mtl_bound_10)]],
+    device const uint32_t * s [[buffer(11)]],
+    constant uint32_t &ns [[buffer(12)]],
+    device const uint8_t * s2mask [[buffer(13)]],
+    constant uint32_t &s2vmin [[buffer(14)]],
+    constant uint32_t &s2nv [[buffer(15)]],
+    constant uint32_t &ibeg [[buffer(16)]],
+    constant uint32_t &iend [[buffer(17)]],
+    uint _tid [[thread_position_in_grid]],
+    uint _ntid [[threads_per_grid]],
+    uint _bid [[threadgroup_position_in_grid]],
+    uint _lid [[thread_position_in_threadgroup]],
+    uint _bdim [[threads_per_threadgroup]],
+    uint _gdim [[threadgroups_per_grid]])
+{
+    device ulong * iters_opt = nullptr;
+    if (mtl_bound_10) iters_opt = iters;
+    k_cofac_body<2, 1, 0>(n, lim2, lpb, c0, budget, sel, njp, status, fac, nfac, iters_opt, s, ns, s2mask, s2vmin, s2nv, ibeg, iend, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+}
+
+kernel void k_cofac_2_0_0(
+    device const mz<2> * n [[buffer(0)]],
+    constant mz<2> &lim2 [[buffer(1)]],
+    constant uint32_t &lpb [[buffer(2)]],
+    constant uint32_t &c0 [[buffer(3)]],
+    constant uint32_t &budget [[buffer(4)]],
+    device const uint32_t * sel [[buffer(5)]],
+    device const uint32_t * njp [[buffer(6)]],
+    device uint8_t * status [[buffer(7)]],
+    device uint64_t * fac [[buffer(8)]],
+    device uint8_t * nfac [[buffer(9)]],
+    device ulong * iters [[buffer(10), function_constant(mtl_bound_10)]],
+    device const uint32_t * s [[buffer(11)]],
+    constant uint32_t &ns [[buffer(12)]],
+    device const uint8_t * s2mask [[buffer(13)]],
+    constant uint32_t &s2vmin [[buffer(14)]],
+    constant uint32_t &s2nv [[buffer(15)]],
+    constant uint32_t &ibeg [[buffer(16)]],
+    constant uint32_t &iend [[buffer(17)]],
+    uint _tid [[thread_position_in_grid]],
+    uint _ntid [[threads_per_grid]],
+    uint _bid [[threadgroup_position_in_grid]],
+    uint _lid [[thread_position_in_threadgroup]],
+    uint _bdim [[threads_per_threadgroup]],
+    uint _gdim [[threadgroups_per_grid]])
+{
+    device ulong * iters_opt = nullptr;
+    if (mtl_bound_10) iters_opt = iters;
+    k_cofac_body<2, 0, 0>(n, lim2, lpb, c0, budget, sel, njp, status, fac, nfac, iters_opt, s, ns, s2mask, s2vmin, s2nv, ibeg, iend, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+}
+
 kernel void k_cofac_3_1_1(
     device const mz<3> * n [[buffer(0)]],
     constant mz<3> &lim2 [[buffer(1)]],
@@ -1301,6 +1394,110 @@ static inline void k_cof_enqueue_body(
     }
 }
 
+kernel void k_cof_enqueue_2_2(
+    device const bn_t * cof0 [[buffer(0)]],
+    device const uint8_t * bits0 [[buffer(1)]],
+    device const bn_t * cof1 [[buffer(2)]],
+    device const uint8_t * bits1 [[buffer(3)]],
+    device const int64_t * a [[buffer(4)]],
+    device const int64_t * b [[buffer(5)]],
+    device const uint32_t * f0 [[buffer(6)]],
+    device const uint32_t * fn0 [[buffer(7)]],
+    device const uint32_t * f1 [[buffer(8)]],
+    device const uint32_t * fn1 [[buffer(9)]],
+    constant uint32_t &n [[buffer(10)]],
+    constant uint32_t &base [[buffer(11)]],
+    constant uint32_t &lpb0 [[buffer(12)]],
+    constant uint32_t &lpb1 [[buffer(13)]],
+    constant cofq_dev_t &Q [[buffer(14)]],
+    uint _tid [[thread_position_in_grid]],
+    uint _ntid [[threads_per_grid]],
+    uint _bid [[threadgroup_position_in_grid]],
+    uint _lid [[thread_position_in_threadgroup]],
+    uint _bdim [[threads_per_threadgroup]],
+    uint _gdim [[threadgroups_per_grid]])
+{
+    k_cof_enqueue_body<2, 2>(cof0, bits0, cof1, bits1, a, b, f0, fn0, f1, fn1, n, base, lpb0, lpb1, Q, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+}
+
+kernel void k_cof_enqueue_2_3(
+    device const bn_t * cof0 [[buffer(0)]],
+    device const uint8_t * bits0 [[buffer(1)]],
+    device const bn_t * cof1 [[buffer(2)]],
+    device const uint8_t * bits1 [[buffer(3)]],
+    device const int64_t * a [[buffer(4)]],
+    device const int64_t * b [[buffer(5)]],
+    device const uint32_t * f0 [[buffer(6)]],
+    device const uint32_t * fn0 [[buffer(7)]],
+    device const uint32_t * f1 [[buffer(8)]],
+    device const uint32_t * fn1 [[buffer(9)]],
+    constant uint32_t &n [[buffer(10)]],
+    constant uint32_t &base [[buffer(11)]],
+    constant uint32_t &lpb0 [[buffer(12)]],
+    constant uint32_t &lpb1 [[buffer(13)]],
+    constant cofq_dev_t &Q [[buffer(14)]],
+    uint _tid [[thread_position_in_grid]],
+    uint _ntid [[threads_per_grid]],
+    uint _bid [[threadgroup_position_in_grid]],
+    uint _lid [[thread_position_in_threadgroup]],
+    uint _bdim [[threads_per_threadgroup]],
+    uint _gdim [[threadgroups_per_grid]])
+{
+    k_cof_enqueue_body<2, 3>(cof0, bits0, cof1, bits1, a, b, f0, fn0, f1, fn1, n, base, lpb0, lpb1, Q, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+}
+
+kernel void k_cof_enqueue_2_4(
+    device const bn_t * cof0 [[buffer(0)]],
+    device const uint8_t * bits0 [[buffer(1)]],
+    device const bn_t * cof1 [[buffer(2)]],
+    device const uint8_t * bits1 [[buffer(3)]],
+    device const int64_t * a [[buffer(4)]],
+    device const int64_t * b [[buffer(5)]],
+    device const uint32_t * f0 [[buffer(6)]],
+    device const uint32_t * fn0 [[buffer(7)]],
+    device const uint32_t * f1 [[buffer(8)]],
+    device const uint32_t * fn1 [[buffer(9)]],
+    constant uint32_t &n [[buffer(10)]],
+    constant uint32_t &base [[buffer(11)]],
+    constant uint32_t &lpb0 [[buffer(12)]],
+    constant uint32_t &lpb1 [[buffer(13)]],
+    constant cofq_dev_t &Q [[buffer(14)]],
+    uint _tid [[thread_position_in_grid]],
+    uint _ntid [[threads_per_grid]],
+    uint _bid [[threadgroup_position_in_grid]],
+    uint _lid [[thread_position_in_threadgroup]],
+    uint _bdim [[threads_per_threadgroup]],
+    uint _gdim [[threadgroups_per_grid]])
+{
+    k_cof_enqueue_body<2, 4>(cof0, bits0, cof1, bits1, a, b, f0, fn0, f1, fn1, n, base, lpb0, lpb1, Q, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+}
+
+kernel void k_cof_enqueue_3_2(
+    device const bn_t * cof0 [[buffer(0)]],
+    device const uint8_t * bits0 [[buffer(1)]],
+    device const bn_t * cof1 [[buffer(2)]],
+    device const uint8_t * bits1 [[buffer(3)]],
+    device const int64_t * a [[buffer(4)]],
+    device const int64_t * b [[buffer(5)]],
+    device const uint32_t * f0 [[buffer(6)]],
+    device const uint32_t * fn0 [[buffer(7)]],
+    device const uint32_t * f1 [[buffer(8)]],
+    device const uint32_t * fn1 [[buffer(9)]],
+    constant uint32_t &n [[buffer(10)]],
+    constant uint32_t &base [[buffer(11)]],
+    constant uint32_t &lpb0 [[buffer(12)]],
+    constant uint32_t &lpb1 [[buffer(13)]],
+    constant cofq_dev_t &Q [[buffer(14)]],
+    uint _tid [[thread_position_in_grid]],
+    uint _ntid [[threads_per_grid]],
+    uint _bid [[threadgroup_position_in_grid]],
+    uint _lid [[thread_position_in_threadgroup]],
+    uint _bdim [[threads_per_threadgroup]],
+    uint _gdim [[threadgroups_per_grid]])
+{
+    k_cof_enqueue_body<3, 2>(cof0, bits0, cof1, bits1, a, b, f0, fn0, f1, fn1, n, base, lpb0, lpb1, Q, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+}
+
 kernel void k_cof_enqueue_3_3(
     device const bn_t * cof0 [[buffer(0)]],
     device const uint8_t * bits0 [[buffer(1)]],
@@ -1351,6 +1548,32 @@ kernel void k_cof_enqueue_3_4(
     uint _gdim [[threadgroups_per_grid]])
 {
     k_cof_enqueue_body<3, 4>(cof0, bits0, cof1, bits1, a, b, f0, fn0, f1, fn1, n, base, lpb0, lpb1, Q, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+}
+
+kernel void k_cof_enqueue_4_2(
+    device const bn_t * cof0 [[buffer(0)]],
+    device const uint8_t * bits0 [[buffer(1)]],
+    device const bn_t * cof1 [[buffer(2)]],
+    device const uint8_t * bits1 [[buffer(3)]],
+    device const int64_t * a [[buffer(4)]],
+    device const int64_t * b [[buffer(5)]],
+    device const uint32_t * f0 [[buffer(6)]],
+    device const uint32_t * fn0 [[buffer(7)]],
+    device const uint32_t * f1 [[buffer(8)]],
+    device const uint32_t * fn1 [[buffer(9)]],
+    constant uint32_t &n [[buffer(10)]],
+    constant uint32_t &base [[buffer(11)]],
+    constant uint32_t &lpb0 [[buffer(12)]],
+    constant uint32_t &lpb1 [[buffer(13)]],
+    constant cofq_dev_t &Q [[buffer(14)]],
+    uint _tid [[thread_position_in_grid]],
+    uint _ntid [[threads_per_grid]],
+    uint _bid [[threadgroup_position_in_grid]],
+    uint _lid [[thread_position_in_threadgroup]],
+    uint _bdim [[threads_per_threadgroup]],
+    uint _gdim [[threadgroups_per_grid]])
+{
+    k_cof_enqueue_body<4, 2>(cof0, bits0, cof1, bits1, a, b, f0, fn0, f1, fn1, n, base, lpb0, lpb1, Q, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_cof_enqueue_4_3(

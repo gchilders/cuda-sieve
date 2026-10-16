@@ -6,7 +6,9 @@
 # the CUDA runtime calls are renamed onto metal_rt.h. The mz<L> arithmetic
 # STAYS -- it is CF_FN, i.e. host-and-device, and the host half parses and
 # verifies with it.
-import re
+import re, sys
+sys.path.insert(0, 'bench/metal')
+from portlib import rewrite_launches, _split_args
 
 SRC = 'bench/cofac.cuh'
 OUT = 'bench/metal/cofac_metal.cpp'
@@ -43,71 +45,51 @@ def strip_kernels(text):
 src, nk = strip_kernels(src)
 
 # ---- launches ------------------------------------------------------------
+#
+# THROUGH portlib, not a private copy. This file used to carry its own fork of
+# the rewriter, and the fork hard-coded the threadgroup length and the stream
+# as `0, 0`. That was invisible while cofac.cuh launched everything on the
+# default stream; upstream a025c32 then put every cofactor launch on
+# g_cof_stream for the async flush, and the fork silently dropped it -- so the
+# kernels ran on stream 0 while cof_sync() and cof_d2h() waited on
+# g_cof_stream, and the host read relation counts and relation buffers the
+# kernels had not written yet. A 288-q band lost 5,000 relations and exited 0.
+#
+# CLAUDE.md has named this hazard since Phase 3: "two copies of that
+# transformation would drift, and a drifting transformation produces a file
+# that compiles and computes something else." This was the second copy.
 ALLOWED = {'k_cofac', 'k_cof_selflags', 'k_cof_selscatter',
            'k_scan_pass1', 'k_scan_pass2', 'k_scan_pass3',
            'k_cof_enqueue', 'k_cof_gate', 'k_cof_status_hist',
            'k_rel_flags', 'k_rel_gather', 'k_rel_pack'}
+skipped = set()
+for _m in re.finditer(r'\b(k_\w+)\s*(?:<[^<>;]*>\s*)?<<<', src):
+    if _m.group(1) not in ALLOWED: skipped.add(_m.group(1))
 
-def rewrite_launches(text):
-    out, i, count, skipped = [], 0, 0, set()
-    while True:
-        j = text.find('<<<', i)
-        if j < 0:
-            out.append(text[i:]); break
-        k = j; targs = None
-        if text[k - 1] == '>':
-            d = 0; k -= 1
-            while k >= 0:
-                if text[k] == '>': d += 1
-                elif text[k] == '<':
-                    d -= 1
-                    if d == 0: break
-                k -= 1
-            targs = text[k + 1:j - 1]
-        e = k
-        while e > 0 and (text[e - 1].isalnum() or text[e - 1] == '_'): e -= 1
-        base = text[e:k]
-        d = 0; m = j + 3
-        while m < len(text):
-            if text[m] == '<': d += 1
-            elif text[m] == '>':
-                if d == 0 and text[m:m + 3] == '>>>': break
-                d -= 1
-            elif text[m] == '(': d += 1
-            elif text[m] == ')': d -= 1
-            m += 1
-        cfg = text[j + 3:m]
-        d = 0; parts = []; cur = ''
-        for ch in cfg:
-            if ch in '(<[': d += 1
-            elif ch in ')>]': d -= 1
-            if ch == ',' and d == 0: parts.append(cur); cur = ''
-            else: cur += ch
-        parts.append(cur)
-        grid, block = parts[0], parts[1]
-        a = text.index('(', m); d = 0; b = a
-        while b < len(text):
-            if text[b] == '(': d += 1
-            elif text[b] == ')':
-                d -= 1
-                if d == 0: break
-            b += 1
-        args = text[a + 1:b]
-        if base not in ALLOWED:
-            skipped.add(base)
-        name = base
-        if targs:
-            tv = [t.strip() for t in targs.split(',')]
-            name = base + '_' + '_'.join('1' if t == 'true' else '0' if t == 'false' else t for t in tv)
-        out.append(text[i:e])
-        out.append('MTL_LAUNCH(%s, %s, %s, 0, 0, %s)'
-                   % (name, grid.strip(), block.strip(),
-                      ' '.join(args.replace('\\\n', ' ').replace('\\', ' ').split())))
-        count += 1
-        i = b + 1
-    return ''.join(out), count, skipped
-
-src, nl, skipped = rewrite_launches(src)
+src, nl = rewrite_launches(src)
+# Every launch here carries a stream, and losing one is silent: see above.
+_n_stream = src.count('g_cof_stream)') + src.count('g_cof_stream,')
+assert src.count('MTL_LAUNCH') == nl
+# k_cof_enqueue is the ONE launch cofac.cuh leaves on the default stream: it
+# runs in the q loop, not in the flush, so it is ordered against the sieve by
+# the same stream the sieve uses. Everything else names g_cof_stream, and a
+# launch that lost it would run on stream 0 while the host waits on
+# g_cof_stream -- silent, and worth five thousand relations.
+_on_default = []
+for _m in re.finditer(r'MTL_LAUNCH\(', src):
+    _a = _m.end() - 1; _d = 0; _b = _a
+    while _b < len(src):
+        if src[_b] == '(': _d += 1
+        elif src[_b] == ')':
+            _d -= 1
+            if _d == 0: break
+        _b += 1
+    _p = _split_args(src[_a + 1:_b], '([{', ')]}')
+    if _p[4].strip() == '0' and not _p[0].strip().startswith('k_cof_enqueue'):
+        _on_default.append(_p[0].strip())
+assert not _on_default, (
+    'cofactor launch(es) rewritten onto the default stream: %s'
+    % ', '.join(sorted(set(_on_default))))
 
 REN = [('cudaDeviceSynchronize','mtlDeviceSynchronize'), ('cudaGetLastError','mtlGetLastError'),
        ('cudaGetErrorString','mtlGetErrorString'), ('cudaMemcpyDeviceToHost','mtlMemcpyDeviceToHost'),
@@ -211,13 +193,36 @@ for fn in ('static double host_ms(void)', 'static int td_build_poly('):
 # run time from L instead, which is exactly what the CUDA compiler was doing
 # at compile time.
 HELPER = (
-"static const char *cf_kname(int L, int method, int stage2)" + chr(10) +
-"{" + chr(10) +
-"    if (L == 3) return method ? (stage2 ? \"k_cofac_3_1_1\" : \"k_cofac_3_1_0\")" + chr(10) +
-"                              : \"k_cofac_3_0_0\";" + chr(10) +
-"    return method ? (stage2 ? \"k_cofac_4_1_1\" : \"k_cofac_4_1_0\")" + chr(10) +
-"                  : \"k_cofac_4_0_0\";" + chr(10) +
-"}" + chr(10))
+chr(10).join([
+"/* The metallib reaches a kernel by NAME, so the width that cf_run_rounds<L>" ,
+" * carries as a template argument has to become one here. BUILT from L, not" ,
+" * enumerated: this used to read `if (L == 3) ... else <4-limb name>`, which" ,
+" * was exhaustive only while CF_LMIN was 3. upstream 2a3dfb0 lowered CF_LMIN" ,
+" * to 2 for a side whose mfb fits 64 bits -- and every 2-limb launch then" ,
+" * ran the FOUR-limb kernel over two-limb data." ,
+" *" ,
+" * It failed silently and expensively. The kernel read each record's modulus" ,
+" * from twice the limbs that were packed, so rho ran its whole budget without" ,
+" * finding a factor: a 1,792-record launch took 2,255 ms instead of tens," ,
+" * relations came out as empty `0,0::` records, `stuck` exploded, and the" ,
+" * resulting multi-second command buffers took WindowServer down." ,
+" *" ,
+" * The range is asserted rather than assumed, because the failure of the" ,
+" * enumerated form was that it had no case for a width it was handed. */" ,
+"static const char *cf_kname(int L, int method, int stage2)" ,
+"{" ,
+"    static char buf[4][24];" ,
+"    const int k = method ? (stage2 ? 0 : 1) : 2;" ,
+"    if (L < CF_LMIN || L > CF_LMAX) {" ,
+"        fprintf(stderr, \"  cofac queue: no %d-limb kernel in this build\"" ,
+"                        \" (CF_LMIN %d, CF_LMAX %d)\\n\", L, CF_LMIN, CF_LMAX);" ,
+"        return \"k_cofac_bad_width\";   /* fails closed: no such kernel */" ,
+"    }" ,
+"    snprintf(buf[k], sizeof buf[k], \"k_cofac_%d_%d_%d\", L," ,
+"             method ? 1 : 0, (method && stage2) ? 1 : 0);" ,
+"    return buf[k];" ,
+"}" ,
+""]))
 for suffix, meth, st2 in (('1_1', '1', '1'), ('1_0', '1', '0'), ('0_0', '0', '0')):
     src = src.replace('MTL_LAUNCH(k_cofac_L_' + suffix + ',',
                       'MTL_LAUNCH_NAMED(cf_kname(L, ' + meth + ', ' + st2 + '),')
@@ -265,9 +270,31 @@ src = src.replace(anchor, anchor + chr(10) + chr(10) + ARGBUF, 1)
 src = HELPER + chr(10) + src
 
 # The two by-value cofq_t launches take the argument buffer instead.
-src = src.replace(", lpb0, lpb1, *Q);", ", lpb0, lpb1, cofq_argbuf(Q));")
-src = src.replace("MTL_LAUNCH(k_rel_pack, blocks, threads, 0, 0, nr, Q->d_idx, *Q,",
-                  "MTL_LAUNCH(k_rel_pack, blocks, threads, 0, 0, nr, Q->d_idx, cofq_argbuf(Q),")
+#
+# ASSERTED, and the anchor names nothing it does not have to. The k_rel_pack
+# replacement used to spell out the whole launch configuration -- including
+# the stream, as `0, 0` -- and when the launches moved onto g_cof_stream the
+# anchor stopped matching and the replace became a silent no-op. `*Q` then
+# went to the GPU as 400 bytes of HOST pointers reinterpreted as device
+# addresses: the kernel read a struct whose every member was nonsense, wrote
+# nothing, and every relation came out as `0,0::` with the COUNT still
+# correct, because the count comes from a different kernel. A 288-q band
+# emitted 12,331 such records and exited 0.
+#
+# "AN UNASSERTED src.replace IN A GENERATOR IS A SILENT NO-OP" -- CLAUDE.md,
+# after the same failure in this same file.
+_bv = [(", lpb0, lpb1, *Q);", ", lpb0, lpb1, cofq_argbuf(Q));"),
+       ("nr, Q->d_idx, *Q,", "nr, Q->d_idx, cofq_argbuf(Q),")]
+for _a, _b in _bv:
+    assert src.count(_a) == 1, 'by-value cofq_t launch anchor: ' + _a
+    src = src.replace(_a, _b, 1)
+# Nothing may still hand a KERNEL the host struct. `sizeof(*Q)` and the
+# `const cofq_t *Q` parameters are host code and stay.
+import re as _re
+_byval = [m.group(0) for m in _re.finditer(r'MTL_LAUNCH[^;\n]*\*Q[,)]', src)]
+assert not _byval, ('a launch still passes cofq_t by value: %s'
+                    % _byval[0][:90])
+print('  both by-value cofq_t launches take the argument buffer')
 
 # CF_ENQ(A, B) parameterises the template arguments, so the mangled kernel
 # name has to be pasted by the preprocessor rather than formed here.
@@ -384,10 +411,22 @@ _lines.insert(_j[0] + 2,
     "             * bound the chunker thought it was holding. Upstream's _peak" + chr(10) +
     "             * bracket hid it -- an event record commits, so the one launch" + chr(10) +
     "             * being MEASURED was the one launch not batched. See 9z-k." + chr(10) +
+    "             *" + chr(10) +
+    "             * ON g_cof_stream, NOT ON 0. This flushed the default stream" + chr(10) +
+    "             * until upstream a025c32 moved the cofactor launches onto" + chr(10) +
+    "             * their own stream for the async flush -- after which it" + chr(10) +
+    "             * committed a queue with nothing in it while the cofactor" + chr(10) +
+    "             * queue batched exactly as before. cbtimecheck caught it at" + chr(10) +
+    "             * 2,561.69 ms in ONE buffer of 23 dispatches, against the" + chr(10) +
+    "             * 400 ms bound: 9z-k undone, silently, by a stream argument." + chr(10) +
     "             */" + chr(10) +
-    "            mtlStreamFlush(0);   /* cannot fail; sync() reports the work */")
+    "            mtlStreamFlush(g_cof_stream);   /* cannot fail; sync() reports the work */")
 src = chr(10).join(_lines)
 print('  per-launch flush added to cf_run_rounds')
+# The flush must name the stream the launches are on, or it bounds nothing.
+assert 'mtlStreamFlush(0)' not in src, \
+    'a cofactor stream flush still commits the default stream'
+
 
 # Hoist upstream's launch_ms to function scope so the steering below can read
 # it: upstream computes it inside its valve's own block.
@@ -654,48 +693,96 @@ src = src.replace(_t_old, chr(10).join([
     "#define COF_CHUNK_TARGET_MS   MTL_INTERACTIVITY_BOUND_MS",
     "#endif"]), 1)
 
-# The floor stops being the policy and becomes a sanity bound: one grid's
-# worth of records, so a slice never has fewer records than the grid can hold
-# in a single wave.
-# The opening value must NOT be the floor any more. It was the same number
-# when the floor was a full grid; now that the floor is a wave, opening there
-# would start every band at a slice far too small to be efficient and, with
-# one flush, never adapt at all -- measured at 722 ms/q against 355 for the
-# right slice. Open at ONE GRID of records, which is what the floor used to
-# be, and let the measurement walk it down toward the bound.
+# The floor stops being the policy and becomes a sanity bound: one WAVE of
+# records, so a slice never has fewer records than the device can run at once.
+#
+# AND THE OPENING VALUE IS THAT FLOOR, not a grid. This used to open at one
+# core-derived grid -- 15,360 records here -- and let the measurement walk it
+# down. That was safe while the opening launch measured ~240 ms on this M3,
+# comfortably inside the 400 ms bound, so the controller never steered at all.
+# After the 2026-10-15 rebase the same opening slice measures 975-1211 ms, and
+# the first flush of every band submitted a command buffer two and a half to
+# three times the bound -- inside the range macOS has been observed killing
+# them in, and it took WindowServer down on this machine.
+#
+# The controller did react, but only AFTER an over-bound submission had run,
+# and it rides down over successive flushes (15360 -> 5043 -> 3972 -> 2670),
+# each one about seventy special-q apart. A controller whose probe is itself
+# the hazard is the wrong shape: fbgen had exactly this and 9z-o replaced it
+# with "start safe and measure" (FB_ROOTS_STRIDES_START). This is the same fix
+# in the cofactoriser.
+#
+# Opening at the floor is device-scaled rather than a magic constant: it is one
+# wave, the smallest slice that still fills the GPU once, so the opening launch
+# is the shortest useful one this device can run. The growth rule below then
+# climbs to the operating point in one or two flushes, and every intermediate
+# step is a slice whose predicted launch is 0.8x the bound BY CONSTRUCTION,
+# because growth is proportional and aims there.
 _op_old = "                            : (Q->chunk_cur ? Q->chunk_cur : floor_ch);"
-_op_new = "                            : (Q->chunk_cur ? Q->chunk_cur : cof_chunk_open(blocks, threads));"
+_op_new = chr(10).join([
+    "                            /* Open at the FLOOR and climb; see",
+    "                             * metal/gen_cofac_host.py. Opening at a grid",
+    "                             * made the first flush of every band the",
+    "                             * probe, at a size this device had never",
+    "                             * been measured at. */",
+    "                            : (Q->chunk_cur ? Q->chunk_cur : floor_ch);"])
 assert _op_old in src, 'auto opening value shape changed'
 src = src.replace(_op_old, _op_new, 1)
-
-_od_old = "static uint32_t cof_chunk_floor(int blocks, int threads)"
-_od_new = chr(10).join([
-    "/* Where auto STARTS: one core-derived grid of records, one per thread.",
-    " * The floor below is where it may descend TO, which is a different and",
-    " * now much smaller number. */",
-    "static uint32_t cof_chunk_open(int blocks, int threads)",
-    "{",
-    "    const int ob = g_cof_floor_blocks ? g_cof_floor_blocks : blocks;",
-    "    const uint64_t f = (uint64_t)(ob > 0 ? ob : 1)",
-    "                     * (uint64_t)(threads > 0 ? threads : 1);",
-    "    return f > 0xffffffffull ? 0xffffffffu : (uint32_t)f;",
-    "}",
-    "",
-    _od_old])
-assert _od_old in src, 'cof_chunk_floor declaration missing'
-src = src.replace(_od_old, _od_new, 1)
-print('  auto opens at one grid, descends toward the bound by measurement')
+print('  auto OPENS at the floor and climbs, instead of opening at a grid')
 
 _fl_old = "    const int fb = g_cof_floor_blocks ? g_cof_floor_blocks : blocks;"
 _fl_new = chr(10).join([
     "    /* One WAVE, not one grid: the measurement decides how far to descend",
     "     * (see the no-progress guard), and this only stops the controller",
-    "     * asking for fewer records than the device can run at once. */",
+    "     * asking for fewer records than the device can run at once. It is",
+    "     * also where auto OPENS, so it has to be a slice any Apple GPU can",
+    "     * run well inside the bound. */",
     "    const int fbb = g_cof_floor_blocks ? g_cof_floor_blocks : blocks;",
     "    const int fb = fbb > 8 ? fbb / 8 : 1;"])
 assert _fl_old in src, 'chunk floor shape changed'
 src = src.replace(_fl_old, _fl_new, 1)
 print('  target 400 ms on a measured launch; floor lowered; no-progress guard added')
+
+# ---- growth has to be able to CLIMB ---------------------------------------
+# Upstream's growth branch is gated on `stage < target/4` -- a quarter of the
+# bound -- which was fine when it was an accident that never ran. Now that auto
+# opens at the floor, it is the path that reaches the operating point, and the
+# quarter-bound gate would strand it: the opening launch measures ~125 ms here
+# against a 100 ms threshold, so the controller would park one wave wide and
+# pay the +150% regime for the whole band.
+#
+# The body already aims at 0.8x the bound and is proportional, so the gate only
+# has to say "there is clear headroom". 0.6x leaves a dead band of [0.6, 1.0]
+# times the bound, wide enough that a noisy flush does not make it oscillate,
+# and no growth step can be predicted over the bound because the step is
+# computed to land at 0.8x it.
+_gr_old = "        } else if (stage < COF_CHUNK_TARGET_MS / 4.0f && Q->chunk_cur < Q->cap) {"
+_gr_new = chr(10).join([
+    "        } else if (stage < COF_CHUNK_GROW_MS && Q->chunk_cur < Q->cap) {"])
+assert src.count(_gr_old) == 1, 'growth branch gate shape changed'
+src = src.replace(_gr_old, _gr_new, 1)
+_gd_old = chr(10).join([
+    "#ifndef COF_CHUNK_TARGET_MS",
+    "#define COF_CHUNK_TARGET_MS   MTL_INTERACTIVITY_BOUND_MS",
+    "#endif"])
+_gd_new = chr(10).join([
+    "#ifndef COF_CHUNK_TARGET_MS",
+    "#define COF_CHUNK_TARGET_MS   MTL_INTERACTIVITY_BOUND_MS",
+    "#endif",
+    "",
+    "/* Grow the slice when a launch comes in under this -- clear headroom, not",
+    " * merely inside the bound. Auto opens at the floor (one wave) and this is",
+    " * the path that walks it up to the operating point, so the old quarter-",
+    " * bound gate would strand it one wave wide: the opening launch measures",
+    " * ~125 ms on this M3 against a 100 ms threshold. The growth step itself is",
+    " * proportional and aims at 0.8x the bound, so the dead band is [0.6, 1.0]",
+    " * times it and no step can be PREDICTED over the bound. */",
+    "#ifndef COF_CHUNK_GROW_MS",
+    "#define COF_CHUNK_GROW_MS     (0.6f * COF_CHUNK_TARGET_MS)",
+    "#endif"])
+assert src.count(_gd_old) == 1, 'target define block shape changed'
+src = src.replace(_gd_old, _gd_new, 1)
+print('  growth gate widened to 0.6x the bound so the floor can climb')
 
 # ---- proportional steering, because the response is LINEAR ----------------
 # Measured at a FULL CQ_FLUSH batch (plan 9z-h), which is the regime every

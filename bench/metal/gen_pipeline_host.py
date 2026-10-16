@@ -13,7 +13,8 @@
 # ternary over the two concrete names, which the compiler folds.
 import re, sys
 sys.path.insert(0, "bench/metal")
-from portlib import rewrite_launches, apply_renames
+from portlib import (_split_args, rewrite_launches, apply_renames,
+                     kernel_param_defaults, pad_launch_defaults)
 
 SRC = 'bench/pipeline.cuh'
 OUT = 'bench/metal/pipeline_host.inc'
@@ -24,6 +25,10 @@ src, nl = rewrite_launches(src)
 # The apply threadgroup width.
 ATHR_NOTE = "/* 192, not CUDA's 512. MEASURED on this box, bracketed interior minimum,\n * three runs per point at logI 14 / J 8192 / region 13 on oracle/c183:\n *\n *   threads   64      128     192     256     512\n *   apply    83.9    56.2    54.6    57.8    77.4  ms\n *\n * Run-to-run spread is under 1%% at each point, so the 29.5%% gap between 192\n * and CUDA's 512 is far outside the noise. 192 is 6 SIMD groups and keeps\n * (athr & 31) == 0, which k_apply's warp-ballot path requires.\n *\n * THE BOX: a 10-core M3 in a fanless MacBook Air that also drives the\n * display. The shape of the curve should carry to other Apple GPUs; the\n * exact optimum may not, and an M3 Max has four times the cores. Re-measure\n * there rather than trusting this number. */\n"
 n_athr = src.count('cfg->apply_threads ? cfg->apply_threads : 512;')
+# ASSERTED: missing this is silent. The build would simply keep CUDA's 512
+# threads for k_apply, which measured 29.5% slower than 192 on this box -- a
+# performance regression with no compile error and no changed output.
+assert n_athr >= 1, 'the apply-threads default is no longer spelled `: 512;`'
 src = src.replace('cfg->apply_threads ? cfg->apply_threads : 512;',
                   'cfg->apply_threads ? cfg->apply_threads : 192;')
 if n_athr:
@@ -33,6 +38,33 @@ if n_athr:
 
 src = apply_renames(src)
 
+# ---- pipeline.cuh's one piece of DEVICE code ------------------------------
+# upstream 2a3dfb0 put k_resieve_bucket and its rb_mod helper here, in a file
+# whose whole premise (see the header above) is that it holds no device code.
+# They go to the metallib instead -- gen_td_metal.py appends the same span to
+# td_body.metal.inc, because the kernel calls td_rank -- and are dropped here,
+# since `__global__`, `__shared__` and __ballot_sync have no meaning in the
+# host translation unit. Asserted on both sides: if one generator stops
+# finding the span the other says so.
+def _drop_fn(text, sig, what):
+    assert text.count(sig) == 1, 'pipeline.cuh device code: %s is not unique' % what
+    i = text.index(sig)
+    j = text.index('{', i); d = 0
+    while j < len(text):
+        if text[j] == '{': d += 1
+        elif text[j] == '}':
+            d -= 1
+            if d == 0: break
+        j += 1
+    return text[:i] + ('/* %s: device code, see metal/td.metal */\n' % what) + text[j + 1:]
+
+src = _drop_fn(src, '__device__ __forceinline__ uint32_t rb_mod(', 'rb_mod')
+src = _drop_fn(src, '__global__ void k_resieve_bucket(', 'k_resieve_bucket')
+for _gone in ('__global__', '__shared__', '__ballot_sync(0xffffffffu, hit)'):
+    assert _gone not in src, 'device code survives in the host file: ' + _gone
+print('  k_resieve_bucket and rb_mod dropped (they are in the metallib)')
+
+
 # cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, n)
 # -> the shim validates the request against the device ceiling instead, which
 # is the check that matters on Apple (32 KB, well under CUDA's opt-in tier).
@@ -40,6 +72,53 @@ src = re.sub(r'cudaFuncSetAttribute\(\s*k_apply<[^>]*>\s*,\s*\n?\s*cudaFuncAttri
              r'mtlFuncSetMaxThreadgroupMemory(SLABBED ? "k_apply_16_1_1_1" : "k_apply_16_1_1_0", \1)',
              src)
 src = src.replace('cuda_optin_smem_limit', 'mtl_optin_smem_limit')
+
+# ---- k_apply's SSTAIL instance, chosen at run time -----------------------
+# upstream 2a3dfb0 picks between two specialisations of k_apply with a
+# function POINTER (`auto *const apply_kern = cond ? k_apply<...,true> :
+# k_apply<...,false>`). Metal reaches a kernel by name, so the pointer becomes
+# a name and the launch becomes MTL_LAUNCH_NAMED. SLABBED is a template
+# parameter of the enclosing function, so the name is a nested ternary over
+# both -- which the compiler folds, since SLABBED is a constant there.
+#
+# The four names are spelled out rather than built, so that an instantiation
+# missing from gen_bench_kernels.py's K table fails as a missing kernel with
+# the name in the message instead of as a silently different specialisation.
+_ak_old = """        auto *const apply_kern = ss_needs_tail(S->nsplit, S->nsmall)
+            ? k_apply<16, 1, NORM_HORNER, SLABBED, true>
+            : k_apply<16, 1, NORM_HORNER, SLABBED, false>;"""
+_ak_new = """        const char *const apply_kern = ss_needs_tail(S->nsplit, S->nsmall)
+            ? (SLABBED ? "k_apply_16_1_1_1_1" : "k_apply_16_1_1_0_1")
+            : (SLABBED ? "k_apply_16_1_1_1_0" : "k_apply_16_1_1_0_0");"""
+assert src.count(_ak_old) == 1, 'k_apply instance selection shape changed'
+src = src.replace(_ak_old, _ak_new, 1)
+# rewrite_launches skipped this launch: its callee is a variable, not a
+# k_-prefixed name. Done here, NULL -> nullptr included -- NULL is 0L in C++
+# and would bind eight bytes of zeros as a constant buffer (see metal_rt.h).
+_akl_start = "        apply_kern<<<nregion, athr, S->apply_smem, st>>>("
+assert src.count(_akl_start) == 1, 'k_apply launch shape changed'
+_i = src.index(_akl_start)
+_j = src.index(');', _i) + 2
+_args = ' '.join(src[_i + len(_akl_start):_j - 2].split())
+_args = re.sub(r'\bNULL\b', 'nullptr', _args)
+src = (src[:_i]
+       + "        MTL_LAUNCH_NAMED(apply_kern, nregion, athr, S->apply_smem, st,\n"
+       + "            " + _args + ");"
+       + src[_j:])
+print('  k_apply SSTAIL instance selected by name')
+
+# The two cudaFuncSetAttribute calls name the same two instances and were
+# rewritten by the regex above WITHOUT the SSTAIL suffix, so they asked about
+# kernels that no longer exist. The shim only validates the request against
+# the device ceiling, which is the same answer for both tail instances, so one
+# per SLABBED value is enough -- but it has to name one that EXISTS.
+_fsa_old = 'mtlFuncSetMaxThreadgroupMemory(SLABBED ? "k_apply_16_1_1_1" : "k_apply_16_1_1_0", apply_smem)'
+_nfsa = src.count(_fsa_old)
+assert _nfsa == 2, 'expected 2 k_apply threadgroup-memory requests, found %d' % _nfsa
+src = src.replace(_fsa_old,
+                  'mtlFuncSetMaxThreadgroupMemory(SLABBED ? "k_apply_16_1_1_1_1"'
+                  ' : "k_apply_16_1_1_0_1", apply_smem)')
+
 
 # k_apply no longer keeps the slice-log table in threadgroup memory, so the
 # length the host binds must lose that term too, or the host would reserve
@@ -61,12 +140,9 @@ assert _inc_anchor in src, 'run_pipeline signature changed'
 src = src.replace(_inc_anchor,
                   '#include "slab_calib.inc"\n\n' + _inc_anchor, 1)
 
-_call_old = """    uint32_t pmax = pmax1 > pmax0 ? pmax1 : pmax0;
-
-    if (slab_make_plan(cfg->logI, cfg->log_region, cfg->J, pmax,
+_call_old = """    if (slab_make_plan(cfg->logI, cfg->log_region, cfg->J, pmax,
                        cfg->slab_j, &plan)) {"""
-_call_new = """    uint32_t pmax = pmax1 > pmax0 ? pmax1 : pmax0;
-    /* Auto-calibration returns 0 when it did not run or was inconclusive, in
+_call_new = """    /* Auto-calibration returns 0 when it did not run or was inconclusive, in
      * which case the caller's own --slab-j (itself usually 0, meaning the
      * static default) is what the planner sees -- exactly as before. */
     const uint32_t calibrated_j = calibrate_slab_rows(fb1, fbs1, fb0, fbs0,
@@ -80,27 +156,44 @@ assert _call_old in src, 'run_pipeline slab_make_plan call shape changed'
 src = src.replace(_call_old, _call_new, 1)
 print('  slab auto-calibration spliced in')
 
+# The error message below it still names --slab-j; say which number the
+# planner was actually given, or a calibrated run reports a request the
+# caller never made.
+_err_old = """                cfg->logI, cfg->J, pmax, cfg->slab_j);"""
+assert src.count(_err_old) == 1, 'slab plan failure message shape changed'
+src = src.replace(_err_old, """                cfg->logI, cfg->J, pmax, forced_j);""", 1)
+
+# ---- upstream's VRAM-modelled slab target --------------------------------
+# main 74fcba0 picks the largest of 4x / 2x / the default SLAB_PERF_REGIONS
+# whose MODELLED footprint fits free VRAM. This port decides the same question
+# by MEASUREMENT -- calibrate_slab_rows times the run's own first special-q
+# against three slab sizes and keeps the fastest (plan 8g) -- so when the
+# calibration fires it owns the decision and the model must not overwrite the
+# plan underneath it. The model still runs when calibration did not (below the
+# trigger geometry, or --slab-j), which is where it is the only evidence there
+# is.
+#
+# Not a judgement that the model is wrong: on UMA `free VRAM` is free system
+# memory and mtlMemGetInfo reports recommendedMaxWorkingSetSize, so the model
+# would happily up-size here. Whether that beats the measured 2^26 is a tuning
+# question with a measurement attached to it, not something to adopt silently.
+_vram_old = "    if (!cfg->slab_j && !cfg->slab_fixed) {"
+assert src.count(_vram_old) == 1, 'VRAM slab chooser guard shape changed'
+src = src.replace(_vram_old,
+                  "    if (!calibrated_j && !cfg->slab_j && !cfg->slab_fixed) {", 1)
+print('  VRAM slab model yields to the measured calibration')
+
 # The j-slabbing status line reports the STATIC target, which becomes a lie the
 # moment calibration overrides it -- the plan printed would not be the one the
 # named target implies. Say which decided.
-_msg_old = """        if (!cfg->slab_j && perf_jmax != 0xffffffffu)
-            printf("  j-slabbing: %u slab%s, up to %u rows/slab"
-                   " (auto target %u bucket regions at --region %d;"
-                   " safety bounds may reduce it further)\\n",
-                   plan.nslab, plan.nslab == 1 ? "" : "s", plan.jmax,
-                   (unsigned)SLAB_PERF_REGIONS, cfg->log_region);"""
-_msg_new = """        if (calibrated_j)
+_msg_old = """        if (!cfg->slab_j && perf_jmax != 0xffffffffu)"""
+_msg_new = """        if (calibrated_j) {
             printf("  j-slabbing: %u slab%s, up to %u rows/slab"
                    " (auto-calibrated against this run's first special-q,"
                    " not the static target)\\n",
-                   plan.nslab, plan.nslab == 1 ? "" : "s", plan.jmax);
-        else if (!cfg->slab_j && perf_jmax != 0xffffffffu)
-            printf("  j-slabbing: %u slab%s, up to %u rows/slab"
-                   " (auto target %u bucket regions at --region %d;"
-                   " safety bounds may reduce it further)\\n",
-                   plan.nslab, plan.nslab == 1 ? "" : "s", plan.jmax,
-                   (unsigned)SLAB_PERF_REGIONS, cfg->log_region);"""
-assert _msg_old in src, 'j-slabbing status message shape changed'
+                   P.nslab, P.nslab == 1 ? "" : "s", P.jmax);
+        } else if (!cfg->slab_j && perf_jmax != 0xffffffffu)"""
+assert src.count(_msg_old) == 1, 'j-slabbing status message shape changed'
 src = src.replace(_msg_old, _msg_new, 1)
 
 # HIP's fleet-aggregation line, ported. stderr, because stderr.txt is the only
@@ -109,8 +202,6 @@ src = src.replace(_msg_old, _msg_new, 1)
 # generalises or whether an M3 Max picks something else, without having to
 # reproduce every machine by hand. Gated on there having BEEN a slab decision
 # worth reporting, so the below-trigger majority does not dilute the aggregate.
-_boinc_old = """    if (slab_make_plan(cfg->logI, cfg->log_region, cfg->J, pmax,
-                       forced_j, &plan)) {"""
 _boinc_marker = "    /* The A/B record path leaves no other trace"
 assert _boinc_marker in src, 'run_pipeline body shape changed'
 src = src.replace(_boinc_marker, """#ifdef HAVE_BOINC
@@ -129,31 +220,93 @@ print('  status line reports who decided; BOINC slab-plan line added')
 # the budget against. It reports a derived round count in Q->ecm_rounds, which
 # every flush must then use instead of cfg->cof_rounds -- otherwise the derived
 # curves would run against the caller's rounds and quietly shrink the budget.
-_ci_old = chr(10).join([
-    "                                   cfg->ecm_b1, cfg->ecm_b2, cfg->ecm_curves,",
-    "                                   cfg->cof_limbs0, cfg->cof_limbs))"])
-_ci_new = chr(10).join([
-    "                                   cfg->ecm_b1, cfg->ecm_b2, cfg->ecm_curves,",
-    "                                   cfg->cof_limbs0, cfg->cof_limbs,",
-    "                                   cfg->ecm_curves_set,",
-    "                                   (uint32_t)cfg->cof_rounds))"])
-assert _ci_old in src, 'cofq_init call site shape changed'
-src = src.replace(_ci_old, _ci_new, 1)
+_ci_pairs = [
+    ("""                                   cfg->cof_limbs0, cfg->cof_limbs))""",
+     """                                   cfg->cof_limbs0, cfg->cof_limbs,
+                                   cfg->ecm_curves_set,
+                                   (uint32_t)cfg->cof_rounds))"""),
+    ("""                        cfg->cof_limbs0, cfg->cof_limbs);""",
+     """                        cfg->cof_limbs0, cfg->cof_limbs,
+                        cfg->ecm_curves_set, (uint32_t)cfg->cof_rounds);"""),
+]
+for _a, _b in _ci_pairs:
+    assert src.count(_a) == 1, 'cofq_init call site shape changed: ' + _a.strip()
+    src = src.replace(_a, _b, 1)
+print('  both cofq_init call sites carry the derivation arguments')
+
+# The ASYNC flush runs in a std::thread whose capture list is fixed, and `Q`
+# there is a POINTER parameter of cofa_start, not the local the other sites
+# see. Read the derived count before the thread is created and capture it by
+# value: `Q->ecm_rounds` inside the lambda would be an uncaptured variable
+# (it does not compile) and capturing Q itself would hand a second thread a
+# pointer the q loop is still writing through.
+_async_old = """    A->th = new std::thread([A, O, cfg, blocks, fr, cs]() {"""
+_async_new = """    const int ecm_rounds = (int)Q->ecm_rounds;
+    A->th = new std::thread([A, O, cfg, blocks, fr, cs, ecm_rounds]() {"""
+assert src.count(_async_old) == 1, 'cofa_start thread shape changed'
+
+# THE HANDOVER NEEDS A BARRIER ON METAL, and nothing in the shared code says
+# so. k_cof_enqueue runs on the q loop's stream and fills exactly the buffers
+# the flush thread is about to read on g_cof_stream. CUDA orders those two
+# through the runtime's own rules for the legacy default stream; two
+# MTLCommandQueues have NO ordering at all, and Metal's hazard tracking is
+# per-queue -- so without this the flush reads whatever the enqueue has
+# managed to write so far. The failure is silent: the records are simply not
+# there, the band exits 0, and only the relation count says anything. Once per
+# flush, i.e. about every 70 special-q.
+#
+# Reported rather than returned: cofa_start is void, and metal_rt's sticky
+# last error survives to the COF_FLUSH_CK(mtlGetLastError()) inside the flush,
+# which is what turns it into this flush's rc.
+_bar_old = """    A->F = *Q;                        /* full buffers, stats, steering   */"""
+_bar_new = """    {   /* Metal only: see metal/gen_pipeline_host.py. The q loop's stream
+         * and g_cof_stream are separate command queues with no ordering
+         * between them, and the enqueue below has just written the buffers
+         * this flush is about to read. */
+        const mtlError_t _e = mtlDeviceSynchronize();
+        if (_e != mtlSuccess)
+            fprintf(stderr, "  pipeline: the cofactor handover barrier failed:"
+                    " %s; the flush will report it\\n", mtlGetErrorString(_e));
+    }
+    A->F = *Q;                        /* full buffers, stats, steering   */"""
+assert src.count(_bar_old) == 1, 'cofa_start handover shape changed'
+src = src.replace(_bar_old, _bar_new, 1)
+print('  cofactor handover barrier inserted (Metal has no cross-queue order)')
+
+src = src.replace(_async_old, _async_new, 1)
+_ar_old = """                           cfg->cof_rounds, cfg->cof_budget, cfg->cof_chunk,
+                           blocks, cfg->threads, fr);"""
+assert src.count(_ar_old) == 1, 'async cofq_flush rounds argument shape changed'
+src = src.replace(_ar_old, """                           ecm_rounds, cfg->cof_budget, cfg->cof_chunk,
+                           blocks, cfg->threads, fr);""", 1)
 
 _n = src.count("cfg->cof_rounds, cfg->cof_budget")
-assert _n >= 1, 'cofq_flush rounds argument shape changed'
+assert _n == 4, 'expected 4 inline cofq_flush sites, found %d' % _n
 src = src.replace("cfg->cof_rounds, cfg->cof_budget",
                   "(int)Q.ecm_rounds, cfg->cof_budget")
-# One site wraps the argument onto its own line and the pattern above misses
-# it. Matched separately and ASSERTED, because a flush left on the caller's
+# Two sites wrap the argument onto its own line and the pattern above misses
+# them. Matched separately and ASSERTED, because a flush left on the caller's
 # rounds would run the derived curve count against the wrong round count and
 # silently shrink the curve budget -- the exact failure this is meant to avoid.
-_wrapped = "cfg->lim, cfg->lpb, cfg->cof_rounds,"
-assert _wrapped in src, 'wrapped cofq_flush rounds argument shape changed'
-src = src.replace(_wrapped, "cfg->lim, cfg->lpb, (int)Q.ecm_rounds,", 1)
-_n += 1
-assert 'cofq_flush' not in src or src.count('cfg->cof_rounds,') == 0 or True
+for _wrapped, _fixed in (
+        ("cfg->lim, cfg->lpb, cfg->cof_rounds,",
+         "cfg->lim, cfg->lpb, (int)Q.ecm_rounds,"),):
+    assert src.count(_wrapped) == 1, 'wrapped cofq_flush rounds argument: ' + _wrapped
+    src = src.replace(_wrapped, _fixed, 1)
+    _n += 1
+assert _n == 5, 'expected 5 cofq_flush sites, found %d' % _n
+# Nothing may be left asking cofq_flush for the CALLER's round count.
+assert 'cof_rounds, cfg->cof_budget' not in src, \
+    'a cofq_flush site still passes cfg->cof_rounds'
 print('  %d cofq_flush site(s) use the derived round count' % _n)
+
+# cofq_init has TWO call sites now: the queue itself and the async spare
+# (upstream a025c32). Both take the derivation's two extra arguments, and the
+# spare must agree with the real queue or a flush that runs on it would use a
+# different curve schedule.
+_ci_sites = src.count("""                                   cfg->cof_limbs0, cfg->cof_limbs))""")
+assert _ci_sites == 0, 'cofq_init anchors already applied'
+
 
 
 # ---- widen the warm-up launch's integer literals --------------------------
@@ -193,6 +346,28 @@ print('  memory-diagnostic warning names Metal')
 # as a PRICING build and refuses --relations from it, which a resume gate needs
 # -- so a deliberately-broken control binary cannot be built that way, and
 # should not be. progresscheck.sh discriminates without one.
+
+
+# ---- defaulted kernel arguments become explicit ones ----------------------
+# See portlib.pad_launch_defaults: Metal has no default argument: every
+# parameter a kernel declares must be bound at dispatch, so each omitted
+# trailing argument is filled in here from the KERNEL'S own default rather
+# than retyped per call site. The assert inside also checks that no launch
+# passes more arguments than the kernel declares -- which is how a kernel
+# gaining a parameter in the middle would be caught.
+_sigs = kernel_param_defaults(['bench/bench_kernels.cu', 'bench/td.cuh',
+                               'bench/pipeline.cuh'])
+src, _npad, _bad = pad_launch_defaults(src, _sigs, allow_unresolved=('apply_kern',))
+assert not _bad, 'launch through a name this cannot resolve: %s' % ', '.join(sorted(_bad))
+print('  %d launch(es) had defaulted arguments filled in' % _npad)
+
+# apply_kern is launched through a VARIABLE, so the padder cannot resolve it;
+# its argument count is checked here instead. k_apply's own default (lut_shift)
+# is passed explicitly at that site by pipeline.cuh itself.
+_ak = src.index('MTL_LAUNCH_NAMED(apply_kern,')
+_ake = src.index(');', _ak)
+assert len(_split_args(src[_ak + len('MTL_LAUNCH_NAMED('):_ake], '([{', ')]}')) - 5 \
+       == len(_sigs['k_apply']), 'the apply_kern launch does not pass every k_apply argument'
 
 open(OUT, 'w').write(src)
 print('wrote %s (%d lines, %d launches rewritten)' % (OUT, src.count('\n'), nl))
