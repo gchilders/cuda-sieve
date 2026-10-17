@@ -183,6 +183,42 @@ src = src.replace(_vram_old,
                   "    if (!calibrated_j && !cfg->slab_j && !cfg->slab_fixed) {", 1)
 print('  VRAM slab model yields to the measured calibration')
 
+# ---- --instances auto never picks 2 on Metal -----------------------------
+# upstream 00e2c8a makes `auto` the default, and auto can choose two whole
+# pipelines on two host threads. NOTHING in this port has ever run that: the
+# only two-thread path here is --cof-async, and the one experiment that let two
+# threads into metal_rt more deeply (dropping g_lock across the GPU wait)
+# produced a 288-q band with 3,054 of 13,485 relations WRONG while every gate
+# passed, because every gate is single-threaded or single-q.
+#
+# So auto resolves to one here. An explicit `--instances N` is left working --
+# this is "untested", not "known broken", and the way to test it is to ask for
+# it -- but it warns, because the failure mode demonstrated above is silent
+# wrong relations rather than a crash.
+_inst_old = "                ninst = c2.fits && c2.idx == c1.idx ? 2 : 1;"
+_inst_new = chr(10).join([
+    "                /* METAL: one. See metal/gen_pipeline_host.py -- two host",
+    "                 * threads against the shim is an untested path whose",
+    "                 * demonstrated failure mode is silently wrong relations,",
+    "                 * and no gate in this tree exercises it. */",
+    "                ninst = 1;",
+    "                (void)c2;"])
+assert src.count(_inst_old) == 1, '--instances auto choice shape changed'
+src = src.replace(_inst_old, _inst_new, 1)
+
+_warn_old = "    if (IP && ninst >= 2) {"
+_warn_new = chr(10).join([
+    "    if (IP && ninst >= 2)",
+    "        fprintf(stderr, \"  warning: --instances %d runs %d pipelines on %d host\"",
+    "                        \" threads, which this Metal port has never tested; the\"",
+    "                        \" failure mode to watch for is wrong relations, not a\"",
+    "                        \" crash. --instances 1 is the tested path.\\n\",",
+    "                ninst, ninst, ninst);",
+    "    if (IP && ninst >= 2) {"])
+assert src.count(_warn_old) == 1, 'instances dispatch shape changed'
+src = src.replace(_warn_old, _warn_new, 1)
+print('  --instances auto resolves to 1; an explicit N warns')
+
 # The j-slabbing status line reports the STATIC target, which becomes a lie the
 # moment calibration overrides it -- the plan printed would not be the one the
 # named target implies. Say which decided.

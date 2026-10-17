@@ -28,8 +28,11 @@
 #define CF_OVERFLOW   3
 #define CF_MAXFAC     4
 #define CF_BATCH    128
-#define CF_ECM_D      30u
-#define CF_ECM_NBABY   4u
+/* CF_ECM_D / CF_ECM_NBABY / CF_ECM_B1_MIN are LIFTED from bench.h into
+ * cofac_body.metal.inc by metal/gen_cofac_metal.py. They were hand-copied
+ * here as 30u/4u, and when upstream moved them to bench.h and raised D to
+ * 210 the stale copy still compiled: the host planned stage 2 for 24 baby
+ * residues and the kernel read 4. Do not reinstate a copy. */
 #define TD_SCAN_BLK  256
 
 

@@ -1,3 +1,20 @@
+/* LIFTED from bench.h by metal/gen_cofac_metal.py -- do not edit. */
+#ifndef CF_ECM_D
+#define CF_ECM_D       210u
+#endif
+#if CF_ECM_D == 30 || CF_ECM_D == 60 || CF_ECM_D == 120
+#define CF_ECM_NBABY   (CF_ECM_D / 30u * 4u)          /* phi(D)/2: 4, 8, 16 */
+#elif CF_ECM_D == 210
+#define CF_ECM_NBABY   24u
+#else
+#error "CF_ECM_D must be 30, 60, 120 or 210"
+#endif
+/* Stage 2 runs only for B1 >= this, at every D. Its first giant step covers
+ * primes above D/2, so with B1 < D/2 the primes in (B1, D/2] are folded into
+ * stage 1 instead (cofac.cuh, cf_ecm_s2_lo) and every prime to B2 is still
+ * covered. */
+#define CF_ECM_B1_MIN  30u
+
 /* Optional buffer arguments: metal_rt supplies bit i = "argument i is bound". */
 constant uint mtl_bound_mask [[function_constant(0)]];
 constant bool mtl_bound_10 = (mtl_bound_mask & (1u << 10)) != 0;
@@ -370,42 +387,64 @@ static inline int mz_rho(thread mz<L> *fac, const thread mz<L> *n, uint32_t c0, 
  * once per curve per record. At tens of curves per record that trade is clearly
  * the right way round, and it keeps a binary extended GCD out of the file.
  *
- * Stage 2 is the small-table Montgomery-XZ continuation below. It deliberately
- * uses D=30: the four unsigned baby residues {1,7,11,13} keep one curve's
- * private table small enough for this first GPU experiment. The host supplies
- * one four-bit mask per giant step; bit u is set when vD-u or vD+u is prime in
- * (B1,B2]. Thus every lane follows the same giant-step walk and only the cheap
- * product-of-differences loop is masked.
+ * Stage 2 is the baby-step/giant-step Montgomery-XZ continuation below, at a
+ * compile-time D (CF_ECM_D: 30, 60, 120 or 210). The baby residues are the odd
+ * u < D/2 coprime to D -- phi(D)/2 of them. The host supplies one mask per
+ * giant step; bit k is set when vD-u_k or vD+u_k is prime in (B1,B2]. Thus
+ * every lane follows the same giant-step walk and only the cheap
+ * product-of-differences loop is masked. A larger D trades a larger baby table
+ * for fewer giant steps: (B2-B1)/D of them, at one differential addition each.
  */
 
-#define CF_ECM_D       30u
-#define CF_ECM_NBABY    4u
+/* CF_ECM_D, CF_ECM_NBABY and CF_ECM_B1_MIN live in bench.h: bench_main's
+ * B1/B2 validation needs the same floor. */
+typedef uint32_t cf_s2mask_t;            /* one bit per baby residue */
 #define CF_ECM_MAX_B1   1000000u
 #define CF_ECM_MAX_B2  10000000u
 
 /* One definition supplies both the host mask-bit mapping and the device baby
- * scalar. A duplicated host/device table can compile and test cleanly while
- * silently assigning different meanings to the same mask bit. */
-static inline uint8_t cf_ecm_baby(uint32_t k)
+ * order. A duplicated host/device table can compile and test cleanly while
+ * silently assigning different meanings to the same mask bit: the device
+ * builds its table by walking the odd m < D/2 and keeping those this accepts,
+ * and cf_ecm_baby numbers them in the same walk. */
+static inline int cf_ecm_coprime(uint32_t m)
 {
-    return k == 0 ? 1u : k == 1 ? 7u : k == 2 ? 11u : 13u;
+    return (m & 1u) && m % 3u && m % 5u && (CF_ECM_D % 7u || m % 7u);
+}
+static inline uint32_t cf_ecm_baby(uint32_t k)
+{
+    for (uint32_t m = 1, i = 0; m < CF_ECM_D / 2u; m += 2)
+        if (cf_ecm_coprime(m) && i++ == k) return m;
+    return 0;
 }
 
 /* Shared composite sieve for both ECM plans. Bounds live here as well as in
  * the CLI: these helpers are also called by tests and must be safe on their
  * own. */
 
-/* The stage-1 exponent lcm(1..B1), held as its prime powers rather than as one
- * big integer: each is at most B1, so the ladder for it is a dozen bits and the
- * whole schedule is an array of uint32 instead of a 1.4*B1-bit number the device
- * would have to store and shift. Returns the count. */
+/* Stage 2's first giant step is v >= 1, so it covers primes above D/2 only.
+ * A B1 below that leaves (B1, D/2] to stage 1 instead: those primes are
+ * folded into its exponent (one power each), and stage 2 starts above
+ * cf_ecm_s2_lo(). Every prime up to B2 is still covered once. */
 
-/* Build the stage-2 prime-pair schedule. For every prime q in (B1,B2], write
- * q = vD +/- u with 0 < u < D/2. Since q > B1 >= 30 in the stage-2 path, q is
- * coprime to D and u is one of the four residues below. One x-coordinate
+/* The stage-1 exponent lcm(1..B1) -- times the primes in (B1, D/2] when
+ * stage 2 is on and B1 < D/2 (see cf_ecm_s2_lo) -- held as its prime powers
+ * rather than as one big integer: each is at most B1 (or D/2), so the ladder
+ * for it is a dozen bits and the whole schedule is an array of uint32 instead
+ * of a 1.4*B1-bit number the device would have to store and shift. Returns
+ * the count. b2 == 0 is stage 1 alone. */
+
+/* Build the stage-2 prime-pair schedule. For every prime q in (lo, B2],
+ * lo = cf_ecm_s2_lo(B1), write q = vD +/- u with 0 < u < D/2. Since q > lo >=
+ * D/2 > 7, q is coprime to D and u is a baby residue. One x-coordinate
  * comparison covers both signs. Empty giant steps remain in the schedule so
  * the device can advance with one differential addition rather than restart a
- * scalar multiplication at every populated v. */
+ * scalar multiplication at every populated v.
+ *
+ * Returns 0 and the giant-step count in *nv_out -- 0 when no prime lies in
+ * (lo, B2], all of them folded into stage 1 -- or -1 on bad bounds, an
+ * allocation failure, or a prime with no baby residue (an inconsistency
+ * between cf_ecm_coprime and D that must not silently drop primes). */
 
 template <int L> struct mpt { mz<L> X, Z; };
 
@@ -500,7 +539,7 @@ static inline void x_mul_s2(thread mpt<L> *p, uint32_t k, const thread mz<L> *an
     x_mul<L>(p, k, an, ad, n, n0inv, work);
 }
 
-/* One pass over the D=30 baby-step/giant-step continuation. All selected
+/* One pass over the baby-step/giant-step continuation (D = CF_ECM_D). All selected
  * cross-products are accumulated and normally only one gcd is paid. If hits
  * for different prime factors make that gcd equal n, replay the same curve and
  * gcd each selected difference. The replay is rare, preserves the fast common
@@ -510,7 +549,7 @@ static inline int mz_ecm_stage2_pass(thread mz<L> *fac, const thread mpt<L> *Q,
                                     const thread mz<L> *an, const thread mz<L> *ad,
                                     const thread mz<L> *one, const thread mz<L> *n,
                                     uint32_t n0inv,
-                                    const device uint8_t * masks,
+                                    const device cf_s2mask_t * masks,
                                     uint32_t vmin, uint32_t nv,
                                     thread uint64_t *work)
 {
@@ -584,12 +623,32 @@ static inline int mz_ecm_stage2_pass(thread mz<L> *fac, const thread mpt<L> *Q,
              * x_mul_s2 is __noinline__, and unrolling its call sites widens
              * the live range of every argument across all NBABY calls. */
             mz<L> bzs[CF_ECM_NBABY], acc, t;
-            for (uint32_t k = 0; k < CF_ECM_NBABY; k++) {
-                const uint32_t scalar = cf_ecm_baby(k);
-                mpt<L> p = *Q;
-                if (scalar != 1)
-                    x_mul_s2<L>(&p, scalar, an, ad, n, n0inv, work);
-                bx[k] = p.X; bzs[k] = p.Z;
+            {
+                /* The odd multiples [m]Q, m < D/2, by one differential
+                 * addition each: [m+2]Q = [m]Q + [2]Q, difference [m-2]Q.
+                 * Those coprime to D are the baby steps, in cf_ecm_baby's
+                 * order. One ladder per baby would cost ~log2(m) ladder steps
+                 * each -- at D=210, 24 of them -- for what this walk does in
+                 * 52 additions. */
+                mpt<L> q2, pm, cm, nm;
+                uint32_t kk = 0;
+                x_dbl<L>(&q2, Q, an, ad, n, n0inv);
+                pm = *Q;
+                bx[kk] = pm.X; bzs[kk] = pm.Z; kk++;        /* m = 1 */
+                x_add<L>(&cm, &q2, Q, Q, n, n0inv);         /* m = 3 */
+                (*work)++;
+                for (uint32_t m = 3; m < CF_ECM_D / 2u; m += 2) {
+                    /* cf_ecm_coprime orders the baby steps for the host's
+                     * mask too (cf_ecm_stage2_plan's kidx), and the plan
+                     * refuses to build unless it accepts exactly NBABY
+                     * residues -- so kk cannot overrun bx[]. */
+                    if (cf_ecm_coprime(m)) { bx[kk] = cm.X; bzs[kk] = cm.Z; kk++; }
+                    if (m + 2 < CF_ECM_D / 2u) {
+                        x_add<L>(&nm, &cm, &q2, &pm, n, n0inv);
+                        pm = cm; cm = nm;
+                        (*work)++;
+                    }
+                }
             }
             /* Forward: bx[k] = X_k * prod_{j<k} Z_j, acc ends at prod_j Z_j. */
             acc = *one;
@@ -615,16 +674,15 @@ static inline int mz_ecm_stage2_pass(thread mz<L> *fac, const thread mpt<L> *Q,
 
         for (uint32_t vi = 0; vi < nv; vi++) {
             const thread mpt<L> *G = vi ? &cur : &prev;
-            const uint32_t mask = masks[vi];
+            const cf_s2mask_t mask = masks[vi];
             if (mask) {
                 /* One denominator for every baby step, so this term is the
                  * same for all k -- hoisted out of the loop below, and not
                  * computed at all on a giant step that selects nothing. */
                 mz<L> gx;
                 mz_mul<L>(&gx, &G->X, &bz, n, n0inv);
-                #pragma unroll
                 for (uint32_t k = 0; k < CF_ECM_NBABY; k++)
-                    if (mask & (1u << k)) {
+                    if (mask & ((cf_s2mask_t)1u << k)) {
                         mz<L> b, d;
                         mz_mul<L>(&b, &bx[k], &G->Z, n, n0inv);
                         d = gx; mz_sub_mod<L>(&d, &b, n);
@@ -658,7 +716,7 @@ static inline int mz_ecm_stage2_pass(thread mz<L> *fac, const thread mpt<L> *Q,
 template <int L, int STAGE2>
 static inline int mz_ecm(thread mz<L> *fac, const thread mz<L> *n, uint32_t sigma,
                  const device uint32_t * s, uint32_t ns,
-                 const device uint8_t * s2mask, uint32_t s2vmin,
+                 const device cf_s2mask_t * s2mask, uint32_t s2vmin,
                  uint32_t s2nv, thread uint64_t *work)
 {
     const uint32_t n0inv = mz_n0inv(n->v[0]);
@@ -727,7 +785,7 @@ template <int L, int METHOD, int STAGE2>
 static inline int mz_split(const thread mz<L> *n0, const thread mz<L> *lim2, uint32_t lpb,
                    uint32_t c0, uint32_t budget, thread uint64_t *out, thread int *nout,
                    thread uint64_t *acc, const device uint32_t * s, uint32_t ns,
-                   const device uint8_t * s2mask, uint32_t s2vmin,
+                   const device cf_s2mask_t * s2mask, uint32_t s2vmin,
                    uint32_t s2nv)
 {
     mz<L> st[CF_MAXFAC];
@@ -782,7 +840,7 @@ static inline void k_cofac_body(
     device ulong * iters,
     device const uint32_t * s,
     constant uint32_t &ns,
-    device const uint8_t * s2mask,
+    device const cf_s2mask_t * s2mask,
     constant uint32_t &s2vmin,
     constant uint32_t &s2nv,
     constant uint32_t &ibeg,
@@ -840,7 +898,7 @@ kernel void k_cofac_2_1_1(
     device ulong * iters [[buffer(10), function_constant(mtl_bound_10)]],
     device const uint32_t * s [[buffer(11)]],
     constant uint32_t &ns [[buffer(12)]],
-    device const uint8_t * s2mask [[buffer(13)]],
+    device const cf_s2mask_t * s2mask [[buffer(13)]],
     constant uint32_t &s2vmin [[buffer(14)]],
     constant uint32_t &s2nv [[buffer(15)]],
     constant uint32_t &ibeg [[buffer(16)]],
@@ -871,7 +929,7 @@ kernel void k_cofac_2_1_0(
     device ulong * iters [[buffer(10), function_constant(mtl_bound_10)]],
     device const uint32_t * s [[buffer(11)]],
     constant uint32_t &ns [[buffer(12)]],
-    device const uint8_t * s2mask [[buffer(13)]],
+    device const cf_s2mask_t * s2mask [[buffer(13)]],
     constant uint32_t &s2vmin [[buffer(14)]],
     constant uint32_t &s2nv [[buffer(15)]],
     constant uint32_t &ibeg [[buffer(16)]],
@@ -902,7 +960,7 @@ kernel void k_cofac_2_0_0(
     device ulong * iters [[buffer(10), function_constant(mtl_bound_10)]],
     device const uint32_t * s [[buffer(11)]],
     constant uint32_t &ns [[buffer(12)]],
-    device const uint8_t * s2mask [[buffer(13)]],
+    device const cf_s2mask_t * s2mask [[buffer(13)]],
     constant uint32_t &s2vmin [[buffer(14)]],
     constant uint32_t &s2nv [[buffer(15)]],
     constant uint32_t &ibeg [[buffer(16)]],
@@ -933,7 +991,7 @@ kernel void k_cofac_3_1_1(
     device ulong * iters [[buffer(10), function_constant(mtl_bound_10)]],
     device const uint32_t * s [[buffer(11)]],
     constant uint32_t &ns [[buffer(12)]],
-    device const uint8_t * s2mask [[buffer(13)]],
+    device const cf_s2mask_t * s2mask [[buffer(13)]],
     constant uint32_t &s2vmin [[buffer(14)]],
     constant uint32_t &s2nv [[buffer(15)]],
     constant uint32_t &ibeg [[buffer(16)]],
@@ -964,7 +1022,7 @@ kernel void k_cofac_3_1_0(
     device ulong * iters [[buffer(10), function_constant(mtl_bound_10)]],
     device const uint32_t * s [[buffer(11)]],
     constant uint32_t &ns [[buffer(12)]],
-    device const uint8_t * s2mask [[buffer(13)]],
+    device const cf_s2mask_t * s2mask [[buffer(13)]],
     constant uint32_t &s2vmin [[buffer(14)]],
     constant uint32_t &s2nv [[buffer(15)]],
     constant uint32_t &ibeg [[buffer(16)]],
@@ -995,7 +1053,7 @@ kernel void k_cofac_3_0_0(
     device ulong * iters [[buffer(10), function_constant(mtl_bound_10)]],
     device const uint32_t * s [[buffer(11)]],
     constant uint32_t &ns [[buffer(12)]],
-    device const uint8_t * s2mask [[buffer(13)]],
+    device const cf_s2mask_t * s2mask [[buffer(13)]],
     constant uint32_t &s2vmin [[buffer(14)]],
     constant uint32_t &s2nv [[buffer(15)]],
     constant uint32_t &ibeg [[buffer(16)]],
@@ -1026,7 +1084,7 @@ kernel void k_cofac_4_1_1(
     device ulong * iters [[buffer(10), function_constant(mtl_bound_10)]],
     device const uint32_t * s [[buffer(11)]],
     constant uint32_t &ns [[buffer(12)]],
-    device const uint8_t * s2mask [[buffer(13)]],
+    device const cf_s2mask_t * s2mask [[buffer(13)]],
     constant uint32_t &s2vmin [[buffer(14)]],
     constant uint32_t &s2nv [[buffer(15)]],
     constant uint32_t &ibeg [[buffer(16)]],
@@ -1057,7 +1115,7 @@ kernel void k_cofac_4_1_0(
     device ulong * iters [[buffer(10), function_constant(mtl_bound_10)]],
     device const uint32_t * s [[buffer(11)]],
     constant uint32_t &ns [[buffer(12)]],
-    device const uint8_t * s2mask [[buffer(13)]],
+    device const cf_s2mask_t * s2mask [[buffer(13)]],
     constant uint32_t &s2vmin [[buffer(14)]],
     constant uint32_t &s2nv [[buffer(15)]],
     constant uint32_t &ibeg [[buffer(16)]],
@@ -1088,7 +1146,7 @@ kernel void k_cofac_4_0_0(
     device ulong * iters [[buffer(10), function_constant(mtl_bound_10)]],
     device const uint32_t * s [[buffer(11)]],
     constant uint32_t &ns [[buffer(12)]],
-    device const uint8_t * s2mask [[buffer(13)]],
+    device const cf_s2mask_t * s2mask [[buffer(13)]],
     constant uint32_t &s2vmin [[buffer(14)]],
     constant uint32_t &s2nv [[buffer(15)]],
     constant uint32_t &ibeg [[buffer(16)]],

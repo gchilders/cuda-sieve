@@ -2503,6 +2503,129 @@ long run burns turns without the run progressing. Wait on a CONDITION
 (`until [ -s file ]`, `while pgrep`) through a backgrounded command or the
 Monitor tool, never on a duration.
 
+## Rebase, 2026-10-16: D=210, and a cost model that kept its units' NAMES
+
+Four upstream commits (`00e2c8a` `--instances auto`, `0e98c00` **ECM stage 2 at
+D=210**, `9479e2d` PRAC parked in the attic, `924e62b` review fixes). Only the
+stage-2 geometry reaches deep into this port, and it did so twice -- once
+loudly, once not at all.
+
+**A HAND-COPIED CONSTANT, EXACTLY WHAT THIS FILE FORBIDS.** `cofac.metal`
+carried its own `#define CF_ECM_D 30u` / `#define CF_ECM_NBABY 4u`. Upstream
+moved those to `bench.h` and raised them to 210/24; the MSL copy kept 30/4, the
+build succeeded, and the device would have run a stage 2 whose geometry
+disagreed with the host's schedule. The whole guarded `ECM_GEOM` block is now
+LIFTED VERBATIM from `bench.h` by `gen_cofac_metal.py`, and the hand copies are
+replaced by a comment forbidding their return. Verified by the device reporting
+277 giant steps where the stale copy implied a different count, and 37 relations
+at the parity q. **"Lift by name, never retype" is in this file twice already;
+it is cheap to say and apparently easy to walk past.**
+
+**`--instances auto` is forced to 1 on Metal**, with a warning. Nothing in the
+port has ever been exercised with concurrent host threads driving `metal_rt`
+(see below), so adopting upstream's default here would ship an untested
+concurrency surface.
+
+### The refusal that could no longer refuse anything
+
+One gate failed after the rebase and it was the right one:
+
+```
+FAIL   large B1 with derived B2           NOT refused -- this crashes the Mac
+```
+
+**The hazard had not gone away; the ESTIMATOR had broken.** `cofq_init` refuses
+above `COF_LAUNCH_REFUSE_MS` (10 s) of work in ONE ECM curve, because
+`--cof-chunk` splits RECORDS and can never make a launch shorter than one
+chain. It estimated `0.0413 * (ns + s2nv)` -- prime powers plus giant steps,
+each counted as one unit. **A giant step stopped being a unit of work.** At
+D=210 there are ~7x fewer of them and each scans 24 baby residues instead of 4,
+so the same stage 2 is the same work in a seventh of the steps and the estimate
+fell by 3.2x.
+
+**MEASURED, one curve, 3-limb side, this M3** (`CUDA_SIEVE_METAL_CBTIME=1` with
+`--ecm-curves 1 --cof-rounds 1`, which is the smallest exposure that measures
+the thing at all):
+
+| B1 | prime powers | giant steps | old estimate | **measured** |
+|---|---|---|---|---|
+| 32,000 | 3,432 | 4,420 | 324 ms | **1,167 ms** |
+| 100,000 | 9,592 | 13,811 | 967 ms | **3,520 ms** |
+| 400,000 | 33,860 | 45,715 | 3,286 ms | **10,371 ms** |
+
+So `--ecm-b1 400000` is still a 10.4 s command buffer -- **26x this build's own
+400 ms interactivity bound** -- and the guard waved it through.
+
+**And it was not one case slipping under a threshold: NOTHING could reach it
+any more.** `ns + s2nv` is maximised at `CF_ECM_MAX_B1` = 10^6 (B2 clamps to
+`CF_ECM_MAX_B2` = 10^7) at 78,498 + 42,858 units = **5,012 ms estimated against
+a 10,000 ms threshold**. Every legal configuration in the whole parameter space
+sat under the line. **A guard that cannot fire reads exactly like a guard that
+never needed to**, and the only thing that said otherwise was a gate asserting a
+refusal rather than an acceptance.
+
+**Fix: weight stage 2 by `CF_ECM_NBABY`,** which restores the original
+calibration instead of replacing it:
+
+```c
+const double ms_one_curve = 0.0413 *
+    ((double)Q->ns + (double)Q->s2nv * (double)CF_ECM_NBABY / 4.0);
+```
+
+The `/4` is not arbitrary -- 0.0413 was measured when NBABY was 4, so at the old
+geometry this is **identical to the formula it replaces**, and `s2nv * NBABY` is
+the number of (giant step, baby residue) pairs actually scanned, which is
+~`B2 * NBABY / D` and therefore nearly D-invariant (0.114 per unit of B2 at
+D=210 against 0.133 at D=30). It predicts 1,237 / 3,819 / 12,727 ms against the
+three measurements: **6-23% high, i.e. conservative, which is the direction a
+guard rail must err in.** B1 400000 is refused again and falls back to trial
+division; B1 200000 still runs at a reported 7,587 ms/launch, which is this
+port's documented policy -- report an unboundable launch, refuse only what
+endangers the session.
+
+**Metal-only.** `COF_LAUNCH_REFUSE_MS` and the refusal block are injected by
+`gen_cofac_host.py`; `cofac.cuh` is untouched and no drift-ledger row is needed.
+
+**The lesson is one this file keeps relearning in new costumes.** 8h made a
+queued stage look like 59% of wall by measuring one q; 8q made a reciprocal look
+like the bottleneck by measuring it in isolation; here a cost model kept its
+units' NAMES while upstream changed what the units MEANT. Nothing in the tree
+compares an estimate against a measurement, so the only alarm available was a
+gate that happened to assert the right direction. **A cost model that survives a
+geometry change unexamined should be assumed wrong, not assumed portable.**
+
+**Upstream observation, NOT changed** (shared `cofac.cuh`, so a CUDA+HIP
+decision about the mathematics, not a Metal tuning change):
+`COF_S2NV_WATCHDOG_WARN` = 20,000 giant steps has drifted the same way -- at
+D=30 it meant B2 ~ 600,000, at D=210 it means B2 ~ 4.2M, so the warning fires
+about 7x later. Its text is stale with it: it tells a volunteer the derived
+default is "~194-500 steps at B1 200-500" when at D=210 it is **29-70**.
+
+### The hand copy is now ENFORCED, not just forbidden
+
+A comment saying "do not re-add these defines" is the same class of protection
+as an unasserted `src.replace`. `gen_cofac_metal.py` now ASSERTS that
+`metal/cofac.metal` contains no `#define CF_ECM_*` of its own, naming the line
+if it does -- **and the control fails**: re-adding `#define CF_ECM_D 30u`
+aborts the generator with that message instead of quietly winning the
+`#ifndef`.
+
+### Verified
+
+`cofcheck.sh` **63 PASS / 0 FAIL**, exit 0, including `large B1 with derived
+B2 refused, as Metal must`. The **288-q band is `cmp`-identical: 13,485
+relations, 564,696 enqueued, sha256 `8e79762c…`** -- the same hash as every
+band since Phase 7, now with D=210 stage 2 underneath it. Zero over-bound
+launch reports; the chunker climbs 1,792 -> 6,580 -> 18,891 -> 25,292 and
+settles, exactly the shape the 2026-10-15 entry describes. Zero generator
+drift across all twelve. Wall 546.97 ms/q, which is inside this fanless box's
+run-to-run spread of the 567.59 measured for the previous rebase and should
+not be read as an improvement.
+
+**Not covered by any of that:** `--instances` is forced to 1 here and so the
+concurrency surface upstream now defaults to is still unexercised on Metal,
+and the band-length RSS claim flagged in the previous entry is still stale.
+
 ## Drift ledger — CUDA-side changes made for this port
 
 **The ledger lives in `bench/METAL_PORT_PLAN.md` section 9, and only there.**

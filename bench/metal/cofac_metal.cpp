@@ -598,25 +598,35 @@ found:
  * once per curve per record. At tens of curves per record that trade is clearly
  * the right way round, and it keeps a binary extended GCD out of the file.
  *
- * Stage 2 is the small-table Montgomery-XZ continuation below. It deliberately
- * uses D=30: the four unsigned baby residues {1,7,11,13} keep one curve's
- * private table small enough for this first GPU experiment. The host supplies
- * one four-bit mask per giant step; bit u is set when vD-u or vD+u is prime in
- * (B1,B2]. Thus every lane follows the same giant-step walk and only the cheap
- * product-of-differences loop is masked.
+ * Stage 2 is the baby-step/giant-step Montgomery-XZ continuation below, at a
+ * compile-time D (CF_ECM_D: 30, 60, 120 or 210). The baby residues are the odd
+ * u < D/2 coprime to D -- phi(D)/2 of them. The host supplies one mask per
+ * giant step; bit k is set when vD-u_k or vD+u_k is prime in (B1,B2]. Thus
+ * every lane follows the same giant-step walk and only the cheap
+ * product-of-differences loop is masked. A larger D trades a larger baby table
+ * for fewer giant steps: (B2-B1)/D of them, at one differential addition each.
  */
 
-#define CF_ECM_D       30u
-#define CF_ECM_NBABY    4u
+/* CF_ECM_D, CF_ECM_NBABY and CF_ECM_B1_MIN live in bench.h: bench_main's
+ * B1/B2 validation needs the same floor. */
+typedef uint32_t cf_s2mask_t;            /* one bit per baby residue */
 #define CF_ECM_MAX_B1   1000000u
 #define CF_ECM_MAX_B2  10000000u
 
 /* One definition supplies both the host mask-bit mapping and the device baby
- * scalar. A duplicated host/device table can compile and test cleanly while
- * silently assigning different meanings to the same mask bit. */
-CF_HD uint8_t cf_ecm_baby(uint32_t k)
+ * order. A duplicated host/device table can compile and test cleanly while
+ * silently assigning different meanings to the same mask bit: the device
+ * builds its table by walking the odd m < D/2 and keeping those this accepts,
+ * and cf_ecm_baby numbers them in the same walk. */
+CF_HD int cf_ecm_coprime(uint32_t m)
 {
-    return k == 0 ? 1u : k == 1 ? 7u : k == 2 ? 11u : 13u;
+    return (m & 1u) && m % 3u && m % 5u && (CF_ECM_D % 7u || m % 7u);
+}
+CF_HD uint32_t cf_ecm_baby(uint32_t k)
+{
+    for (uint32_t m = 1, i = 0; m < CF_ECM_D / 2u; m += 2)
+        if (cf_ecm_coprime(m) && i++ == k) return m;
+    return 0;
 }
 
 /* Shared composite sieve for both ECM plans. Bounds live here as well as in
@@ -635,20 +645,34 @@ static uint8_t *cf_ecm_sieve(uint32_t limit)
     return composite;
 }
 
-/* The stage-1 exponent lcm(1..B1), held as its prime powers rather than as one
- * big integer: each is at most B1, so the ladder for it is a dozen bits and the
- * whole schedule is an array of uint32 instead of a 1.4*B1-bit number the device
- * would have to store and shift. Returns the count. */
-static uint32_t cf_ecm_plan(uint32_t b1, uint32_t **out)
+/* Stage 2's first giant step is v >= 1, so it covers primes above D/2 only.
+ * A B1 below that leaves (B1, D/2] to stage 1 instead: those primes are
+ * folded into its exponent (one power each), and stage 2 starts above
+ * cf_ecm_s2_lo(). Every prime up to B2 is still covered once. */
+static uint32_t cf_ecm_s2_lo(uint32_t b1)
+{
+    return b1 > CF_ECM_D / 2u ? b1 : CF_ECM_D / 2u;
+}
+
+/* The stage-1 exponent lcm(1..B1) -- times the primes in (B1, D/2] when
+ * stage 2 is on and B1 < D/2 (see cf_ecm_s2_lo) -- held as its prime powers
+ * rather than as one big integer: each is at most B1 (or D/2), so the ladder
+ * for it is a dozen bits and the whole schedule is an array of uint32 instead
+ * of a 1.4*B1-bit number the device would have to store and shift. Returns
+ * the count. b2 == 0 is stage 1 alone. */
+static uint32_t cf_ecm_plan(uint32_t b1, uint32_t b2, uint32_t **out)
 {
     uint32_t n = 0, cap = 0, *s = NULL;
     uint8_t *sieve;
+    uint32_t top = b1;
     if (b1 < 2 || b1 > CF_ECM_MAX_B1) { *out = NULL; return 0; }
-    sieve = cf_ecm_sieve(b1);
+    if (b2 > b1 && b1 < CF_ECM_D / 2u)
+        top = b2 < CF_ECM_D / 2u ? b2 : CF_ECM_D / 2u;
+    sieve = cf_ecm_sieve(top);
     if (!sieve) { *out = NULL; return 0; }
-    for (uint32_t p = 2; p <= b1; p++) {
+    for (uint32_t p = 2; p <= top; p++) {
         if (sieve[p]) continue;
-        {   /* the largest power of p that still fits under B1 */
+        {   /* the largest power of p that still fits under B1; above B1, p */
             uint64_t pe = p;
             while (pe * p <= b1) pe *= p;
             if (n == cap) {
@@ -666,45 +690,56 @@ static uint32_t cf_ecm_plan(uint32_t b1, uint32_t **out)
     return n;
 }
 
-/* Build the stage-2 prime-pair schedule. For every prime q in (B1,B2], write
- * q = vD +/- u with 0 < u < D/2. Since q > B1 >= 30 in the stage-2 path, q is
- * coprime to D and u is one of the four residues below. One x-coordinate
+/* Build the stage-2 prime-pair schedule. For every prime q in (lo, B2],
+ * lo = cf_ecm_s2_lo(B1), write q = vD +/- u with 0 < u < D/2. Since q > lo >=
+ * D/2 > 7, q is coprime to D and u is a baby residue. One x-coordinate
  * comparison covers both signs. Empty giant steps remain in the schedule so
  * the device can advance with one differential addition rather than restart a
- * scalar multiplication at every populated v. */
-static uint32_t cf_ecm_stage2_plan(uint32_t b1, uint32_t b2, uint32_t *vmin_out,
-                                   uint8_t **mask_out)
+ * scalar multiplication at every populated v.
+ *
+ * Returns 0 and the giant-step count in *nv_out -- 0 when no prime lies in
+ * (lo, B2], all of them folded into stage 1 -- or -1 on bad bounds, an
+ * allocation failure, or a prime with no baby residue (an inconsistency
+ * between cf_ecm_coprime and D that must not silently drop primes). */
+static int cf_ecm_stage2_plan(uint32_t b1, uint32_t b2, uint32_t *vmin_out,
+                              cf_s2mask_t **mask_out, uint32_t *nv_out)
 {
-    uint8_t *composite = NULL, *mask = NULL;
-    uint32_t qlo, qhi, vmin, vmax, nv;
-    if (b2 <= b1 || b1 < CF_ECM_D || b1 > CF_ECM_MAX_B1 ||
-        b2 > CF_ECM_MAX_B2) {
-        *vmin_out = 0; *mask_out = NULL; return 0;
-    }
+    uint8_t *composite = NULL;
+    cf_s2mask_t *mask = NULL;
+    int8_t kidx[CF_ECM_D / 2u];
+    uint32_t qlo, qhi, vmin, vmax, nv, nb = 0;
+    const uint32_t lo = cf_ecm_s2_lo(b1);
+    *vmin_out = 0; *mask_out = NULL; *nv_out = 0;
+    if (b2 <= b1 || b1 < CF_ECM_B1_MIN || b1 > CF_ECM_MAX_B1 ||
+        b2 > CF_ECM_MAX_B2)
+        return -1;
+    /* u -> mask bit, in cf_ecm_baby's order, once. */
+    for (uint32_t u = 0; u < CF_ECM_D / 2u; u++)
+        kidx[u] = (int8_t)(cf_ecm_coprime(u) ? nb++ : -1);
+    if (nb != CF_ECM_NBABY) return -1;
+    if (b2 <= lo) return 0;                  /* all of (B1, B2] in stage 1 */
     composite = cf_ecm_sieve(b2);
-    if (!composite) { *vmin_out = 0; *mask_out = NULL; return 0; }
-    for (qlo = b1 + 1; qlo <= b2 && composite[qlo]; qlo++) {}
-    if (qlo > b2) {
-        free(composite); *vmin_out = 0; *mask_out = NULL; return 0;
-    }
+    if (!composite) return -1;
+    for (qlo = lo + 1; qlo <= b2 && composite[qlo]; qlo++) {}
+    if (qlo > b2) { free(composite); return 0; }
     for (qhi = b2; qhi > qlo && composite[qhi]; qhi--) {}
     vmin = (qlo + CF_ECM_D / 2) / CF_ECM_D;
     vmax = (qhi + CF_ECM_D / 2) / CF_ECM_D;
     nv = vmax - vmin + 1;
-    mask = (uint8_t *)calloc(nv, 1);
-    if (!mask) { free(composite); *vmin_out = 0; *mask_out = NULL; return 0; }
-    for (uint32_t q = b1 + 1; q <= b2; q++) if (!composite[q]) {
+    mask = (cf_s2mask_t *)calloc(nv, sizeof *mask);
+    if (!mask) { free(composite); return -1; }
+    for (uint32_t q = qlo; q <= qhi; q++) if (!composite[q]) {
         const uint32_t v = (q + CF_ECM_D / 2) / CF_ECM_D;
         const uint32_t vd = v * CF_ECM_D;
         const uint32_t u = q > vd ? q - vd : vd - q;
-        for (uint32_t k = 0; k < CF_ECM_NBABY; k++)
-            if (u == cf_ecm_baby(k)) {
-                mask[v - vmin] |= (uint8_t)(1u << k); break;
-            }
+        if (u >= CF_ECM_D / 2u || kidx[u] < 0) {
+            free(composite); free(mask); return -1;
+        }
+        mask[v - vmin] |= (cf_s2mask_t)1u << kidx[u];
     }
     free(composite);
-    *vmin_out = vmin; *mask_out = mask;
-    return nv;
+    *vmin_out = vmin; *mask_out = mask; *nv_out = nv;
+    return 0;
 }
 
 template <int L> struct mpt { mz<L> X, Z; };
@@ -800,7 +835,7 @@ CF_NOINLINE void x_mul_s2(mpt<L> *p, uint32_t k, const mz<L> *an,
     x_mul<L>(p, k, an, ad, n, n0inv, work);
 }
 
-/* One pass over the D=30 baby-step/giant-step continuation. All selected
+/* One pass over the baby-step/giant-step continuation (D = CF_ECM_D). All selected
  * cross-products are accumulated and normally only one gcd is paid. If hits
  * for different prime factors make that gcd equal n, replay the same curve and
  * gcd each selected difference. The replay is rare, preserves the fast common
@@ -810,7 +845,7 @@ CF_NOINLINE int mz_ecm_stage2_pass(mz<L> *fac, const mpt<L> *Q,
                                     const mz<L> *an, const mz<L> *ad,
                                     const mz<L> *one, const mz<L> *n,
                                     uint32_t n0inv,
-                                    const uint8_t *__restrict masks,
+                                    const cf_s2mask_t *__restrict masks,
                                     uint32_t vmin, uint32_t nv,
                                     uint64_t *work)
 {
@@ -884,12 +919,32 @@ CF_NOINLINE int mz_ecm_stage2_pass(mz<L> *fac, const mpt<L> *Q,
              * x_mul_s2 is __noinline__, and unrolling its call sites widens
              * the live range of every argument across all NBABY calls. */
             mz<L> bzs[CF_ECM_NBABY], acc, t;
-            for (uint32_t k = 0; k < CF_ECM_NBABY; k++) {
-                const uint32_t scalar = cf_ecm_baby(k);
-                mpt<L> p = *Q;
-                if (scalar != 1)
-                    x_mul_s2<L>(&p, scalar, an, ad, n, n0inv, work);
-                bx[k] = p.X; bzs[k] = p.Z;
+            {
+                /* The odd multiples [m]Q, m < D/2, by one differential
+                 * addition each: [m+2]Q = [m]Q + [2]Q, difference [m-2]Q.
+                 * Those coprime to D are the baby steps, in cf_ecm_baby's
+                 * order. One ladder per baby would cost ~log2(m) ladder steps
+                 * each -- at D=210, 24 of them -- for what this walk does in
+                 * 52 additions. */
+                mpt<L> q2, pm, cm, nm;
+                uint32_t kk = 0;
+                x_dbl<L>(&q2, Q, an, ad, n, n0inv);
+                pm = *Q;
+                bx[kk] = pm.X; bzs[kk] = pm.Z; kk++;        /* m = 1 */
+                x_add<L>(&cm, &q2, Q, Q, n, n0inv);         /* m = 3 */
+                (*work)++;
+                for (uint32_t m = 3; m < CF_ECM_D / 2u; m += 2) {
+                    /* cf_ecm_coprime orders the baby steps for the host's
+                     * mask too (cf_ecm_stage2_plan's kidx), and the plan
+                     * refuses to build unless it accepts exactly NBABY
+                     * residues -- so kk cannot overrun bx[]. */
+                    if (cf_ecm_coprime(m)) { bx[kk] = cm.X; bzs[kk] = cm.Z; kk++; }
+                    if (m + 2 < CF_ECM_D / 2u) {
+                        x_add<L>(&nm, &cm, &q2, &pm, n, n0inv);
+                        pm = cm; cm = nm;
+                        (*work)++;
+                    }
+                }
             }
             /* Forward: bx[k] = X_k * prod_{j<k} Z_j, acc ends at prod_j Z_j. */
             acc = *one;
@@ -915,16 +970,15 @@ CF_NOINLINE int mz_ecm_stage2_pass(mz<L> *fac, const mpt<L> *Q,
 
         for (uint32_t vi = 0; vi < nv; vi++) {
             const mpt<L> *G = vi ? &cur : &prev;
-            const uint32_t mask = masks[vi];
+            const cf_s2mask_t mask = masks[vi];
             if (mask) {
                 /* One denominator for every baby step, so this term is the
                  * same for all k -- hoisted out of the loop below, and not
                  * computed at all on a giant step that selects nothing. */
                 mz<L> gx;
                 mz_mul<L>(&gx, &G->X, &bz, n, n0inv);
-                #pragma unroll
                 for (uint32_t k = 0; k < CF_ECM_NBABY; k++)
-                    if (mask & (1u << k)) {
+                    if (mask & ((cf_s2mask_t)1u << k)) {
                         mz<L> b, d;
                         mz_mul<L>(&b, &bx[k], &G->Z, n, n0inv);
                         d = gx; mz_sub_mod<L>(&d, &b, n);
@@ -958,7 +1012,7 @@ CF_NOINLINE int mz_ecm_stage2_pass(mz<L> *fac, const mpt<L> *Q,
 template <int L, int STAGE2>
 CF_FN int mz_ecm(mz<L> *fac, const mz<L> *n, uint32_t sigma,
                  const uint32_t *__restrict s, uint32_t ns,
-                 const uint8_t *__restrict s2mask, uint32_t s2vmin,
+                 const cf_s2mask_t *__restrict s2mask, uint32_t s2vmin,
                  uint32_t s2nv, uint64_t *work)
 {
     const uint32_t n0inv = mz_n0inv(n->v[0]);
@@ -1027,7 +1081,7 @@ template <int L, int METHOD, int STAGE2>
 CF_FN int mz_split(const mz<L> *n0, const mz<L> *lim2, uint32_t lpb,
                    uint32_t c0, uint32_t budget, uint64_t *out, int *nout,
                    uint64_t *acc, const uint32_t *__restrict s, uint32_t ns,
-                   const uint8_t *__restrict s2mask, uint32_t s2vmin,
+                   const cf_s2mask_t *__restrict s2mask, uint32_t s2vmin,
                    uint32_t s2nv)
 {
     mz<L> st[CF_MAXFAC];
@@ -1146,7 +1200,7 @@ typedef struct {
     uint32_t curves;        /* ECM curves attempted per round                */
     const uint32_t *d_s;    /* ECM stage-1 prime powers, on device           */
     uint32_t ns;
-    const uint8_t *d_s2mask;/* D=30 stage-2 prime-pair mask per giant step   */
+    const cf_s2mask_t *d_s2mask;/* stage-2 prime-pair mask per giant step  */
     uint32_t s2vmin, s2nv;
     /* Records per launch. ALWAYS A CONCRETE COUNT, never a sentinel: a value
      * at or above the batch means one launch (the original behaviour,
@@ -1471,8 +1525,15 @@ static int cf_run_rounds_dyn(int L, const uint32_t *d_n, uint64_t lim,
 /* Refuse above this much estimated work in ONE curve, because no chunking
  * can divide a chain. 10 s: launches of 3.6 s and 6.9 s have both run
  * here without incident, and the case that crashed the machine twice
- * estimates at ~19 s per curve. Between those, closer to what is known to
- * work than to what is known to kill it. */
+ * (--ecm-b1 400000) is MEASURED at 10.4 s per curve since CF_ECM_D went
+ * to 210, estimated at 12.7. Between those, closer to what is known to
+ * work than to what is known to kill it.
+ *
+ * THE THRESHOLD IS ONLY AS GOOD AS THE ESTIMATE. It fired on nothing at
+ * all between the D=210 rebase and the fix above, because the estimate
+ * stopped counting stage 2 properly -- a guard that cannot fire reads
+ * exactly like a guard that never needs to. If this constant is ever
+ * changed, check it against a configuration that must still trip it. */
 #define COF_LAUNCH_REFUSE_MS  10000.0
 
 /* The floor is `blocks * threads`: one record per thread, and never less.
@@ -1695,7 +1756,7 @@ typedef struct {
      * 2-4x at 3LP (RESULTS finding 70). A per-job choice would get one of the
      * two sides wrong on nearly every job. */
     int meth[2];
-    uint8_t  *d_s2mask; uint32_t s2vmin, s2nv;/* ECM stage-2 schedule      */
+    cf_s2mask_t *d_s2mask; uint32_t s2vmin, s2nv;/* ECM stage-2 schedule   */
     double ms_rat, ms_alg, ms_host;
     float  ms_launch_prev;  /* launch time before the last halving      */
     uint32_t chunk_prev;    /* the chunk that produced it               */
@@ -1889,7 +1950,7 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
 {
     const uint32_t nb = (cap + TD_SCAN_BLK - 1) / TD_SCAN_BLK;
     uint32_t *h_s = NULL;
-    uint8_t *h_s2mask = NULL;
+    cf_s2mask_t *h_s2mask = NULL;
     int rc = -1;
 
 #define COF_INIT_CK(x) do { if (CUDA_CHECKED(x)) goto done; } while (0)
@@ -1915,7 +1976,7 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
            " (%d bits); this build carries %d..%d\n",
            Q->L0, 32 * Q->L0, Q->L1, 32 * Q->L1, CF_LMIN, CF_LMAX);
     if (meth0 || meth1) {          /* one plan serves whichever sides use ECM */
-        Q->ns = cf_ecm_plan(ecm_b1, &h_s);
+        Q->ns = cf_ecm_plan(ecm_b1, ecm_b2, &h_s);
         if (!Q->ns) {
             fprintf(stderr, "  cofac queue: empty ECM plan for B1=%u\n", ecm_b1);
             goto done;
@@ -1925,16 +1986,18 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
                                mtlMemcpyHostToDevice));
         free(h_s); h_s = NULL;
         if (ecm_b2) {
-            Q->s2nv = cf_ecm_stage2_plan(ecm_b1, ecm_b2, &Q->s2vmin,
-                                         &h_s2mask);
-            if (!Q->s2nv) {
-                fprintf(stderr, "  cofac queue: empty ECM stage-2 plan for"
-                        " B1=%u B2=%u\n", ecm_b1, ecm_b2);
+            if (cf_ecm_stage2_plan(ecm_b1, ecm_b2, &Q->s2vmin, &h_s2mask,
+                                   &Q->s2nv)) {
+                fprintf(stderr, "  cofac queue: cannot build the ECM stage-2"
+                        " plan for B1=%u B2=%u\n", ecm_b1, ecm_b2);
                 goto done;
             }
-            COF_INIT_CK(mtlMalloc(&Q->d_s2mask, Q->s2nv));
-            COF_INIT_CK(mtlMemcpy(Q->d_s2mask, h_s2mask, Q->s2nv,
-                                   mtlMemcpyHostToDevice));
+            if (Q->s2nv) {      /* 0: every stage-2 prime folded into stage 1 */
+                COF_INIT_CK(mtlMalloc(&Q->d_s2mask, Q->s2nv * sizeof *h_s2mask));
+                COF_INIT_CK(mtlMemcpy(Q->d_s2mask, h_s2mask,
+                                       Q->s2nv * sizeof *h_s2mask,
+                                       mtlMemcpyHostToDevice));
+            }
             free(h_s2mask); h_s2mask = NULL;
         }
         if (!g_cofq_quiet) printf("  cofactor queue: ECM B1 = %u, %u prime powers, B2 = %u"
@@ -1945,7 +2008,7 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
          * Chunking splits the RECORD list, so the smallest launch it can make
          * is one record per thread. A launch therefore never gets shorter than
          * ONE record's own splitting work, and stage 2 is where that can grow
-         * without limit: the giant-step count is B2/30, so a large B2 buys a
+         * without limit: the giant-step count is B2/D, so a large B2 buys a
          * per-record cost no slice size can divide.
          *
          * The auto-derived configuration is nowhere near this -- cof_auto_b1
@@ -1973,14 +2036,30 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
                     " way.\n", Q->s2nv, ecm_curves);
     }
     if (Q->meth[0] || Q->meth[1]) {
-        /* ~0.045 ms per prime power + giant step, 10-core M3. A slower or
-         * faster Apple GPU moves this; it is a guard rail, not a model. */
-        /* MARGINAL cost of a curve: 0.0413 ms per prime power + giant
-         * step. The one-curve points (110/370/1461 ms at B1 2000/8000/
-         * 32000) include a fixed per-launch overhead and so overstate
-         * it; 8 curves at B1 2000 measured 740 ms, i.e. 92.5 ms each
-         * over 2,237 units. Calibrated on a 10-core M3. */
-        const double ms_one_curve = 0.0413 * (double)(Q->ns + Q->s2nv);
+        /* MARGINAL cost of a curve: 0.0413 ms per unit of work on a
+         * 10-core M3. A slower or faster Apple GPU moves this; it is a
+         * guard rail, not a model. The one-curve points (110/370/1461 ms
+         * at B1 2000/8000/32000) include a fixed per-launch overhead and
+         * so overstate it; 8 curves at B1 2000 measured 740 ms, i.e.
+         * 92.5 ms each over 2,237 units.
+         *
+         * A UNIT IS NOT A GIANT STEP. It was, while CF_ECM_D was 30 and
+         * each giant step scanned CF_ECM_NBABY = 4 baby residues. Raising
+         * D to 210 (NBABY 24) left the stage-2 WORK alone and merely
+         * repackaged it -- ~7x fewer giant steps, each 6x wider -- so the
+         * unweighted count silently became a 3.2x UNDER-estimate and the
+         * refusal below stopped firing for every legal configuration.
+         * Measured, one curve, 3-limb side, this M3:
+         *   B1  32000   3,432 pp +  4,420 gs -> 1,167 ms (est 1,237)
+         *   B1 100000   9,592 pp + 13,811 gs -> 3,520 ms (est 3,819)
+         *   B1 400000  33,860 pp + 45,715 gs -> 10,371 ms (est 12,727)
+         * Weighting by NBABY restores the calibration above, which was
+         * taken when NBABY was 4 -- hence the /4, which makes this
+         * formula identical to the one it replaces at the old geometry.
+         * It is 6-23% high, i.e. conservative, which is the direction a
+         * guard rail should err in. */
+        const double ms_one_curve = 0.0413 *
+            ((double)Q->ns + (double)Q->s2nv * (double)CF_ECM_NBABY / 4.0);
         const int both_ecm = Q->meth[0] && Q->meth[1];
         /* No advisory branch: when this cannot act -- an explicit
          * --ecm-curves, or a side running rho -- it stays silent rather
@@ -3219,7 +3298,7 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
 {
     FILE *f = fopen(path, "rb");
     uint32_t *h_s = NULL, *d_s = NULL, ns = 0;
-    uint8_t *h_s2mask = NULL, *d_s2mask = NULL;
+    cf_s2mask_t *h_s2mask = NULL, *d_s2mask = NULL;
     uint32_t s2vmin = 0, s2nv = 0;
     cf_sched_t sched;
     char *buf = NULL;
@@ -3340,24 +3419,27 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
     st0 = (uint8_t *)malloc(n0 ? n0 : 1); nf0 = (uint8_t *)calloc(n0 ? n0 : 1, 1);
     fac0 = (uint64_t *)malloc((size_t)(n0 ? n0 : 1) * CF_MAXFAC * 8);
     if (meth0 || meth1) {
-        ns = cf_ecm_plan(ecm_b1, &h_s);
+        ns = cf_ecm_plan(ecm_b1, ecm_b2, &h_s);
         if (!ns) { fprintf(stderr, "  cofac: empty ECM plan for B1=%u\n", ecm_b1); return -1; }
         CK(mtlMalloc(&d_s, (size_t)ns * 4));
         CK(mtlMemcpy(d_s, h_s, (size_t)ns * 4, mtlMemcpyHostToDevice));
         free(h_s);
         if (ecm_b2) {
-            s2nv = cf_ecm_stage2_plan(ecm_b1, ecm_b2, &s2vmin, &h_s2mask);
-            if (!s2nv) {
-                fprintf(stderr, "  cofac: empty ECM stage-2 plan for B1=%u"
-                        " B2=%u\n", ecm_b1, ecm_b2);
+            if (cf_ecm_stage2_plan(ecm_b1, ecm_b2, &s2vmin, &h_s2mask,
+                                   &s2nv)) {
+                fprintf(stderr, "  cofac: cannot build the ECM stage-2 plan"
+                        " for B1=%u B2=%u\n", ecm_b1, ecm_b2);
                 free(h_s2mask); mtlFree(d_s);
                 free(buf); free(rest); free(j0); free(j1); free(i0); free(i1);
                 free(small0); free(small1); free(side0ok); free(alg_job);
                 free(st0); free(nf0); free(fac0);
                 return -1;
             }
-            CK(mtlMalloc(&d_s2mask, s2nv));
-            CK(mtlMemcpy(d_s2mask, h_s2mask, s2nv, mtlMemcpyHostToDevice));
+            if (s2nv) {         /* 0: every stage-2 prime folded into stage 1 */
+                CK(mtlMalloc(&d_s2mask, s2nv * sizeof *h_s2mask));
+                CK(mtlMemcpy(d_s2mask, h_s2mask, s2nv * sizeof *h_s2mask,
+                              mtlMemcpyHostToDevice));
+            }
             free(h_s2mask);
         }
         printf("  ECM: B1 = %u, %u prime powers, B2 = %u (%u giant steps),"

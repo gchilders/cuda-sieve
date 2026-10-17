@@ -158,6 +158,30 @@ CF_LIMBS = [str(L) for L in range(CF_LMIN, 5)]
 print('  cofactor limb widths: %s (CF_LMIN lifted from bench.h)'
       % ', '.join(CF_LIMBS))
 
+# ---- bench.h's ECM stage-2 geometry, LIFTED VERBATIM ---------------------
+# CF_ECM_D / CF_ECM_NBABY / CF_ECM_B1_MIN used to live in cofac.cuh, inside the
+# region this generator extracts, so the metallib got them for free.
+# upstream 0e98c00 moved them to bench.h and changed D from 30 to 210 (NBABY 4
+# to 24) -- and metal/cofac.metal carried a HAND-COPIED `#define CF_ECM_D 30u`
+# that went on satisfying the compiler. The build succeeded, the host planned
+# stage 2 for 24 baby residues, and the kernel read 4 of them. Nothing would
+# have failed except the arithmetic.
+#
+# Lifted as a BLOCK, because CF_ECM_NBABY is derived from CF_ECM_D by #if and
+# retyping that derivation is the same mistake one level down. "No hand-copied
+# constants remain... lift by name, never retype" -- CLAUDE.md, Phase 4.
+_bh = open('bench/bench.h').read()
+_b0 = _bh.index('#ifndef CF_ECM_D')
+_b1 = _bh.index('#define CF_ECM_B1_MIN')
+_b1 = _bh.index(chr(10), _b1) + 1
+ECM_GEOM = _bh[_b0:_b1]
+for _need in ('#define CF_ECM_D', '#define CF_ECM_NBABY', '#define CF_ECM_B1_MIN',
+              '#error "CF_ECM_D must be'):
+    assert _need in ECM_GEOM, 'bench.h ECM stage-2 geometry block lost ' + _need
+# Guarded so a -D on the command line still wins, as bench.h's own #ifndef does.
+ECM_GEOM = ('/* LIFTED from bench.h by metal/gen_cofac_metal.py -- do not edit. */' +
+            chr(10) + ECM_GEOM)
+
 K = {
  'k_cofac': (['int L', 'int METHOD', 'int STAGE2'],
              [(L, m, s) for L in CF_LIMBS for (m, s) in (('1','1'), ('1','0'), ('0','0'))]),
@@ -323,6 +347,21 @@ _idx = sorted({i for v in OPTIONAL_BUFFERS.values() for i in v})
 body = (MASK_DECL + ''.join(
     'constant bool %s = (mtl_bound_mask & (1u << %d)) != 0;\n' % (bound_name(i), i)
     for i in _idx) + '\n') + body
+
+# The lifted geometry goes at the TOP, before anything that uses it, and the
+# generated file is where it lives -- metal/cofac.metal must not keep a copy.
+body = ECM_GEOM + chr(10) + body
+assert 'CF_ECM_D' in body and 'CF_ECM_NBABY' in body
+
+# ...and that last sentence is ENFORCED, not merely written down. A hand copy
+# in the including file would win on the #ifndef and silently restore the bug
+# this lift exists to fix, with a comment above it saying it must not.
+_host_metal = open('bench/metal/cofac.metal').read()
+for _ln in _host_metal.splitlines():
+    _t = _ln.split('/*')[0]
+    assert not (_t.lstrip().startswith('#define') and 'CF_ECM_' in _t), (
+        'bench/metal/cofac.metal re-introduced a hand-copied ECM geometry '
+        'define; it is lifted from bench.h here: ' + _ln.strip())
 
 open(OUT, 'w').write(body + '\n')
 print('wrote %s (%d lines, %d heads qualified)' % (OUT, body.count('\n'), nq))
