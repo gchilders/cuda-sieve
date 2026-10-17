@@ -156,6 +156,24 @@ else
     bad "--target-rels runs one pipeline" "exit $st"; tail -3 "$TMP/o.open"
 fi
 
+# Multi-GPU: every worker thread must run on the device bench selected. The
+# current device is per host thread and a new thread starts on device 0, so
+# the async cofactor flush (one instance) and the instance threads (two) both
+# used to land on device 0 when the task was given another card -- the flush
+# failing at its first batch with "invalid resource handle" (a Tesla T4 as
+# BOINC device 1 of 4), the instances silently sieving on the wrong GPU.
+ngpu=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ' || true)
+if [ "${ngpu:-0}" -ge 2 ]; then
+    for inst in 1 2; do
+        clean
+        st=0; run "$TMP/o.dev$inst" --qrange $Q --device 1 --instances $inst \
+                  --relations "$R" || st=$?
+        same_as_ref "--device 1, --instances $inst" "$TMP/o.dev$inst" $st
+    done
+else
+    printf 'SKIP   %-46s %s\n' "--device 1 (needs two GPUs)" "${ngpu:-0} visible"
+fi
+
 # A band with fewer q values than instances: split into as many as it has.
 # Before the cap, instance 0 got the empty range [q, q-1] and the band failed.
 Q1=120000053:120000053
