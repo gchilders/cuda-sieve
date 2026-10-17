@@ -1629,6 +1629,53 @@ sibling. Compare on the actual deployment workload. The
 contention and an unresolved discrepancy between internal elapsed time and
 external timing, so keep clock sources explicit when interpreting rates.
 
+## Building the NFS@Home BOINC binary
+
+The release binary is built on `nvidia/cuda:12.8.1-devel-rockylinux8`. Rocky 8
+fixes the glibc floor at 2.28, and CUDA 12.8 is the last toolkit that still
+emits sm_50–sm_70, which `GPU_ARCH=full` needs. `/scratch` is ephemeral
+storage:
+
+```sh
+cd /scratch
+
+yum install -y git autoconf automake libtool pkgconfig m4 nano dnf-plugins-core which
+
+yum config-manager --set-enabled powertools
+yum install -y libstdc++-static
+
+git clone https://github.com/BOINC/boinc.git
+cd boinc
+./_autosetup
+
+./configure --disable-server --disable-client --disable-manager
+make
+
+cd ..
+git clone https://github.com/gchilders/cuda-sieve.git
+cd cuda-sieve
+
+make -C bench bench HAVE_BOINC=1 GPU_ARCH=full \
+    BOINC_CPPFLAGS="-I/scratch/boinc/api -I/scratch/boinc/lib" \
+    BOINC_LIBS="-L/scratch/boinc/api -L/scratch/boinc/lib -lboinc_api -lboinc -lpthread"
+
+cp bench/bench ../cudasieve
+```
+
+- **`which` is required.** BOINC's `_autosetup` calls it, and the CUDA image
+  does not ship it, so without it `_autosetup` exits 127. `configure` and
+  `make` then fail, and the cuda-sieve build has no `libboinc` to link.
+- **Check the result before signing:** `ldd cudasieve` should list only
+  libpthread, libdl, librt, libm and libc. The newest `GLIBC_` symbol in
+  `objdump -T` should be at most 2.28, with no `GLIBCXX`/`CXXABI` symbols.
+  `cuobjdump --list-elf` should show sm_50 through sm_120.
+- **Sign on the machine that holds the key,** never on the build host:
+  `crypt_prog -sign cudasieve <private key> > cudasieve.sig`.
+- **The BOINC runtime redirects stderr to `stderr.txt`** in the working
+  directory, even standalone. Tests that grep the binary's stderr from a pipe
+  (three cases in `cofcheck.sh`) therefore miss when run against this binary.
+  The messages are in that file.
+
 ## Checking the output
 
 ```sh

@@ -136,6 +136,10 @@ logging, verification, and msieve handoff.
 
 ## Optional BOINC application build
 
+The NFS@Home release recipe -- Rocky 8, CUDA 12.8, BOINC built from source,
+`GPU_ARCH=full` -- is in
+[`RUNBOOK.md`](RUNBOOK.md#building-the-nfshome-boinc-binary).
+
 BOINC integration is compiled only when `HAVE_BOINC=1`. The normal build has no
 BOINC header or library dependency; its wrappers compile to no-ops and the
 recurring per-q progress path is omitted. With distribution-provided BOINC
