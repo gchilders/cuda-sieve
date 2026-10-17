@@ -381,6 +381,20 @@ fbretrycheck:
 # instead -- it computes the pre-fix answer from the same run-log record and
 # asserts the build does not produce it.
 .PHONY: progresscheck
+# ---- every user-facing string names Metal, not CUDA ----------------------
+#
+# 9z-g got this to zero by hand and nothing kept it there, so upstream
+# dae6cca's three "cannot select CUDA device" messages walked straight in --
+# through pipeline.cuh, which this port generates from, so nobody here wrote
+# them. Needs no build and no GPU: it reads the generated sources.
+#
+# The gate joins adjacent string literals before matching. Every message long
+# enough to be wrong is split across source lines, and `grep "cannot select
+# CUDA device"` on the tree that had the bug returns ZERO.
+.PHONY: msgcheck
+msgcheck:
+	@python3 metal/msgscan.py .
+
 progresscheck: ../oracle/c183.fb1
 	@$(MAKE) -f Makefile.metal $(BUILD)/bench >/dev/null
 	@sh metal/progresscheck.sh $(CURDIR)/$(BUILD)/bench \

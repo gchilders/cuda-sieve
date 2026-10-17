@@ -276,9 +276,34 @@ print('  both cofq_init call sites carry the derivation arguments')
 # value: `Q->ecm_rounds` inside the lambda would be an uncaptured variable
 # (it does not compile) and capturing Q itself would hand a second thread a
 # pointer the q loop is still writing through.
-_async_old = """    A->th = new std::thread([A, O, cfg, blocks, fr, cs]() {"""
+# upstream dae6cca's three new messages name CUDA, and this binary is not
+# CUDA. 9z-g scanned every fprintf(stderr, ...) in the port and got the count
+# to zero; these are the first regression of that since, and they arrived
+# through shared code rather than through anything written here. Metal-side
+# only -- pipeline.cuh keeps its own wording. Anchored on fragments with no
+# escapes in them: the message is split across source lines and spelling the
+# join needs a backslash-n that has to survive being written BY a generator
+# INTO a generator, which it did not the first time.
+for _o, _n in [("cannot select CUDA\"", "cannot select Metal\""),
+               ("cannot read the current CUDA device",
+                "cannot read the current Metal device"),
+               ("instance %d: cannot select CUDA device %d",
+                "instance %d: cannot select Metal device %d")]:
+    assert src.count(_o) == 1, 'device-selection message shape changed: ' + _o
+    src = src.replace(_o, _n, 1)
+print('  device-selection messages say Metal, not CUDA')
+
+# upstream dae6cca added `dev` to this capture list, which broke the anchor --
+# loudly, which is the point of asserting it. The device handover itself is
+# INERT here and is kept rather than stripped: Apple silicon exposes one Metal
+# device, metal_rt holds it in a process-global set once under g_lock, and
+# mtlGetDevice always answers 0 while mtlSetDevice(0) always succeeds. So the
+# multi-GPU hazard it fixes cannot arise, the generated code costs one lock
+# acquisition per flush thread, and carrying shared code unchanged is worth
+# more than deleting a branch that does nothing.
+_async_old = """    A->th = new std::thread([A, O, cfg, blocks, fr, cs, dev]() {"""
 _async_new = """    const int ecm_rounds = (int)Q->ecm_rounds;
-    A->th = new std::thread([A, O, cfg, blocks, fr, cs, ecm_rounds]() {"""
+    A->th = new std::thread([A, O, cfg, blocks, fr, cs, dev, ecm_rounds]() {"""
 assert src.count(_async_old) == 1, 'cofa_start thread shape changed'
 
 # THE HANDOVER NEEDS A BARRIER ON METAL, and nothing in the shared code says

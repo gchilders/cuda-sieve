@@ -2626,6 +2626,115 @@ not be read as an improvement.
 concurrency surface upstream now defaults to is still unexercised on Metal,
 and the band-length RSS claim flagged in the previous entry is still stale.
 
+## Rebase, 2026-10-17: a fix for a bug Metal cannot have, carrying three
+## messages Metal should not print
+
+Two upstream commits. `0a54b5a` is README/RUNBOOK only -- the NFS@Home BOINC
+build recipe, which never mentions macOS or Metal, so this port's own
+packaging notes stay the only record of that half. `dae6cca` is the fix:
+**CUDA's current device is per HOST THREAD and a new thread starts on device
+0**, so on a multi-GPU host assigned any card but 0 the `--cof-async` flush
+thread created its events on device 0 and recorded them on the assigned
+device's stream ("invalid resource handle", every work unit on an NFS@Home
+Tesla T4 at device 1 of 4), and `--instances` threads silently sieved on
+device 0.
+
+**THE BUG CANNOT OCCUR ON METAL, and it is worth saying exactly why rather
+than "Apple has one GPU".** `metal_rt` holds the device in a PROCESS GLOBAL
+(`g_dev`) set once under `g_lock` in `ensure_init_locked` -- there is no
+per-thread current-device state to inherit or lose. `mtlGetDevice` always
+answers 0 and `mtlSetDevice(0)` always succeeds, so **both of upstream's new
+failure branches are unreachable here**; the flush thread's device handover
+costs one `g_lock` acquisition and nothing else.
+
+**Carried anyway, not stripped.** A dead branch in shared code is cheaper
+than a generator step that deletes it and must then be re-justified at every
+future rebase. The `instcheck.sh` half does not reach this port at all --
+`Makefile.metal` has no `instcheck` target, and `--instances` resolves to 1
+here regardless.
+
+**The generator's assert fired, which is the system working.** `dae6cca` adds
+`dev` to the flush thread's lambda capture list, and `gen_pipeline_host.py`
+anchors on exactly that list to capture `ecm_rounds` alongside it. Loud
+failure, one line to fix.
+
+### The actual finding: three CUDA-named messages, and no gate to catch them
+
+```c
+fprintf(stderr, "  cofactor flush thread: cannot select CUDA" " device %d\n", dev);
+fprintf(stderr, "--instances: cannot read the current CUDA device\n");
+fprintf(stderr, "  instance %d: cannot select CUDA device %d\n", k, dev);
+```
+
+9z-g scanned every `fprintf(stderr, ...)` in the port and got the count of
+CUDA-named messages to **zero**. **This is the first regression of that
+since, and nobody here wrote it** -- the strings arrived through
+`pipeline.cuh`, a file this port generates from and never edits. They are
+unreachable on Metal, so no volunteer would ever have read one; they would
+have sat in the shipped binary contradicting a documented property of it.
+
+**9z-g's scan was never a gate, which is the whole reason this got in.** It
+is one now: `make -f Makefile.metal msgcheck`, no build and no GPU, it reads
+the generated sources.
+
+**AND EXTENDING IT PAST stderr FOUND THREE MORE, ALL PRE-EXISTING.** 9z-g
+scanned `fprintf(stderr, ...)` specifically, so `printf` and `runlog_note`
+were never in scope -- and those are read by exactly the people the scan was
+for:
+
+| where | said | why it matters |
+|---|---|---|
+| `--help`, `--blocking-sync` | "CUDA busy-waits by default" | `cofcheck.sh` classifies a build from `--help` |
+| `fbgen_gpu_metal.cpp` | "GPU stage time (summed CUDA events)" | wrong twice: the timings come from `mtlEvent` |
+| the run log's device record | `"CUDA %d of %d: %s [%s], %s"` | **what a project reads off a failed task** |
+
+The help text was only stale, not a behaviour difference -- the build already
+answers `--blocking-sync: implicit on Metal (waitUntilCompleted already
+blocks)` at runtime, so only its description still described CUDA. All three
+fixed in the GENERATORS; `bench_main.cu`, `fbgen_gpu.cu` and `pipeline.cuh`
+keep their own wording, because the two builds deliberately differ in what
+they log (9c) and no drift-ledger row is needed.
+
+**THE GATE JOINS ADJACENT STRING LITERALS, and that is the whole design.**
+Every message long enough to be wrong is split across source lines. On the
+tree that had the bug, `grep "cannot select CUDA device"` returns **ZERO**;
+the gate returns the hit. Its control is exactly that shape -- a deliberately
+split message -- and it fails, with the naive grep printed beside it finding
+nothing. The allowlist is by exact FRAGMENT, not by file and line, so
+re-wording an allowed string makes you justify it again instead of silently
+inheriting the exemption. Four fragments are allowed: the project's own name
+`cuda-sieve`, the `CUDA_SIEVE_METAL*` environment variables, the deliberate
+"is an NVIDIA measurement and no Apple part" provenance note, and
+`phase5_test` naming the CUDA tree it compares against. **And an allowlist entry
+that matches nothing FAILS the gate**, because dead config reads exactly like
+a live exemption -- the same failure as an anchor that silently matches
+nothing, which is this port's most-repeated one. Its control is a fragment
+renamed to something absent, and the gate exits 1.
+
+### Verified
+
+Six gates green -- `msgcheck`, `sievecheck`, `validationcheck`, `cbtimecheck`,
+`cofaccheck` -- plus `cofcheck.sh` **63 PASS / 0 FAIL**. Zero generator drift.
+The 288-q band is **`cmp`-identical to the previous one: 13,485 relations,
+564,696 enqueued, sha256 `8e79762c`**, zero over-bound launches. The six
+CUDA-named strings are gone from the BUILT BINARY (`strings`), not only from
+the sources.
+
+**Wall was 589.05 ms/q against 546.97 the day before, and that is NOT a
+measurement** -- the band started straight after a full gate suite on a
+fanless MacBook Air, which this file has already recorded once as producing a
+17m48s band that re-ran at 3m39s. Nothing in this change touches a hot path:
+three string literals and a branch that cannot be taken.
+
+### Checked and NOT a second instance of the same class
+
+`g_cof_peak` is `thread_local` too and is NOT handed to the flush thread the
+way `g_cof_stream` is -- which looks like the identical bug one field over.
+It is not: `cofq_flush` assigns it from its own locals `pk0`/`pk1` at the top
+of each side, so whichever thread runs the flush arms its own bracket. Read
+rather than assumed, because the peak bracket is what the whole chunk
+steering is measured from.
+
 ## Drift ledger — CUDA-side changes made for this port
 
 **The ledger lives in `bench/METAL_PORT_PLAN.md` section 9, and only there.**

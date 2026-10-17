@@ -2085,10 +2085,24 @@ static void cofa_start(cofasync_t *A, cofq_t *Q, cofq_out_t *O,
      * 196.8/195.6/203.5 vs 192.5 (and c187 68.6/70.5/69.8 vs 66.9). No
      * effect, so there is no knob. */
     const mtlStream_t cs = g_cof_stream;   /* thread_local: hand it over */
+    /* The CURRENT DEVICE is per host thread too, and a new thread starts on
+     * device 0. On a multi-GPU host whose task was given another card, the
+     * flush's events were created on device 0 and recorded on this device's
+     * stream: "invalid resource handle" at the first flush (a Tesla T4 as
+     * device 1 of 4, every work unit). Hand the device over with the stream. */
+    int dev = 0;
+    if (mtlGetDevice(&dev) != mtlSuccess) dev = -1;
     const int ecm_rounds = (int)Q->ecm_rounds;
-    A->th = new std::thread([A, O, cfg, blocks, fr, cs, ecm_rounds]() {
+    A->th = new std::thread([A, O, cfg, blocks, fr, cs, dev, ecm_rounds]() {
         g_cof_stream = cs;
         wd_bind(-1);    /* the sieve thread's slot stays the sieve thread's */
+        if (dev < 0 || mtlSetDevice(dev) != mtlSuccess) {
+            fprintf(stderr, "  cofactor flush thread: cannot select Metal"
+                    " device %d\n", dev);
+            A->rc = -1;
+            A->fin->store(1, std::memory_order_release);
+            return;
+        }
         A->rc = cofq_flush(&A->F, O, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
                            ecm_rounds, cfg->cof_budget, cfg->cof_chunk,
                            blocks, cfg->threads, fr);
@@ -5235,6 +5249,15 @@ static int run_pipeline_instances(const fb_t *fb1, const fb_t *fbs1,
                     I->relations[0] ? I->relations : "(no relations)",
                     I->done ? " complete" : I->resume ? " resumed" : "");
     }
+    /* Each instance thread must select the device itself: the current device
+     * is per host thread and a new one starts on device 0, so on a multi-GPU
+     * host every instance would otherwise sieve on device 0 -- not the card
+     * the client assigned, and on top of whatever task owns device 0. */
+    int dev = 0;
+    if (mtlGetDevice(&dev) != mtlSuccess) {
+        fprintf(stderr, "--instances: cannot read the current Metal device\n");
+        return PIPE_RC_FAIL;
+    }
     /* One stop hook for all of them, owned here: an instance that finishes
      * first must not unhook the others (see the g_pinst test where
      * run_pipeline_impl would install it). */
@@ -5255,9 +5278,15 @@ static int run_pipeline_instances(const fb_t *fb1, const fb_t *fbs1,
             wd_bind(k + 1);
             snprintf(tag, sizeof tag, "inst%d", k);
             runlog_thread_tag(tag);
-            rc[k] = pipe_inst_run_one(fb1, fbs1, fb0, fbs0, POLY, cfg,
-                                      &IP->in[k], k, plan, base_plan,
-                                      upsized);
+            if (mtlSetDevice(dev) != mtlSuccess) {
+                fprintf(stderr, "  instance %d: cannot select Metal device %d\n",
+                        k, dev);
+                rc[k] = PIPE_RC_FAIL;
+            } else {
+                rc[k] = pipe_inst_run_one(fb1, fbs1, fb0, fbs0, POLY, cfg,
+                                          &IP->in[k], k, plan, base_plan,
+                                          upsized);
+            }
             /* A failure or a policy stop ends the band, so let the others
              * drain and checkpoint at their next special-q rather than sieve
              * on into a work unit that will not be credited. */

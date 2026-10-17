@@ -1608,7 +1608,7 @@ int main(int argc, char **argv)
     printf("primes through max bound             %12llu\n", (unsigned long long)prime_total);
     printf("rational prime ideals                %12llu\n", (unsigned long long)rat_ideal_total);
     printf("algebraic prime ideals               %12llu\n", (unsigned long long)alg_ideal_total);
-    printf("\n--- GPU stage time (summed CUDA events) ---\n");
+    printf("\n--- GPU stage time (summed Metal events) ---\n");
     printf("candidate generation                 %10.3f ms\n", ms_make);
     printf("segmented composite marking          %10.3f ms\n", ms_mark);
     printf("prime compaction                      %10.3f ms\n", ms_select);

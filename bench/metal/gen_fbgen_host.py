@@ -386,5 +386,15 @@ _wrapped = (
 s = s[:_ra] + _wrapped + s[_rz:]
 print('  killed segments are redone at half the slice size')
 
+# This stage-time banner is the last CUDA-named user-facing string in the
+# port's own output. It is printf, so 9z-g's fprintf(stderr, ...) scan never
+# saw it -- and it is wrong twice over here, because the timings come from
+# mtlEvent, not CUDA events.
+_o = "--- GPU stage time (summed CUDA events) ---"
+_n = "--- GPU stage time (summed Metal events) ---"
+assert s.count(_o) == 1, 'fbgen stage-time banner shape changed'
+s = s.replace(_o, _n, 1)
+print('  stage-time banner names Metal events')
+
 open(OUT, 'w').write(s)
 print('re-wrote %s with macro dispatch fixed' % OUT)

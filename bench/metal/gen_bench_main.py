@@ -522,6 +522,35 @@ assert _r1_old in src, 'cof-rounds validation shape changed'
 src = src.replace(_r1_old, _r1_new, 1)
 print('  cof-rounds cap lifted to 1000 for ECM; rho keeps 24; curves bounded to 994')
 
+# ---- two user-facing strings that still named CUDA ------------------------
+# 9z-g scanned fprintf(stderr, ...) and got the port to zero CUDA-named
+# messages. These two were never in that scan's scope -- one is printf (the
+# --help text) and one is runlog_note -- and both are read by exactly the
+# people the scan was for: --help is what cofcheck.sh classifies a build from,
+# and the run log's device record is what a project reads off a task.
+#
+# The help text was only STALE, not a behaviour difference: the build already
+# answers "--blocking-sync: implicit on Metal (waitUntilCompleted already
+# blocks)" at runtime, so the flag is handled and only its description was
+# left describing CUDA's spin-wait.
+#
+# Anchored on sentence fragments carrying no escapes. Spelling a join across
+# these split literals needs a backslash-n that must survive being written BY
+# a generator INTO a generator, and twice now it has not.
+for _o, _n in [
+    ("CUDA busy-waits by default, so a host thread that is 90%%",
+     "Metal's waitUntilCompleted already blocks rather than"),
+    ("idle still pegs a core; this frees it, at the cost of a",
+     "spinning, so this flag is accepted, reported at startup,"),
+    ("wakeup latency per synchronisation",
+     "and changes nothing here"),
+    ('runlog_note("device", "CUDA %d of %d: %s [%s], %s"',
+     'runlog_note("device", "Metal %d of %d: %s [%s], %s"'),
+]:
+    assert src.count(_o) == 1, 'CUDA-named user-facing string shape changed: ' + _o[:50]
+    src = src.replace(_o, _n, 1)
+print('  --help and the run log name Metal, not CUDA')
+
 open(OUT, 'w').write(src)
 print('wrote %s (%d lines)' % (OUT, src.count('\n')))
 left = sorted(set(re.findall(r'\bcuda[A-Z]\w*|CUDART_VERSION', src)))

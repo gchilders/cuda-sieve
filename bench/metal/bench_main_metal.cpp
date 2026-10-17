@@ -334,9 +334,9 @@ static void usage(void)
 "                   [32,1024]. Independent of --threads: fill wants many\n"
 "                   narrow blocks, the other kernels do not.            [0]\n"
 "  --blocking-sync  yield the CPU while waiting on the GPU instead of spinning.\n"
-"                   CUDA busy-waits by default, so a host thread that is 90%%\n"
-"                   idle still pegs a core; this frees it, at the cost of a\n"
-"                   wakeup latency per synchronisation\n"
+"                   Metal's waitUntilCompleted already blocks rather than\n"
+"                   spinning, so this flag is accepted, reported at startup,\n"
+"                   and changes nothing here\n"
 "\n"
 "BENCHMARK HARNESS  (single-side measurement; REFUSED under --pipeline)\n"
 "  These reproduce the numbers in RESULTS.md. They select configurations that\n"
@@ -3470,7 +3470,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
                          rt / 1000, (rt % 1000) / 10);
             else
                 snprintf(ver, sizeof ver, "driver/runtime version unavailable");
-            runlog_note("device", "CUDA %d of %d: %s [%s], %s",
+            runlog_note("device", "Metal %d of %d: %s [%s], %s",
                         dev_ordinal, dev_count, dev_name, dev_pci, ver);
             /* Geometry in one field, in the units the CPU comparison uses.
              * logI 15 is gnfs-lasieve4I15e and logI 14 is I14e, and grading a
