@@ -546,20 +546,34 @@ static uint8_t *cf_ecm_sieve(uint32_t limit)
     return composite;
 }
 
-/* The stage-1 exponent lcm(1..B1), held as its prime powers rather than as one
- * big integer: each is at most B1, so the ladder for it is a dozen bits and the
- * whole schedule is an array of uint32 instead of a 1.4*B1-bit number the device
- * would have to store and shift. Returns the count. */
-static uint32_t cf_ecm_plan(uint32_t b1, uint32_t **out)
+/* Stage 2's first giant step is v >= 1, so it covers primes above D/2 only.
+ * A B1 below that leaves (B1, D/2] to stage 1 instead: those primes are
+ * folded into its exponent (one power each), and stage 2 starts above
+ * cf_ecm_s2_lo(). Every prime up to B2 is still covered once. */
+static uint32_t cf_ecm_s2_lo(uint32_t b1)
+{
+    return b1 > CF_ECM_D / 2u ? b1 : CF_ECM_D / 2u;
+}
+
+/* The stage-1 exponent lcm(1..B1) -- times the primes in (B1, D/2] when
+ * stage 2 is on and B1 < D/2 (see cf_ecm_s2_lo) -- held as its prime powers
+ * rather than as one big integer: each is at most B1 (or D/2), so the ladder
+ * for it is a dozen bits and the whole schedule is an array of uint32 instead
+ * of a 1.4*B1-bit number the device would have to store and shift. Returns
+ * the count. b2 == 0 is stage 1 alone. */
+static uint32_t cf_ecm_plan(uint32_t b1, uint32_t b2, uint32_t **out)
 {
     uint32_t n = 0, cap = 0, *s = NULL;
     uint8_t *sieve;
+    uint32_t top = b1;
     if (b1 < 2 || b1 > CF_ECM_MAX_B1) { *out = NULL; return 0; }
-    sieve = cf_ecm_sieve(b1);
+    if (b2 > b1 && b1 < CF_ECM_D / 2u)
+        top = b2 < CF_ECM_D / 2u ? b2 : CF_ECM_D / 2u;
+    sieve = cf_ecm_sieve(top);
     if (!sieve) { *out = NULL; return 0; }
-    for (uint32_t p = 2; p <= b1; p++) {
+    for (uint32_t p = 2; p <= top; p++) {
         if (sieve[p]) continue;
-        {   /* the largest power of p that still fits under B1 */
+        {   /* the largest power of p that still fits under B1; above B1, p */
             uint64_t pe = p;
             while (pe * p <= b1) pe *= p;
             if (n == cap) {
@@ -577,46 +591,56 @@ static uint32_t cf_ecm_plan(uint32_t b1, uint32_t **out)
     return n;
 }
 
-/* Build the stage-2 prime-pair schedule. For every prime q in (B1,B2], write
- * q = vD +/- u with 0 < u < D/2. Since q > B1 >= 30 in the stage-2 path, q is
- * coprime to D and u is one of the four residues below. One x-coordinate
+/* Build the stage-2 prime-pair schedule. For every prime q in (lo, B2],
+ * lo = cf_ecm_s2_lo(B1), write q = vD +/- u with 0 < u < D/2. Since q > lo >=
+ * D/2 > 7, q is coprime to D and u is a baby residue. One x-coordinate
  * comparison covers both signs. Empty giant steps remain in the schedule so
  * the device can advance with one differential addition rather than restart a
- * scalar multiplication at every populated v. */
-static uint32_t cf_ecm_stage2_plan(uint32_t b1, uint32_t b2, uint32_t *vmin_out,
-                                   cf_s2mask_t **mask_out)
+ * scalar multiplication at every populated v.
+ *
+ * Returns 0 and the giant-step count in *nv_out -- 0 when no prime lies in
+ * (lo, B2], all of them folded into stage 1 -- or -1 on bad bounds, an
+ * allocation failure, or a prime with no baby residue (an inconsistency
+ * between cf_ecm_coprime and D that must not silently drop primes). */
+static int cf_ecm_stage2_plan(uint32_t b1, uint32_t b2, uint32_t *vmin_out,
+                              cf_s2mask_t **mask_out, uint32_t *nv_out)
 {
     uint8_t *composite = NULL;
     cf_s2mask_t *mask = NULL;
-    uint32_t qlo, qhi, vmin, vmax, nv;
+    int8_t kidx[CF_ECM_D / 2u];
+    uint32_t qlo, qhi, vmin, vmax, nv, nb = 0;
+    const uint32_t lo = cf_ecm_s2_lo(b1);
+    *vmin_out = 0; *mask_out = NULL; *nv_out = 0;
     if (b2 <= b1 || b1 < CF_ECM_B1_MIN || b1 > CF_ECM_MAX_B1 ||
-        b2 > CF_ECM_MAX_B2) {
-        *vmin_out = 0; *mask_out = NULL; return 0;
-    }
+        b2 > CF_ECM_MAX_B2)
+        return -1;
+    /* u -> mask bit, in cf_ecm_baby's order, once. */
+    for (uint32_t u = 0; u < CF_ECM_D / 2u; u++)
+        kidx[u] = (int8_t)(cf_ecm_coprime(u) ? nb++ : -1);
+    if (nb != CF_ECM_NBABY) return -1;
+    if (b2 <= lo) return 0;                  /* all of (B1, B2] in stage 1 */
     composite = cf_ecm_sieve(b2);
-    if (!composite) { *vmin_out = 0; *mask_out = NULL; return 0; }
-    for (qlo = b1 + 1; qlo <= b2 && composite[qlo]; qlo++) {}
-    if (qlo > b2) {
-        free(composite); *vmin_out = 0; *mask_out = NULL; return 0;
-    }
+    if (!composite) return -1;
+    for (qlo = lo + 1; qlo <= b2 && composite[qlo]; qlo++) {}
+    if (qlo > b2) { free(composite); return 0; }
     for (qhi = b2; qhi > qlo && composite[qhi]; qhi--) {}
     vmin = (qlo + CF_ECM_D / 2) / CF_ECM_D;
     vmax = (qhi + CF_ECM_D / 2) / CF_ECM_D;
     nv = vmax - vmin + 1;
     mask = (cf_s2mask_t *)calloc(nv, sizeof *mask);
-    if (!mask) { free(composite); *vmin_out = 0; *mask_out = NULL; return 0; }
-    for (uint32_t q = b1 + 1; q <= b2; q++) if (!composite[q]) {
+    if (!mask) { free(composite); return -1; }
+    for (uint32_t q = qlo; q <= qhi; q++) if (!composite[q]) {
         const uint32_t v = (q + CF_ECM_D / 2) / CF_ECM_D;
         const uint32_t vd = v * CF_ECM_D;
         const uint32_t u = q > vd ? q - vd : vd - q;
-        for (uint32_t k = 0; k < CF_ECM_NBABY; k++)
-            if (u == cf_ecm_baby(k)) {
-                mask[v - vmin] |= (cf_s2mask_t)1u << k; break;
-            }
+        if (u >= CF_ECM_D / 2u || kidx[u] < 0) {
+            free(composite); free(mask); return -1;
+        }
+        mask[v - vmin] |= (cf_s2mask_t)1u << kidx[u];
     }
     free(composite);
-    *vmin_out = vmin; *mask_out = mask;
-    return nv;
+    *vmin_out = vmin; *mask_out = mask; *nv_out = nv;
+    return 0;
 }
 
 template <int L> struct mpt { mz<L> X, Z; };
@@ -811,6 +835,10 @@ CF_NOINLINE int mz_ecm_stage2_pass(mz<L> *fac, const mpt<L> *Q,
                 x_add<L>(&cm, &q2, Q, Q, n, n0inv);         /* m = 3 */
                 (*work)++;
                 for (uint32_t m = 3; m < CF_ECM_D / 2u; m += 2) {
+                    /* cf_ecm_coprime orders the baby steps for the host's
+                     * mask too (cf_ecm_stage2_plan's kidx), and the plan
+                     * refuses to build unless it accepts exactly NBABY
+                     * residues -- so kk cannot overrun bx[]. */
                     if (cf_ecm_coprime(m)) { bx[kk] = cm.X; bzs[kk] = cm.Z; kk++; }
                     if (m + 2 < CF_ECM_D / 2u) {
                         x_add<L>(&nm, &cm, &q2, &pm, n, n0inv);
@@ -1928,7 +1956,7 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
            " (%d bits); this build carries %d..%d\n",
            Q->L0, 32 * Q->L0, Q->L1, 32 * Q->L1, CF_LMIN, CF_LMAX);
     if (meth0 || meth1) {          /* one plan serves whichever sides use ECM */
-        Q->ns = cf_ecm_plan(ecm_b1, &h_s);
+        Q->ns = cf_ecm_plan(ecm_b1, ecm_b2, &h_s);
         if (!Q->ns) {
             fprintf(stderr, "  cofac queue: empty ECM plan for B1=%u\n", ecm_b1);
             goto done;
@@ -1938,17 +1966,18 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
                                cudaMemcpyHostToDevice));
         free(h_s); h_s = NULL;
         if (ecm_b2) {
-            Q->s2nv = cf_ecm_stage2_plan(ecm_b1, ecm_b2, &Q->s2vmin,
-                                         &h_s2mask);
-            if (!Q->s2nv) {
-                fprintf(stderr, "  cofac queue: empty ECM stage-2 plan for"
-                        " B1=%u B2=%u\n", ecm_b1, ecm_b2);
+            if (cf_ecm_stage2_plan(ecm_b1, ecm_b2, &Q->s2vmin, &h_s2mask,
+                                   &Q->s2nv)) {
+                fprintf(stderr, "  cofac queue: cannot build the ECM stage-2"
+                        " plan for B1=%u B2=%u\n", ecm_b1, ecm_b2);
                 goto done;
             }
-            COF_INIT_CK(cudaMalloc(&Q->d_s2mask, Q->s2nv * sizeof *h_s2mask));
-            COF_INIT_CK(cudaMemcpy(Q->d_s2mask, h_s2mask,
-                                   Q->s2nv * sizeof *h_s2mask,
-                                   cudaMemcpyHostToDevice));
+            if (Q->s2nv) {      /* 0: every stage-2 prime folded into stage 1 */
+                COF_INIT_CK(cudaMalloc(&Q->d_s2mask, Q->s2nv * sizeof *h_s2mask));
+                COF_INIT_CK(cudaMemcpy(Q->d_s2mask, h_s2mask,
+                                       Q->s2nv * sizeof *h_s2mask,
+                                       cudaMemcpyHostToDevice));
+            }
             free(h_s2mask); h_s2mask = NULL;
         }
         if (!g_cofq_quiet) printf("  cofactor queue: ECM B1 = %u, %u prime powers, B2 = %u"
@@ -3286,25 +3315,27 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
     st0 = (uint8_t *)malloc(n0 ? n0 : 1); nf0 = (uint8_t *)calloc(n0 ? n0 : 1, 1);
     fac0 = (uint64_t *)malloc((size_t)(n0 ? n0 : 1) * CF_MAXFAC * 8);
     if (meth0 || meth1) {
-        ns = cf_ecm_plan(ecm_b1, &h_s);
+        ns = cf_ecm_plan(ecm_b1, ecm_b2, &h_s);
         if (!ns) { fprintf(stderr, "  cofac: empty ECM plan for B1=%u\n", ecm_b1); return -1; }
         CK(cudaMalloc(&d_s, (size_t)ns * 4));
         CK(cudaMemcpy(d_s, h_s, (size_t)ns * 4, cudaMemcpyHostToDevice));
         free(h_s);
         if (ecm_b2) {
-            s2nv = cf_ecm_stage2_plan(ecm_b1, ecm_b2, &s2vmin, &h_s2mask);
-            if (!s2nv) {
-                fprintf(stderr, "  cofac: empty ECM stage-2 plan for B1=%u"
-                        " B2=%u\n", ecm_b1, ecm_b2);
+            if (cf_ecm_stage2_plan(ecm_b1, ecm_b2, &s2vmin, &h_s2mask,
+                                   &s2nv)) {
+                fprintf(stderr, "  cofac: cannot build the ECM stage-2 plan"
+                        " for B1=%u B2=%u\n", ecm_b1, ecm_b2);
                 free(h_s2mask); cudaFree(d_s);
                 free(buf); free(rest); free(j0); free(j1); free(i0); free(i1);
                 free(small0); free(small1); free(side0ok); free(alg_job);
                 free(st0); free(nf0); free(fac0);
                 return -1;
             }
-            CK(cudaMalloc(&d_s2mask, s2nv * sizeof *h_s2mask));
-            CK(cudaMemcpy(d_s2mask, h_s2mask, s2nv * sizeof *h_s2mask,
-                          cudaMemcpyHostToDevice));
+            if (s2nv) {         /* 0: every stage-2 prime folded into stage 1 */
+                CK(cudaMalloc(&d_s2mask, s2nv * sizeof *h_s2mask));
+                CK(cudaMemcpy(d_s2mask, h_s2mask, s2nv * sizeof *h_s2mask,
+                              cudaMemcpyHostToDevice));
+            }
             free(h_s2mask);
         }
         printf("  ECM: B1 = %u, %u prime powers, B2 = %u (%u giant steps),"

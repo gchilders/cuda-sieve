@@ -246,8 +246,7 @@ static void usage(void)
 "  --cof-ecm        ECM instead of Pollard-Brent rho; stage 1 alone loses,\n"
 "                   while tuned stage 2 is near rho at matched yield\n"
 "  --ecm-b1 N       ECM stage-1 bound                              [1000]\n"
-"  --ecm-b2 N       ECM stage-2 bound, baby-step/giant-step at D=210, so\n"
-"                   it needs B1 >= 105; 0 disables stage 2              [0]\n"
+"  --ecm-b2 N       ECM stage-2 bound, needs B1 >= 30; 0 disables it   [0]\n"
 "  --ecm-curves N   ECM curves attempted per round                 [16]\n"
 "  --candidates F   write the cofactorisation batch here\n"
 "  --cofac FILE     cofactorise a batch written by --candidates and emit the\n"
@@ -502,8 +501,8 @@ static int resolve_and_check_cofactor_config(bench_cfg_t *cfg, uint32_t alim,
          * merely because it is zero. */
         /* 30*B1, CLAMPED INTO THE VALIDATOR'S OWN RANGE. A derived value must
          * never be able to fail the check that follows it: B1 below
-         * CF_ECM_B1_MIN is outside the continuation's domain (q > D/2 for its
-         * first giant step), and 30*B1 above 10^7 exceeds
+         * CF_ECM_B1_MIN (30) is outside the continuation's domain, and 30*B1
+         * above 10^7 exceeds
          * the B2 ceiling -- so an unclamped rule turned `--ecm-b1 2` and every
          * `--ecm-b1` above 333,333 into a hard refusal citing an --ecm-b2 the
          * user never passed. Two thirds of --ecm-b1's own documented range was
@@ -1409,8 +1408,11 @@ static int inst_prepare(bench_cfg_t *cfg, const poly_t *POLY, int qrange_set,
             char part[CKPT_PATH_MAX];
             if (ckpt_part_path(cfg->relations, part, sizeof part)) return 1;
             if (!cfg->restart && bench_path_exists(part)) {
-                printf("instances: %s is a one-pipeline band under way;"
-                       " resuming it with one pipeline\n", part);
+                /* Said only to someone who asked for instances: under the
+                 * default this is every ordinary resume. */
+                if (g_instances_set && cfg->instances != 1)
+                    printf("instances: %s is a one-pipeline band under way;"
+                           " resuming it with one pipeline\n", part);
                 return 0;
             }
             /* Instance files with no manifest. The manifest goes last when a

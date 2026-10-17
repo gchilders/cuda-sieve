@@ -20,6 +20,7 @@
 
 #include "td.cuh"      /* ss_magic_build, SS_KSHIFT */
 #include <thread>
+#include <chrono>
 #include <functional>
 #include <mutex>
 #include <atomic>
@@ -3174,6 +3175,19 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
          * two, and the end-of-band stats fold-in depends on this and
          * accumulate_stats being exact complements. */
         const int want_host = !cfg->cofactor || fc;
+
+        /* A BOINC suspend pauses only the thread that called boinc_init. With
+         * --instances that thread is parked in a join and the sieving happens
+         * here, so each instance pauses itself at the special-q boundary --
+         * otherwise a "suspended" task goes on using the GPU. Its watchdog
+         * slot reads as idle meanwhile, so a long suspend is not a stall. A
+         * quit needs nothing here: the runtime exits the whole process. */
+        if (g_pinst && bench_boinc_suspended()) {
+            wd_active(0);
+            while (bench_boinc_suspended() && !g_pipe_stop)
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            wd_active(1);
+        }
 
         wd_phase("q.select");
         int pre_issued = 0, ts_read = 0, qr;

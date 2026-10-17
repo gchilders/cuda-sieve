@@ -12173,6 +12173,20 @@ one ladder each. Relations are byte-identical to `main` at every D tried, and
 Default wall clock: 2,1147+ went from 139.5–140.0 to 133.4–134.0 ms/q, and
 c187 (one pipeline) from 35.7 to 34.7.
 
+**The cost is local memory.** The 24 baby X and Z values are indexed
+dynamically, so k_cofac<4,ECM,stage2>'s stack frame grows from 496 to 1,104
+bytes, and the kernel sits at exactly 128 registers, the `__launch_bounds__`
+cliff, where one more register would halve its warps. (An earlier version of
+this finding blamed the frame on PRAC; the D=210 build without PRAC already
+has it, per `cuobjdump --dump-resource-usage`.) A smaller table does not
+help: D=120 (16 babies) is slightly slower than 210, so the frame is not
+the binding cost.
+
+**A B1 below D/2.** Stage 2's first giant step covers primes above D/2
+(105), so for B1 in [30, 105) the primes in (B1, 105] are folded into stage
+1 and stage 2 starts above 105. Every prime up to B2 is still covered. Only
+an explicit `--ecm-b1` lands there; the derived B1 is 200 and up.
+
 ### Parked: PRAC stage 1 (`attic/prac_stage1.patch`)
 
 These are GMP-ECM's Lucas chains. The host picks each prime's multiplier and
@@ -12193,7 +12207,6 @@ But it does not pay:
   control, disabled" found 37 relations where 36 are pinned. The chains form
   different intermediate multiples, so a point of small order mod p can make
   one of them find a factor the other misses.
-- **It needs more stack.** k_cofac<4,ECM,stage2>'s frame grows to 1,104 bytes.
 
 ### Ruled out: finer rounds at the same curve budget
 

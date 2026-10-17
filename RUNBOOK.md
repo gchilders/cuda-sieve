@@ -1308,6 +1308,21 @@ itself, so neither pays it.)
   that instance slower, never failed, and the banner says which extras it got.
 - **Not split:** `--target-rels`, `--nq`, `--qlist` and `--candidates` bands
   run one pipeline and say so. An open band has no end to divide.
+- **Under BOINC** the default applies too, and it was tested under a real
+  client: the current BOINC client source, built with its `app_test`
+  framework, on a 4090 pod (2026-10-17). c187 over 2,300 q ran as two
+  instances. These all ended with relations byte-identical to a non-BOINC run:
+  - a task suspend, where the client removes a GPU task from memory;
+  - an in-memory suspend from a forced CPU benchmark run (`suspend_all` with
+    `REMOVE_NEVER`, as "suspend when non-BOINC CPU usage is above X%" does);
+  - a client quit and restart mid-band.
+
+  The BOINC runtime pauses only the thread that called `boinc_init`:
+  `SuspendThread` on Windows, a `SIGALRM` handler on Unix. Under `--instances`
+  that thread is parked in a join, so each instance pauses itself at its next
+  special-q while the task is suspended. On Linux the instance threads happen
+  to catch the same process-wide `SIGALRM` and pause either way; the Windows
+  path is the one the self-pause exists for, and it is untested here.
 
 ### Logging an unattended run
 

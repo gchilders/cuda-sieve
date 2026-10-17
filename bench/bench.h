@@ -470,6 +470,11 @@ int  bench_boinc_gpu_device(void);
 int  bench_boinc_resolve_path(const char *option, const char *logical_name,
                               const char **resolved_name);
 void bench_boinc_fraction_done(double fraction_done);
+/* True while the client has this task suspended. The runtime pauses only the
+ * thread that called bench_boinc_init (its SIGALRM handler sleeps on Unix,
+ * SuspendThread on Windows); a thread doing the work elsewhere -- an
+ * --instances pipeline -- must ask and pause itself. 0 outside BOINC. */
+int  bench_boinc_suspended(void);
 /* `status` is the process exit status; `outcome` is what the run actually did,
  * and it is the one that decides how BOINC is told. They are separate because
  * a clean stop exits 0 for the shell -- unattended scripts have always read it
@@ -570,6 +575,27 @@ static inline uint32_t cof_auto_b1(unsigned lpb)
     if (lpb >= 34u) return 300u;
     return 200u;
 }
+
+/* ECM stage 2's baby-step/giant-step modulus (cofac.cuh): 30, 60, 120 or 210.
+ * The baby steps are the odd u < D/2 coprime to D, phi(D)/2 of them, and a
+ * curve walks (B2-B1)/D giant steps. 210 measured best -- RTX 4090, ECM device
+ * time vs 30: -22% on 2,1147+ (483 -> 70 giant steps), -18% on c187's
+ * algebraic side, relations byte-identical on both. */
+#ifndef CF_ECM_D
+#define CF_ECM_D       210u
+#endif
+#if CF_ECM_D == 30 || CF_ECM_D == 60 || CF_ECM_D == 120
+#define CF_ECM_NBABY   (CF_ECM_D / 30u * 4u)          /* phi(D)/2: 4, 8, 16 */
+#elif CF_ECM_D == 210
+#define CF_ECM_NBABY   24u
+#else
+#error "CF_ECM_D must be 30, 60, 120 or 210"
+#endif
+/* Stage 2 runs only for B1 >= this, at every D. Its first giant step covers
+ * primes above D/2, so with B1 < D/2 the primes in (B1, D/2] are folded into
+ * stage 1 instead (cofac.cuh, cf_ecm_s2_lo) and every prime to B2 is still
+ * covered. */
+#define CF_ECM_B1_MIN  30u
 
 /* ---- GPU entry points ------------------------------------------------- */
 
@@ -1093,25 +1119,6 @@ enum {
  * relation file and resume state. The rest of each instance's configuration
  * is the band's cfg; see pipe_inst_cfg. */
 #define PIPE_INSTANCES_MAX 4
-/* ECM stage 2's baby-step/giant-step modulus (cofac.cuh): 30, 60, 120 or 210.
- * The baby steps are the odd u < D/2 coprime to D, phi(D)/2 of them, and a
- * curve walks (B2-B1)/D giant steps. 210 measured best -- RTX 4090, ECM device
- * time vs 30: -22% on 2,1147+ (483 -> 70 giant steps), -18% on c187's
- * algebraic side, relations byte-identical on both. */
-#ifndef CF_ECM_D
-#define CF_ECM_D       210u
-#endif
-#if CF_ECM_D == 30 || CF_ECM_D == 60 || CF_ECM_D == 120
-#define CF_ECM_NBABY   (CF_ECM_D / 30u * 4u)          /* phi(D)/2: 4, 8, 16 */
-#elif CF_ECM_D == 210
-#define CF_ECM_NBABY   24u
-#else
-#error "CF_ECM_D must be 30, 60, 120 or 210"
-#endif
-/* A stage-2 prime q in (B1,B2] must be coprime to D (q > 7 is enough) and lie
- * past the first giant step (q > D/2, so v >= 1): stage 2 needs B1 >= this.
- * D=30 keeps its old floor of 30. */
-#define CF_ECM_B1_MIN  (CF_ECM_D / 2u > 30u ? CF_ECM_D / 2u : 30u)
 /* --instances auto picks two only for a band of at least this many expected
  * special-q (see run_pipeline). */
 #define PIPE_INST_AUTO_MIN_Q 256

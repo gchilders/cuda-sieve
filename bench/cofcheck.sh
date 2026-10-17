@@ -104,6 +104,22 @@ if run --cofactor --cof-ecm --ecm-b1 400000 --nq 1 --relations $TMP/b1hi.txt \
 else
     printf 'FAIL   %-34s refused itself\n' "large B1 with derived B2"; fail=1
 fi
+# A B1 below D/2 (105 at D=210) with stage 2. Stage 2's first giant step covers
+# primes above D/2 only, so (B1, D/2] is folded into stage 1. Before the fold,
+# raising D silently turned stage 2 off here (and refused an explicit --ecm-b2).
+# It must run, report its stage 2, and never find fewer relations than stage 1
+# alone at the same B1 and curves.
+s1=$(run --cofactor --cof-ecm --cof-rounds 2 --ecm-b1 50 --ecm-b2 0 --ecm-curves 16 \
+         --relations $TMP/lb1.txt | grep 'total relations' | tail -1 | awk '{print $NF}')
+out=$(run --cofactor --cof-ecm --cof-rounds 2 --ecm-b1 50 --ecm-b2 1500 --ecm-curves 16 \
+          --relations $TMP/lb2.txt || true)
+s2=$(printf '%s' "$out" | grep 'total relations' | tail -1 | awk '{print $NF}')
+if printf '%s' "$out" | grep -qE 'ECM B1 = 50, .*B2 = 1500 \([1-9][0-9]* giant steps\)' &&
+   [ -n "$s1" ] && [ -n "$s2" ] && [ "$s2" -ge "$s1" ]; then
+    printf 'PASS   %-34s stage 1 %s, with stage 2 %s\n' "B1 below D/2 keeps stage 2" "$s1" "$s2"
+else
+    printf 'FAIL   %-34s stage 1 %s, with stage 2 %s\n' "B1 below D/2 keeps stage 2" "$s1" "$s2"; fail=1
+fi
 # --ecm-b2 without --cof-ecm is NO LONGER an error: since 2026-08-19 the method
 # is chosen per side, and this job's algebraic side is 3LP, so ECM is selected
 # automatically and the flag is live. Forcing rho is what makes it a no-op.
