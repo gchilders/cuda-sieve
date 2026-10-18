@@ -3075,6 +3075,40 @@ demands no binding for an argument the shader never reads. The real control
 has to be at the GENERATOR, where losing the entry also removes the guard and
 makes the argument live again.
 
+## `fillcheck.sh` run on Metal for the first time (2026-10-17)
+
+Upstream has an identity gate for exactly the options the review's bug lived
+in -- `--fill-rows`, `--resieve-rows`, `--fill-gate`, `--q-pipeline` -- and
+`Makefile.metal` has never wired it in. Run against the fixed build it is
+**48 arms over four job shapes, all ok**: c143 at I13 and I14, c183 at I15
+both auto-slabbed and at `--slab-j 4095`. Every arm reproduces the
+all-off configuration's relation file byte for byte, `rows4-rs` and
+`rows16-rs-gate3` included -- the arms that launch `k_resieve_rows`.
+
+**Two things stop it being wired in as-is.**
+
+1. **`c194.roots1.m16` is not on this machine**, so the fifth job fails on
+   missing data. That job is logI 16, which this file already flags as
+   differentially untested.
+
+2. **Slab auto-calibration breaks its q-pipeline assertions, silently.** 8g's
+   three probe bands each emit their own band summary, so
+   `ah=$(grep -h "issued ahead (--q-pipeline)" ...)` captures FOUR lines
+   (`15 slab(s), 0 q`, `7`, `3`, then the real band's `6 slab(s), 1 q`), and
+   `[ "${nqa:-0}" -eq 0 ]` dies with `integer expression expected`. A failing
+   `[` inside an `if` does not trip `set -e`, so **the assertion simply does
+   not evaluate and the arm still prints `ok`.** That is this file's oldest
+   failure shape wearing upstream's clothes.
+
+   The fix is `tail -1` -- the real band is the last summary -- NOT `--slab-j`,
+   which looks like the obvious answer and is wrong: pinning the slab plan
+   SUPPRESSES `k_resieve_rows` on this job, so it would make exactly the arms
+   that found the review's bug vacuous. The two obvious hygiene moves here
+   conflict, and only one of them preserves coverage.
+
+Not wired in yet: it is upstream's script, the change belongs in it or in a
+Metal wrapper, and that is a decision rather than a fix.
+
 ## Drift ledger — CUDA-side changes made for this port
 
 **The ledger lives in `bench/METAL_PORT_PLAN.md` section 9, and only there.**
