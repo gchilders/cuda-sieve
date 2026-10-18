@@ -29,7 +29,9 @@
 # NEEDS A CARD, so this is NOT in `check`.
 set -e
 
-BENCH=./bench
+# $BENCH is honoured so a tree whose binary is not ./bench can drive this
+# unchanged -- the Metal port builds to .metal-build/bench. Default unchanged.
+BENCH=${BENCH:-./bench}
 [ -x "$BENCH" ] || { echo "fillcheck: no $BENCH -- run make first"; exit 1; }
 
 TMP=$(mktemp -d)
@@ -68,6 +70,16 @@ single|--no-q-pipeline
 default|'
 
 echo "$JOBS" | while IFS='|' read -r job jargs; do
+    # A job whose factor base or poly is not in this tree is reported and
+    # skipped, not failed: a gate that fails for missing DATA gets ignored,
+    # and then it is not a gate. Reported, so it cannot pass quietly either.
+    miss=
+    for f in $jargs; do
+        case $f in
+            ../oracle/*) [ -e "$f" ] || miss="$miss $f" ;;
+        esac
+    done
+    if [ -n "$miss" ]; then echo "skip $job: missing$miss"; continue; fi
     # shellcheck disable=SC2086
     $BENCH --pipeline --cofactor $jargs $OFF --relations "$TMP/$job.base.rel" \
         > "$TMP/$job.base.out" 2>&1 || { echo "FAIL $job base: exit $?"; tail -5 "$TMP/$job.base.out"; exit 1; }
@@ -98,7 +110,14 @@ echo "$JOBS" | while IFS='|' read -r job jargs; do
             exit 1
         fi
         if [ $want -eq 1 ]; then
-            ah=$(grep -h "issued ahead (--q-pipeline)" "$TMP/$job.$arm.out")
+            # tail -1: the LAST summary is the real band's. A build that
+            # calibrates something by running throwaway bands first prints one
+            # per probe (the Metal port's slab auto-calibration prints three),
+            # and then `ah` is multi-line, `[ "$nqa" -eq 0 ]` dies with
+            # "integer expression expected", and -- because a failing [ inside
+            # an if does not trip set -e -- the assertion SILENTLY DOES NOT RUN
+            # while the arm still prints ok. On one summary this is a no-op.
+            ah=$(grep -h "issued ahead (--q-pipeline)" "$TMP/$job.$arm.out" | tail -1)
             nsl=$(echo "$ah" | grep -oE '[0-9]+ slab' | grep -oE '[0-9]+')
             nqa=$(echo "$ah" | grep -oE '[0-9]+ q$' | grep -oE '[0-9]+')
             if [ "${nqa:-0}" -eq 0 ]; then

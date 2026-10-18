@@ -381,6 +381,24 @@ fbretrycheck:
 # instead -- it computes the pre-fix answer from the same run-log record and
 # asserts the build does not produce it.
 .PHONY: progresscheck
+# ---- upstream's identity gate for the fill/resieve/pipeline options ------
+#
+# fillcheck.sh is upstream's, portable, and was never wired in here -- which
+# is part of why a null `ispow` reached k_resieve_rows unnoticed (seventh
+# review): --resieve-rows derives from --fill-rows, this build defaults that
+# to 0, and nothing else launches the kernel.
+#
+# NOT given --slab-j, deliberately. Pinning the slab plan looks like the
+# obvious hygiene and is wrong here: it SUPPRESSES k_resieve_rows on the c183
+# job, so the arms that matter most would run nothing.
+#
+# Needs a card and several minutes; it is not in any aggregate target.
+.PHONY: fillcheck
+fillcheck: $(BUILD)/bench
+	@BENCH=$(CURDIR)/$(BUILD)/bench \
+	 CUDA_SIEVE_METALLIB=$(CURDIR)/$(BUILD)/bench.metallib \
+	    sh fillcheck.sh
+
 # ---- every user-facing string names Metal, not CUDA ----------------------
 #
 # 9z-g got this to zero by hand and nothing kept it there, so upstream

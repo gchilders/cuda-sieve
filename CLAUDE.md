@@ -3106,8 +3106,25 @@ all-off configuration's relation file byte for byte, `rows4-rs` and
    that found the review's bug vacuous. The two obvious hygiene moves here
    conflict, and only one of them preserves coverage.
 
-Not wired in yet: it is upstream's script, the change belongs in it or in a
-Metal wrapper, and that is a decision rather than a fix.
+**WIRED IN: `make -f Makefile.metal fillcheck`.** The three changes went into
+`fillcheck.sh` itself rather than a Metal fork, because each is a no-op where
+the CUDA build runs -- `BENCH=${BENCH:-./bench}` keeps the old default,
+`tail -1` of one line is that line, and the missing-data skip cannot fire
+where the data is present. Drift-ledger row added.
+
+**The `tail -1` is a real fix to the gate, not a portability wart.** It is the
+difference between an assertion that runs and one that does not, and it was
+invisible from the gate's own output, which said `ok`.
+
+**The target does NOT pass `--slab-j`**, and the comment there says why: it
+would suppress `k_resieve_rows` on the c183 job and make exactly the arms that
+caught the seventh review's bug vacuous. This file's standing advice to pin
+the slab plan before comparing is right for throughput comparisons and wrong
+here.
+
+**`c194-i16` reports as skipped** on this machine for its missing factor base,
+rather than failing -- a gate that fails for missing DATA gets ignored, and
+then it is not a gate. It is reported, so it cannot pass quietly either.
 
 ## Drift ledger — CUDA-side changes made for this port
 
