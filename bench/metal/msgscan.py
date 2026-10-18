@@ -34,12 +34,32 @@ CALL = re.compile(r"\b(?:fprintf\s*\(\s*stderr\s*,|printf\s*\(|runlog_note\s*\()
 LIT = re.compile(r'"((?:[^"\\]|\\.)*)"')
 BAD = re.compile(r"CUDA|NVIDIA|cuda|nvidia")
 
+# The shared .c/.cpp the METAL binary links (Makefile.metal's BENCH_CPUOBJ,
+# with fbgen_lib.o built from fbgen.c). These live outside metal/ and so were
+# invisible to a metal/-only scan -- including boinc_support.cpp, which is
+# where 9z-g found one of its nine and which this build compiles with its own
+# -DBENCH_BOINC_METAL_GPU selector. Scoping the gate to metal/ would have
+# dropped exactly the file most likely to regress.
+SHARED = ("fb_load.c", "verify_cpu.c", "poly.c", "primes.c", "rfb.c",
+          "fb_cado.c", "platform.c", "boinc_support.cpp", "runlog.c",
+          "watchdog.c", "fbgen.c")
+
 def scan(root):
     pats = ("metal/*.cpp", "metal/*.inc", "metal/*.h", "metal/*.mm")
     files = sorted({f for p in pats for f in glob.glob(os.path.join(root, p))})
-    if not files:
-        print("msgscan: no sources found under %s" % root)
+    if not files:                       # wrong root: say so before blaming
+        print("msgscan: no metal/ sources found under %s" % root)
         return None
+    for nm in SHARED:
+        f = os.path.join(root, nm)
+        # Named individually, not globbed: bench/ also holds CUDA-only sources
+        # this binary never links, and flagging their messages would be wrong.
+        if not os.path.exists(f):
+            print("msgscan: shared source %s is missing -- the object list in"
+                  " Makefile.metal has moved; fix SHARED here" % nm)
+            return None
+        files.append(f)
+    files = sorted(set(files))
     bad = []
     for f in files:
         src = open(f, encoding="utf-8", errors="replace").read()
