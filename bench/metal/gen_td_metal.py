@@ -130,11 +130,29 @@ def split_top(s):
         else: cur += ch
     out.append(cur); return out
 
-# Buffer indices the host sometimes passes nullptr for. Metal has no unbound
+# Parameters the host sometimes passes nullptr for. Metal has no unbound
 # argument -- setBuffer:nil is an UNSET argument and dispatch is refused -- so
-# these are declared under an MSL function constant, exactly as
-# gen_bench_kernels.py does. See plan 9z-c/9z-d.
-OPTIONAL_BUFFERS = {'k_td': [3, 16, 17, 18], 'k_resieve_scatter': [2, 14]}
+# these are declared under an MSL function constant. See plan 9z-c/9z-d.
+#
+# BY NAME, not by index, and k_resieve_rows is here because it was NOT.
+# This table was a list of indices; k_resieve_rows was added to K in the
+# 2026-10-15 rebase and never added here, so its `ispow` -- which
+# pipeline_host.inc passes as nullptr -- was declared as an ordinary buffer.
+# Metal said so exactly:
+#     Compute Function(k_resieve_rows_4_1): missing Buffer binding at
+#     index 2 for ispow[0]
+# and NOTHING caught it, because --resieve-rows derives from --fill-rows,
+# which this build defaults to 0, so validationcheck never launches the
+# kernel. Indices are how that survives: they are correct until upstream
+# inserts a parameter, and then they are silently about something else.
+OPTIONAL_BUFFERS = {
+    'k_td':              ['sel', 'nhit', 'fac', 'faccnt'],
+    'k_resieve_scatter': ['ispow', 'walk_cur'],
+    'k_resieve_rows':    ['ispow'],
+}
+
+_opt_seen = set()
+_opt_indices = set()
 
 MASK_DECL = ('/* Optional buffer arguments: metal_rt supplies bit i ='
              ' "argument i is bound". */\n'
@@ -230,7 +248,16 @@ for name, (tparams, insts) in K.items():
                 for tn, tv in zip(tnames, inst):
                     q = re.sub(r'\b' + tn + r'\b', tv, q)
                 cps.append(q)
-            opt = set(OPTIONAL_BUFFERS.get(name, ()))
+            _want = OPTIONAL_BUFFERS.get(name, ())
+            _pnames = [re.sub(r'.*?(\w+)\s*$', r'\1',
+                              pp.strip().replace('*', ' ')) for pp in cps]
+            for _w in _want:
+                assert _w in _pnames, (
+                    '%s has no parameter named %s (it has %s)'
+                    % (name, _w, ', '.join(_pnames)))
+            _opt_seen.add(name)
+            opt = set(_pnames.index(w) for w in _want)
+            _opt_indices |= opt
             kps = [bufparam(pp, k, opt) for k, pp in enumerate(cps)] + IDS
             suffix = '_'.join('1' if a == 'true' else '0' if a == 'false' else a for a in inst)
             decls = (chr(10).join(tg_bufs) + chr(10)) if tg_bufs else ''
@@ -361,7 +388,7 @@ if _wf_old in body:
     _te += 1
 print('  k_td: tile[e] copied once per prime in both variants (%d sites)' % _te)
 
-_idx = sorted({i for v in OPTIONAL_BUFFERS.values() for i in v})
+_idx = sorted(_opt_indices)
 body = (MASK_DECL + ''.join(
     'constant bool %s = (mtl_bound_mask & (1u << %d)) != 0;\n' % (bound_name(i), i)
     for i in _idx) + '\n') + body

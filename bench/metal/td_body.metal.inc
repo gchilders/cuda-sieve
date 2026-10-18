@@ -711,7 +711,7 @@ static inline void k_resieve_rows_body(
 kernel void k_resieve_rows_4_0(
     device const uint32_t * primes [[buffer(0)]],
     device const uint32_t * rts [[buffer(1)]],
-    device const uint8_t * ispow [[buffer(2)]],
+    device const uint8_t * ispow [[buffer(2), function_constant(mtl_bound_2)]],
     constant uint32_t &n [[buffer(3)]],
     constant uint32_t &nbands [[buffer(4)]],
     constant uint32_t &rows [[buffer(5)]],
@@ -732,13 +732,15 @@ kernel void k_resieve_rows_4_0(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_resieve_rows_body<4, false>(primes, rts, ispow, n, nbands, rows, logI, summary, bits, gbase, plist, pcnt, K, noverflow, log_gran, j_base, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device const uint8_t * ispow_opt = nullptr;
+    if (mtl_bound_2) ispow_opt = ispow;
+    k_resieve_rows_body<4, false>(primes, rts, ispow_opt, n, nbands, rows, logI, summary, bits, gbase, plist, pcnt, K, noverflow, log_gran, j_base, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 kernel void k_resieve_rows_4_1(
     device const uint32_t * primes [[buffer(0)]],
     device const uint32_t * rts [[buffer(1)]],
-    device const uint8_t * ispow [[buffer(2)]],
+    device const uint8_t * ispow [[buffer(2), function_constant(mtl_bound_2)]],
     constant uint32_t &n [[buffer(3)]],
     constant uint32_t &nbands [[buffer(4)]],
     constant uint32_t &rows [[buffer(5)]],
@@ -759,7 +761,9 @@ kernel void k_resieve_rows_4_1(
     uint _bdim [[threads_per_threadgroup]],
     uint _gdim [[threadgroups_per_grid]])
 {
-    k_resieve_rows_body<4, true>(primes, rts, ispow, n, nbands, rows, logI, summary, bits, gbase, plist, pcnt, K, noverflow, log_gran, j_base, _tid, _ntid, _bid, _lid, _bdim, _gdim);
+    device const uint8_t * ispow_opt = nullptr;
+    if (mtl_bound_2) ispow_opt = ispow;
+    k_resieve_rows_body<4, true>(primes, rts, ispow_opt, n, nbands, rows, logI, summary, bits, gbase, plist, pcnt, K, noverflow, log_gran, j_base, _tid, _ntid, _bid, _lid, _bdim, _gdim);
 }
 
 

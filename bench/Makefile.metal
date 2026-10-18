@@ -452,9 +452,38 @@ validationcheck: $(BUILD)/bench ../oracle/c183.fb1
 	    --allowance 101.6 --allowance0 68.1 --cofactor 2>&1 \
 	  | tee $(BUILD)/validation.log | grep -E "total relations" | tail -1
 	@grep -q "total relations *37$$" $(BUILD)/validation.log \
-	  && echo "METAL VALIDATION GATE: PASS" \
-	  || { echo "METAL VALIDATION GATE: FAIL"; \
+	  || { echo "METAL VALIDATION GATE: FAIL (default arm)"; \
 	       grep -iE "assertion|missing Buffer" $(BUILD)/validation.log | head -3; exit 1; }
+# The default arm does not launch every kernel. --resieve-rows derives from
+# --fill-rows, which this build defaults to 0, so k_fill_rows and
+# k_resieve_rows never ran here -- and k_resieve_rows was launched with a null
+# `ispow` that no function constant covered, which Metal reported as
+# `missing Buffer binding at index 2 for ispow[0]` the first time anything
+# executed it. A nil-binding gate that skips the kernels most likely to have
+# one is not a gate.
+#
+# The slab plan is left on AUTO deliberately: --slab-j 2048 suppresses
+# k_resieve_rows entirely on this job, so pinning it would make the arm
+# vacuous. Two q, because one does not reach the row tier either.
+	@echo "== the row tier under MTL_DEBUG_LAYER=1 =="
+	@MTL_DEBUG_LAYER=1 CUDA_SIEVE_METALLIB=$(CURDIR)/$(BUILD)/bench.metallib \
+	    $(BUILD)/bench --pipeline --cadofb ../oracle/c183.fb1 \
+	    --poly ../oracle/c183.poly --qrange 120000053:120000500 --nq 2 \
+	    --allowance 101.6 --allowance0 68.1 --cofactor \
+	    --fill-rows 4 --resieve-rows 2>&1 \
+	  | tee $(BUILD)/validation_rows.log | grep -E "total relations" | tail -1
+	@grep -q "total relations *83$$" $(BUILD)/validation_rows.log \
+	  || { echo "METAL VALIDATION GATE: FAIL (row arm relations)"; exit 1; }
+# Assert on the ASSERTION, not only on the relation count. The missing
+# binding above produced the right relations anyway -- `if (ispow && ...)`
+# with an unset pointer behaved like the nullptr the host meant -- so a gate
+# that only counts relations passes the very bug it is named for.
+	@for f in $(BUILD)/validation.log $(BUILD)/validation_rows.log; do \
+	    if grep -qiE "failed assertion|missing Buffer" $$f; then \
+	        echo "METAL VALIDATION GATE: FAIL -- validation complained in $$f"; \
+	        grep -iE "failed assertion|missing Buffer" $$f | head -3; exit 1; \
+	    fi; done
+	@echo "METAL VALIDATION GATE: PASS (default + row tier, no assertions)"
 
 # ---- Phase 5 gate: the sieve against the tree's own CPU ground truth -----
 

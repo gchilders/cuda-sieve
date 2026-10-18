@@ -199,8 +199,10 @@ OPTIONAL_BUFFERS = {
     'k_fill_atomic':       ['walk_cur', 'walk_next', 'gate'],
     'k_fill_rows':         ['gate'],
     'k_transform':         ['walk_cur', 'rt_out'],
-    'k_resieve_scatter':   ['ispow', 'walk_cur'],
-    'k_resieve_rows':      ['ispow'],
+    # k_resieve_scatter and k_resieve_rows are NOT emitted here: they come from
+    # td.cuh/pipeline.cuh through gen_td_metal.py, which carries its own table.
+    # Entries for them sat in this one doing nothing until the consumed-key
+    # assert below named them.
     'k_intersect_compact': ['out_x', 'out_a', 'out_b', 'nqb'],
 }
 
@@ -208,6 +210,13 @@ OPTIONAL_BUFFERS = {
 # emission loop; the function-constant declarations at the end of this
 # file are emitted for exactly these.
 OPT_INDICES = set()
+# Kernels this run actually emitted, so a key naming a kernel that no longer
+# exists FAILS instead of going quietly dead. That direction matters more
+# than it looks: a dead entry stops its buffers being declared under a
+# function constant, which is exactly the nil-binding bug (9z-c) the table
+# exists to prevent -- and on a kernel that is off by default here, such as
+# k_fill_rows, validationcheck would never run it to notice.
+_opt_seen = set()
 
 MASK_DECL = """/* Optional buffer arguments: see metal/gen_bench_kernels.py.
  * metal_rt supplies bit i = "kernel argument i is bound". */
@@ -322,6 +331,7 @@ for name, (tparams, insts, dynsmem) in K.items():
         wrappers = []
         _names = [argname(p) for p in params]
         _want = OPTIONAL_BUFFERS.get(name, ())
+        _opt_seen.add(name)
         for _w in _want:
             assert _w in _names, ('%s has no parameter named %s' % (name, _w))
         opt = set(_names.index(w) for w in _want)
@@ -438,6 +448,7 @@ HELPER_SPACES = {
     'fill_gate_drops':         {'gate': 'device'},
 }
 _unspecified = []
+_hs_used = set()
 
 def qual(params, fname):
     res = []
@@ -446,6 +457,7 @@ def qual(params, fname):
         if '*' not in p or re.search(r'\b(thread|constant|device|threadgroup)\b', p):
             res.append(p); continue
         nm = re.sub(r'.*?(\w+)\s*$', r'\1', p.strip().replace('*', ' '))
+        _hs_used.add((fname, nm))
         if nm not in spaces:
             _unspecified.append('%s(%s)' % (fname, nm))
         space = spaces.get(nm, 'thread') + ' '
@@ -453,6 +465,18 @@ def qual(params, fname):
         res.append(pad + ('const ' + space + st[6:] if st.startswith('const ') else space + st))
     return ','.join(res)
 body, nq = head_re.subn(lambda m: m.group(1) + qual(m.group(3), m.group(2)) + m.group(4), body)
+_opt_dead = sorted(set(OPTIONAL_BUFFERS) - _opt_seen)
+assert not _opt_dead, (
+    'OPTIONAL_BUFFERS names kernels this generator never emitted: %s.\n'
+    'A renamed or removed kernel leaves the entry dead, its buffers stop being\n'
+    'declared under a function constant, and a null binding comes back.'
+    % ', '.join(_opt_dead))
+_hs_dead = sorted('%s(%s)' % (f, n) for f, d in HELPER_SPACES.items()
+                  for n in d if (f, n) not in _hs_used)
+assert not _hs_dead, (
+    'HELPER_SPACES entries that matched no device helper pointer parameter: %s.\n'
+    'The helper or the parameter was renamed; the address space it names is no\n'
+    'longer being applied to anything.' % ', '.join(_hs_dead))
 assert not _unspecified, (
     'device helper pointer parameters with no entry in HELPER_SPACES: %s.\n'
     'Add each one explicitly -- defaulting to `thread` is a guess, and a wrong\n'

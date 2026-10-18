@@ -2989,6 +2989,92 @@ FAIL**, zero generator drift, and the 288-q band **`cmp`-identical at 13,485
 relations / sha256 `8e79762c`** with zero over-bound launches. A normal run
 never enters the new branch, which is what that hash says.
 
+## Seventh review, 2026-10-17: a live nil binding in a kernel nothing runs
+
+The sixth review was half-blind -- the toolchain was unbuildable, so it could
+only read. Redone with a working one, aimed at what this session ADDED rather
+than at what it changed, and the first thing executed turned up a real defect.
+
+### The finding: `k_resieve_rows` was launched with an argument Metal had no
+### binding for
+
+```
+validateComputeFunctionArguments:1038: failed assertion
+`Compute Function(k_resieve_rows_4_1): missing Buffer binding at index 2 for ispow[0].'
+```
+
+`pipeline_host.inc` passes `nullptr` for `ispow`. Metal has no unbound
+argument, so such a parameter must be declared under a FUNCTION CONSTANT
+(9z-c/9z-d) -- and `gen_td_metal.py`'s table did not mention the kernel.
+**It is a kernel this session added to that generator's `K` table and never
+added to its optional-buffer table.**
+
+**Three things had to line up for it to survive, and all three are the point.**
+
+1. **The table was BY INDEX** -- `{'k_td': [3, 16, 17, 18], 'k_resieve_scatter':
+   [2, 14]}` -- the brittle form `gen_bench_kernels.py` was converted away from
+   earlier in this same session, because an inserted parameter silently
+   renumbers it. A new kernel simply has no row, and nothing says so.
+2. **The kernel is OFF BY DEFAULT HERE, as a side effect of a tuning change.**
+   `resieve_rows` derives from `fill_rows`, and this build defaults
+   `fill_rows` to 0 (it costs 3.7% of wall). So my own default flip took
+   **two** kernels out of every default run.
+3. **`validationcheck` only ran the default path**, so the gate that exists to
+   catch nil bindings never launched the kernel that had one.
+
+**It was benign in practice, by luck.** The body reads
+`if (ispow && ispow[k])`, and an unset pointer that happens to read as null
+behaves exactly like the `nullptr` the host meant: `fillcheck`'s `rows4-rs`
+and `rows16-rs-gate3` arms gave identical relations on c143-i13 with the bug
+present. Luck is not a binding, and the validation layer said so.
+
+**Fixed by converting the table to NAMES and adding the kernel** -- and the
+name check earns its place immediately: it rejected my first attempt, because
+I guessed `k_td`'s optional parameters as `nsm/dump/dbg/probe` when indices
+3/16/17/18 are `sel/nhit/fac/faccnt`. An index table cannot catch that; a name
+table did, at the generator, in one run.
+
+### Both optional-buffer tables now assert their entries are USED
+
+Neither generator checked that an entry matched anything, so a key could go
+dead in a rename and take its function constants with it -- the same stale-
+entry class as `msgcheck`'s allowlist, fixed the same morning. Added, and it
+immediately named two real dead entries: `k_resieve_scatter` and
+`k_resieve_rows` were listed in `gen_bench_kernels.py`, which does not emit
+them (they come from `td.cuh`/`pipeline.cuh` through `gen_td_metal.py`).
+`HELPER_SPACES` gained the same check at PARAMETER granularity, so a renamed
+parameter fails too.
+
+### GATED: `validationcheck` now runs the row tier, and asserts on assertions
+
+Two changes, and the second matters as much as the first.
+
+- **A second arm** at `--fill-rows 4 --resieve-rows`. The slab plan is left on
+  AUTO on purpose: `--slab-j 2048` SUPPRESSES `k_resieve_rows` on this job, so
+  pinning it -- which this file elsewhere tells you to do -- would have made
+  the arm vacuous. Two q, because one q does not reach the row tier either.
+- **The PASS condition is no longer the relation count alone.** It was
+  `total relations == 37`, and this very bug produced the right relations
+  anyway. A gate that only counts relations passes the bug it is named for.
+
+**Control:** removing the `k_resieve_rows` entry again fails the gate with the
+original assertion. Verified both ways.
+
+**Validated:** six gates green -- `validationcheck` (both arms),
+`msgcheck`, `sievecheck`, `cbtimecheck`, `cofaccheck` -- plus `cofcheck.sh`
+**63 PASS / 0 FAIL**, zero generator drift, and the 288-q band
+**`cmp`-identical at 13,485 relations / sha256 `8e79762c`**. The default path
+never launches the kernel that changed, which is exactly what that hash says
+and why the new arm had to exist.
+
+**A trap worth recording, because it cost a detour.** Hand-sabotaging the
+generated declaration -- dropping `function_constant(mtl_bound_2)` from the
+parameter while leaving the wrapper's `if (mtl_bound_2)` guard -- did NOT
+reproduce the assertion. The guard makes the argument UNUSED, and Metal
+demands no binding for an argument the shader never reads. The real control
+has to be at the GENERATOR, where losing the entry also removes the guard and
+makes the argument live again.
+
 ## Drift ledger — CUDA-side changes made for this port
 
 **The ledger lives in `bench/METAL_PORT_PLAN.md` section 9, and only there.**
