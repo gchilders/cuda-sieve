@@ -2,6 +2,7 @@
 #include "boinc_api.h"
 #include <cstdio>
 
+volatile BOINC_STATUS boinc_status;   /* zeroed: not suspended */
 double stub_reported[256];
 int    stub_nreported;
 int    stub_fraction_rc;

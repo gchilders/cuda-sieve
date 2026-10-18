@@ -17,10 +17,26 @@ the dangerous one failed *quietly* underneath. See "Rebase, 2026-09-16" below.
 ## This machine
 - Apple M3 MacBook Air (fanless), 10-core GPU, `MTLGPUFamilyApple9`, 16 GB
   unified, 8 CPU cores (4P + 4E).
-- macOS 26.5, Xcode 26.5 (17F42), Metal Toolchain 17F42.
+- macOS 26.7.1 (25G241), **Xcode 27.1 (27A9275), Metal Toolchain 27A266a**
+  (`metal` 32023.921). Was macOS 26.5 / Xcode 26.5 (17F42) until 2026-10-17 --
+  see "The toolchain moved" below for what that upgrade did and did not change.
+- **Xcode 27 ships NO Metal compiler.** It is a separate 839 MB asset and
+  `xcrun metal` says `missing Metal Toolchain` until you fetch it:
+  `xcodebuild -downloadComponent MetalToolchain`. A fresh machine needs this
+  before anything here builds.
 - `xcode-select -p` points at CommandLineTools, which ships **no** `metal`
   compiler. Do not `sudo xcode-select -s`; export
   `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` instead.
+- **An Xcode upgrade resets the licence, and an unaccepted licence blocks
+  EVERY gate -- not just compilation.** `Makefile.metal` exports
+  `DEVELOPER_DIR` to Xcode for everything, and `/usr/bin/python3` is itself a
+  developer-tools shim, so `msgcheck` fails with the licence message exactly
+  like `metal` does. Xcode's `clang++` invoked by ABSOLUTE PATH works
+  throughout, which is what isolates the cause to `xcrun`.
+  And `sudo xcodebuild -license` does not work here, because `xcodebuild`
+  resolves through `xcode-select`: reach it by path, which changes no system
+  setting --
+  `sudo /Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild -license accept`.
 - **Performance tuning on this box is allowed** (changed 2026-09-14, was
   "correctness vehicle only"). This is a full M3, not a crippled iGPU: fp32
   and fp64-by-emulation behave like the real thing, the GPU is a normal
@@ -93,7 +109,10 @@ lane order (so `td.cuh:647` holds), `simd_shuffle_up` matching CUDA,
 Set 2026-09-14. `METAL_MIN_MACOS` in `bench/Makefile.metal`, default 13.0,
 with `-std=metal3.0`.
 
-MSL 3.0 is this toolchain's floor, not a preference: Xcode 26.5's Metal
+MSL 3.0 is this toolchain's floor, not a preference -- **re-checked on
+Xcode 27.1 (2026-10-17): `-std=metal2.4` is still rejected and
+`metal3.0` still accepted, so the upgrade cost no hardware coverage.**
+Xcode 26.5's Metal
 compiler lists `metal2.0`-`metal2.4` in its own `-std` help text and then
 refuses every one of them. MSL 3.0 requires macOS 13 at runtime. Reaching
 macOS 11/12 would mean building the metallib with an older Xcode (14.x emits
@@ -2829,6 +2848,83 @@ way `g_cof_stream` is, which looks like the same bug one field over --
 runs the flush arms its own bracket. And the eleven shared sources are clean
 of CUDA-named user strings today, so finding 2 closes a gap rather than a
 defect.
+
+## The toolchain moved: Xcode 26.5 -> 27.1, and byte-identity SURVIVED
+
+Xcode updated itself mid-session on 2026-10-17. That is a new **shader
+compiler**, which is the one kind of change that could move this port's
+output without any source changing, so it was treated as a rebase would be.
+
+**The metallib really is different code**, which is what makes the rest
+meaningful rather than a no-op: **1,330,477 -> 1,330,301 bytes**, different
+sha256, same sources.
+
+**And the relations are the same bytes.** 288-q band at the shipped defaults:
+**13,485 relations, 564,696 enqueued, sha256 `8e79762c`**, `cmp`-identical to
+the Xcode 26.5 band -- confirmed on **two** runs.
+
+| checked | result |
+|---|---|
+| builds at `-std=metal3.0` | yes |
+| `metalcheck` | **50 PASS / 0 FAIL** |
+| softfp64, device build vs host build | still **bit-identical**, 2,097,152 results |
+| `pl_log2f` vs libm | still **10,156 / 1,000,000, max 3 ULP** -- the Phase 2 numbers are unmoved |
+| the MSL floor | `-std=metal2.4` still REJECTED, `metal3.0` accepted, so the macOS 13 support floor is unaffected |
+| packaging (9a/9d) | `minos 13.0` (sdk now 27.0), `__metallib` section present at the new size, `otool -L` still only macOS libraries |
+| gates | **eleven green** -- `metalcheck`, `msgcheck`, `sievecheck`,
+`validationcheck`, `cbtimecheck`, `cofaccheck`, `fbcheck`,
+`metallibcheck`, `fbretrycheck`, `boinccheck`, `progresscheck` -- plus
+`cofcheck.sh` **63 PASS / 0 FAIL** |
+
+**That is a data point this port did not have:** every byte-identity result
+before today was from one shader compiler. It now survives two.
+
+### The first band after a new metallib steers on a number that is not GPU work
+
+The first 288-q band on the new toolchain reported **one launch of 3209 ms**
+at the opening 1,792-record chunk -- 8x the 400 ms bound, and over the 1000 ms
+valve bound too -- and the controller descended **1792 -> 1024** before
+climbing back. The second run of the same binary reported **zero** over-bound
+launches and ramped **1792 -> 7623 -> 20170**, the same shape the old
+toolchain gave (1792 -> 6914 -> 19484). Wall 649.08 -> **578.97 ms/q**,
+against 589.05 on Xcode 26.5.
+
+**So it is a FIRST-USE cost of a new metallib, not a property of the new
+compiler** -- and the tell was in the first run's own numbers: later launches
+at **22,410** records came in under the bound while the 1,792-record one took
+3.2 s. Twelve times the work, faster. Nothing about a steady-state slowdown
+explains that.
+
+The likely mechanism is pipeline-state compilation on first use of a library
+with no on-disk cache yet. **Not isolated** -- what is established is that it
+does not recur. If that is what it is, it is CPU-side and so NOT an
+interactivity-watchdog risk, but the event bracket spans it and reports it as
+launch time, so **the chunk controller takes its first decision from a
+measurement that is not GPU work.** It self-corrects within a few flushes.
+
+**Field relevance, unmeasured:** every volunteer receiving a new binary
+version pays this once per machine, and their first flush begins by
+descending. On a slower part the same stall would be larger.
+
+### boinccheck had been broken since the D=210 rebase, and I missed it
+
+`make boinccheck` failed outright -- **a compile error**, not an assertion.
+upstream `924e62b` added `bench_boinc_suspended()`, which reads `BOINC_STATUS`
+/ `boinc_status`; the real `boinc_api.h` declares both and
+`metal/boinc_stub/` did not, so the gate stopped COMPILING the moment that
+rebase landed. **I ran the other gates after that rebase and not this one.**
+
+**It is the gate, not the product.** A `HAVE_BOINC=1` build uses the real SDK
+headers, which declare both, so nothing shipped was affected -- but the gate
+that exists to stop the 99%-pinned-task bug reaching the field had silently
+stopped running. Stub fixed with the real header's field order (only
+`suspended` is read here), 8 checks green and **the control still reproduces
+the bug**.
+
+**The rule this breaks is already in this file in other words: after a rebase,
+run the WHOLE suite.** A gate that is not run is not a gate, and the ones that
+rot are exactly the ones whose subject matter the rebase touched -- `924e62b`
+has "BOINC suspend" in its own commit title.
 
 ## Drift ledger — CUDA-side changes made for this port
 

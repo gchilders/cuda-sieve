@@ -26,6 +26,25 @@ struct BOINC_OPTIONS {
     int multi_thread, multi_process;
 };
 
+/* upstream 924e62b's bench_boinc_suspended() reads the client's heartbeat
+ * status. The real boinc_api.h declares this; the stub did not, so the gate
+ * stopped COMPILING the moment that rebase landed -- and nothing noticed,
+ * because boinccheck was not re-run after it. Field order matches the real
+ * header so the stub cannot drift into testing a different struct; only
+ * `suspended` is read by this port. */
+typedef struct BOINC_STATUS {
+    int no_heartbeat;
+    int suspended;
+    int quit_request;
+    int reread_init_data_file;
+    int abort_request;
+    double working_set_size;
+    double max_working_set_size;
+    int network_suspended;
+} BOINC_STATUS;
+
+extern volatile BOINC_STATUS boinc_status;
+
 /* The recorder the test reads. Every fraction-done value that survives
  * boinc_support.cpp's own filtering lands here, in order. */
 extern double stub_reported[256];
