@@ -2061,14 +2061,22 @@ static int cofa_wait(cofasync_t *A, cofq_t *Q)
 static void cofa_start(cofasync_t *A, cofq_t *Q, cofq_out_t *O,
                        const bench_cfg_t *cfg, int blocks, FILE *fr)
 {
+    int bar_rc = 0;                   /* carried to the flush thread     */
     {   /* Metal only: see metal/gen_pipeline_host.py. The q loop's stream
          * and g_cof_stream are separate command queues with no ordering
          * between them, and the enqueue below has just written the buffers
          * this flush is about to read. */
-        const mtlError_t _e = mtlDeviceSynchronize();
-        if (_e != mtlSuccess)
+        mtlError_t _e = mtlDeviceSynchronize();
+#ifdef PIPE_BARRIER_FORCE_FAIL
+        /* The gate's hook. This path cannot be provoked on demand, and a
+         * recovery path that has never run is not a recovery path. */
+        if (_e == mtlSuccess) _e = mtlErrorLaunchFailure;
+#endif
+        if (_e != mtlSuccess) {
             fprintf(stderr, "  pipeline: the cofactor handover barrier failed:"
-                    " %s; the flush will report it\n", mtlGetErrorString(_e));
+                    " %s; this flush is abandoned\n", mtlGetErrorString(_e));
+            bar_rc = -1;
+        }
     }
     A->F = *Q;                        /* full buffers, stats, steering   */
     cofq_swap_buffers(Q, &A->spare);  /* Q now fills the spare set, n=0  */
@@ -2093,12 +2101,17 @@ static void cofa_start(cofasync_t *A, cofq_t *Q, cofq_out_t *O,
     int dev = 0;
     if (mtlGetDevice(&dev) != mtlSuccess) dev = -1;
     const int ecm_rounds = (int)Q->ecm_rounds;
-    A->th = new std::thread([A, O, cfg, blocks, fr, cs, dev, ecm_rounds]() {
+    A->th = new std::thread([A, O, cfg, blocks, fr, cs, dev, bar_rc, ecm_rounds]() {
         g_cof_stream = cs;
         wd_bind(-1);    /* the sieve thread's slot stays the sieve thread's */
         if (dev < 0 || mtlSetDevice(dev) != mtlSuccess) {
             fprintf(stderr, "  cofactor flush thread: cannot select Metal"
                     " device %d\n", dev);
+            A->rc = -1;
+            A->fin->store(1, std::memory_order_release);
+            return;
+        }
+        if (bar_rc) {
             A->rc = -1;
             A->fin->store(1, std::memory_order_release);
             return;

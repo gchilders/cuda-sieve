@@ -2756,8 +2756,8 @@ steering is measured from.
 
 ## Sixth review, 2026-10-17 (the D=210 and dae6cca work)
 
-### 1. OPEN: making `g_last_error` thread_local broke the handover barrier's
-### documented error path
+### 1. FIXED (below): making `g_last_error` thread_local broke the handover
+### barrier's documented error path
 
 The 2026-10-15 rebase made metal_rt's sticky error **`thread_local`**, and the
 reason is good -- `--cof-async` runs `cofq_flush` on a second host thread, and
@@ -2925,6 +2925,69 @@ the bug**.
 run the WHOLE suite.** A gate that is not run is not a gate, and the ones that
 rot are exactly the ones whose subject matter the rebase touched -- `924e62b`
 has "BOINC suspend" in its own commit title.
+
+## Fixing the handover barrier's error path (2026-10-17)
+
+The sixth review left this open because the toolchain was unbuildable. With a
+working toolchain the path was forced, and **the measurement moved the
+severity in both directions at once.**
+
+**Forced over 80 q, pre-fix** (the real `mtlDeviceSynchronize()` still runs;
+a genuinely failing call then raises a real error on the same thread, so the
+sticky state is exactly a true barrier failure's):
+
+```
+pipeline: the cofactor handover barrier failed: invalid value; the flush will report it
+Metal mtlGetLastError(): invalid value at metal/pipeline_host.inc:3852
+EXIT=255, total relations 3153
+```
+
+**Milder than feared: the band DIES.** It is not a silent wrong answer. The
+barrier runs on the MAIN thread, so its sticky error stays there and the q
+loop's own `mtlGetLastError()` catches it -- **two thousand lines from the
+barrier, against a check that has nothing to do with it**, under a line
+promising that a flush would report it. The flush never looked and never
+could. 9z-i's whole lesson is that the defect is the log being unable to say.
+
+**Worse than feared in the other direction: the flush RAN, and its output
+reached disk.** Between the barrier reporting failure and the q loop
+noticing, the flush executed on buffers whose writes may not have landed, and
+the run left **3,153 relations in `.part` plus a `.ckpt`** -- resume state a
+retry would build on. (In this synthetic control the sync itself really
+succeeded, so those particular relations are fine; the point is that nothing
+in the code knew that.)
+
+**Fix: carry the result to the thread instead of leaving it sticky.**
+`cofa_start` sets `bar_rc`, the lambda captures it, and the flush bails in the
+SAME shape upstream's device-select failure already uses -- placed after that
+check, so a run that cannot select a device still reports the device, which is
+the more specific fault. The message now says what happens: `this flush is
+abandoned`.
+
+**Measured after, same forced failure:**
+
+```
+pipeline: the cofactor handover barrier failed: kernel launch failed; this flush is abandoned
+EXIT=255, total relations 0
+```
+
+The misattributed `pipeline_host.inc:3852` line is gone and no flush runs.
+
+**GATED, because this path cannot be provoked on demand:**
+`METAL_EXTRA_DEFS=-DPIPE_BARRIER_FORCE_FAIL` forces the barrier to fail. It is
+compile-time, and the tree's own `DEFS` guard already marks such a build as
+PRICING and refuses `--relations` from it, so the hook cannot reach a
+shipping binary. A recovery path that has never run is not a recovery path.
+
+**The thread_local change itself stays.** It is right for the instance threads
+and the flush thread -- each raises and reads its own -- and the barrier was
+the only place in the port that depended on an error crossing threads.
+
+**Validated:** six gates green -- `validationcheck`, `cbtimecheck`,
+`cofaccheck`, `sievecheck`, `msgcheck` -- plus `cofcheck.sh` **63 PASS / 0
+FAIL**, zero generator drift, and the 288-q band **`cmp`-identical at 13,485
+relations / sha256 `8e79762c`** with zero over-bound launches. A normal run
+never enters the new branch, which is what that hash says.
 
 ## Drift ledger — CUDA-side changes made for this port
 

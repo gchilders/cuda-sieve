@@ -303,7 +303,7 @@ print('  device-selection messages say Metal, not CUDA')
 # more than deleting a branch that does nothing.
 _async_old = """    A->th = new std::thread([A, O, cfg, blocks, fr, cs, dev]() {"""
 _async_new = """    const int ecm_rounds = (int)Q->ecm_rounds;
-    A->th = new std::thread([A, O, cfg, blocks, fr, cs, dev, ecm_rounds]() {"""
+    A->th = new std::thread([A, O, cfg, blocks, fr, cs, dev, bar_rc, ecm_rounds]() {"""
 assert src.count(_async_old) == 1, 'cofa_start thread shape changed'
 
 # THE HANDOVER NEEDS A BARRIER ON METAL, and nothing in the shared code says
@@ -316,18 +316,42 @@ assert src.count(_async_old) == 1, 'cofa_start thread shape changed'
 # there, the band exits 0, and only the relation count says anything. Once per
 # flush, i.e. about every 70 special-q.
 #
-# Reported rather than returned: cofa_start is void, and metal_rt's sticky
-# last error survives to the COF_FLUSH_CK(mtlGetLastError()) inside the flush,
-# which is what turns it into this flush's rc.
+# RETURNED, not left sticky. That sentence used to read "cofa_start is void,
+# and metal_rt's sticky last error survives to the
+# COF_FLUSH_CK(mtlGetLastError()) inside the flush" -- true when g_last_error
+# was one global, FALSE since the 2026-10-15 rebase made it thread_local,
+# because the flush runs on its own thread whenever --cof-async is set, which
+# is the DEFAULT. Measured: a second thread reads mtlSuccess while the raising
+# thread still sees the error.
+#
+# What a failed barrier actually did, measured by forcing one over 80 q: the
+# band DIED -- exit 255, zero relations -- but at mtlGetLastError() in the q
+# loop, because the barrier runs on the MAIN thread and its sticky error stays
+# there. So the consequence was never a wrong answer; it was a failure
+# attributed to an unrelated check two thousand lines away, under a line
+# promising a flush would report it. 9z-i's whole lesson is that the defect is
+# the log being unable to say.
+#
+# And the flush ran anyway, on buffers whose writes may not have landed,
+# between the barrier failing and the q loop noticing. Carrying the result to
+# the thread fixes both: the flush reports it, and does not run.
 _bar_old = """    A->F = *Q;                        /* full buffers, stats, steering   */"""
-_bar_new = """    {   /* Metal only: see metal/gen_pipeline_host.py. The q loop's stream
+_bar_new = """    int bar_rc = 0;                   /* carried to the flush thread     */
+    {   /* Metal only: see metal/gen_pipeline_host.py. The q loop's stream
          * and g_cof_stream are separate command queues with no ordering
          * between them, and the enqueue below has just written the buffers
          * this flush is about to read. */
-        const mtlError_t _e = mtlDeviceSynchronize();
-        if (_e != mtlSuccess)
+        mtlError_t _e = mtlDeviceSynchronize();
+#ifdef PIPE_BARRIER_FORCE_FAIL
+        /* The gate's hook. This path cannot be provoked on demand, and a
+         * recovery path that has never run is not a recovery path. */
+        if (_e == mtlSuccess) _e = mtlErrorLaunchFailure;
+#endif
+        if (_e != mtlSuccess) {
             fprintf(stderr, "  pipeline: the cofactor handover barrier failed:"
-                    " %s; the flush will report it\\n", mtlGetErrorString(_e));
+                    " %s; this flush is abandoned\\n", mtlGetErrorString(_e));
+            bar_rc = -1;
+        }
     }
     A->F = *Q;                        /* full buffers, stats, steering   */"""
 assert src.count(_bar_old) == 1, 'cofa_start handover shape changed'
@@ -429,6 +453,22 @@ _ak = src.index('MTL_LAUNCH_NAMED(apply_kern,')
 _ake = src.index(');', _ak)
 assert len(_split_args(src[_ak + len('MTL_LAUNCH_NAMED('):_ake], '([{', ')]}')) - 5 \
        == len(_sigs['k_apply']), 'the apply_kern launch does not pass every k_apply argument'
+
+# The bail, in the SAME shape upstream's device-select failure uses so a
+# reader meets one idiom rather than two. It sits after that check, so a run
+# that cannot select a device still reports the device -- the more specific
+# fault of the two.
+_bail_anchor = ("        A->rc = cofq_flush(&A->F, O, cfg->lim0, cfg->lpb0,"
+                " cfg->lim, cfg->lpb,")
+_bail = """        if (bar_rc) {
+            A->rc = -1;
+            A->fin->store(1, std::memory_order_release);
+            return;
+        }
+""" + _bail_anchor
+assert src.count(_bail_anchor) == 1, 'async cofq_flush call shape changed'
+src = src.replace(_bail_anchor, _bail, 1)
+print('  a failed handover barrier is carried to the flush, not left sticky')
 
 open(OUT, 'w').write(src)
 print('wrote %s (%d lines, %d launches rewritten)' % (OUT, src.count('\n'), nl))
