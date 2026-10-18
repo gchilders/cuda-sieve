@@ -2735,6 +2735,101 @@ of each side, so whichever thread runs the flush arms its own bracket. Read
 rather than assumed, because the peak bracket is what the whole chunk
 steering is measured from.
 
+## Sixth review, 2026-10-17 (the D=210 and dae6cca work)
+
+### 1. OPEN: making `g_last_error` thread_local broke the handover barrier's
+### documented error path
+
+The 2026-10-15 rebase made metal_rt's sticky error **`thread_local`**, and the
+reason is good -- `--cof-async` runs `cofq_flush` on a second host thread, and
+a shared sticky error lets one thread's `mtlGetLastError()` consume the
+other's failure. For the `--instances` threads and the flush thread it is
+strictly correct: each raises and reads its own.
+
+**But the cofactor handover barrier was written against the old, shared
+behaviour and still says so.** `gen_pipeline_host.py` carries:
+
+> Reported rather than returned: cofa_start is void, and metal_rt's sticky
+> last error survives to the COF_FLUSH_CK(mtlGetLastError()) inside the flush,
+> which is what turns it into this flush's rc.
+
+and the generated barrier tells the operator `the flush will report it`.
+**It cannot.** `cofa_start` runs on the q-loop thread; `cofq_flush` runs on
+the flush thread whenever `cfg.cof_async` is set, which is the DEFAULT.
+
+**MEASURED, against the real shim** (`mtlSetDevice(1)` fails by construction,
+so an error can be raised without provoking a GPU fault):
+
+```
+main raised          : invalid value
+second thread sees   : no error          <- the error does not cross
+main thread sees     : invalid value     <- control
+```
+
+**What is NOT established, and matters for severity.** The barrier runs on
+the MAIN thread, so its error stays sticky THERE, and the q loop has its own
+`mtlGetLastError()` checks downstream. The likely consequence is therefore a
+**misattributed** failure -- the band still dies, but against some later
+operation, with a message that pointed at a flush which never looked -- rather
+than a silently wrong answer. That was not confirmed: the control needs a
+forced barrier failure in a band long enough to fill the cofactor queue
+(~71 q, since `cofa_start` only runs when `Q.n + nacc_s > Q.cap`), and the
+toolchain went unbuildable mid-review (below). **Do not downgrade this on the
+strength of the reasoning alone.**
+
+**The fix is to stop relying on sticky state crossing threads at all**: have
+`cofa_start` record the barrier result in the `cofasync_t` and have the flush
+thread bail on it, which is the shape upstream's own device-select failure
+already uses (`A->rc = -1; A->fin->store(1, release); return;`). Not applied,
+because this port does not commit an unverified lifetime change -- 9z-b and
+the `g_lock` experiment are both on the record for why.
+
+### 2. FIXED: `msgcheck` dropped the file most likely to regress
+
+The gate added the day before scoped itself to `metal/*`. The Metal binary
+links **eleven shared objects out of `bench/`** that it never scanned,
+including `boinc_support.cpp` -- the file carrying this port's
+`-DBENCH_BOINC_METAL_GPU` selector and one of the nine 9z-g had to fix.
+37 files -> **48**, still clean. Sources are named from `BENCH_CPUOBJ`
+individually rather than globbed, because `bench/` also holds CUDA-only
+sources this binary never links; a linked source that vanishes FAILS the gate
+instead of shrinking its coverage. Both controls exit 1 with the right
+message.
+
+### 3. RECORDED: `CUDA_SIEVE_METAL_FAULT_SYNC` is absorbed by slab calibration
+
+Aiming the injector at the pipeline, every ordinal from 20 to 480 produced a
+reported device failure and **exit 0 with the clean run's relation count**.
+That is not a swallowed error in the pipeline: with `--slab-j` pinned (which
+turns slab auto-calibration off, 8g) the same ordinals give **exit 255**. The
+three throwaway calibration bands absorb the fault and fall back, which is
+defensible for a band whose output is discarded -- but it means **an injector
+run without `--slab-j` is testing calibration's tolerance, not the
+pipeline's**, and reads exactly like "faults are ignored". `fbretrycheck` is
+unaffected (it faults inside fbgen). Anyone using this injector on the
+pipeline must pin `--slab-j` first.
+
+### 4. ENVIRONMENT, not code: Xcode updated mid-session and blocks every gate
+
+`/Applications/Xcode.app` was rewritten today and
+`IDEXcodeVersionForAgreedToGMLicense` is 26.3, so **`xcrun` refuses until
+`sudo xcodebuild -license` is accepted**. That blocks more than the `metal`
+compiler: `Makefile.metal` exports `DEVELOPER_DIR` to Xcode for everything, so
+the host compile fails too -- and so does **`/usr/bin/python3`**, which is
+itself a developer-tools shim. **Every gate in this Makefile, including the
+pure-Python ones, fails with the licence message.** Xcode's `clang++` invoked
+by absolute path works fine, which is what isolates the cause to `xcrun`.
+Nothing was committed that needs a build to be trusted.
+
+### Reviewed with no finding
+
+`g_cof_peak` is `thread_local` too and is NOT handed to the flush thread the
+way `g_cof_stream` is, which looks like the same bug one field over --
+`cofq_flush` assigns it from its own `pk0`/`pk1` locals, so whichever thread
+runs the flush arms its own bracket. And the eleven shared sources are clean
+of CUDA-named user strings today, so finding 2 closes a gap rather than a
+defect.
+
 ## Drift ledger — CUDA-side changes made for this port
 
 **The ledger lives in `bench/METAL_PORT_PLAN.md` section 9, and only there.**
