@@ -3137,8 +3137,9 @@ finding 92.
     one record's work is whatever its parameters say.** `cofac.cuh` documents
     the ECM form: a large enough `--ecm-b2` makes a single record's stage 2
     exceed a watchdog no matter how the list is sliced. `cofq_init` warns above
-    20,000 giant steps/curve; the derived default is ~194-500, and the
-    configuration known to kill gfx1103 is `--ecm-b1 400000` (~320,000 steps).
+    B2 = 600,000 (this was 20,000 giant steps/curve, which meant the same B2
+    only while D was 30); the derived default is B2 6,000-15,000, and the
+    configuration known to kill gfx1103 is `--ecm-b1 400000` (B2 10^7).
 
     The RHO form is not documented there and is worth stating (found in review
     2026-09-12). Slices are cut against the batch `n`, but each round compacts

@@ -98,7 +98,11 @@ echo "$JOBS" | while IFS='|' read -r job jargs; do
             exit 1
         fi
         if [ $want -eq 1 ]; then
-            ah=$(grep -h "issued ahead (--q-pipeline)" "$TMP/$job.$arm.out")
+            # The band's own summary is the last such line: a build that runs
+            # throwaway calibration bands first prints theirs too, and a
+            # multi-line $ah would make the -eq tests below error out and the
+            # assertion silently pass.
+            ah=$(grep -h "issued ahead (--q-pipeline)" "$TMP/$job.$arm.out" | tail -1)
             nsl=$(echo "$ah" | grep -oE '[0-9]+ slab' | grep -oE '[0-9]+')
             nqa=$(echo "$ah" | grep -oE '[0-9]+ q$' | grep -oE '[0-9]+')
             if [ "${nqa:-0}" -eq 0 ]; then

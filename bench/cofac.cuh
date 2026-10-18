@@ -1433,11 +1433,16 @@ static int cf_run_rounds_dyn(int L, const uint32_t *d_n, uint64_t lim,
  */
 #define COF_CHUNK_TARGET_MS   250.0f
 
-/* Giant steps per curve above which cofq_init warns that record chunking can
- * no longer bound a launch. ~40x the derived default's ~500 and ~16x below the
- * ~320,000 of the one configuration known to trip a watchdog; see the warning
- * site in cofq_init for why this is a judgement rather than a measurement. */
-#define COF_S2NV_WATCHDOG_WARN  20000u
+/* B2 above which cofq_init warns that record chunking can no longer bound a
+ * launch. A record's stage-2 work is its giant steps, (B2-B1)/D, plus one
+ * product per prime in (B1, B2] -- and the prime count depends on B2 alone, so
+ * B2 is the measure that means the same thing at every D. (This used to be
+ * 20,000 GIANT STEPS: B2 ~600,000 at D=30, but ~4.2M once D went to 210, a
+ * warning 7x later than meant.) 40x the derived default's B2 of 15,000 and
+ * ~16x below the 10^7 of the one configuration known to trip a watchdog; see
+ * the warning site in cofq_init for why this is a judgement rather than a
+ * measurement. */
+#define COF_S2_B2_WATCHDOG_WARN  600000u
 
 /* The floor is `blocks * threads`: one record per thread, and never less.
  *
@@ -1992,10 +1997,11 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
          * per-record cost no slice size can divide.
          *
          * The auto-derived configuration is nowhere near this -- cof_auto_b1
-         * returns 200..500, so B2 is 6,000..15,000 and s2nv is ~194..500 giant
-         * steps -- which is why the default path needs no warning at all. The
+         * returns 200..500, so B2 is 6,000..15,000 (29..70 giant steps at
+         * D=210) -- which is why the default path needs no warning at all. The
          * one configuration observed to actually trip a device watchdog is
-         * --ecm-b1 400000 (B2 clamped to 10^7, ~320,000 giant steps), which
+         * --ecm-b1 400000 (B2 clamped to 10^7; ~320,000 giant steps when D was
+         * 30, ~47,600 at 210, and ~620,000 primes either way), which
          * reproducibly kills the stage-2 kernel on gfx1103 and is why
          * cofcheck.sh skips that case on HIP.
          *
@@ -2004,16 +2010,16 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
          * derived default and well below the one value known to fail, and it
          * warns rather than refuses because a fast card runs these settings
          * perfectly well. Do not restate it as a supported limit. */
-        if (Q->s2nv > COF_S2NV_WATCHDOG_WARN)
-            fprintf(stderr, "  cofactor queue: WARNING: %u giant steps/curve x"
-                    " %u curves is far above the derived default (~194-500"
-                    " steps at B1 200-500). --cof-chunk bounds a launch by"
+        if (Q->s2nv && ecm_b2 > COF_S2_B2_WATCHDOG_WARN)
+            fprintf(stderr, "  cofactor queue: WARNING: B2 %u (%u giant steps)"
+                    " x %u curves is far above the derived default (B2"
+                    " 6,000-15,000 at B1 200-500). --cof-chunk bounds a launch by"
                     " RECORDS and cannot go below one record, so this much"
                     " stage-2 work per record can still exceed a slow device's"
                     " GPU watchdog and be killed mid-launch"
                     " (cudaErrorLaunchTimeout, or \"unspecified launch"
                     " failure\" on AMD). Lower --ecm-b2 if tasks fail that"
-                    " way.\n", Q->s2nv, ecm_curves);
+                    " way.\n", ecm_b2, Q->s2nv, ecm_curves);
     }
     {
         static const char *nm[2] = { "rho", "ECM" };
