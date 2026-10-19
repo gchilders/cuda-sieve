@@ -126,6 +126,17 @@ read as the job file's lambda flowing through into the bound. It does not; see
 "Lambda: we ignore it, on purpose" below. The `reported only` suffix is what
 the binary actually prints, and it is there to stop exactly that misreading.
 
+**The file's `n:` is checked against its polynomials on load.** The two
+polynomials must share a root modulo n: with m = −Y0/Y1, f(m) ≡ 0 (mod n).
+A file that pairs one job's algebraic polynomial with another job's rational
+one, or carries the wrong n, sieves normally, and every relation verifies,
+against polynomials that cannot factor n. Nothing downstream notices until the
+linear algebra yields only trivial dependencies. So `bench`, `fbgen`,
+`fbgen_gpu` and `normscan` refuse such a file at startup with "the two
+polynomials have no common root mod n" and exit before anything is generated
+or written. A file with no `n:` line loads with a warning that it cannot be
+checked.
+
 Anything you state explicitly wins over the file; anything the file carries
 wins over the derivation. A CADO `.poly` carries none of these keys, so there
 you either state them or let them derive.
@@ -208,6 +219,44 @@ caveat for such comparisons: a slab that overflows its buckets is skipped, and
 level 2 writes a third fewer records, so if a level-0 run reports skipped
 slabs the two outputs can differ legitimately. Per-side survivor counts also
 differ between levels by design; only the relations are identical.
+
+**The fill defaults (2026-10-13) are output-identical too; leave them on.**
+`--fill-rows 4` (at logI <= 15, and at logI 16 on a card with at least 64
+SMs) fills the bucketed primes below `4I` row by row in bands, and `--resieve-rows` (at logI <= 13) resieves them the same
+way. `--fill-gate` (everywhere except under `--fill-concurrent`) stores side
+0's fill records only where side 1 has a survivor. Together they took the
+C143 first band from 91.5 to 68.0 s at I13 and from 77.0 to 68.9 s at I14,
+with c183 -6.4% and C194 -5.5% of wall (`bench/RESULTS.md` finding 107).
+At logI 16 the tier pays only on a wide card: the tail it removes is one
+thread's walk, the same time on any card, while the rest of the fill
+finishes sooner with more SMs. Neutral on a 48-SM RTX 5070; on a 128-SM RTX
+4090, 2,1147+ went from 153.5 to 139.5 ms/q (-9.1%).
+`--fill-rows 0 --no-fill-gate` restores the old fill, for A/B timing and
+comparison with older logs. Every run log names the settings on its
+`# fill` line. The same overflow caveat applies: a slab that overflows
+ungated can fit gated. `bench/fillcheck.sh` is the identity gate; it needs a
+card.
+
+**Two special-q in flight (`--q-pipeline`, default on) is output-identical
+as well.** The next q is sieved on its own stream while this one is
+trial-divided: C143 first band 68.0 -> 59.2 s at I13 and 68.9 -> 61.9 s at
+I14, c183 -8.1% (`bench/RESULTS.md` finding 108). It costs a second copy of
+the transform output, not a second bucket array: 0.05 GB at C143, 0.26 GB
+at c183. On a slabbed plan (C194 and larger) each slab's sieve also runs
+under the previous slab's trial division (finding 109); that adds a third
+walk-cursor buffer, 0.66 GB in all at C194 and 0.81 GB for an lpba-34 I16
+job, and gains only 2.6% at C194 and 4.2% on that job, because those jobs
+already keep the card 92-94% busy. It **stays single-queued, and says so on the banner and in the run
+log's `# q-pipeline` line**, when its extra does not fit in free VRAM after
+setup. `--no-q-pipeline`
+turns it off; `--fill-concurrent` and `--qspan` exclude it. The per-stage
+times in the band report then include sharing the card with the other q; only
+wall clock per q is additive, and `unaccounted` and GPU-accounted / wall
+(`acc/wall` in the run log) print as `n/a`. If you need that ratio to diagnose
+a starved host, compare a `--no-q-pipeline` band. **Under WSL2 "free VRAM" is whatever the
+Windows driver reports:** it evicts other processes' idle allocations, and
+over-allocation pages to system memory rather than failing, so a card that
+is short of memory there gets slower rather than refusing.
 
 The remaining representation limits are:
 
@@ -722,7 +771,14 @@ geometry difference is the bucket array.
 
 **`--fill-concurrent` needs the bucket array TWICE.** The two sides share one
 allocation *because* they sieve back to back; the flag overlaps them on two
-streams, and a second array is its entire cost. Size it as `2 x bucket + the
+streams, and a second array is its entire cost. **It also turns off the fill
+gate**, which needs side 1 finished before side 0's fill (finding 107); an
+explicit `--fill-gate` with it is refused, and it excludes the two-q
+pipeline. Measured on the 5070 at C143 (finding 108): the flag was 1-2%
+faster than the gate alone (9.08 against 9.26 ms/q at I13), but the default,
+with two q in flight, is 7.46. Leave it off on this card at that size.
+Slabbed jobs (C194 and larger), which are pipelined too now (finding 109),
+and wider cards are not measured (`bench/STATUS.md`, NOW/NEXT row 16). Size it as `2 x bucket + the
 rest`, and note that the bullet above — "the bucket array is sized by the larger
 side, so raising the smaller side's lim is nearly free" — **stops holding under
 the flag**: both sides carry a full-size array. The run refuses at startup with
@@ -1179,6 +1235,95 @@ allowance, and a job fingerprint.
   because every one of them changes which relations a run emits while leaving
   each individual line verifiable.
 
+### Several pipelines on one GPU: `--instances`
+
+```sh
+bench --pipeline --cofactor ... --qrange 300000000:300008000 \
+      --relations NAME            # --instances auto is the default
+```
+
+`--instances N` (1–4) splits a **bounded** `--qrange` into N equal q ranges
+and sieves them concurrently, each on its own host thread. One pipeline leaves
+the GPU partly idle between kernels and between special-q; a second fills
+those gaps. Measured on an RTX 4090 with the relation files on local disk:
+
+| job | one | two |
+|---|---|---|
+| c187 GNFS, logI 15, alim 180M, 540 q (default slab either way) | 33.8 s | 30.1 s (−11%) |
+| 2,1147+ SNFS, logI 16, 420 q (2^31 slab alone, 2^30 each as two) | 108.2 s | 110.0 s (+1.6%) |
+
+Relations are byte-identical in every case. Three instances were slower than
+two. A second instance pays only when it does not cost the slab size: on
+2,1147+ the smaller slab eats the whole gain, so `auto` keeps one there.
+(Earlier figures of −7% and −21% were taken with the relation files on a
+network filesystem, where each checkpoint's fsync stalled the q loop and a
+second instance hid that stall. The flush thread now writes the checkpoint
+itself, so neither pays it.)
+
+- **`auto` is the default.** It picks two when all three hold, and one
+  otherwise:
+  - two modelled footprints plus the headroom fit free VRAM;
+  - each instance still gets the slab size one would get alone;
+  - the band holds at least 256 expected special-q (`PIPE_INST_AUTO_MIN_Q`).
+
+  A second instance costs its own setup, so a short band loses. Measured on
+  c187 (RTX 4090), whole process, one against two:
+
+  | special-q | one | two |
+  |---|---|---|
+  | 65 | 7.24 s | 7.55 s |
+  | 109 | 8.77 s | 8.69 s |
+  | 281 | 14.83 s | 14.13 s |
+  | 570 | 24.95 s | 23.12 s |
+
+  On c187 it picks two on cards from about 12 GB up, and one at 8 GB and 4 GB.
+  On 2,1147+ it picks one everywhere, because two would cost slab size. The
+  model runs ~0.6 GB per instance high on the c187, so on an 8 GB card `auto`
+  says one where two would have fit; an explicit `--instances 2` runs there
+  with a warning. `--instances 1` restores the single pipeline.
+- **A band is never split into more shares than it has q values;** an
+  explicit N larger than that is lowered and said so.
+- **Output is the same file.** Instance k writes `NAME.inst<k>` with its own
+  `.part`, checkpoint and BOINC recovery counter: everything in "Stopping and
+  resuming" applies to each one unchanged. When all of them have committed,
+  they are concatenated into `NAME` in q order. That is the file one pipeline
+  writes, and `make instcheck` holds it to that byte for byte.
+- **`NAME.instances`** is written when the band starts and records N, the
+  band and the job fingerprint. A relaunch always resumes with that N,
+  whatever `--instances` says. A different `--qrange` or job is refused;
+  `--restart` discards the manifest with every instance's files. A
+  one-pipeline `NAME.part` already under way resumes as one pipeline.
+- **Stops and failures** are shared. One `^C`/`SIGTERM` or `--stop-file`
+  drains and checkpoints every instance. An instance that fails or hits a
+  policy stop (exit 3 or 5) stops the others at their next special-q, and
+  the band exits with the worst status. Each instance has its own watchdog
+  slot, so one instance's progress cannot hide another's stall. Progress lines
+  are tagged `[k]`, run-log records `instK`, and the BOINC fraction is the
+  instances' mean.
+- **VRAM:** the slab target is chosen so that N footprints plus one headroom
+  fit; the footprint includes `--q-pipeline`'s second transform set. Setup
+  runs one instance at a time. Each optional extra (the second bucket array,
+  then the q-pipeline set) is admitted only if the instances not yet set up
+  still have their modelled footprint left. An extra that is refused leaves
+  that instance slower, never failed, and the banner says which extras it got.
+- **Not split:** `--target-rels`, `--nq`, `--qlist` and `--candidates` bands
+  run one pipeline and say so. An open band has no end to divide.
+- **Under BOINC** the default applies too, and it was tested under a real
+  client: the current BOINC client source, built with its `app_test`
+  framework, on a 4090 pod (2026-10-17). c187 over 2,300 q ran as two
+  instances. These all ended with relations byte-identical to a non-BOINC run:
+  - a task suspend, where the client removes a GPU task from memory;
+  - an in-memory suspend from a forced CPU benchmark run (`suspend_all` with
+    `REMOVE_NEVER`, as "suspend when non-BOINC CPU usage is above X%" does);
+  - a client quit and restart mid-band.
+
+  The BOINC runtime pauses only the thread that called `boinc_init`:
+  `SuspendThread` on Windows, a `SIGALRM` handler on Unix. Under `--instances`
+  that thread is parked in a join, so each instance pauses itself at its next
+  special-q while the task is suspended. On Linux the instance threads happen
+  to catch the same process-wide `SIGALRM` and pause either way; the Windows
+  path is the one the self-pause exists for, and it is untested here.
+
 ### Logging an unattended run
 
 ```sh
@@ -1457,6 +1602,79 @@ findings 48–53):
 The pipeline prints the same three stages under `sieve, both sides`, which is
 the honest source for transform: there it runs once per q against a warm
 context, the way production does.
+
+### Sharing CPUs with other tasks
+
+Low sustained CPU use is an NFS@Home deployment objective. Measure aggregate
+process user+system CPU seconds divided by elapsed seconds, including CUDA
+helper threads, alongside relation rate and the throughput of competing
+tasks. `gpu=` and `acc/wall` help identify changing host conditions but do not
+measure CPU consumption or attribute a slowdown.
+
+**Current limitation of `--blocking-sync` (reviewed 2026-10-12):** it sets
+the device scheduling policy, but pipeline events are created without
+`cudaEventBlockingSync`, so their `cudaEventSynchronize` waits remain busy
+waits under the documented CUDA API semantics. Do not assume the option
+makes the whole process sleep while the GPU runs. Completing that policy,
+then reducing host readbacks and testing graphs/a bounded work queue, is
+proposed in [STATUS item 4](bench/STATUS.md#low-cpu-plan) and
+[finding 106](bench/RESULTS.md#finding-106). No new default or measured CPU
+reduction has shipped.
+
+Avoid oversubscribing the host. The project's existing affinity, nice and
+real-time-priority experiments did not improve measured sieve throughput;
+reserving a logical CPU also does not isolate a physical core from its SMT
+sibling. Compare on the actual deployment workload. The
+[C143 comparison](bench/RESULTS.md#finding-105) records both substantial CPU
+contention and an unresolved discrepancy between internal elapsed time and
+external timing, so keep clock sources explicit when interpreting rates.
+
+## Building the NFS@Home BOINC binary
+
+The release binary is built on `nvidia/cuda:12.8.1-devel-rockylinux8`. Rocky 8
+fixes the glibc floor at 2.28, and CUDA 12.8 is the last toolkit that still
+emits sm_50–sm_70, which `GPU_ARCH=full` needs. `/scratch` is ephemeral
+storage:
+
+```sh
+cd /scratch
+
+yum install -y git autoconf automake libtool pkgconfig m4 nano dnf-plugins-core which
+
+yum config-manager --set-enabled powertools
+yum install -y libstdc++-static
+
+git clone https://github.com/BOINC/boinc.git
+cd boinc
+./_autosetup
+
+./configure --disable-server --disable-client --disable-manager
+make
+
+cd ..
+git clone https://github.com/gchilders/cuda-sieve.git
+cd cuda-sieve
+
+make -C bench bench HAVE_BOINC=1 GPU_ARCH=full \
+    BOINC_CPPFLAGS="-I/scratch/boinc/api -I/scratch/boinc/lib" \
+    BOINC_LIBS="-L/scratch/boinc/api -L/scratch/boinc/lib -lboinc_api -lboinc -lpthread"
+
+cp bench/bench ../cudasieve
+```
+
+- **`which` is required.** BOINC's `_autosetup` calls it, and the CUDA image
+  does not ship it, so without it `_autosetup` exits 127. `configure` and
+  `make` then fail, and the cuda-sieve build has no `libboinc` to link.
+- **Check the result before signing:** `ldd cudasieve` should list only
+  libpthread, libdl, librt, libm and libc. The newest `GLIBC_` symbol in
+  `objdump -T` should be at most 2.28, with no `GLIBCXX`/`CXXABI` symbols.
+  `cuobjdump --list-elf` should show sm_50 through sm_120.
+- **Sign on the machine that holds the key,** never on the build host:
+  `crypt_prog -sign cudasieve <private key> > cudasieve.sig`.
+- **The BOINC runtime redirects stderr to `stderr.txt`** in the working
+  directory, even standalone. Tests that grep the binary's stderr from a pipe
+  (three cases in `cofcheck.sh`) therefore miss when run against this binary.
+  The messages are in that file.
 
 ## Checking the output
 

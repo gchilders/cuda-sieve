@@ -1,0 +1,355 @@
+diff --git a/bench/cofac.cuh b/bench/cofac.cuh
+index d59dcef..5508d21 100644
+--- a/bench/cofac.cuh
++++ b/bench/cofac.cuh
+@@ -546,14 +546,150 @@ static uint8_t *cf_ecm_sieve(uint32_t limit)
+     return composite;
+ }
+ 
+-/* The stage-1 exponent lcm(1..B1), held as its prime powers rather than as one
+- * big integer: each is at most B1, so the ladder for it is a dozen bits and the
+- * whole schedule is an array of uint32 instead of a 1.4*B1-bit number the device
+- * would have to store and shift. Returns the count. */
+-static uint32_t cf_ecm_plan(uint32_t b1, uint32_t **out)
++/* ---- stage 1 by PRAC chains ------------------------------------------- *
++ *
++ * Montgomery's PRAC (as in GMP-ECM's prac()) reaches [k]P with differential
++ * additions along a Lucas chain chosen by a golden-ratio heuristic: about 26%
++ * fewer multiplies than the ladder at B1 200..1000 (x_add and x_dbl are 6
++ * multiplies each here, the ladder 12 per bit). The chain is decided by
++ * integer arithmetic on (d, e) alone, the same in every lane, so it costs no
++ * divergence.
++ *
++ * The host picks the starting r = round(k*v) for each prime and PROVES the
++ * chain before the device ever runs it: cf_prac_valid replays x_prac's rules
++ * on integer multiples of P and requires every differential addition to have
++ * the right difference and two distinct summands, and the chain to end at k.
++ * Not every (k, v) passes -- 29 of the 78,497 primes below 10^6 fail at the
++ * best v -- so the other multipliers are tried in cost order, and a prime
++ * with no valid chain goes back to the ladder (r = 0). */
++#define CF_PRAC_NV 10
++static const double cf_prac_val[CF_PRAC_NV] = {
++    0.61803398874989485, 0.72360679774997897, 0.58017872829546410,
++    0.63283980608870629, 0.61242994950949500, 0.62018198080741576,
++    0.62200947008102768, 0.62437875525230826, 0.62580369531942009,
++    0.61993972057189085 };
++
++/* Multiplies to reach [k]P from r = round(k*v), as x_prac would spend them. */
++static uint32_t cf_lucas_cost(uint32_t k, double v)
++{
++    uint32_t d, e, c, r = (uint32_t)((double)k * v + 0.5);
++    if (r >= k || 2 * r < k) return 0xffffffffu;
++    d = k - r; e = 2 * r - k; c = 12;          /* first x_dbl, last x_add */
++    while (d != e) {
++        if (d < e) { uint32_t x = d; d = e; e = x; }
++        if (d - e <= e / 4 && (d + e) % 3 == 0) { d = (2 * d - e) / 3; e = (e - d) / 2; c += 18; }
++        else if (d - e <= e / 4 && (d - e) % 6 == 0) { d = (d - e) / 2; c += 12; }
++        else if ((d + 3) / 4 <= e) { d -= e; c += 6; }
++        else if ((d + e) % 2 == 0) { d = (d - e) / 2; c += 12; }
++        else if (d % 2 == 0) { d /= 2; c += 12; }
++        else if (d % 3 == 0) { d = d / 3 - e; c += 24; }
++        else if ((d + e) % 3 == 0) { d = (d - 2 * e) / 3; c += 24; }
++        else if ((d - e) % 3 == 0) { d = (d - e) / 3; c += 24; }
++        else { if (e & 1u) return 0xffffffffu; e /= 2; c += 12; }
++        if (c > 64u * 32u) return 0xffffffffu;    /* runaway: not a chain */
++    }
++    return c;
++}
++
++/* x_prac's rules on integer multiples: A, B, C, T, T2 stand for [a]P etc. */
++static int cf_prac_add(uint64_t *out, uint64_t x, uint64_t y, uint64_t dif)
++{
++    if (x == y || !dif || dif != (x > y ? x - y : y - x)) return 0;
++    *out = x + y;
++    return 1;
++}
++static int cf_prac_valid(uint32_t k, uint32_t r)
++{
++    uint64_t A, B, C, T, T2, x;
++    uint32_t d, e, steps = 0;
++    if (r >= k || 2 * r < k) return 0;
++    d = k - r; e = 2 * r - k;
++    B = C = 1; A = 2;
++    while (d != e) {
++        if (++steps > 4096) return 0;
++        if (d < e) { uint32_t y = d; d = e; e = y; x = A; A = B; B = x; }
++        if (d - e <= e / 4 && (d + e) % 3 == 0) {
++            d = (2 * d - e) / 3; e = (e - d) / 2;
++            if (!cf_prac_add(&T, A, B, C) || !cf_prac_add(&T2, T, A, B) ||
++                !cf_prac_add(&x, B, T, A)) return 0;
++            B = x; A = T2;
++        } else if (d - e <= e / 4 && (d - e) % 6 == 0) {
++            d = (d - e) / 2;
++            if (!cf_prac_add(&x, A, B, C)) return 0;
++            B = x; A *= 2;
++        } else if ((d + 3) / 4 <= e) {
++            d -= e;
++            if (!cf_prac_add(&T, B, A, C)) return 0;
++            C = B; B = T;
++        } else if ((d + e) % 2 == 0) {
++            d = (d - e) / 2;
++            if (!cf_prac_add(&x, B, A, C)) return 0;
++            B = x; A *= 2;
++        } else if (d % 2 == 0) {
++            d /= 2;
++            if (!cf_prac_add(&x, C, A, B)) return 0;
++            C = x; A *= 2;
++        } else if (d % 3 == 0) {
++            d = d / 3 - e;
++            T = 2 * A;
++            if (!cf_prac_add(&T2, A, B, C) || !cf_prac_add(&x, T, A, A)) return 0;
++            A = x;
++            if (!cf_prac_add(&x, T, T2, C)) return 0;
++            C = B; B = x;
++        } else if ((d + e) % 3 == 0) {
++            d = (d - 2 * e) / 3;
++            if (!cf_prac_add(&T, A, B, C) || !cf_prac_add(&x, T, A, B)) return 0;
++            B = x; T = 2 * A;
++            if (!cf_prac_add(&x, A, T, A)) return 0;
++            A = x;
++        } else if ((d - e) % 3 == 0) {
++            d = (d - e) / 3;
++            if (!cf_prac_add(&T, A, B, C) || !cf_prac_add(&x, C, A, B)) return 0;
++            C = x; B = T; T = 2 * A;
++            if (!cf_prac_add(&x, A, T, A)) return 0;
++            A = x;
++        } else {
++            if (e & 1u) return 0;
++            e /= 2;
++            if (!cf_prac_add(&x, C, B, A)) return 0;
++            C = x; B *= 2;
++        }
++    }
++    return cf_prac_add(&x, A, B, C) && x == k;
++}
++
++/* The r for x_prac(k), or 0 for the ladder: the cheapest multiplier whose
++ * chain cf_prac_valid proves, provided it beats the ladder. */
++static uint32_t cf_prac_r(uint32_t k)
+ {
+-    uint32_t n = 0, cap = 0, *s = NULL;
++    uint32_t cost[CF_PRAC_NV], ladder = 0, best = 0;
++    int used[CF_PRAC_NV] = {0};
++    for (uint32_t b = k; b > 1; b >>= 1) ladder += 12;
++    if (k < 3) return 0;
++    for (int i = 0; i < CF_PRAC_NV; i++) cost[i] = cf_lucas_cost(k, cf_prac_val[i]);
++    for (int pass = 0; pass < CF_PRAC_NV; pass++) {
++        int bi = -1;
++        for (int i = 0; i < CF_PRAC_NV; i++)
++            if (!used[i] && (bi < 0 || cost[i] < cost[bi])) bi = i;
++        used[bi] = 1;
++        if (cost[bi] == 0xffffffffu || cost[bi] >= ladder) break;
++        best = (uint32_t)((double)k * cf_prac_val[bi] + 0.5);
++        if (cf_prac_valid(k, best)) return best;
++    }
++    return 0;
++}
++
++/* The stage-1 exponent lcm(1..B1), as a schedule of (k, r) pairs rather than
++ * one big integer: x_prac(k) from r, or with r = 0 the ladder on k. An odd
++ * prime with a proven chain appears once per power of it that fits under B1;
++ * 2 and any prime without one appear once, as the whole power p^e <= B1. The
++ * array holds 2 words per pair; returns the word count, and the number of
++ * prime powers through *npp. */
++static uint32_t cf_ecm_plan(uint32_t b1, uint32_t **out, uint32_t *npp)
++{
++    uint32_t n = 0, cap = 0, *s = NULL, nprime = 0;
+     uint8_t *sieve;
++    if (npp) *npp = 0;
+     if (b1 < 2 || b1 > CF_ECM_MAX_B1) { *out = NULL; return 0; }
+     sieve = cf_ecm_sieve(b1);
+     if (!sieve) { *out = NULL; return 0; }
+@@ -561,18 +697,25 @@ static uint32_t cf_ecm_plan(uint32_t b1, uint32_t **out)
+         if (sieve[p]) continue;
+         {   /* the largest power of p that still fits under B1 */
+             uint64_t pe = p;
+-            while (pe * p <= b1) pe *= p;
+-            if (n == cap) {
+-                uint32_t *grown;
+-                cap = cap ? cap * 2 : 256;
+-                grown = (uint32_t *)realloc(s, (size_t)cap * sizeof(*s));
+-                if (!grown) { free(s); free(sieve); *out = NULL; return 0; }
+-                s = grown;
++            uint32_t ex = 1;
++            const uint32_t r = p > 2 ? cf_prac_r(p) : 0;
++            while (pe * p <= b1) { pe *= p; ex++; }
++            nprime++;
++            for (uint32_t i = 0; i < (r ? ex : 1u); i++) {
++                if (n + 2 > cap) {
++                    uint32_t *grown;
++                    cap = cap ? cap * 2 : 512;
++                    grown = (uint32_t *)realloc(s, (size_t)cap * sizeof(*s));
++                    if (!grown) { free(s); free(sieve); *out = NULL; return 0; }
++                    s = grown;
++                }
++                s[n++] = r ? p : (uint32_t)pe;
++                s[n++] = r;
+             }
+-            s[n++] = (uint32_t)pe;
+         }
+     }
+     free(sieve);
++    if (npp) *npp = nprime;
+     *out = s;
+     return n;
+ }
+@@ -712,6 +855,73 @@ CF_NOINLINE void x_mul_s2(mpt<L> *p, uint32_t k, const mz<L> *an,
+     x_mul<L>(p, k, an, ad, n, n0inv, work);
+ }
+ 
++/* P = [k]P along the PRAC chain from r (see cf_prac_r, which proved it on
++ * the host). Rule for rule the same as cf_prac_valid, with the multiples
++ * replaced by points; x_add's output never aliases an input, hence the
++ * temporaries. */
++template <int L>
++CF_FN void x_prac(mpt<L> *P, uint32_t k, uint32_t r, const mz<L> *an,
++                  const mz<L> *ad, const mz<L> *n, uint32_t n0inv,
++                  uint64_t *work)
++{
++    mpt<L> A, B, C, T, T2, x;
++    uint32_t d = k - r, e = 2 * r - k;
++    B = *P; C = *P;
++    x_dbl<L>(&A, P, an, ad, n, n0inv);
++    while (d != e) {
++        if (d < e) { const uint32_t y = d; d = e; e = y; x = A; A = B; B = x; }
++        if (d - e <= e / 4 && (d + e) % 3 == 0) {
++            d = (2 * d - e) / 3; e = (e - d) / 2;
++            x_add<L>(&T, &A, &B, &C, n, n0inv);
++            x_add<L>(&T2, &T, &A, &B, n, n0inv);
++            x_add<L>(&x, &B, &T, &A, n, n0inv);
++            B = x; A = T2;
++        } else if (d - e <= e / 4 && (d - e) % 6 == 0) {
++            d = (d - e) / 2;
++            x_add<L>(&x, &A, &B, &C, n, n0inv); B = x;
++            x_dbl<L>(&x, &A, an, ad, n, n0inv); A = x;
++        } else if ((d + 3) / 4 <= e) {
++            d -= e;
++            x_add<L>(&T, &B, &A, &C, n, n0inv);
++            C = B; B = T;
++        } else if ((d + e) % 2 == 0) {
++            d = (d - e) / 2;
++            x_add<L>(&x, &B, &A, &C, n, n0inv); B = x;
++            x_dbl<L>(&x, &A, an, ad, n, n0inv); A = x;
++        } else if (d % 2 == 0) {
++            d /= 2;
++            x_add<L>(&x, &C, &A, &B, n, n0inv); C = x;
++            x_dbl<L>(&x, &A, an, ad, n, n0inv); A = x;
++        } else if (d % 3 == 0) {
++            d = d / 3 - e;
++            x_dbl<L>(&T, &A, an, ad, n, n0inv);
++            x_add<L>(&T2, &A, &B, &C, n, n0inv);
++            x_add<L>(&x, &T, &A, &A, n, n0inv); A = x;
++            x_add<L>(&x, &T, &T2, &C, n, n0inv);
++            C = B; B = x;
++        } else if ((d + e) % 3 == 0) {
++            d = (d - 2 * e) / 3;
++            x_add<L>(&T, &A, &B, &C, n, n0inv);
++            x_add<L>(&x, &T, &A, &B, n, n0inv); B = x;
++            x_dbl<L>(&T, &A, an, ad, n, n0inv);
++            x_add<L>(&x, &A, &T, &A, n, n0inv); A = x;
++        } else if ((d - e) % 3 == 0) {
++            d = (d - e) / 3;
++            x_add<L>(&T, &A, &B, &C, n, n0inv);
++            x_add<L>(&x, &C, &A, &B, n, n0inv); C = x;
++            B = T;
++            x_dbl<L>(&T, &A, an, ad, n, n0inv);
++            x_add<L>(&x, &A, &T, &A, n, n0inv); A = x;
++        } else {
++            e /= 2;
++            x_add<L>(&x, &C, &B, &A, n, n0inv); C = x;
++            x_dbl<L>(&x, &B, an, ad, n, n0inv); B = x;
++        }
++        (*work)++;
++    }
++    x_add<L>(P, &A, &B, &C, n, n0inv);
++}
++
+ /* One pass over the baby-step/giant-step continuation (D = CF_ECM_D). All selected
+  * cross-products are accumulated and normally only one gcd is paid. If hits
+  * for different prime factors make that gcd equal n, replay the same curve and
+@@ -880,7 +1090,7 @@ CF_NOINLINE int mz_ecm_stage2_pass(mz<L> *fac, const mpt<L> *Q,
+     return 0;
+ }
+ 
+-/* One curve of stage 1. `s` holds the prime powers p^e <= B1, ascending.
++/* One curve of stage 1. `s` holds cf_ecm_plan's (k, r) pairs, ns words.
+  * Returns 1 and a nontrivial factor when gcd(Z, n) splits n. */
+ template <int L, int STAGE2>
+ CF_FN int mz_ecm(mz<L> *fac, const mz<L> *n, uint32_t sigma,
+@@ -922,8 +1132,11 @@ CF_FN int mz_ecm(mz<L> *fac, const mz<L> *n, uint32_t sigma,
+     mz_mul<L>(&ad, &w, &v, n, n0inv);                             /* *v       */
+     if (mz_is_zero<L>(&ad)) return 0;
+ 
+-    for (uint32_t i = 0; i < ns; i++)
+-        x_mul<L>(&P, s[i], &an, &ad, n, n0inv, work);
++    for (uint32_t i = 0; i + 1 < ns; i += 2) {
++        const uint32_t k = s[i], r = s[i + 1];
++        if (r) x_prac<L>(&P, k, r, &an, &ad, n, n0inv, work);
++        else   x_mul<L>(&P, k, &an, &ad, n, n0inv, work);
++    }
+ 
+     mz_gcd<L>(&g, P.Z, *n);
+     if (mz_is_one<L>(&g)) {
+@@ -1126,7 +1339,7 @@ typedef struct {
+     int      rounds;
+     uint32_t budget;        /* rho iterations in round 0; doubles each round */
+     uint32_t curves;        /* ECM curves attempted per round                */
+-    const uint32_t *d_s;    /* ECM stage-1 prime powers, on device           */
++    const uint32_t *d_s;    /* ECM stage-1 (k, r) pairs, on device: ns words */
+     uint32_t ns;
+     const cf_s2mask_t *d_s2mask;/* stage-2 prime-pair mask per giant step  */
+     uint32_t s2vmin, s2nv;
+@@ -1902,7 +2115,7 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
+                      uint32_t ecm_curves, int limbs0, int limbs1)
+ {
+     const uint32_t nb = (cap + TD_SCAN_BLK - 1) / TD_SCAN_BLK;
+-    uint32_t *h_s = NULL;
++    uint32_t *h_s = NULL, npp = 0;
+     cf_s2mask_t *h_s2mask = NULL;
+     int rc = -1;
+ 
+@@ -1928,7 +2141,7 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
+            " (%d bits); this build carries %d..%d\n",
+            Q->L0, 32 * Q->L0, Q->L1, 32 * Q->L1, CF_LMIN, CF_LMAX);
+     if (meth0 || meth1) {          /* one plan serves whichever sides use ECM */
+-        Q->ns = cf_ecm_plan(ecm_b1, &h_s);
++        Q->ns = cf_ecm_plan(ecm_b1, &h_s, &npp);
+         if (!Q->ns) {
+             fprintf(stderr, "  cofac queue: empty ECM plan for B1=%u\n", ecm_b1);
+             goto done;
+@@ -1952,7 +2165,7 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
+             free(h_s2mask); h_s2mask = NULL;
+         }
+         if (!g_cofq_quiet) printf("  cofactor queue: ECM B1 = %u, %u prime powers, B2 = %u"
+-               " (%u giant steps), %u curves per round\n", ecm_b1, Q->ns,
++               " (%u giant steps), %u curves per round\n", ecm_b1, npp,
+                ecm_b2, Q->s2nv, ecm_curves);
+         /* The one thing --cof-chunk cannot bound.
+          *
+@@ -3164,7 +3377,7 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
+                          uint32_t chunk)
+ {
+     FILE *f = fopen(path, "rb");
+-    uint32_t *h_s = NULL, *d_s = NULL, ns = 0;
++    uint32_t *h_s = NULL, *d_s = NULL, ns = 0, npp = 0;
+     cf_s2mask_t *h_s2mask = NULL, *d_s2mask = NULL;
+     uint32_t s2vmin = 0, s2nv = 0;
+     cf_sched_t sched;
+@@ -3286,7 +3499,7 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
+     st0 = (uint8_t *)malloc(n0 ? n0 : 1); nf0 = (uint8_t *)calloc(n0 ? n0 : 1, 1);
+     fac0 = (uint64_t *)malloc((size_t)(n0 ? n0 : 1) * CF_MAXFAC * 8);
+     if (meth0 || meth1) {
+-        ns = cf_ecm_plan(ecm_b1, &h_s);
++        ns = cf_ecm_plan(ecm_b1, &h_s, &npp);
+         if (!ns) { fprintf(stderr, "  cofac: empty ECM plan for B1=%u\n", ecm_b1); return -1; }
+         CK(cudaMalloc(&d_s, (size_t)ns * 4));
+         CK(cudaMemcpy(d_s, h_s, (size_t)ns * 4, cudaMemcpyHostToDevice));
+@@ -3308,7 +3521,7 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
+             free(h_s2mask);
+         }
+         printf("  ECM: B1 = %u, %u prime powers, B2 = %u (%u giant steps),"
+-               " %u curves per round, %d rounds\n", ecm_b1, ns, ecm_b2,
++               " %u curves per round, %d rounds\n", ecm_b1, npp, ecm_b2,
+                s2nv, ecm_curves, rounds);
+     }
+     sched.method = meth0; sched.rounds = rounds; sched.budget = budget;

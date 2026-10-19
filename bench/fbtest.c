@@ -557,10 +557,10 @@ static int poly_parse_case(const char *text, int want_ok, poly_t *out)
 static int verify_poly_parser_strict(void)
 {
     static const char good[] =
-        "n: 12345678901234567890\n"
+        "n: 12345678901234567890\n"     /* divides c0: the root is m = 0 */
         "cost: 2.7e18\n"
         "skew: 1.5\n"
-        "c0: -1\n"
+        "c0: -12345678901234567890\n"
         "c1: 2\n"
         "Y0: 0\n"
         "Y1: 1\n"
@@ -577,7 +577,13 @@ static int verify_poly_parser_strict(void)
         "skew:1\nc0:-1\nc1:2\nc1:3\nY0:0\nY1:1\n",      /* duplicate */
         "skew:1\nc0:-1\nc1:2\nY0:0\nY1:1\nrlim:4294967296\n",
         "skew:1x\nc0:-1\nc1:2\nY0:0\nY1:1\n",
-        "skew:1\rjunk\nc0:-1\nc1:2\nY0:0\nY1:1\n"
+        "skew:1\rjunk\nc0:-1\nc1:2\nY0:0\nY1:1\n",
+        "n:12345\nskew:1\nc0:-1\nc1:2\nY0:0\nY1:1\n",      /* n not a common root */
+        "n:12x45\nskew:1\nc0:-12345\nc1:2\nY0:0\nY1:1\n",  /* n not an integer */
+        "n:7\nskew:1\nc0:-7\nc1:2\nY0:0\nY1:1\n",          /* n too small to mean anything */
+        "n:5\nn:5\nskew:1\nc0:-5\nc1:2\nY0:0\nY1:1\n",    /* duplicate n */
+        "N:12345\nskew:1\nc0:-1\nc1:2\nY0:0\nY1:1\n",      /* N: is checked too */
+        "n:5\nN:5\nskew:1\nc0:-5\nc1:2\nY0:0\nY1:1\n"     /* n: and N: are one field */
     };
     /* Unicode pasted from a web page must be named, not blamed on the
      * value's syntax. The field-name cases loaded before, silently dropping
@@ -600,11 +606,17 @@ static int verify_poly_parser_strict(void)
           ":2: non-comment line has no ':' separator" },
         { "skew:1\nc0:-1\nc123456789012345678:2\nY0:0\nY1:1\n",
           ":3: coefficient index overflow" },
+        /* The NFS@Home failure: one job's polynomials, another's n. */
+        { "n:12345\nskew:1\nc0:-1\nc1:2\nY0:0\nY1:1\n",
+          "the two polynomials have no common root mod n" },
     };
     /* A Notepad byte-order mark, a zero-padded coefficient name longer than
      * any field name, and non-ASCII inside a comment all still load. */
     static const char *good_deg1[] = {
-        "\xEF\xBB\xBFn: 12345\nskew:1\nc0:-1\nc1:2\nY0:0\nY1:1\n",
+        "\xEF\xBB\xBFn: 12345\nskew:1\nc0:-12345\nc1:2\nY0:0\nY1:1\n",
+        /* A root other than 0: G = x - 13 and f = 2x - 1, f(13) = 25. */
+        "n: 25\nskew:1\nc0:-1\nc1:2\nY0:-13\nY1:1\n",
+        "N: 25\nskew:1\nc0:-1\nc1:2\nY0:-13\nY1:1\n",
         "\xEF\xBB\xBFskew:1\nc0:-1\nc1:2\nY0:0\nY1:1\n",
         "skew:1\nc0:-1\nc0000000000000001:2\nY0:0\nY1:1\n",
         "skew:1 # caf\xC3\xA9\nc0:-1\nc1:2\nY0:0\nY1:1\n",

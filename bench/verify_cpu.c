@@ -600,3 +600,51 @@ uint64_t verify_count_updates(const fb_t *fb, const qlat_t *L,
                 (unsigned long long)nrow);
     return total;
 }
+
+/* --fill-rows' slab handoff (k_rows_walk_next) jumps to the next strip row
+ * with pl_rows_to_hit instead of stepping row by row. Check it against
+ * stepping, over random lattices plus the roots whose gaps run to ~q - I rows
+ * (rt = 1, q - 1, just past q/2 and q/3) and rt = 0, which has no answer once
+ * off >= I. Returns the number of cases checked, -1 on a mismatch. */
+int verify_rows_to_hit(void)
+{
+    static const int logIs[] = { 8, 11, 13 };
+    uint64_t s = 0x9e3779b97f4a7c15ull;
+    int ncase = 0;
+#define XS() (s ^= s << 13, s ^= s >> 7, s ^= s << 17, s)
+    for (unsigned li = 0; li < sizeof logIs / sizeof logIs[0]; li++) {
+        const uint32_t I = 1u << logIs[li];
+        for (int c = 0; c < 400; c++) {
+            uint32_t q = I + (uint32_t)(XS() % (63u * I));   /* [I, 64I) */
+            uint32_t rt, off, o;
+            uint64_t t = 0, want, got;
+            if (c % 50 == 0) q = 4u * I;                     /* a power of two */
+            if (c % 50 == 25) q = I;                         /* the tier floor */
+            rt = (uint32_t)(XS() % q);
+            switch (c % 10) {
+            case 1: rt = 1; break;
+            case 2: rt = q - 1; break;
+            case 3: rt = q / 2 + 1; break;
+            case 4: rt = q / 3 + 1; break;
+            case 5: rt = 0; break;
+            default: break;
+            }
+            off = (uint32_t)(XS() % q);
+            for (o = off; o >= I && t <= q; t++) {
+                o += rt;
+                if (o >= q) o -= q;
+            }
+            want = (o < I) ? t : UINT64_MAX;
+            got = pl_rows_to_hit(off, rt, q, I);
+            if (got != want) {
+                fprintf(stderr, "verify_rows_to_hit MISMATCH I=%u q=%u rt=%u"
+                        " off=%u: got %llu, stepping gives %llu\n", I, q, rt,
+                        off, (unsigned long long)got, (unsigned long long)want);
+                return -1;
+            }
+            ncase++;
+        }
+    }
+#undef XS
+    return ncase;
+}

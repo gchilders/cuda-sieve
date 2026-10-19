@@ -264,6 +264,11 @@ typedef struct {
                               /* the exact integer F(a,b), not its log. c0 is */
                               /* 147 bits on this job, so the double is only  */
                               /* good to 53 of them. See bigint.cuh.          */
+    /* The number being factored, exactly, when the file carries an n: line
+     * (CADO and GGNFS files both do). poly_load refuses a file whose two
+     * polynomials do not share a root modulo it -- see poly_check_n. */
+    char   ns[1280];
+    int    has_n;
 
     /* Sieve parameters carried by a GGNFS .job file. Zero means ABSENT, which
      * is the normal case for a CADO .poly -- the caller then falls back to a
@@ -312,6 +317,9 @@ double job_allowance_bits(double lambda, uint32_t lim);
  * algebraic norm and a factor base without p = 2 is truncated. 0 if it cannot,
  * in which case the absence of p = 2 is correct and not a missing --cadofb. */
 int poly_has_root_mod2(const poly_t *P);
+/* 0 when n is a root of both polynomials mod n (or the file has no n), -1
+ * when it is not, -2 when n itself is unusable. poly_load runs it. */
+int poly_check_n(const poly_t *P);
 
 /* Build the rational factor base: G(x) = Y1*x + Y0 has one root per prime,
  * r = -Y0/Y1 mod p, with p | Y1 encoded as r == p. Nothing on disk holds this
@@ -374,6 +382,7 @@ float norm_target_host(const norm_t *N, int32_t i, uint32_t j);
 int  verify_walk(int logI, uint32_t J, int nprimes);
 int  verify_walk_slabs(int logI, uint32_t J, uint32_t slab_J, int nprimes);
 int  verify_walk_slab_cases(void);
+int  verify_rows_to_hit(void);
 
 /* Count updates the walk produces for the given FB, single-threaded.
  * This is the ground truth the GPU fill must reproduce exactly. */
@@ -464,6 +473,11 @@ void bench_boinc_log_gpu_assignment(void);
 int  bench_boinc_resolve_path(const char *option, const char *logical_name,
                               const char **resolved_name);
 void bench_boinc_fraction_done(double fraction_done);
+/* True while the client has this task suspended. The runtime pauses only the
+ * thread that called bench_boinc_init (its SIGALRM handler sleeps on Unix,
+ * SuspendThread on Windows); a thread doing the work elsewhere -- an
+ * --instances pipeline -- must ask and pause itself. 0 outside BOINC. */
+int  bench_boinc_suspended(void);
 /* Suspend/resume fraction-done reporting. The slab auto-calibration pass runs a
  * throwaway single-q band through the same run_pipeline_impl that reports
  * progress, and a one-q band reads as 100% complete -- which, because BOINC
@@ -503,15 +517,19 @@ int  bench_boinc_finish(enum bench_outcome outcome, int status);
 #if CF_LMAX != 3 && CF_LMAX != 4
 #error "CF_LMAX must be 3 (96-bit cofactors) or 4 (128-bit)"
 #endif
-#define CF_LMIN 3
+/* 2 limbs is back for a side whose mfb fits 64 bits -- the rational side of
+ * most GNFS jobs (lpbr <= 32, mfbr <= 64). It was the rational side's width
+ * until lpb 33 needed a third limb; keeping 3 for everything cost those jobs
+ * a Montgomery multiply half again as wide on every rho step. */
+#define CF_LMIN 2
 
 /* Narrowest width that can hold an mfb-bit residual, or 0 if this build has
- * none. Not `(mfb + 31) / 32` clamped up: below 96 bits there is no narrower
- * instantiation to fall to, so the answer is CF_LMIN and the caller does not
- * get to think it has a 1- or 2-limb path. */
+ * none. Not `(mfb + 31) / 32` clamped up: there is no 1-limb instantiation,
+ * so the answer is never below CF_LMIN. */
 static inline int cf_limbs_for_mfb(uint32_t mfb)
 {
     if (mfb <= 32u * CF_LMIN) return CF_LMIN;
+    if (mfb <= 32u * 3u) return 3;
     if (mfb <= 32u * CF_LMAX) return CF_LMAX;
     return 0;
 }
@@ -544,9 +562,18 @@ static inline unsigned cof_parts(unsigned mfb, unsigned lpb)
     return lpb ? (mfb + lpb - 1u) / lpb : 0u;
 }
 
+/* AND BY lpb AT THE TOP: rho's sqrt(2^lpb) is what a 2LP split costs, and at
+ * large lpb it is no longer cheap. Measured on the 2,1147+ SNFS job (lpbr 36,
+ * mfbr 72, 2LP rational side), RTX 4090, 420 q: rho 31.6 ms/q on the rational
+ * queue with 3,271 records stuck, ECM 11.5 ms/q with 7 -- 215.5 -> 202.7 ms/q
+ * wall and 33 more relations, none lost. Finding 70's rho win was at lpb 33.
+ * 34 is unmeasured; 35 is the conservative cut. --cof-rho still forces rho. */
+#define COF_ECM_2LP_MIN_LPB 35u
+
 static inline int cof_auto_method(unsigned mfb, unsigned lpb)
 {
-    return cof_parts(mfb, lpb) >= 3u ? COF_METHOD_ECM : COF_METHOD_RHO;
+    if (cof_parts(mfb, lpb) >= 3u) return COF_METHOD_ECM;
+    return lpb >= COF_ECM_2LP_MIN_LPB ? COF_METHOD_ECM : COF_METHOD_RHO;
 }
 
 /* B1 for a side's lpb, from the measured optima: 200 at lpb 31-33, 300 at
@@ -558,6 +585,27 @@ static inline uint32_t cof_auto_b1(unsigned lpb)
     if (lpb >= 34u) return 300u;
     return 200u;
 }
+
+/* ECM stage 2's baby-step/giant-step modulus (cofac.cuh): 30, 60, 120 or 210.
+ * The baby steps are the odd u < D/2 coprime to D, phi(D)/2 of them, and a
+ * curve walks (B2-B1)/D giant steps. 210 measured best -- RTX 4090, ECM device
+ * time vs 30: -22% on 2,1147+ (483 -> 70 giant steps), -18% on c187's
+ * algebraic side, relations byte-identical on both. */
+#ifndef CF_ECM_D
+#define CF_ECM_D       210u
+#endif
+#if CF_ECM_D == 30 || CF_ECM_D == 60 || CF_ECM_D == 120
+#define CF_ECM_NBABY   (CF_ECM_D / 30u * 4u)          /* phi(D)/2: 4, 8, 16 */
+#elif CF_ECM_D == 210
+#define CF_ECM_NBABY   24u
+#else
+#error "CF_ECM_D must be 30, 60, 120 or 210"
+#endif
+/* Stage 2 runs only for B1 >= this, at every D. Its first giant step covers
+ * primes above D/2, so with B1 < D/2 the primes in (B1, D/2] are folded into
+ * stage 1 instead (cofac.cuh, cf_ecm_s2_lo) and every prime to B2 is still
+ * covered. */
+#define CF_ECM_B1_MIN  30u
 
 /* ---- GPU entry points ------------------------------------------------- */
 
@@ -602,6 +650,53 @@ typedef struct {
      * sharing forbids. Off by default, and refused with a message rather than
      * silently when the second array does not fit. */
     int      fill_concurrent; /* 0 = sides run back to back (default) */
+    /* Flush the cross-q cofactor queue from a host thread on its own
+     * non-blocking stream, double-buffered, so the flush overlaps the sieving
+     * of the next special-q instead of stalling the q loop (after glas). On by
+     * default; --no-cof-async restores the inline flush. Same relations. */
+    int      cof_async;
+    /* --slab-fixed: the original fixed SLAB_PERF_REGIONS slab target instead
+     * of the largest one free VRAM admits. */
+    int      slab_fixed;
+    /* Resieve bucketed primes from the bucket records that survive to trial
+     * division (side 0 serial, both under --fill-concurrent) instead of
+     * re-walking their lattices. On by default; --no-bucket-resieve. */
+    int      bucket_resieve;
+    /* Serial arm: a second bucket array when VRAM allows, so side 1 also
+     * resieves from its records. On by default; --no-dual-bucket. */
+    int      dual_bucket;
+    /* --instances N (1..4) or auto (0): N whole pipelines on one GPU, each
+     * on its own host thread and its own share of a bounded q range. The
+     * request; what actually runs is `inst` below (NULL = one pipeline). */
+    int      instances;
+    struct pipe_inst_plan *inst;   /* run_pipeline fills a fresh band's split */
+    /* --fill-rows N: bucketed moduli q < N*I are filled row by row in bands
+     * (k_fill_rows) instead of one thread walking all xmax/q of their hits,
+     * which is what sets k_fill_atomic's tail (finding 105 follow-up).
+     * Output-identical by construction. 0 = off; default 4 at logI <= 15
+     * (bench_main resolves FILL_ROWS_UNSET). --fill-row-bands sets the bands per slab;
+     * 0 = one per FILL_ROW_RUN rows. */
+    int      fill_rows;
+    int      fill_row_bands;
+    /* --resieve-rows: k_resieve_scatter's walk of the same --fill-rows tier
+     * goes to k_resieve_rows, banded by row. Same (survivor, prime) pairs. */
+    int      resieve_rows;
+    /* --fill-gate: side 0's fill stores a record only where side 1 has a
+     * survivor within 2^fill_gate_shift positions (CADO's GLAS_FILL_GATE).
+     * Output-identical by construction, except that a slab which overflowed
+     * ungated may now fit. Serial sides only: default on, off under
+     * --fill-concurrent, where an explicit --fill-gate is refused. */
+    int      fill_gate;
+    int      fill_gate_shift;
+    /* --q-pipeline: the next unit of sieving is issued on its own stream
+     * after this one's intersection -- the next slab of a slabbed q, or the
+     * next q -- so it runs under this one's trial division, cofactorisation
+     * and host work. Needs a second copy of the per-entry transform output
+     * (plat, rowrt) and, slabbed, a third walk-cursor buffer; run_pipeline_impl
+     * stays single-queued, and says so, when that does not fit in free VRAM.
+     * Output-identical by construction. Default on (bench_main resolves -1);
+     * off under --fill-concurrent and --qspan. */
+    int      q_pipeline;
     /* --qspan: bracket each special-q's GPU work with two events and report
      * the span, splitting `unaccounted` into host-with-no-GPU-work versus
      * idle-between-stages. Diagnostic; STATUS item 19 step 2. */
@@ -856,6 +951,25 @@ typedef struct {
  * data-driven (one block per super-bucket) and has no grid to tune. */
 #define FILL_BLOCKS_DEFAULT  4608
 #define FILL_THREADS_DEFAULT 32
+/* --fill-rows auto bands: rows per band. ~ the visits of an average
+ * k_fill_atomic thread, so a row-tier warp is no longer than the rest. */
+#define FILL_ROW_RUN         256
+/* Row-tier root sentinel (k_transform's rt_out): g > 1, so no plat_t walk;
+ * k_fill_rows and k_resieve_rows skip the entry exactly as the FK kernels do. */
+#define ROWRT_NONE           0xFFFFFFFFu
+/* --resieve-rows is on by default at logI <= this (finding 107). */
+#define RESIEVE_ROWS_LOGI_MAX   13
+/* The fewest SMs at which --fill-rows defaults on at logI 16 (see bench_main).
+ * Measured off-side at 48 (RTX 5070) and on-side at 128 (RTX 4090); 64 is a
+ * guess between them, to be moved when a card in between is measured. */
+#define FILL_ROWS_I16_MIN_SMS   64
+/* cfg.fill_rows before it is settled. bench_main resolves UNSET from logI
+ * after parsing and BY_DEVICE from the SM count once the card is known;
+ * run_pipeline refuses either, so neither can reach a kernel as a count. */
+#define FILL_ROWS_UNSET         (-1)
+#define FILL_ROWS_BY_DEVICE     (-2)
+#define BENCH_STR_(x) #x
+#define BENCH_STR(x)  BENCH_STR_(x)
 /* Concurrency test only (item 1). Each workspace is a full bucket array, so
  * the practical ceiling is memory, not this constant -- 2 and 4 fit a 12 GB
  * card at the I15e/I16 geometries, 8 does not. */
@@ -1018,6 +1132,30 @@ enum {
     /* Same reasoning, same rule: not an independent 5. */
     PIPE_RC_DEGRADED    = BENCH_EXIT_DEGRADED
 };
+
+/* --instances: the band split bench_main settled -- from the request, or from
+ * the manifest of a band already under way -- with each instance's own
+ * relation file and resume state. The rest of each instance's configuration
+ * is the band's cfg; see pipe_inst_cfg. */
+#define PIPE_INSTANCES_MAX 4
+/* --instances auto picks two only for a band of at least this many expected
+ * special-q (see run_pipeline). */
+#define PIPE_INST_AUTO_MIN_Q 256
+#define PIPE_INST_PATH     2048   /* == BENCH_PATH_MAX, asserted in bench_main */
+typedef struct pipe_inst_one {
+    uint64_t qmin, qmax;          /* this instance's share of the band       */
+    int      done;                /* its relation file is already committed  */
+    char     relations[PIPE_INST_PATH];   /* NAME.inst<k>; "" without --relations */
+    /* From its checkpoint, as resume_prepare left them. */
+    int      resume;
+    uint64_t resume_q, resume_rho, resume_qmin;
+    unsigned long long resume_rel_bytes, resume_nrel, resume_nq;
+} pipe_inst_one_t;
+typedef struct pipe_inst_plan {
+    int n;                        /* 2..PIPE_INSTANCES_MAX                   */
+    pipe_inst_one_t in[PIPE_INSTANCES_MAX];
+    char manifest[PIPE_INST_PATH];        /* NAME.instances; "" without --relations */
+} pipe_inst_plan_t;
 
 int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                  const fb_t *fb0, const fb_t *fbs0,

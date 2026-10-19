@@ -110,6 +110,18 @@ void wd_q(unsigned long long q, unsigned long long rho,
           unsigned long long nqdone);
 void wd_slab(unsigned slab, unsigned nslab);
 
+/* --instances: each pipeline thread binds its own heartbeat slot (1..4; 0 is
+ * the thread that called wd_start) on entry, and the watchdog checks every
+ * active slot, so one instance's progress cannot mask another's stall. A
+ * thread that is legitimately idle -- a finished instance, the main thread
+ * parked in a join -- marks its slot inactive with wd_active(0) rather than
+ * reading as stalled. A helper thread that calls code with heartbeats in it
+ * (the --cof-async flush, which also writes the checkpoint) binds -1: no
+ * slot, so its phases neither relabel nor count as progress for the sieve
+ * thread it serves. */
+void wd_bind(int slot);
+void wd_active(int on);
+
 #ifdef __cplusplus
 }
 #endif

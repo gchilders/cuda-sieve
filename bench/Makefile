@@ -216,8 +216,17 @@ endif
 # you cannot debug on, while working fine on the build host. Stamp the arch and
 # depend on it. The $(shell) rewrites the file only when the value changed, so
 # its mtime moves only then and repeat builds stay incremental.
+#
+# The default-stream mode rides in the same stamp. --instances runs several
+# pipelines on host threads, and their <<<>>> launches overlap on the device
+# only when each thread's default stream is its own; under the legacy default
+# stream every launch from every thread serialises. Every stream dependency in
+# the pipeline is stated with an event or a stream sync rather than inherited
+# from legacy-stream semantics, so one pipeline runs identically either way
+# (measured: 2,1147+, byte-identical relations, 188.5 vs 191.6 ms/q).
+NVCC_STREAM := --default-stream per-thread
 ARCH_STAMP := .arch.stamp
-$(shell [ "$$(cat $(ARCH_STAMP) 2>/dev/null)" = '$(NVCC_ARCH)' ] || printf '%s' '$(NVCC_ARCH)' > $(ARCH_STAMP))
+$(shell [ "$$(cat $(ARCH_STAMP) 2>/dev/null)" = '$(NVCC_ARCH) $(NVCC_STREAM)' ] || printf '%s' '$(NVCC_ARCH) $(NVCC_STREAM)' > $(ARCH_STAMP))
 
 # Extra -D's for pricing experiments, e.g. make DEFS=-DNORM_CANCEL_TOL=0.0f or
 # make DEFS=-DNORM_FAST_LOG2. Nothing in the default build sets this; it exists
@@ -384,7 +393,7 @@ CUDART_LINK ?= static
 # -t 0: run the per-target ptxas passes concurrently, one thread per CPU. The
 # gencode list above is otherwise walked serially, which is where the bulk of a
 # fat build goes; see the timing table. Harmless when GPU_ARCH picks one target.
-NVCC_FLAGS = $(NVCC_ARCH) -t 0 -O3 -std=c++17 -lineinfo -MMD -MP \
+NVCC_FLAGS = $(NVCC_ARCH) $(NVCC_STREAM) -t 0 -O3 -std=c++17 -lineinfo -MMD -MP \
              -Xcompiler "-O3 -Wall" $(DEFS) $(CF_LMAX_DEF) $(BOINC_DEFS) $(BOINC_CPPFLAGS)
 CFLAGS     = -O3 $(HOST_TUNE) -Wall -Wextra -std=c11 -MMD -MP \
              $(DEFS) $(CF_LMAX_DEF) $(BOINC_DEFS)
@@ -572,12 +581,12 @@ mkcofbatch: mkcofbatch.c $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE
 clean:
 	rm -f bench fbtest fbgen fbgen_gpu sqgentest normscan dumpcmp mkcofbatch ckpttest stoptest slabtest *.o *.d $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP) $(GIT_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE_K_STAMP)
 
-.PHONY: all clean check ckptcheck stopcheck cofcheck chunkcheck chunksimcheck fbgencheck fbgpucheck sqgencheck walkcheck slabcheck skipcheck degradecheck
+.PHONY: all clean check ckptcheck stopcheck cofcheck instcheck chunkcheck chunksimcheck fbgencheck fbgpucheck sqgencheck walkcheck slabcheck skipcheck degradecheck
 
 # `check` depended on fbtest alone, so the whole CUDA path -- kernels, the
 # cofactoriser, the pipeline -- could fail to compile while the gates reported
 # "all gates passed". Depend on `all`.
-check: all ckptcheck stopcheck cofcheck chunksimcheck fbgencheck sqgencheck walkcheck slabcheck
+check: all ckptcheck stopcheck cofcheck instcheck chunksimcheck fbgencheck sqgencheck walkcheck slabcheck
 	./fbtest --fb1 ../oracle/c183.fb1
 
 ckptcheck: ckpttest
@@ -605,7 +614,7 @@ stopcheck: stoptest
 walkcheck: bench
 	@out=$$(./bench --verify-only 2>&1); st=$$?; \
 	 printf '%s\n' "$$out" \
-	   | grep -E 'Franke-Kleinjung|primes x 5 roots|FAILED' \
+	   | grep -E 'Franke-Kleinjung|primes x 5 roots|row-tier|FAILED' \
 	   | sed 's/^/  /'; \
 	 if [ $$st -ne 0 ]; then \
 	   printf '%s\n' "$$out" | tail -20 | sed 's/^/  | /'; \
@@ -672,6 +681,11 @@ sqgencheck: sqgentest
 # change of method or a truncated parse fails here rather than in a band run.
 cofcheck: bench
 	@./cofcheck.sh
+
+# --instances: split, stopped, killed, resumed and restarted bands must all
+# commit the file one pipeline writes. Needs a card (~5 min on an RTX 4090).
+instcheck: bench
+	@./instcheck.sh
 
 # The AUTO chunk controller. NOT in `check`: it needs its own build (the valve
 # bound has to be lowered before any healthy card can reach it) and a band of

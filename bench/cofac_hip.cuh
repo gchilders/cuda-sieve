@@ -505,25 +505,35 @@ found:
  * once per curve per record. At tens of curves per record that trade is clearly
  * the right way round, and it keeps a binary extended GCD out of the file.
  *
- * Stage 2 is the small-table Montgomery-XZ continuation below. It deliberately
- * uses D=30: the four unsigned baby residues {1,7,11,13} keep one curve's
- * private table small enough for this first GPU experiment. The host supplies
- * one four-bit mask per giant step; bit u is set when vD-u or vD+u is prime in
- * (B1,B2]. Thus every lane follows the same giant-step walk and only the cheap
- * product-of-differences loop is masked.
+ * Stage 2 is the baby-step/giant-step Montgomery-XZ continuation below, at a
+ * compile-time D (CF_ECM_D: 30, 60, 120 or 210). The baby residues are the odd
+ * u < D/2 coprime to D -- phi(D)/2 of them. The host supplies one mask per
+ * giant step; bit k is set when vD-u_k or vD+u_k is prime in (B1,B2]. Thus
+ * every lane follows the same giant-step walk and only the cheap
+ * product-of-differences loop is masked. A larger D trades a larger baby table
+ * for fewer giant steps: (B2-B1)/D of them, at one differential addition each.
  */
 
-#define CF_ECM_D       30u
-#define CF_ECM_NBABY    4u
+/* CF_ECM_D, CF_ECM_NBABY and CF_ECM_B1_MIN live in bench.h: bench_main's
+ * B1/B2 validation needs the same floor. */
+typedef uint32_t cf_s2mask_t;            /* one bit per baby residue */
 #define CF_ECM_MAX_B1   1000000u
 #define CF_ECM_MAX_B2  10000000u
 
 /* One definition supplies both the host mask-bit mapping and the device baby
- * scalar. A duplicated host/device table can compile and test cleanly while
- * silently assigning different meanings to the same mask bit. */
-CF_HD uint8_t cf_ecm_baby(uint32_t k)
+ * order. A duplicated host/device table can compile and test cleanly while
+ * silently assigning different meanings to the same mask bit: the device
+ * builds its table by walking the odd m < D/2 and keeping those this accepts,
+ * and cf_ecm_baby numbers them in the same walk. */
+CF_HD int cf_ecm_coprime(uint32_t m)
 {
-    return k == 0 ? 1u : k == 1 ? 7u : k == 2 ? 11u : 13u;
+    return (m & 1u) && m % 3u && m % 5u && (CF_ECM_D % 7u || m % 7u);
+}
+CF_HD uint32_t cf_ecm_baby(uint32_t k)
+{
+    for (uint32_t m = 1, i = 0; m < CF_ECM_D / 2u; m += 2)
+        if (cf_ecm_coprime(m) && i++ == k) return m;
+    return 0;
 }
 
 /* Shared composite sieve for both ECM plans. Bounds live here as well as in
@@ -542,20 +552,34 @@ static uint8_t *cf_ecm_sieve(uint32_t limit)
     return composite;
 }
 
-/* The stage-1 exponent lcm(1..B1), held as its prime powers rather than as one
- * big integer: each is at most B1, so the ladder for it is a dozen bits and the
- * whole schedule is an array of uint32 instead of a 1.4*B1-bit number the device
- * would have to store and shift. Returns the count. */
-static uint32_t cf_ecm_plan(uint32_t b1, uint32_t **out)
+/* Stage 2's first giant step is v >= 1, so it covers primes above D/2 only.
+ * A B1 below that leaves (B1, D/2] to stage 1 instead: those primes are
+ * folded into its exponent (one power each), and stage 2 starts above
+ * cf_ecm_s2_lo(). Every prime up to B2 is still covered once. */
+static uint32_t cf_ecm_s2_lo(uint32_t b1)
+{
+    return b1 > CF_ECM_D / 2u ? b1 : CF_ECM_D / 2u;
+}
+
+/* The stage-1 exponent lcm(1..B1) -- times the primes in (B1, D/2] when
+ * stage 2 is on and B1 < D/2 (see cf_ecm_s2_lo) -- held as its prime powers
+ * rather than as one big integer: each is at most B1 (or D/2), so the ladder
+ * for it is a dozen bits and the whole schedule is an array of uint32 instead
+ * of a 1.4*B1-bit number the device would have to store and shift. Returns
+ * the count. b2 == 0 is stage 1 alone. */
+static uint32_t cf_ecm_plan(uint32_t b1, uint32_t b2, uint32_t **out)
 {
     uint32_t n = 0, cap = 0, *s = NULL;
     uint8_t *sieve;
+    uint32_t top = b1;
     if (b1 < 2 || b1 > CF_ECM_MAX_B1) { *out = NULL; return 0; }
-    sieve = cf_ecm_sieve(b1);
+    if (b2 > b1 && b1 < CF_ECM_D / 2u)
+        top = b2 < CF_ECM_D / 2u ? b2 : CF_ECM_D / 2u;
+    sieve = cf_ecm_sieve(top);
     if (!sieve) { *out = NULL; return 0; }
-    for (uint32_t p = 2; p <= b1; p++) {
+    for (uint32_t p = 2; p <= top; p++) {
         if (sieve[p]) continue;
-        {   /* the largest power of p that still fits under B1 */
+        {   /* the largest power of p that still fits under B1; above B1, p */
             uint64_t pe = p;
             while (pe * p <= b1) pe *= p;
             if (n == cap) {
@@ -573,45 +597,56 @@ static uint32_t cf_ecm_plan(uint32_t b1, uint32_t **out)
     return n;
 }
 
-/* Build the stage-2 prime-pair schedule. For every prime q in (B1,B2], write
- * q = vD +/- u with 0 < u < D/2. Since q > B1 >= 30 in the stage-2 path, q is
- * coprime to D and u is one of the four residues below. One x-coordinate
+/* Build the stage-2 prime-pair schedule. For every prime q in (lo, B2],
+ * lo = cf_ecm_s2_lo(B1), write q = vD +/- u with 0 < u < D/2. Since q > lo >=
+ * D/2 > 7, q is coprime to D and u is a baby residue. One x-coordinate
  * comparison covers both signs. Empty giant steps remain in the schedule so
  * the device can advance with one differential addition rather than restart a
- * scalar multiplication at every populated v. */
-static uint32_t cf_ecm_stage2_plan(uint32_t b1, uint32_t b2, uint32_t *vmin_out,
-                                   uint8_t **mask_out)
+ * scalar multiplication at every populated v.
+ *
+ * Returns 0 and the giant-step count in *nv_out -- 0 when no prime lies in
+ * (lo, B2], all of them folded into stage 1 -- or -1 on bad bounds, an
+ * allocation failure, or a prime with no baby residue (an inconsistency
+ * between cf_ecm_coprime and D that must not silently drop primes). */
+static int cf_ecm_stage2_plan(uint32_t b1, uint32_t b2, uint32_t *vmin_out,
+                              cf_s2mask_t **mask_out, uint32_t *nv_out)
 {
-    uint8_t *composite = NULL, *mask = NULL;
-    uint32_t qlo, qhi, vmin, vmax, nv;
-    if (b2 <= b1 || b1 < CF_ECM_D || b1 > CF_ECM_MAX_B1 ||
-        b2 > CF_ECM_MAX_B2) {
-        *vmin_out = 0; *mask_out = NULL; return 0;
-    }
+    uint8_t *composite = NULL;
+    cf_s2mask_t *mask = NULL;
+    int8_t kidx[CF_ECM_D / 2u];
+    uint32_t qlo, qhi, vmin, vmax, nv, nb = 0;
+    const uint32_t lo = cf_ecm_s2_lo(b1);
+    *vmin_out = 0; *mask_out = NULL; *nv_out = 0;
+    if (b2 <= b1 || b1 < CF_ECM_B1_MIN || b1 > CF_ECM_MAX_B1 ||
+        b2 > CF_ECM_MAX_B2)
+        return -1;
+    /* u -> mask bit, in cf_ecm_baby's order, once. */
+    for (uint32_t u = 0; u < CF_ECM_D / 2u; u++)
+        kidx[u] = (int8_t)(cf_ecm_coprime(u) ? (int)nb++ : -1);
+    if (nb != CF_ECM_NBABY) return -1;
+    if (b2 <= lo) return 0;                  /* all of (B1, B2] in stage 1 */
     composite = cf_ecm_sieve(b2);
-    if (!composite) { *vmin_out = 0; *mask_out = NULL; return 0; }
-    for (qlo = b1 + 1; qlo <= b2 && composite[qlo]; qlo++) {}
-    if (qlo > b2) {
-        free(composite); *vmin_out = 0; *mask_out = NULL; return 0;
-    }
+    if (!composite) return -1;
+    for (qlo = lo + 1; qlo <= b2 && composite[qlo]; qlo++) {}
+    if (qlo > b2) { free(composite); return 0; }
     for (qhi = b2; qhi > qlo && composite[qhi]; qhi--) {}
     vmin = (qlo + CF_ECM_D / 2) / CF_ECM_D;
     vmax = (qhi + CF_ECM_D / 2) / CF_ECM_D;
     nv = vmax - vmin + 1;
-    mask = (uint8_t *)calloc(nv, 1);
-    if (!mask) { free(composite); *vmin_out = 0; *mask_out = NULL; return 0; }
-    for (uint32_t q = b1 + 1; q <= b2; q++) if (!composite[q]) {
+    mask = (cf_s2mask_t *)calloc(nv, sizeof *mask);
+    if (!mask) { free(composite); return -1; }
+    for (uint32_t q = qlo; q <= qhi; q++) if (!composite[q]) {
         const uint32_t v = (q + CF_ECM_D / 2) / CF_ECM_D;
         const uint32_t vd = v * CF_ECM_D;
         const uint32_t u = q > vd ? q - vd : vd - q;
-        for (uint32_t k = 0; k < CF_ECM_NBABY; k++)
-            if (u == cf_ecm_baby(k)) {
-                mask[v - vmin] |= (uint8_t)(1u << k); break;
-            }
+        if (u >= CF_ECM_D / 2u || kidx[u] < 0) {
+            free(composite); free(mask); return -1;
+        }
+        mask[v - vmin] |= (cf_s2mask_t)1u << kidx[u];
     }
     free(composite);
-    *vmin_out = vmin; *mask_out = mask;
-    return nv;
+    *vmin_out = vmin; *mask_out = mask; *nv_out = nv;
+    return 0;
 }
 
 template <int L> struct mpt { mz<L> X, Z; };
@@ -707,7 +742,7 @@ CF_NOINLINE void x_mul_s2(mpt<L> *p, uint32_t k, const mz<L> *an,
     x_mul<L>(p, k, an, ad, n, n0inv, work);
 }
 
-/* One pass over the D=30 baby-step/giant-step continuation. All selected
+/* One pass over the baby-step/giant-step continuation (D = CF_ECM_D). All selected
  * cross-products are accumulated and normally only one gcd is paid. If hits
  * for different prime factors make that gcd equal n, replay the same curve and
  * gcd each selected difference. The replay is rare, preserves the fast common
@@ -717,7 +752,7 @@ CF_NOINLINE int mz_ecm_stage2_pass(mz<L> *fac, const mpt<L> *Q,
                                     const mz<L> *an, const mz<L> *ad,
                                     const mz<L> *one, const mz<L> *n,
                                     uint32_t n0inv,
-                                    const uint8_t *__restrict masks,
+                                    const cf_s2mask_t *__restrict masks,
                                     uint32_t vmin, uint32_t nv,
                                     uint64_t *work)
 {
@@ -791,12 +826,32 @@ CF_NOINLINE int mz_ecm_stage2_pass(mz<L> *fac, const mpt<L> *Q,
              * x_mul_s2 is __noinline__, and unrolling its call sites widens
              * the live range of every argument across all NBABY calls. */
             mz<L> bzs[CF_ECM_NBABY], acc, t;
-            for (uint32_t k = 0; k < CF_ECM_NBABY; k++) {
-                const uint32_t scalar = cf_ecm_baby(k);
-                mpt<L> p = *Q;
-                if (scalar != 1)
-                    x_mul_s2<L>(&p, scalar, an, ad, n, n0inv, work);
-                bx[k] = p.X; bzs[k] = p.Z;
+            {
+                /* The odd multiples [m]Q, m < D/2, by one differential
+                 * addition each: [m+2]Q = [m]Q + [2]Q, difference [m-2]Q.
+                 * Those coprime to D are the baby steps, in cf_ecm_baby's
+                 * order. One ladder per baby would cost ~log2(m) ladder steps
+                 * each -- at D=210, 24 of them -- for what this walk does in
+                 * 52 additions. */
+                mpt<L> q2, pm, cm, nm;
+                uint32_t kk = 0;
+                x_dbl<L>(&q2, Q, an, ad, n, n0inv);
+                pm = *Q;
+                bx[kk] = pm.X; bzs[kk] = pm.Z; kk++;        /* m = 1 */
+                x_add<L>(&cm, &q2, Q, Q, n, n0inv);         /* m = 3 */
+                (*work)++;
+                for (uint32_t m = 3; m < CF_ECM_D / 2u; m += 2) {
+                    /* cf_ecm_coprime orders the baby steps for the host's
+                     * mask too (cf_ecm_stage2_plan's kidx), and the plan
+                     * refuses to build unless it accepts exactly NBABY
+                     * residues -- so kk cannot overrun bx[]. */
+                    if (cf_ecm_coprime(m)) { bx[kk] = cm.X; bzs[kk] = cm.Z; kk++; }
+                    if (m + 2 < CF_ECM_D / 2u) {
+                        x_add<L>(&nm, &cm, &q2, &pm, n, n0inv);
+                        pm = cm; cm = nm;
+                        (*work)++;
+                    }
+                }
             }
             /* Forward: bx[k] = X_k * prod_{j<k} Z_j, acc ends at prod_j Z_j. */
             acc = *one;
@@ -822,16 +877,15 @@ CF_NOINLINE int mz_ecm_stage2_pass(mz<L> *fac, const mpt<L> *Q,
 
         for (uint32_t vi = 0; vi < nv; vi++) {
             const mpt<L> *G = vi ? &cur : &prev;
-            const uint32_t mask = masks[vi];
+            const cf_s2mask_t mask = masks[vi];
             if (mask) {
                 /* One denominator for every baby step, so this term is the
                  * same for all k -- hoisted out of the loop below, and not
                  * computed at all on a giant step that selects nothing. */
                 mz<L> gx;
                 mz_mul<L>(&gx, &G->X, &bz, n, n0inv);
-                #pragma unroll
                 for (uint32_t k = 0; k < CF_ECM_NBABY; k++)
-                    if (mask & (1u << k)) {
+                    if (mask & ((cf_s2mask_t)1u << k)) {
                         mz<L> b, d;
                         mz_mul<L>(&b, &bx[k], &G->Z, n, n0inv);
                         d = gx; mz_sub_mod<L>(&d, &b, n);
@@ -865,7 +919,7 @@ CF_NOINLINE int mz_ecm_stage2_pass(mz<L> *fac, const mpt<L> *Q,
 template <int L, int STAGE2>
 CF_FN int mz_ecm(mz<L> *fac, const mz<L> *n, uint32_t sigma,
                  const uint32_t *__restrict s, uint32_t ns,
-                 const uint8_t *__restrict s2mask, uint32_t s2vmin,
+                 const cf_s2mask_t *__restrict s2mask, uint32_t s2vmin,
                  uint32_t s2nv, uint64_t *work)
 {
     const uint32_t n0inv = mz_n0inv(n->v[0]);
@@ -934,7 +988,7 @@ template <int L, int METHOD, int STAGE2>
 CF_FN int mz_split(const mz<L> *n0, const mz<L> *lim2, uint32_t lpb,
                    uint32_t c0, uint32_t budget, uint64_t *out, int *nout,
                    uint64_t *acc, const uint32_t *__restrict s, uint32_t ns,
-                   const uint8_t *__restrict s2mask, uint32_t s2vmin,
+                   const cf_s2mask_t *__restrict s2mask, uint32_t s2vmin,
                    uint32_t s2nv)
 {
     mz<L> st[CF_MAXFAC];
@@ -1002,7 +1056,7 @@ __global__ void k_cofac(const mz<L> *__restrict n, mz<L> lim2, uint32_t lpb,
                         uint64_t *__restrict fac, uint8_t *__restrict nfac,
                         unsigned long long *__restrict iters,
                         const uint32_t *__restrict s, uint32_t ns,
-                        const uint8_t *__restrict s2mask, uint32_t s2vmin,
+                        const cf_s2mask_t *__restrict s2mask, uint32_t s2vmin,
                         uint32_t s2nv, uint32_t ibeg, uint32_t iend)
 {
     /* [ibeg, iend) is this launch's slice of the compacted list; cf_sched_t's
@@ -1082,7 +1136,7 @@ typedef struct {
     uint32_t curves;        /* ECM curves attempted per round                */
     const uint32_t *d_s;    /* ECM stage-1 prime powers, on device           */
     uint32_t ns;
-    const uint8_t *d_s2mask;/* D=30 stage-2 prime-pair mask per giant step   */
+    const cf_s2mask_t *d_s2mask;/* stage-2 prime-pair mask per giant step  */
     uint32_t s2vmin, s2nv;
     /* Records per launch. ALWAYS A CONCRETE COUNT, never a sentinel: a value
      * at or above the batch means one launch (the original behaviour,
@@ -1175,7 +1229,38 @@ typedef struct {
  * event record forces ordering, so this measures the FIRST slice of the first
  * round and nothing else; the rest of the flush is untouched. */
 typedef struct { hipEvent_t a, b; int armed, fired; } cof_peak_t;
-static cof_peak_t *g_cof_peak;
+static thread_local cof_peak_t *g_cof_peak;
+
+/* The stream the cross-q queue's flush runs on. 0 is the legacy default
+ * stream and the original, fully synchronous behaviour. --cof-async sets it to
+ * a non-blocking stream so a flush, driven from its own host thread, overlaps
+ * the sieving of the next special-q (the glas arrangement). Everything a flush
+ * launches, records, copies or waits on goes through it; see cof_sync and
+ * cof_d2h, which fall back to the device-wide forms when it is 0 so that the
+ * default path is bit-for-bit what it was. */
+static thread_local hipStream_t g_cof_stream = 0;
+
+/* Set while --cof-async initialises its second buffer set, so cofq_init's
+ * configuration lines (width, ECM plan, method) are printed once. cofcheck.sh
+ * counts them. Errors are never suppressed. */
+static thread_local int g_cofq_quiet = 0;
+
+/* This thread's stream, never the device: under --q-pipeline the next
+ * special-q is sieving on another stream that a device-wide sync would wait
+ * out (finding 108), and under --instances so are the other pipelines. With
+ * nothing else in flight the two are the same wait. */
+static hipError_t cof_sync(void)
+{
+    return hipStreamSynchronize(g_cof_stream ? g_cof_stream : 0);
+}
+
+static hipError_t cof_d2h(void *dst, const void *src, size_t n)
+{
+    if (!g_cof_stream) return hipMemcpy(dst, src, n, hipMemcpyDeviceToHost);
+    hipError_t e = hipMemcpyAsync(dst, src, n, hipMemcpyDeviceToHost,
+                                    g_cof_stream);
+    return e != hipSuccess ? e : hipStreamSynchronize(g_cof_stream);
+}
 
 template <int L>
 static void cf_run_rounds(const mz<L> *d_n, mz<L> lim2, uint32_t lpb, uint32_t n,
@@ -1190,11 +1275,11 @@ static void cf_run_rounds(const mz<L> *d_n, mz<L> lim2, uint32_t lpb, uint32_t n
          * function of the status array alone and the output stays reproducible
          * byte for byte. Three small kernels over the batch -- microseconds
          * against a stage that runs for tens of milliseconds. */
-        k_cof_selflags<<<blocks, threads>>>(n, d_status, W->d_flag);
-        k_scan_pass1<<<nb, TD_SCAN_BLK>>>(W->d_flag, n, W->d_off, W->d_bsum);
-        k_scan_pass2<<<1, 1024>>>(W->d_bsum, nb);
-        k_scan_pass3<<<nb, TD_SCAN_BLK>>>(W->d_off, n, W->d_bsum);
-        k_cof_selscatter<<<blocks, threads>>>(n, W->d_flag, W->d_off,
+        k_cof_selflags<<<blocks, threads, 0, g_cof_stream>>>(n, d_status, W->d_flag);
+        k_scan_pass1<<<nb, TD_SCAN_BLK, 0, g_cof_stream>>>(W->d_flag, n, W->d_off, W->d_bsum);
+        k_scan_pass2<<<1, 1024, 0, g_cof_stream>>>(W->d_bsum, nb);
+        k_scan_pass3<<<nb, TD_SCAN_BLK, 0, g_cof_stream>>>(W->d_off, n, W->d_bsum);
+        k_cof_selscatter<<<blocks, threads, 0, g_cof_stream>>>(n, W->d_flag, W->d_off,
                                               W->d_sel, W->d_nsel);
         /* One launch per record slice. chunk 0 (or any value covering the
          * batch) gives exactly one launch over [0, n) -- the original single
@@ -1208,26 +1293,26 @@ static void cf_run_rounds(const mz<L> *d_n, mz<L> lim2, uint32_t lpb, uint32_t n
             /* The flush's worst-case launch; see the safety valve above. */
             const int _peak = (r == 0 && b == 0 && g_cof_peak
                                && g_cof_peak->armed);
-            if (_peak) hipEventRecord(g_cof_peak->a);
+            if (_peak) hipEventRecord(g_cof_peak->a, g_cof_stream);
             if (S->method) {
                 if (S->s2nv)
-                    k_cofac<L, 1, 1><<<blocks, threads>>>(
+                    k_cofac<L, 1, 1><<<blocks, threads, 0, g_cof_stream>>>(
                         d_n, lim2, lpb, (uint32_t)(r + 1), S->curves,
                         W->d_sel, W->d_nsel, d_status, d_fac, d_nfac, d_iters,
                         S->d_s, S->ns, S->d_s2mask, S->s2vmin, S->s2nv, b, e);
                 else
-                    k_cofac<L, 1, 0><<<blocks, threads>>>(
+                    k_cofac<L, 1, 0><<<blocks, threads, 0, g_cof_stream>>>(
                         d_n, lim2, lpb, (uint32_t)(r + 1), S->curves,
                         W->d_sel, W->d_nsel, d_status, d_fac, d_nfac, d_iters,
                         S->d_s, S->ns, NULL, 0, 0, b, e);
             } else {
-                k_cofac<L, 0, 0><<<blocks, threads>>>(
+                k_cofac<L, 0, 0><<<blocks, threads, 0, g_cof_stream>>>(
                     d_n, lim2, lpb, (uint32_t)(r + 1), S->budget << r,
                     W->d_sel, W->d_nsel, d_status, d_fac, d_nfac, d_iters,
                     NULL, 0, NULL, 0, 0, b, e);
             }
             if (_peak) {
-                hipEventRecord(g_cof_peak->b);
+                hipEventRecord(g_cof_peak->b, g_cof_stream);
                 g_cof_peak->armed = 0; g_cof_peak->fired = 1;
             }
         }
@@ -1284,6 +1369,7 @@ static int cf_run_rounds_dyn(int L, const uint32_t *d_n, uint64_t lim,
         return 0;                                                             \
     } while (0)
     switch (L) {
+    case 2: CF_RR(2);
     case 3: CF_RR(3);
 #if CF_LMAX >= 4
     case 4: CF_RR(4);
@@ -1323,11 +1409,16 @@ static int cf_run_rounds_dyn(int L, const uint32_t *d_n, uint64_t lim,
  */
 #define COF_CHUNK_TARGET_MS   250.0f
 
-/* Giant steps per curve above which cofq_init warns that record chunking can
- * no longer bound a launch. ~40x the derived default's ~500 and ~16x below the
- * ~320,000 of the one configuration known to trip a watchdog; see the warning
- * site in cofq_init for why this is a judgement rather than a measurement. */
-#define COF_S2NV_WATCHDOG_WARN  20000u
+/* B2 above which cofq_init warns that record chunking can no longer bound a
+ * launch. A record's stage-2 work is its giant steps, (B2-B1)/D, plus one
+ * product per prime in (B1, B2] -- and the prime count depends on B2 alone, so
+ * B2 is the measure that means the same thing at every D. (This used to be
+ * 20,000 GIANT STEPS: B2 ~600,000 at D=30, but ~4.2M once D went to 210, a
+ * warning 7x later than meant.) 40x the derived default's B2 of 15,000 and
+ * ~16x below the 10^7 of the one configuration known to trip a watchdog; see
+ * the warning site in cofq_init for why this is a judgement rather than a
+ * measurement. */
+#define COF_S2_B2_WATCHDOG_WARN  600000u
 
 /* The floor is `blocks * threads`: one record per thread, and never less.
  *
@@ -1523,7 +1614,7 @@ typedef struct {
      * 2-4x at 3LP (RESULTS finding 70). A per-job choice would get one of the
      * two sides wrong on nearly every job. */
     int meth[2];
-    uint8_t  *d_s2mask; uint32_t s2vmin, s2nv;/* ECM stage-2 schedule      */
+    cf_s2mask_t *d_s2mask; uint32_t s2vmin, s2nv;/* ECM stage-2 schedule   */
     double ms_rat, ms_alg, ms_host;
     unsigned long long nseen, nrel;
     /* Per side, per CF_* status, accumulated over flushes. `ndead`/`nstuck`
@@ -1635,8 +1726,13 @@ static int cof_enqueue(int blocks, int threads,
         return 0;                                                             \
     } while (0)
     switch (Q->L0 * 8 + Q->L1) {
+    case 2 * 8 + 2: CF_ENQ(2, 2);
+    case 2 * 8 + 3: CF_ENQ(2, 3);
+    case 3 * 8 + 2: CF_ENQ(3, 2);
     case 3 * 8 + 3: CF_ENQ(3, 3);
 #if CF_LMAX >= 4
+    case 2 * 8 + 4: CF_ENQ(2, 4);
+    case 4 * 8 + 2: CF_ENQ(4, 2);
     case 3 * 8 + 4: CF_ENQ(3, 4);
     case 4 * 8 + 3: CF_ENQ(4, 3);
     case 4 * 8 + 4: CF_ENQ(4, 4);
@@ -1812,7 +1908,7 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
 {
     const uint32_t nb = (cap + TD_SCAN_BLK - 1) / TD_SCAN_BLK;
     uint32_t *h_s = NULL;
-    uint8_t *h_s2mask = NULL;
+    cf_s2mask_t *h_s2mask = NULL;
     int rc = -1;
 
 #define COF_INIT_CK(x) do { if (CUDA_CHECKED(x)) goto done; } while (0)
@@ -1833,11 +1929,11 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
      * only has 3", and those are different facts when the question is whether
      * a wider job could have run at all. It is also what lets cofcheck.sh
      * discover which cases this build can even attempt. */
-    printf("  cofactor width: side 0 %d limbs (%d bits), side 1 %d limbs"
+    if (!g_cofq_quiet) printf("  cofactor width: side 0 %d limbs (%d bits), side 1 %d limbs"
            " (%d bits); this build carries %d..%d\n",
            Q->L0, 32 * Q->L0, Q->L1, 32 * Q->L1, CF_LMIN, CF_LMAX);
     if (meth0 || meth1) {          /* one plan serves whichever sides use ECM */
-        Q->ns = cf_ecm_plan(ecm_b1, &h_s);
+        Q->ns = cf_ecm_plan(ecm_b1, ecm_b2, &h_s);
         if (!Q->ns) {
             fprintf(stderr, "  cofac queue: empty ECM plan for B1=%u\n", ecm_b1);
             goto done;
@@ -1847,19 +1943,21 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
                                hipMemcpyHostToDevice));
         free(h_s); h_s = NULL;
         if (ecm_b2) {
-            Q->s2nv = cf_ecm_stage2_plan(ecm_b1, ecm_b2, &Q->s2vmin,
-                                         &h_s2mask);
-            if (!Q->s2nv) {
-                fprintf(stderr, "  cofac queue: empty ECM stage-2 plan for"
-                        " B1=%u B2=%u\n", ecm_b1, ecm_b2);
+            if (cf_ecm_stage2_plan(ecm_b1, ecm_b2, &Q->s2vmin, &h_s2mask,
+                                   &Q->s2nv)) {
+                fprintf(stderr, "  cofac queue: cannot build the ECM stage-2"
+                        " plan for B1=%u B2=%u\n", ecm_b1, ecm_b2);
                 goto done;
             }
-            COF_INIT_CK(hipMalloc(&Q->d_s2mask, Q->s2nv));
-            COF_INIT_CK(hipMemcpy(Q->d_s2mask, h_s2mask, Q->s2nv,
-                                   hipMemcpyHostToDevice));
+            if (Q->s2nv) {      /* 0: every stage-2 prime folded into stage 1 */
+                COF_INIT_CK(hipMalloc(&Q->d_s2mask, Q->s2nv * sizeof *h_s2mask));
+                COF_INIT_CK(hipMemcpy(Q->d_s2mask, h_s2mask,
+                                       Q->s2nv * sizeof *h_s2mask,
+                                       hipMemcpyHostToDevice));
+            }
             free(h_s2mask); h_s2mask = NULL;
         }
-        printf("  cofactor queue: ECM B1 = %u, %u prime powers, B2 = %u"
+        if (!g_cofq_quiet) printf("  cofactor queue: ECM B1 = %u, %u prime powers, B2 = %u"
                " (%u giant steps), %u curves per round\n", ecm_b1, Q->ns,
                ecm_b2, Q->s2nv, ecm_curves);
         /* The one thing --cof-chunk cannot bound.
@@ -1867,14 +1965,15 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
          * Chunking splits the RECORD list, so the smallest launch it can make
          * is one record per thread. A launch therefore never gets shorter than
          * ONE record's own splitting work, and stage 2 is where that can grow
-         * without limit: the giant-step count is B2/30, so a large B2 buys a
+         * without limit: the giant-step count is B2/D, so a large B2 buys a
          * per-record cost no slice size can divide.
          *
          * The auto-derived configuration is nowhere near this -- cof_auto_b1
-         * returns 200..500, so B2 is 6,000..15,000 and s2nv is ~194..500 giant
-         * steps -- which is why the default path needs no warning at all. The
+         * returns 200..500, so B2 is 6,000..15,000 (29..70 giant steps at
+         * D=210) -- which is why the default path needs no warning at all. The
          * one configuration observed to actually trip a device watchdog is
-         * --ecm-b1 400000 (B2 clamped to 10^7, ~320,000 giant steps), which
+         * --ecm-b1 400000 (B2 clamped to 10^7; ~320,000 giant steps when D was
+         * 30, ~47,600 at 210, and ~620,000 primes either way), which
          * reproducibly kills the stage-2 kernel on gfx1103 and is why
          * cofcheck.sh skips that case on HIP.
          *
@@ -1883,20 +1982,20 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
          * derived default and well below the one value known to fail, and it
          * warns rather than refuses because a fast card runs these settings
          * perfectly well. Do not restate it as a supported limit. */
-        if (Q->s2nv > COF_S2NV_WATCHDOG_WARN)
-            fprintf(stderr, "  cofactor queue: WARNING: %u giant steps/curve x"
-                    " %u curves is far above the derived default (~194-500"
-                    " steps at B1 200-500). --cof-chunk bounds a launch by"
+        if (Q->s2nv && ecm_b2 > COF_S2_B2_WATCHDOG_WARN)
+            fprintf(stderr, "  cofactor queue: WARNING: B2 %u (%u giant steps)"
+                    " x %u curves is far above the derived default (B2"
+                    " 6,000-15,000 at B1 200-500). --cof-chunk bounds a launch by"
                     " RECORDS and cannot go below one record, so this much"
                     " stage-2 work per record can still exceed a slow device's"
                     " GPU watchdog and be killed mid-launch"
                     " (cudaErrorLaunchTimeout, or \"unspecified launch"
                     " failure\" on AMD). Lower --ecm-b2 if tasks fail that"
-                    " way.\n", Q->s2nv, ecm_curves);
+                    " way.\n", ecm_b2, Q->s2nv, ecm_curves);
     }
     {
         static const char *nm[2] = { "rho", "ECM" };
-        printf("  cofactor method: side 0 %s, side 1 %s\n",
+        if (!g_cofq_quiet) printf("  cofactor method: side 0 %s, side 1 %s\n",
                nm[Q->meth[0] ? 1 : 0], nm[Q->meth[1] ? 1 : 0]);
     }
     /* Every enqueued record can become a relation, so the readback slots have
@@ -2081,7 +2180,7 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     COF_FLUSH_CK(hipEventCreate(&e2));
     COF_FLUSH_CK(hipEventCreate(&pk0.a)); COF_FLUSH_CK(hipEventCreate(&pk0.b));
     COF_FLUSH_CK(hipEventCreate(&pk1.a)); COF_FLUSH_CK(hipEventCreate(&pk1.b));
-    COF_FLUSH_CK(hipEventRecord(e0));
+    COF_FLUSH_CK(hipEventRecord(e0, g_cof_stream));
     pk0.armed = 1; g_cof_peak = &pk0;
     if (cf_run_rounds_dyn(Q->L0, Q->d_c0, lim0, lpb0, n, Q->d_st0,
                           Q->d_sp0, Q->d_nsp0, &S, &W, NULL, blocks, threads))
@@ -2089,26 +2188,26 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     /* The class-aware gate: a record whose rational side did not split is dead
      * whatever the algebraic side does, so its side-1 job is never started. */
     g_cof_peak = NULL;
-    k_cof_gate<<<blocks, threads>>>(n, Q->d_st0, Q->d_st1);
-    COF_FLUSH_CK(hipEventRecord(e1));
+    k_cof_gate<<<blocks, threads, 0, g_cof_stream>>>(n, Q->d_st0, Q->d_st1);
+    COF_FLUSH_CK(hipEventRecord(e1, g_cof_stream));
     pk1.armed = 1; g_cof_peak = &pk1;
     if (cf_run_rounds_dyn(Q->L1, Q->d_c1, lim1, lpb1, n, Q->d_st1,
                           Q->d_sp1, Q->d_nsp1, &S1, &W, NULL, blocks, threads))
         goto done;
     g_cof_peak = NULL;
-    COF_FLUSH_CK(hipEventRecord(e2));
+    COF_FLUSH_CK(hipEventRecord(e2, g_cof_stream));
 
     /* Instrumentation, not accounting: recorded after e2 so it cannot land in
      * the per-side timings this same flush reports. */
-    k_cof_status_hist<<<blocks, threads>>>(n, Q->d_st0, Q->d_st1, Q->d_nst);
+    k_cof_status_hist<<<blocks, threads, 0, g_cof_stream>>>(n, Q->d_st0, Q->d_st1, Q->d_nst);
 
-    k_rel_flags<<<blocks, threads>>>(n, Q->d_st0, Q->d_st1, Q->d_flag);
-    k_scan_pass1<<<nb, TD_SCAN_BLK>>>(Q->d_flag, n, Q->d_off, Q->d_bsum);
-    k_scan_pass2<<<1, 1024>>>(Q->d_bsum, nb);
-    k_scan_pass3<<<nb, TD_SCAN_BLK>>>(Q->d_off, n, Q->d_bsum);
-    k_rel_gather<<<blocks, threads>>>(n, Q->d_flag, Q->d_off, Q->rcap,
+    k_rel_flags<<<blocks, threads, 0, g_cof_stream>>>(n, Q->d_st0, Q->d_st1, Q->d_flag);
+    k_scan_pass1<<<nb, TD_SCAN_BLK, 0, g_cof_stream>>>(Q->d_flag, n, Q->d_off, Q->d_bsum);
+    k_scan_pass2<<<1, 1024, 0, g_cof_stream>>>(Q->d_bsum, nb);
+    k_scan_pass3<<<nb, TD_SCAN_BLK, 0, g_cof_stream>>>(Q->d_off, n, Q->d_bsum);
+    k_rel_gather<<<blocks, threads, 0, g_cof_stream>>>(n, Q->d_flag, Q->d_off, Q->rcap,
                                       Q->d_idx, Q->d_nrel);
-    COF_FLUSH_CK(hipDeviceSynchronize()); COF_FLUSH_CK(hipGetLastError());
+    COF_FLUSH_CK(cof_sync()); COF_FLUSH_CK(hipGetLastError());
     COF_FLUSH_CK(hipEventElapsedTime(&t0, e0, e1));
     COF_FLUSH_CK(hipEventElapsedTime(&t1, e1, e2));
     Q->ms_rat += t0; Q->ms_alg += t1;
@@ -2325,14 +2424,14 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
         if (Q->chunk_cur != was) cof_report_chunk(Q->chunk_cur, n, 0);
     }
 
-    COF_FLUSH_CK(hipMemcpy(&nr, Q->d_nrel, 4, hipMemcpyDeviceToHost));
+    COF_FLUSH_CK(cof_d2h(&nr, Q->d_nrel, 4));
     /* The width invariant, asserted rather than trusted: cof_classify rejects
      * a residual above mfb and resolve_and_check_cofactor_config refuses an mfb above
      * 32*L, so a record that did not fit its side's limbs means one of those
      * two is wrong. Stop -- the alternative is a relation built from a
      * truncated cofactor, which reconstructs to the wrong norm and is far
      * harder to trace back here. */
-    COF_FLUSH_CK(hipMemcpy(&novf, Q->d_ovf, 4, hipMemcpyDeviceToHost));
+    COF_FLUSH_CK(cof_d2h(&novf, Q->d_ovf, 4));
     if (novf) {
         fprintf(stderr, "  cofac queue: %u residual(s) exceeded the %d/%d-limb"
                 " cofactor width; mfb and the width are out of step\n",
@@ -2356,27 +2455,27 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     {   /* cumulative on the device, so this is a snapshot of the total rather
          * than a per-flush delta -- assign, do not add. */
         unsigned long long h[8];
-        if (!CUDA_CHECKED(hipMemcpy(h, Q->d_nst, sizeof h, hipMemcpyDeviceToHost)))
+        if (!CUDA_CHECKED(cof_d2h(h, Q->d_nst, sizeof h)))
             for (int sd = 0; sd < 2; sd++)
                 for (int k = 0; k < 4; k++) Q->nst[sd][k] = h[sd * 4 + k];
     }
     if (!nr) { Q->n = 0; rc = 0; goto done; }
 
-    k_rel_pack<<<blocks, threads>>>(nr, Q->d_idx, *Q, O->d_a, O->d_b,
+    k_rel_pack<<<blocks, threads, 0, g_cof_stream>>>(nr, Q->d_idx, *Q, O->d_a, O->d_b,
                                     O->d_f0, O->d_fn0, O->d_f1, O->d_fn1,
                                     O->d_sp0, O->d_nsp0, O->d_sp1, O->d_nsp1);
-    COF_FLUSH_CK(hipDeviceSynchronize()); COF_FLUSH_CK(hipGetLastError());
+    COF_FLUSH_CK(cof_sync()); COF_FLUSH_CK(hipGetLastError());
     h0 = host_ms();
-    COF_FLUSH_CK(hipMemcpy(O->a, O->d_a, (size_t)nr * 8, hipMemcpyDeviceToHost));
-    COF_FLUSH_CK(hipMemcpy(O->b, O->d_b, (size_t)nr * 8, hipMemcpyDeviceToHost));
-    COF_FLUSH_CK(hipMemcpy(O->f0, O->d_f0, (size_t)nr * TD_FMAX * 4, hipMemcpyDeviceToHost));
-    COF_FLUSH_CK(hipMemcpy(O->f1, O->d_f1, (size_t)nr * TD_FMAX * 4, hipMemcpyDeviceToHost));
-    COF_FLUSH_CK(hipMemcpy(O->fn0, O->d_fn0, nr, hipMemcpyDeviceToHost));
-    COF_FLUSH_CK(hipMemcpy(O->fn1, O->d_fn1, nr, hipMemcpyDeviceToHost));
-    COF_FLUSH_CK(hipMemcpy(O->sp0, O->d_sp0, (size_t)nr * CF_MAXFAC * 8, hipMemcpyDeviceToHost));
-    COF_FLUSH_CK(hipMemcpy(O->sp1, O->d_sp1, (size_t)nr * CF_MAXFAC * 8, hipMemcpyDeviceToHost));
-    COF_FLUSH_CK(hipMemcpy(O->nsp0, O->d_nsp0, nr, hipMemcpyDeviceToHost));
-    COF_FLUSH_CK(hipMemcpy(O->nsp1, O->d_nsp1, nr, hipMemcpyDeviceToHost));
+    COF_FLUSH_CK(cof_d2h(O->a, O->d_a, (size_t)nr * 8));
+    COF_FLUSH_CK(cof_d2h(O->b, O->d_b, (size_t)nr * 8));
+    COF_FLUSH_CK(cof_d2h(O->f0, O->d_f0, (size_t)nr * TD_FMAX * 4));
+    COF_FLUSH_CK(cof_d2h(O->f1, O->d_f1, (size_t)nr * TD_FMAX * 4));
+    COF_FLUSH_CK(cof_d2h(O->fn0, O->d_fn0, nr));
+    COF_FLUSH_CK(cof_d2h(O->fn1, O->d_fn1, nr));
+    COF_FLUSH_CK(cof_d2h(O->sp0, O->d_sp0, (size_t)nr * CF_MAXFAC * 8));
+    COF_FLUSH_CK(cof_d2h(O->sp1, O->d_sp1, (size_t)nr * CF_MAXFAC * 8));
+    COF_FLUSH_CK(cof_d2h(O->nsp0, O->d_nsp0, nr));
+    COF_FLUSH_CK(cof_d2h(O->nsp1, O->d_nsp1, nr));
     if (fo)
         for (uint32_t k = 0; k < nr; k++) {
             int64_t a = O->a[k], b = O->b[k];
@@ -2610,6 +2709,9 @@ static int cf_run_side_dyn(int L, const mz<CF_LMAX> *h_n, uint32_t nj,
                            const cf_sched_t *S, const char *side_name)
 {
     switch (L) {
+    case 2: return cf_run_side_at<2>(h_n, nj, lim, lpb, h_status, h_fac,
+                                     h_nfac, blocks, threads, verbose, ms_out,
+                                     S, side_name);
     case 3: return cf_run_side_at<3>(h_n, nj, lim, lpb, h_status, h_fac,
                                      h_nfac, blocks, threads, verbose, ms_out,
                                      S, side_name);
@@ -3070,7 +3172,7 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
 {
     FILE *f = fopen(path, "rb");
     uint32_t *h_s = NULL, *d_s = NULL, ns = 0;
-    uint8_t *h_s2mask = NULL, *d_s2mask = NULL;
+    cf_s2mask_t *h_s2mask = NULL, *d_s2mask = NULL;
     uint32_t s2vmin = 0, s2nv = 0;
     cf_sched_t sched;
     char *buf = NULL;
@@ -3191,24 +3293,27 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
     st0 = (uint8_t *)malloc(n0 ? n0 : 1); nf0 = (uint8_t *)calloc(n0 ? n0 : 1, 1);
     fac0 = (uint64_t *)malloc((size_t)(n0 ? n0 : 1) * CF_MAXFAC * 8);
     if (meth0 || meth1) {
-        ns = cf_ecm_plan(ecm_b1, &h_s);
+        ns = cf_ecm_plan(ecm_b1, ecm_b2, &h_s);
         if (!ns) { fprintf(stderr, "  cofac: empty ECM plan for B1=%u\n", ecm_b1); return -1; }
         CK(hipMalloc(&d_s, (size_t)ns * 4));
         CK(hipMemcpy(d_s, h_s, (size_t)ns * 4, hipMemcpyHostToDevice));
         free(h_s);
         if (ecm_b2) {
-            s2nv = cf_ecm_stage2_plan(ecm_b1, ecm_b2, &s2vmin, &h_s2mask);
-            if (!s2nv) {
-                fprintf(stderr, "  cofac: empty ECM stage-2 plan for B1=%u"
-                        " B2=%u\n", ecm_b1, ecm_b2);
+            if (cf_ecm_stage2_plan(ecm_b1, ecm_b2, &s2vmin, &h_s2mask,
+                                   &s2nv)) {
+                fprintf(stderr, "  cofac: cannot build the ECM stage-2 plan"
+                        " for B1=%u B2=%u\n", ecm_b1, ecm_b2);
                 free(h_s2mask); hipFree(d_s);
                 free(buf); free(rest); free(j0); free(j1); free(i0); free(i1);
                 free(small0); free(small1); free(side0ok); free(alg_job);
                 free(st0); free(nf0); free(fac0);
                 return -1;
             }
-            CK(hipMalloc(&d_s2mask, s2nv));
-            CK(hipMemcpy(d_s2mask, h_s2mask, s2nv, hipMemcpyHostToDevice));
+            if (s2nv) {         /* 0: every stage-2 prime folded into stage 1 */
+                CK(hipMalloc(&d_s2mask, s2nv * sizeof *h_s2mask));
+                CK(hipMemcpy(d_s2mask, h_s2mask, s2nv * sizeof *h_s2mask,
+                              hipMemcpyHostToDevice));
+            }
             free(h_s2mask);
         }
         printf("  ECM: B1 = %u, %u prime powers, B2 = %u (%u giant steps),"

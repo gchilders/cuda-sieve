@@ -144,6 +144,22 @@ elif run --cofactor --cof-ecm --ecm-b1 400000 --nq 1 --relations $TMP/b1hi.txt \
 else
     printf 'FAIL   %-34s refused itself\n' "large B1 with derived B2"; fail=1
 fi
+# A B1 below D/2 (105 at D=210) with stage 2. Stage 2's first giant step covers
+# primes above D/2 only, so (B1, D/2] is folded into stage 1. Before the fold,
+# raising D silently turned stage 2 off here (and refused an explicit --ecm-b2).
+# It must run, report its stage 2, and never find fewer relations than stage 1
+# alone at the same B1 and curves.
+s1=$(run --cofactor --cof-ecm --cof-rounds 2 --ecm-b1 50 --ecm-b2 0 --ecm-curves 16 \
+         --relations $TMP/lb1.txt | grep 'total relations' | tail -1 | awk '{print $NF}')
+out=$(run --cofactor --cof-ecm --cof-rounds 2 --ecm-b1 50 --ecm-b2 1500 --ecm-curves 16 \
+          --relations $TMP/lb2.txt || true)
+s2=$(printf '%s' "$out" | grep 'total relations' | tail -1 | awk '{print $NF}')
+if printf '%s' "$out" | grep -qE 'ECM B1 = 50, .*B2 = 1500 \([1-9][0-9]* giant steps\)' &&
+   [ -n "$s1" ] && [ -n "$s2" ] && [ "$s2" -ge "$s1" ]; then
+    printf 'PASS   %-34s stage 1 %s, with stage 2 %s\n' "B1 below D/2 keeps stage 2" "$s1" "$s2"
+else
+    printf 'FAIL   %-34s stage 1 %s, with stage 2 %s\n' "B1 below D/2 keeps stage 2" "$s1" "$s2"; fail=1
+fi
 # --ecm-b2 without --cof-ecm is NO LONGER an error: since 2026-08-19 the method
 # is chosen per side, and this job's algebraic side is 3LP, so ECM is selected
 # automatically and the flag is live. Forcing rho is what makes it a no-op.
@@ -314,6 +330,15 @@ if [ "$got" = "1" ]; then
 else
     printf 'FAIL   %-34s did not resolve to rho / ECM\n' "auto method, 2LP and 3LP sides"; fail=1
 fi
+# ...unless the 2LP side's lpb is large: rho's sqrt(2^lpb) stops being cheap,
+# so at lpb >= COF_ECM_2LP_MIN_LPB (35) a 2LP side goes to ECM too. Same job
+# with the rational side widened to lpb 36 / mfb 72 (still 2 parts).
+got=$(run --cofactor --lpb0 36 --mfb0 72 --relations $TMP/m36.txt | grep -c 'cofactor method: side 0 ECM, side 1 ECM' || true)
+if [ "$got" = "1" ]; then
+    printf 'PASS   %-34s ECM / ECM\n' "auto method, 2LP at lpb 36"
+else
+    printf 'FAIL   %-34s did not resolve to ECM / ECM\n' "auto method, 2LP at lpb 36"; fail=1
+fi
 # Forcing must override the automatic choice in both directions.
 got=$(run --cofactor --cof-rho --relations $TMP/m.txt | grep -c 'side 0 rho, side 1 rho' || true)
 got2=$(run --cofactor --cof-ecm --relations $TMP/m.txt | grep -c 'side 0 ECM, side 1 ECM' || true)
@@ -382,7 +407,7 @@ if [ "$LMAX" -ge 4 ]; then
     # asymmetry: side 1 wide, side 0 narrow, chosen by nobody.
     out=$(run --cofactor --cof-rounds 2 --cof-budget 65536 --lpb 33 --mfb 99 \
               --relations $TMP/w99.txt || true)
-    got=$(printf '%s' "$out" | grep -c 'side 0 3 limbs (96 bits), side 1 4 limbs (128 bits)' || true)
+    got=$(printf '%s' "$out" | grep -c 'side 0 2 limbs (64 bits), side 1 4 limbs (128 bits)' || true)
     n99=$(printf '%s' "$out" | grep 'total relations' | tail -1 | awk '{print $NF}')
     # Not pinned to a number: mfb 99 admits candidates the pinned lpb-33 case
     # (mfb 92) never saw, so the count is a property of the wider gate and not
@@ -392,7 +417,7 @@ if [ "$LMAX" -ge 4 ]; then
     if [ "$got" = "1" ] && [ "${n99:-0}" -ge 59 ] && \
        ./bench --check-relations $TMP/w99.txt --poly $POLY --lpb 33 --lpb0 31 2>&1 \
        | grep -q 'PASS'; then
-        printf 'PASS   %-34s 4/3 derived, %s relations, all reconstruct\n' \
+        printf 'PASS   %-34s 4/2 derived, %s relations, all reconstruct\n' \
                "lpb 33 / mfb 99 needs 4 limbs" "$n99"
     else
         printf 'FAIL   %-34s width line %s, %s relations\n' \
@@ -403,6 +428,32 @@ if [ "$LMAX" -ge 4 ]; then
     expect_refused "cof-limbs below what mfb needs" --cofactor --lpb 33 --mfb 99 --cof-limbs 3
 else
     printf 'SKIP   %-34s build is 3-limb only\n' "4-limb width cases"
+fi
+
+# The rational side of this job has mfbr 60, so its width DERIVES to 2 limbs;
+# forcing it back to 3 must change the cost and nothing else -- the same
+# Montgomery-domain argument as the 3 -> 4 cases above.
+run --cofactor --cof-rho --cof-rounds 2 --cof-budget 65536 --relations $TMP/n2.txt \
+    > $TMP/n2.out 2>&1 || true
+run --cofactor --cof-rho --cof-rounds 2 --cof-budget 65536 --cof-limbs0 3 \
+    --relations $TMP/n3.txt >/dev/null 2>&1 || true
+if grep -q 'side 0 2 limbs (64 bits)' $TMP/n2.out && [ -s $TMP/n2.txt ] && \
+   cmp -s $TMP/n2.txt $TMP/n3.txt; then
+    printf 'PASS   %-34s identical to the 3-limb run\n' "side 0 derived at 2 limbs"
+else
+    printf 'FAIL   %-34s width not 2, or output differs from 3 limbs\n' "side 0 derived at 2 limbs"; fail=1
+fi
+# The same for ECM, whose 2-limb curve arithmetic is a separate instantiation
+# (cf_run_side_dyn case 2) that the rho case above never runs.
+run --cofactor --cof-ecm --ecm-b1 1000 --ecm-b2 10000 --ecm-curves 16 \
+    --relations $TMP/ne2.txt > $TMP/ne2.out 2>&1 || true
+run --cofactor --cof-ecm --ecm-b1 1000 --ecm-b2 10000 --ecm-curves 16 \
+    --cof-limbs0 3 --relations $TMP/ne3.txt >/dev/null 2>&1 || true
+if grep -q 'side 0 2 limbs (64 bits)' $TMP/ne2.out && [ -s $TMP/ne2.txt ] && \
+   cmp -s $TMP/ne2.txt $TMP/ne3.txt; then
+    printf 'PASS   %-34s identical to the 3-limb run\n' "ECM side 0 derived at 2 limbs"
+else
+    printf 'FAIL   %-34s width not 2, or output differs from 3 limbs\n' "ECM side 0 derived at 2 limbs"; fail=1
 fi
 
 expect_refused "zero rho budget"              --cofactor --cof-budget 0

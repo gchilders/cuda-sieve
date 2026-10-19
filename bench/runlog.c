@@ -117,14 +117,35 @@ void runlog_close(void)
     L.nvml_power = NULL;
 }
 
+/* --instances: each pipeline thread keeps its own record clock and tags its
+ * records, so every instance logs on the period and a reader can tell them
+ * apart. A thread that never calls runlog_thread_tag() uses the shared clock
+ * and writes untagged records, exactly as before. */
+#if defined(_MSC_VER)
+#define RL_TLS __declspec(thread)
+#else
+#define RL_TLS _Thread_local
+#endif
+static RL_TLS int    rl_tl_on;
+static RL_TLS double rl_tl_next;
+static RL_TLS char   rl_tag[16];
+
+void runlog_thread_tag(const char *tag)
+{
+    snprintf(rl_tag, sizeof rl_tag, "%s", tag ? tag : "");
+    rl_tl_on = 1;
+    rl_tl_next = runlog_now_ms() + L.period_ms;
+}
+
 int runlog_due(void)
 {
     const double now = runlog_now_ms();
-    if (!L.f || now < L.t_next) return 0;
+    double *next = rl_tl_on ? &rl_tl_next : &L.t_next;
+    if (!L.f || now < *next) return 0;
     /* From now, not from the previous deadline: a q that overruns the period
      * (a slow band, a suspended process) must not leave the log owing a burst
      * of back-to-back records to catch up. */
-    L.t_next = now + L.period_ms;
+    *next = now + L.period_ms;
     return 1;
 }
 
@@ -211,8 +232,9 @@ static void runlog_prefix(char *pre, size_t n)
 {
     char ts[40];
     runlog_stamp(ts, sizeof ts);
-    snprintf(pre, n, "%s +%.0fs  ", ts,
-             (runlog_now_ms() - L.t_open) / 1000.0);
+    snprintf(pre, n, "%s +%.0fs  %s%s", ts,
+             (runlog_now_ms() - L.t_open) / 1000.0, rl_tag,
+             rl_tag[0] ? "  " : "");
 }
 
 void runlog_record(const char *fmt, ...)

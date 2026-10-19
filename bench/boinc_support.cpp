@@ -260,6 +260,18 @@ extern "C" int bench_boinc_is_managed(void)
 #endif
 }
 
+extern "C" int bench_boinc_suspended(void)
+{
+#ifdef HAVE_BOINC
+    /* Written by the runtime's timer thread; a plain int read of a flag that
+     * is polled once per special-q. Late by one q at worst. */
+    return boinc_state == BOINC_READY &&
+           ((volatile BOINC_STATUS *)&boinc_status)->suspended != 0;
+#else
+    return 0;
+#endif
+}
+
 extern "C" int bench_boinc_resolve_path(const char *option,
                                          const char *logical_name,
                                          const char **resolved_name)
