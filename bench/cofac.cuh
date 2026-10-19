@@ -616,7 +616,7 @@ static int cf_ecm_stage2_plan(uint32_t b1, uint32_t b2, uint32_t *vmin_out,
         return -1;
     /* u -> mask bit, in cf_ecm_baby's order, once. */
     for (uint32_t u = 0; u < CF_ECM_D / 2u; u++)
-        kidx[u] = (int8_t)(cf_ecm_coprime(u) ? nb++ : -1);
+        kidx[u] = (int8_t)(cf_ecm_coprime(u) ? (int)nb++ : -1);
     if (nb != CF_ECM_NBABY) return -1;
     if (b2 <= lo) return 0;                  /* all of (B1, B2] in stage 1 */
     composite = cf_ecm_sieve(b2);
