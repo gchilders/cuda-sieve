@@ -2403,6 +2403,11 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     unsigned long long ntd_skipped = 0;
     /* q abandoned because every slab of it was skipped. */
     unsigned long long nq_lost = 0;
+    /* q fully sieved with no two-sided survivor, on a DEGENERATE q-lattice
+     * (qlat_degenerate) -- the one zero that is explained by geometry rather
+     * than by a skip. Kept apart from nq_lost, and NOT fed to PIPE_LOST_MAX:
+     * nothing was lost, the q simply has (almost) nothing to find. */
+    unsigned long long nq_degen = 0;
     unsigned long long nqskip = 0;   /* special-q passed over on norm width */
     size_t optin_smem_limit = 0;
     double acc_isect = 0, acc_host = 0, acc_wall = 0;
@@ -4118,13 +4123,63 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
              * no two-sided survivor means something is wrong, and that
              * invariant predates slabbing. But if slabs were soft-skipped
              * above, zero is explained rather than suspicious -- do not
-             * convert a bucket overflow into a dead task by the back door. */
-            if (!nslab_skipped_q) {
-                fprintf(stderr, "  pipeline: no survivors at this q\n");
+             * convert a bucket overflow into a dead task by the back door.
+             *
+             * The second explained zero is a DEGENERATE q-lattice
+             * (qlat_degenerate in poly.c): q divides F(a,b) for a small
+             * (a,b), the reduced basis is (tiny, ~q/tiny), and the rectangle
+             * never reaches small norms: on the case below its median cell is
+             * ~57 bits larger on the algebraic side than an ordinary q's, and
+             * it keeps 0-5% of an ordinary root's two-sided survivors. Such a
+             * q was sieved in full, honestly, and a zero from it is a Poisson
+             * tail rather than a fault. Found on the C155 of 13^249+11^249 at
+             * q = 21387733 = F(-3,1), which killed the band and with it the
+             * whole hcngpu job; RESULTS.md finding 116 has the measurements.
+             *
+             * WHY THIS DOES NOT BLUNT THE INVARIANT. The exemption is decided
+             * by the lattice alone, before anything about this q's sieve is
+             * known, and it covers ~1e-4 of (q,rho) (159 of ~1.36M on that
+             * job). A fault that zeroes ordinary q still fails here on the
+             * first one it touches. The only fault it can hide is one confined
+             * to degenerate lattices, and those q already yield a few percent
+             * of an ordinary q at best -- so the most yield it could ever hide
+             * is ~1e-4 of a percent-scale share. That bound, not a yield
+             * model, is the justification; it is also why the threshold is
+             * the geometric one and not tuned to this job.
+             *
+             * Sieved FIRST and exempted only on a zero, rather than skipped up
+             * front: a degenerate q is not empty -- q = 11253973 = F(-1,3) on
+             * the same job had 10 two-sided survivors -- and anything it does
+             * find is a valid relation. */
+            const int degen = !nslab_skipped_q &&
+                              qlat_degenerate(&Lq, POLY->skew, cfg->logI);
+            if (!nslab_skipped_q && !degen) {
+                fprintf(stderr, "  pipeline: no survivors at this q"
+                        " (q=%llu rho=%llu)\n",
+                        (unsigned long long)cur->q,
+                        (unsigned long long)cur->rho);
                 PIPE_Q_ROLLBACK();
                 rc = -1; break;
             }
-            nq_lost++;
+            if (degen) {
+                /* Loud, like every other pass-over in this loop, and naming
+                 * the basis: the short vector IS the (a,b) with q | F(a,b),
+                 * which is what makes the line checkable by hand. */
+                nq_degen++;
+                runlog_warn("  q=%llu rho=%llu: no two-sided survivor on a"
+                            " degenerate q-lattice, basis (%lld,%lld)"
+                            " (%lld,%lld), so its norms are far above an"
+                            " ordinary q's (side 1: %llu survivors, side 0:"
+                            " %llu). Passed over; this is geometry, not a"
+                            " fault.",
+                            (unsigned long long)cur->q,
+                            (unsigned long long)cur->rho,
+                            (long long)Lq.a0, (long long)Lq.a1,
+                            (long long)Lq.b0, (long long)Lq.b1,
+                            (unsigned long long)side_surv1,
+                            (unsigned long long)side_surv0);
+            } else
+                nq_lost++;
             /* Roll back the accumulators this q already charged. The others
              * are either held in a local above (ts1/ts0, so acc_fi and acc_ap
              * never see this q) or added after this point.
@@ -5045,6 +5100,13 @@ done:
     if (nq_lost)
         runlog_warn("  %llu special-q produced nothing because every slab of"
                     " them was skipped", nq_lost);
+    /* Not a yield loss, so not a warning about the band -- but counted in the
+     * summary so a band's q total reconciles: these q were sieved and are in
+     * neither nqdone nor nq_lost. */
+    if (nq_degen)
+        runlog_warn("  %llu special-q on a degenerate q-lattice found no"
+                    " two-sided survivor and were passed over (not counted in"
+                    " the per-q figures)", nq_degen);
     if (stop_hooked) bench_stop_hook_remove();
     /* CUDA failures can jump here from any stage. Normal completion already
      * finalized exactly once above; an early jump closes and discards here --

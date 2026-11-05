@@ -12231,3 +12231,138 @@ scheduler that runs one curve per launch and compacts in between could recover
 some of it. It would have to carry `mz_split`'s factor stack between launches,
 because changing the curves or the rounds changes the relations (above). Not
 attempted.
+
+## Finding 116 — a special-q whose lattice holds a tiny (a,b) killed a whole band: q = 21387733 = F(−3,1) on the 13^249+11^249 C155 sieved to zero two-sided survivors and tripped the whole-q invariant. Degenerate q-lattices (I·|u|² ≤ q) are now passed over on a zero instead of failing; everything else still fails
+
+A100 80 GB on turing (`a100-4u-0-1`), `main` at `bba2da8` (the deployed
+binary) and the same tree with this change built `GPU_ARCH=80`. The job is
+hcngpu's SNFS sextic for the C155 cofactor of 13^249+11^249:
+f = 28561x^6 − 20449x^3 + 14641, skew 0.8946, lim 6e6 both sides, lpb 28,
+mfb 56, `--logI 13 --region 12 --sq-side 1` (so J = 4096).
+
+### What happened
+
+`--qrange 21387733:21387800` failed after two q with
+`pipeline: no survivors at this q`. The third root of 21387733 is
+rho = 21387730 ≡ −3, and 21387733 = F(−3,1) exactly, so (−3,1) is a vector of
+the (q,rho) lattice. hcngpu gives up on a number when a band fails, so the
+whole factorisation stopped there. It was finished by hand by sieving around
+q = 21387733 and q = 26174977 = F(−3,2).
+
+### Why it gives zero
+
+Gauss reduction finds the tiny vector: the basis is u = (3,−1),
+v = (1746556, 6547059). The determinant is q, so row j of the rectangle lies
+at distance j·q/|u| from the line through u. Each row spans only I·|u| ≈ 26 k
+along that line, so all 8192 cells of a row have essentially the same (a,b)
+size. The rectangle never comes near the origin. Sampled over the rectangle
+(log2 of |F|/q, and of |G|):
+
+| (q, rho) | basis u | algebraic min / median / max | rational median |
+|---|---|---:|---:|
+| 21387733, 12345678 (any ordinary lattice) | (1249, 1994) | 92 / 134.5 / 140 | 123.5 |
+| 21387733, 20150313 (its ordinary sibling) | (−363, −4684) | 81 / 132.1 / 137 | 123.1 |
+| **21387733, 21387730** | **(3, −1)** | **125 / 191.2 / 197** | **133.5** |
+| 11253973, 3751324 = F(−1,3) | (1, −3) | 121 / 187.2 / 193 | 131.3 |
+| 29728687, 3096739 (I·\|u\|² ≈ q, the boundary) | (37, 48) | 102 / 167.7 / 173 | 129.3 |
+
+The degenerate lattice's best cell is only an ordinary q's 10th percentile,
+and its median cell is about 57 bits worse on the algebraic side and 10 bits
+worse on the rational side. On the device: 893 side-1 survivors and 154
+side-0 survivors, none of them on both sides. An ordinary root of the same q
+has about 1,850 two-sided survivors.
+
+It is not a scale artefact. The band derives its byte scale from its first
+(q,rho), and a degenerate first pair coarsens it, from 1.80 to 1.30 on side 1.
+Measured over the 33 q of 11253973–11254400, both scales emit the identical
+relation set: 522 relations each, same sorted sha256.
+
+### Why F(−1,3) did not fail
+
+The geometry is the same. q is half the size, so |v| is about half and every
+cell is ~4 bits smaller on the algebraic side and ~2 bits on the rational
+side. 11253973 kept 10 two-sided survivors and gave 0 relations. It passed the
+invariant by sitting just on the other side of a Poisson tail. Measured at a
+fixed scale, F(−3,2) = 26174977 also kept 3 (the hand workaround skipped it
+too). Survivors per degenerate root, `--scale 1.8 --scale0 2.025`, each q run
+alone, against the median of the same q's ordinary roots:
+
+| q | short vector | q/\|u\|² | I·\|u\|²/q | two-sided survivors | ordinary roots (mean of 2 / median of 5) | joint cand. |
+|---|---|---:|---:|---:|---:|---:|
+| 21387733 | (−3, 1) | 1,953,218 | 1/238 | **0** (derived scale) | ~1,850 | 0 |
+| 26174977 | (−3, 2) | 1,918,987 | 1/234 | 3 | 1,664 | 0 |
+| 11253973 | (−1, 3) | 1,227,260 | 1/150 | 10 (derived scale) | 2,319 | 0 |
+| 10773241 | (1, 5) | 458,826 | 1/56 | 22 | 2,782 | 0 |
+| 10897093 | (−7, 1) | 195,744 | 1/24 | 22 | 2,516 | 0 |
+| 8508373 | (6, 7) | 101,194 | 1/12 | 48 | 2,819 | 1 |
+| 13545199 | (−5, 11) | 99,458 | 1/12 | 24 | 2,431 | 2 |
+| 9552757 | (7, 9) | 75,077 | 1/9 | 40 | 2,291 | 1 |
+| 11117569 | (8, 11) | 61,836 | 1/7.5 | 52 | 2,561 | 0 |
+| 21387823 | (9, 26) | 30,761 | 1/3.8 | 52 | 1,383 | 0 |
+| 6314881 | (−11, 10) | 28,101 | 1/3.4 | 87 | 2,111 | 1 |
+| 13389553 | (24, 1) | 20,767 | 1/2.5 | 51 | 2,370 | 0 |
+| 29728687 | (37, 48) | 8,278 | 1/1.0 | 97 | 1,808 | 2 |
+
+Every degenerate root keeps 0–5% of an ordinary root's two-sided survivors.
+That includes the one sitting on the criterion's boundary. Joint candidates
+go from 30–60 to 0–2.
+
+### How rare
+
+Enumerating coprime (a,b) with I·|(a,b)|² ≤ 3e7 in the skewed norm, and
+factoring F(a,b), gives **159 degenerate (q,rho) in [6e6, 3e7]** at logI 13,
+against about 1.36M (q,rho) in that range: about 1.2e-4. That is the same
+order as the π/(2I) ≈ 1.9e-4 a random lattice would give. Every one is the pair
+(p, a/b mod p) for a prime p | F(a,b) with |a|, |b| ≲ 55.
+
+### The fix
+
+`qlat_degenerate()` (poly.c) is true when I·|u|² ≤ q in the skewed norm
+`qlat_build` reduces under. It is the geometric condition above: a row is
+shorter than its distance from the origin. It names no yield threshold and
+reads nothing but the lattice and logI. In `run_pipeline`, a q with no
+two-sided survivor is passed over when its lattice is degenerate, and is
+still fatal otherwise:
+
+- The q is still sieved in full. Anything it finds is a valid relation; F(−1,3)
+  found survivors.
+- The pass-over is the `nq_lost` exit (rollback, `continue`, nqdone not
+  incremented). It is counted in its own `nq_degen`, because nothing was lost:
+  it is NOT fed to `PIPE_LOST_MAX` and does not make the band DEGRADED.
+- One loud line per occurrence names the basis, so it can be checked by hand,
+  plus a band-summary count. The fatal message now names (q, rho), which it
+  never did.
+
+**Why this does not weaken the invariant.** The exemption is decided from the
+lattice alone, before the sieve runs, and covers ~1e-4 of (q,rho). A fault
+that zeroes ordinary q still fails on the first one it touches. The only fault
+it could hide is one confined to degenerate lattices, whose q yield 0–5% of an
+ordinary q anyway. So the most yield it could ever hide is about 1e-4 × 5%,
+and that bound, not a yield model, is the argument. Tightening the threshold
+to "only where zero is likely" would need a per-job yield model, and the
+table shows it would still have to admit lattices that sometimes yield 0.
+
+### Verified
+
+On the A100, with the patched `main`:
+
+| run | result |
+|---|---|
+| the original repro, `--instances 1 --no-q-pipeline` | exit 0; (21387733, 21387730) passed over; 5 q, 59 relations |
+| the same at production defaults (`--q-pipeline`, `--instances auto`) | exit 0; the identical 59-relation set |
+| 26174977:26175100 (F(−3,2)) | exit 0, 100 relations (its degenerate root kept 3 survivors, so nothing was exempted) |
+| 11253900:11254000 (holds F(−1,3)) | 133 relations, **sorted set identical to the deployed binary** |
+| 21387000:21387100 (ordinary) | 33 relations, **identical to the deployed binary** |
+| control: ordinary band, `--allowance 0 --allowance0 0` | exit 255, `no survivors at this q (q=21387001 rho=1600241)` |
+| control: the repro band with the same allowance | exit 255 on the first ordinary root, (21387733, 1237423) |
+
+The Metal build (10-core M3, `make -f Makefile.metal benchbin`, regenerated
+`pipeline_host.inc`) passes the same pair over with the same 893/154 per-side
+counts, and emits the same 59-relation set as the A100.
+
+### What is left
+
+Nothing in the sieve. The hand workaround for 13^249+11^249 skipped all roots
+of 21387733 and 26174977, not just the degenerate ones. That cost the ~2×13
+relations of each q's ordinary roots, which is immaterial for a finished
+number.

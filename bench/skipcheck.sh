@@ -141,8 +141,11 @@ echo "  build width: $LIMIT bits (BN_LIMBS*32)"
 #     soft-skip landed, a q whose slabs were ALL skipped (bucket overflow or a
 #     truncated factor list; norm overflow is fatal) is counted in nq_lost and
 #     passed over instead. Only an explained zero is tolerated; a q that actually
-#     sieved and found nothing still dies. So the generated job must actually
-#     yield relations, not merely overflow.
+#     sieved and found nothing still dies. (The one other explained zero is a
+#     degenerate q-lattice -- qlat_degenerate, RESULTS finding 116 -- decided
+#     from the lattice alone; it cannot rescue this gate's job, whose q are
+#     ordinary.) So the generated job must actually yield relations, not
+#     merely overflow.
 #   * A job that overflows 256 bits on one side has ~375 bits of norm across the
 #     two. At toy bounds (lim 2e6, lpb 26) that yields no survivors at all and
 #     the band dies; measured 2026-09-04 at BN_LIMBS=8. At bounds that would

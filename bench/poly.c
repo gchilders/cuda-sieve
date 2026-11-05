@@ -1100,3 +1100,49 @@ void qlat_build(qlat_t *L, uint64_t q, uint64_t rho, double skew)
     }
     L->a0 = a0; L->a1 = a1; L->b0 = b0; L->b1 = b1; L->q = q; L->rho = rho;
 }
+
+/* A DEGENERATE q-lattice: one whose reduced basis is so lopsided that the
+ * sieve rectangle never comes near the small norms a special-q is for.
+ *
+ * HOW IT ARISES. If q divides F(a,b) for some small coprime (a,b) -- most
+ * sharply when q == |F(a,b)| itself -- then rho == a/b (mod q) and (a,b) is a
+ * vector of the (q,rho) lattice. Gauss reduction finds it, so u = (a0,a1) is
+ * that tiny vector and, because the basis has determinant q, the other one is
+ * pushed out to |v| ~ q/|u|. The case that found this, the C155 of
+ * 13^249+11^249 (f = 28561x^6 - 20449x^3 + 14641, skew 0.8946), had
+ * q = 21387733 = F(-3,1), rho = -3: u = (3,-1), v = (1746556, 6547059).
+ *
+ * WHAT IT DOES TO THE SIEVE. The region is i in [-I/2, I/2), j in [1, J), and
+ * (a,b) = i*u + j*v. Row j sits at distance j*q/|u| from the line through u
+ * (area = determinant) and spans only I*|u| along it, so once I*|u| <= q/|u|
+ * a row is a short segment far from the origin and every cell in it has very
+ * nearly the same norm: the rectangle collapses to J distinct norm sizes,
+ * growing by deg*log2(j) bits from row 1. On the C155 the SMALLEST algebraic
+ * norm in the whole rectangle (row 1, 125 bits after dividing out q) is
+ * merely an ordinary q's 10th percentile, and the MEDIAN cell is 191 bits
+ * against an ordinary q's ~133 -- 57 bits worse, plus 10 on the rational
+ * side. Yield collapses with it, to 0-5% of an ordinary root's two-sided
+ * survivors (RESULTS.md finding 116); the case above had none at all, and
+ * pipeline.cuh's whole-q invariant then failed the band.
+ *
+ * THE TEST is exactly that geometric condition, I*|u|^2 <= q, in the same
+ * skewed norm the reduction used (the skew map has determinant 1, so the
+ * determinant is still q there). It names no yield threshold and depends on
+ * nothing but the lattice and logI. It is RARE: it needs a lattice vector of
+ * squared length <= q/I, i.e. q | F(a,b) with |a|,|b| ~ sqrt(q/I), which is
+ * ~1.2e-4 of all (q,rho) on the C155 at logI 13 (159 of ~1.36M in
+ * [6e6,3e7]). What the caller does with it -- pass over a degenerate q that
+ * found nothing, instead of failing -- is justified by that rarity, not by
+ * the yield model: see the comment at the `no survivors` check.
+ *
+ * Takes the smaller of the two vectors rather than trusting the (a0,a1)
+ * invariant, because qlat_build's guard can exit the loop without the final
+ * swap having been tested. */
+int qlat_degenerate(const qlat_t *L, double skew, int logI)
+{
+    const double wa = 1.0 / skew, wb = skew;
+    const double nu = wa * (double)L->a0 * L->a0 + wb * (double)L->a1 * L->a1;
+    const double nv = wa * (double)L->b0 * L->b0 + wb * (double)L->b1 * L->b1;
+    const double n = nu < nv ? nu : nv;
+    return ldexp(n, logI) <= (double)L->q;
+}
